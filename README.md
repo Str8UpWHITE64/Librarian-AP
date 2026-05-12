@@ -17,7 +17,7 @@ open up new series and bookcases.
 - **UE4SS — experimental build**. The stable release isn't new enough;
   download the experimental build directly:
 
-  <https://github.com/UE4SS-RE/RE-UE4SS/releases/download/experimental-latest/UE4SS_v3.0.1-946-g265115c0.zip>
+  <https://github.com/UE4SS-RE/RE-UE4SS/releases/download/experimental-latest/UE4SS_v3.0.1-949-gdd6777a8.zip>
 
   UE4SS ships with `BPModLoaderMod` already included; that's the loader
   that picks up the `.pak` mod below.
