@@ -70,7 +70,7 @@ So you end up with:
 <Win64>\Mods\mods.txt                          (our version)
 <Win64>\Mods\Librarian-AP\Scripts\main.lua
 <Win64>\Mods\Librarian-AP\Scripts\AP\...
-<Win64>\Mods\Librarian-AP\enabled.txt
+<Win64>\Mods\Librarian-AP\ap_config.json 
 ```
 
 ### 3. Install the BP companion pak
