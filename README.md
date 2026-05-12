@@ -87,14 +87,11 @@ start; nothing else to configure.
 
 ### 4. Install the Archipelago apworld
 
-Copy `apworld/librarian/` into your Archipelago install:
+Copy `librarian.apworld` from Releases into your Archipelago install:
 
 ```
-<Archipelago>\custom_worlds\librarian\
+<Archipelago>\custom_worlds\librarian.apworld
 ```
-
-(If your Archipelago install only has a `lib/worlds/` folder, drop it
-there instead.)
 
 ---
 
@@ -102,7 +99,7 @@ there instead.)
 
 ### 1. Generate the YAML
 
-After Placing the APWorld file in Custom Worlds, relaunch Archipelago and click Generate Template Options. This will open up the templates, where you can find `Librarian Tidy Up the Arcane Library.yaml`.  Edit it with your preferred settings.
+After placing the APWorld file in Custom Worlds, relaunch Archipelago and click Generate Template Options. This will open up the templates, where you can find `Librarian Tidy Up the Arcane Library.yaml`.  Edit it with your preferred settings.
 
 ### 2. Generate a seed
 
