@@ -37,7 +37,8 @@ local function log(msg) print(LOG_PREFIX .. " " .. tostring(msg)) end
 -- AP location ID layout (mirrors apworld/librarian/Locations.py)
 local AP_BASE              = 1910000
 local AP_LOC_LEVEL_FIRST   = AP_BASE + 560   -- 45 entries: Level 1..45
-local AP_LOC_MILESTONE_FIRST = AP_BASE + 640 -- 10 entries: aligned to MILESTONE_THRESHOLDS order
+local AP_LOC_MILESTONE_FIRST = AP_BASE + 640 -- 22 entries: aligned to MILESTONE_THRESHOLDS order
+local AP_LOC_ROW_COMPLETION_FIRST = AP_BASE + 1000 -- 50 entries: aligned to ROW_COMPLETION_THRESHOLDS order
 local AP_MAX_PLAYER_LEVEL  = 45
 
 local UPGRADE = {
@@ -140,16 +141,28 @@ M._case_to_section  = {}
 -- runs every 5s and was spamming the log with identical lines.
 M._last_apply_log_key = nil
 
--- Per-case completion snapshot: { [case_key] = { [asset_idx] = book_count } }.
--- Counts placed books per AssetIdx by walking `BookCase.PlacingBookInfo`.
--- A series is complete when its count reaches its volume count (3, 5, or 10).
--- This avoids RowStatus's completion-order indexing (RowStatus[i] is the
--- i-th *completed* row globally, not the i-th positional row, so the index
--- doesn't tell us which series).
-M._case_completion_snapshot = {}
+-- Per-case row-status length snapshot. `case.RowStatus` is the game's own
+-- per-case list of completed rows (a row is "complete" only when the
+-- right series's volumes are placed in volume order — the game validates
+-- order + section internally). When the list's length grows we know the
+-- game has just registered a new row on that case. Combined with the
+-- per-AssetIdx count walk, we identify exactly which series completed,
+-- without false fires from wrong-order placements.
+M._case_row_status_count = {}
+
+-- Tracks which AssetIdx values we've already fired AP checks for, per
+-- bookcase. Avoids re-firing if the player removes and re-completes the
+-- same row on the same case. Combined with M._sent_row_locations (the
+-- global de-dupe set), gives us belt-and-suspenders protection against
+-- duplicate row checks across reconnect / save reload.
+M._case_fired_per_aidx = {}
 
 -- Already-sent row location IDs in this session (de-dupe defense).
 M._sent_row_locations = {}
+
+-- Already-fired row-completion thresholds in this session (de-dupe defense).
+-- Keyed by threshold value (matches slot_data.row_completion_thresholds entries).
+M._sent_row_completions = {}
 
 -- Highest player level we've sent a "Reached Level N" check for. Synced from
 -- GameSaveData ONCE at apply-safe (baseline) so loaded saves catch up to
@@ -162,6 +175,18 @@ M._level_baseline_done = false
 
 -- Milestone thresholds we've already sent checks for (set { [threshold] = true }).
 M._milestones_sent = {}
+
+
+
+-- "Stray" BookCase actors found in the level that aren't referenced by any
+-- CabinetLabel's CountBookCase array. These appear to be level-design
+-- artifacts — bookcases tucked into walls / corners that don't belong to
+-- any section but are still real BookCase actors. They were never indexed
+-- (and so never hidden/collision-disabled), and the game's placement system
+-- can still find them by aim angle, causing a softlock when the player
+-- places a book they can't retrieve. Collected once during _index_bookcases
+-- and permanently kept hidden + collision-off by _apply_bookcases_to_world.
+M._stray_cases = {}
 
 -- One-shot guard: baseline sync (rows/levels/milestones) runs only on the
 -- first detected player movement after entering gameplay. The title screen
@@ -226,11 +251,14 @@ function M.set_slot_data(slot_data)
     M._pending_skill_grants = {}
     M._applied_skill_counts = {}
     M._sent_row_locations = {}
+    M._sent_row_completions = {}
     M._last_applied_series_unlocked = {}
     M._levels_reached = 0
     M._level_baseline_done = false
     M._milestones_sent = {}
     M._baseline_sync_done = false
+    M._books_placed_observed = 0
+    M._books_placed_peak = 0
     M._initialized = next(M._asset_to_series) ~= nil
     if not M._initialized then
         log("WARNING: slot data set but asset data not loaded; init incomplete")
@@ -323,7 +351,9 @@ function M.set_gameplay_active(state)
             log("Clearing bookcase index (left gameplay)")
             M._section_to_cases = {}
             M._case_to_section = {}
-            M._case_completion_snapshot = {}
+            M._case_row_status_count = {}
+            M._case_fired_per_aidx = {}
+            M._stray_cases = {}
             M._last_apply_log_key = nil
             M._cases_indexed = false
         end
@@ -431,10 +461,6 @@ function M.flush_apply()
     -- over several seconds, but locked sections are already out of sight.
     M._apply_bookcases_to_world()
     M._apply_books_to_world()
-    -- Diagnostic: print which series the player can place on each visible
-    -- case, marking which are currently unlocked. Helps when the player
-    -- can't find any book to fit an open shelf.
-    pcall(function() M.log_visible_case_series() end)
     -- NOTE: baseline syncs (rows, levels, milestones) are NOT done here.
     -- The title menu loads the previous save behind the scenes, so reading
     -- GameSaveData at apply-safe time can return stale values. Baseline
@@ -454,6 +480,28 @@ function M.run_baseline_sync()
     pcall(function() row_synced = M.detect_completed_rows() end)
     if row_synced and row_synced > 0 then
         log(("Row baseline sync: sent %d check(s) for already-completed rows"):format(row_synced))
+    end
+
+    -- Read the game's CurrentFinishedRowNum and fire any
+    -- "Complete N Rows" thresholds the saved game has already passed.
+    -- Without this, a save loaded mid-run would silently skip those
+    -- milestones (FinishRow only fires for NEW row completions).
+    local rows_finished = 0
+    pcall(function()
+        local gi = FindFirstOf("BP_LibrarianGameInstance_C")
+            or FindFirstOf("LibrarianGameInstanceBase")
+        if gi and gi:IsValid() then
+            local sg = gi.GameSaveData
+            if sg and sg:IsValid() then
+                rows_finished = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
+            end
+        end
+    end)
+    local rc_synced = 0
+    pcall(function() rc_synced = M.fire_row_completion_checks(rows_finished) end)
+    if rc_synced and rc_synced > 0 then
+        log(("Row-completion baseline sync: sent %d check(s) for thresholds <= %d rows"):format(
+            rc_synced, rows_finished))
     end
 
     local lvl_sent, ms_sent = 0, 0
@@ -787,7 +835,13 @@ function M._initialize_hism_book_mapping()
     end
 
     -- Phase 2: classify books as warded/unwarded/uninitialized. We only
-    -- mark warded books (the ones we'll need to hide).
+    -- mark warded books (the ones we'll need to hide). Same rule as
+    -- _apply_books_to_world Pass 1 — the only_unward_shelfable_books
+    -- toggle gates whether the bookcase-side check is added on top of
+    -- the series unlock.
+    local only_shelfable = M._slot_data
+        and M._slot_data.only_unward_shelfable_books == 1
+    local shelf_req_map = (M._slot_data and M._slot_data.shelf_req_map) or {}
     local is_warded_book = {}
     local warded_count, unwarded_count, uninit_count = 0, 0, 0
     for i = 1, bn do
@@ -796,7 +850,16 @@ function M._initialize_hism_book_mapping()
             local asset_idx = _book_valid_asset_idx(b)
             if asset_idx ~= nil then
                 local series = M._asset_to_series[asset_idx]
-                local should_unward = series and M._series_unlocked[series]
+                local section_id = M._asset_to_section[asset_idx]
+                local series_open = series and M._series_unlocked[series]
+                local should_unward = series_open
+                if only_shelfable and series_open and section_id then
+                    local needed = shelf_req_map[series]
+                    if needed and needed > 0 then
+                        local open = M._shelves_open[section_id] or 0
+                        if open < needed then should_unward = false end
+                    end
+                end
                 if should_unward then
                     unwarded_count = unwarded_count + 1
                 else
@@ -1143,6 +1206,16 @@ function M._apply_books_to_world()
     local hide_mesh = M._slot_data
         and M._slot_data.book_visibility == "hidden"
 
+    -- only_unward_shelfable_books (YAML toggle, default off): when set, a
+    -- book is only unwarded if BOTH its series is received AND its target
+    -- bookcase is open. The shelf_req_map is the per-series bookcase index
+    -- needed (series_name → required shelf count). Disabled by default to
+    -- preserve the "pick up any unlocked-series book, mis-shelf and recover"
+    -- gameplay loop.
+    local only_shelfable = M._slot_data
+        and M._slot_data.only_unward_shelfable_books == 1
+    local shelf_req_map = (M._slot_data and M._slot_data.shelf_req_map) or {}
+
     -- Sanity check: are book actors INITIALIZED yet? When M01 first loads,
     -- BP_GrabbingBook actors are spawned but their ItemInfo.AssetIdx is the
     -- default 0 until the game runs its placement / population logic.
@@ -1197,7 +1270,23 @@ function M._apply_books_to_world()
             local asset_idx = _book_valid_asset_idx(book)
             if asset_idx ~= nil then
                 local series_name = M._asset_to_series[asset_idx]
-                local should_unward = series_name and M._series_unlocked[series_name]
+                local section_id = M._asset_to_section[asset_idx]
+                -- Default rule: any book in an unlocked series is pickable
+                -- (the player can mis-shelve and recover). With the YAML
+                -- toggle only_unward_shelfable_books = 1, ADD a
+                -- shelf-side check — the book stays warded until its
+                -- own bookcase is also open. The Python world's
+                -- milestone access rule is paired with this toggle so
+                -- the two stay in sync.
+                local series_open = series_name and M._series_unlocked[series_name]
+                local should_unward = series_open
+                if only_shelfable and series_open and section_id then
+                    local needed = shelf_req_map[series_name]
+                    if needed and needed > 0 then
+                        local open = M._shelves_open[section_id] or 0
+                        if open < needed then should_unward = false end
+                    end
+                end
                 local key = book:GetFullName()
                 local is_warded = M._books_warded[key] or false
                 local ok = pcall(function()
@@ -1238,7 +1327,19 @@ function M._apply_books_to_world()
                 local asset_idx = _book_valid_asset_idx(book)
                 if asset_idx ~= nil then
                     local series_name = M._asset_to_series[asset_idx]
-                    local should_unward = series_name and M._series_unlocked[series_name]
+                    local section_id = M._asset_to_section[asset_idx]
+                    -- Same rule as Pass 1 — toggle gates the shelf-side
+                    -- intersection. Default off keeps the old visibility
+                    -- behavior; on adds the shelf check.
+                    local series_open = series_name and M._series_unlocked[series_name]
+                    local should_unward = series_open
+                    if only_shelfable and series_open and section_id then
+                        local needed = shelf_req_map[series_name]
+                        if needed and needed > 0 then
+                            local open = M._shelves_open[section_id] or 0
+                            if open < needed then should_unward = false end
+                        end
+                    end
                     local key = book:GetFullName()
                     local is_hidden_by_us = M._books_we_have_hidden[key] or false
                     pcall(function()
@@ -1363,7 +1464,8 @@ end
 function M._index_bookcases(silent)
     M._section_to_cases = {}
     M._case_to_section  = {}
-    M._case_completion_snapshot = {}
+    M._case_row_status_count = {}
+    M._case_fired_per_aidx = {}
 
     -- Step 1: build boi → BP_BookCase_C map. The wrappers (PillarCabinet,
     -- Cabinet_01) reference their child bookcases via BookOrderIndex (matches
@@ -1409,9 +1511,19 @@ function M._index_bookcases(silent)
     local labels_ok, labels_skipped = 0, 0
     local resolved, unresolved = 0, 0
 
+    -- De-dup by GetFullName, not tostring(case): UE4SS doesn't always return
+    -- the same Lua wrapper across different fetch paths (FindAllOf vs reading
+    -- CabinetLabel.CountBookCase[j]) even when both point to the same UObject.
+    -- GetFullName returns the actor's stable UE path so it matches across calls.
+    local function _case_key(case)
+        local name
+        pcall(function() name = case:GetFullName() end)
+        return name or tostring(case)
+    end
+
     local function add_case(sid, case)
         if not case or not case:IsValid() then return end
-        local key = tostring(case)
+        local key = _case_key(case)
         if seen[key] then return end
         seen[key] = true
         table.insert(M._section_to_cases[sid], case)
@@ -1479,14 +1591,43 @@ function M._index_bookcases(silent)
         end
     end
 
+    -- Stray-case sweep: every BookCase actor in the level that wasn't
+    -- added via a CabinetLabel walk is treated as a "stray" — a level-
+    -- design artifact (e.g., a case tucked into a wall corner) that
+    -- isn't part of any AP section. The game's placement system can
+    -- still find these by aim angle and accept books on them, but the
+    -- player can't navigate back to retrieve those books — softlock.
+    -- We collect them here and keep them permanently hidden + collision-
+    -- off via _apply_bookcases_to_world. _case_key matches the add_case
+    -- key so already-indexed cases aren't re-classified as strays.
+    M._stray_cases = {}
+    local all_cases = FindAllOf("BookCaseBase")
+    if not all_cases or (function() local nn = 0; pcall(function() nn = #all_cases end); return nn end)() == 0 then
+        all_cases = FindAllOf("BP_BookCase_C")
+    end
+    if all_cases then
+        local an = 0
+        pcall(function() an = #all_cases end)
+        for i = 1, an do
+            local c = all_cases[i]
+            if c and c:IsValid() then
+                local key = _case_key(c)
+                if not seen[key] then
+                    seen[key] = true
+                    M._stray_cases[#M._stray_cases + 1] = c
+                end
+            end
+        end
+    end
+
     M._cases_indexed = true
     if silent then return end
 
     local section_keys = {}
     for k in pairs(M._section_to_cases) do section_keys[#section_keys + 1] = k end
     table.sort(section_keys)
-    log(("Indexed %d BookCases across %d sections (labels: %d ok, %d skipped, %d unresolved-boi)"):format(
-        resolved, #section_keys, labels_ok, labels_skipped, unresolved))
+    log(("Indexed %d BookCases across %d sections (labels: %d ok, %d skipped, %d unresolved-boi), %d stray"):format(
+        resolved, #section_keys, labels_ok, labels_skipped, unresolved, #M._stray_cases))
     log(("Sections with bookcases: %s"):format(table.concat(section_keys, ", ")))
 
     local missing = {}
@@ -1684,11 +1825,48 @@ function M._apply_bookcases_to_world()
             end
         end
     end
+
+    -- Stray cases: cases that exist in the level but aren't tied to any
+    -- section via CabinetLabel. Keep them permanently hidden + collision-
+    -- off so the placement system can't drop books on them.
+    local stray_disabled, stray_dead = 0, 0
+    for i = 1, #M._stray_cases do
+        local case = M._stray_cases[i]
+        if case and case:IsValid() then
+            local ok = pcall(function()
+                case:SetActorHiddenInGame(true)
+                case:SetActorEnableCollision(false)
+                local root = case:K2_GetRootComponent()
+                if root and root:IsValid() then
+                    _walk_set_visibility(root, false)
+                end
+                local comps
+                pcall(function() comps = case.BlueprintCreatedComponents end)
+                if comps then
+                    local cn = 0; pcall(function() cn = #comps end)
+                    for j = 1, cn do
+                        local c = comps[j]
+                        if c and c:IsValid() then
+                            pcall(function() c:SetVisibility(false, false) end)
+                            pcall(function() c:SetHiddenInGame(true, false) end)
+                            pcall(function() c:MarkRenderStateDirty() end)
+                        end
+                    end
+                end
+            end)
+            if ok then stray_disabled = stray_disabled + 1
+            else stray_dead = stray_dead + 1 end
+        else
+            stray_dead = stray_dead + 1
+        end
+    end
+
     -- Only log when something changed vs the last apply (the periodic
     -- re-apply runs every 5s and used to spam identical lines).
-    local key = string.format("%d/%d/%d", shown, hidden, dead)
+    local key = string.format("%d/%d/%d/%d", shown, hidden, dead, stray_disabled)
     if M._last_apply_log_key ~= key then
-        log(("Bookcases: shown=%d hidden=%d dead=%d"):format(shown, hidden, dead))
+        log(("Bookcases: shown=%d hidden=%d dead=%d stray=%d"):format(
+            shown, hidden, dead, stray_disabled))
         M._last_apply_log_key = key
     end
 end
@@ -1761,54 +1939,95 @@ end
 -- Row completion detection (FinishRow → AP location check)
 -- ============================================================================
 
--- Walks every indexed bookcase, counts placed books per AssetIdx via
--- `PlacingBookInfo`, and detects newly-complete series (count >= volumes).
--- Sends AP location checks for those. Returns the number of checks queued.
+-- Walks every indexed bookcase and detects newly-complete series.
 --
--- Approach uses placement count instead of RowStatus indexing because
--- RowStatus[i] tracks the i-th *globally-completed* row (not the i-th
--- positional row of the case). Per-AssetIdx counting sidesteps that.
+-- Authoritative trigger: the game's own per-case RowStatus list. The game
+-- only appends to a case's RowStatus when it considers a row complete on
+-- that case — correct series, all volumes, in volume order. If the player
+-- places books in the wrong order, or in the wrong section, or splits a
+-- series across rows, RowStatus does not grow and we don't fire.
 --
--- The series's section is looked up via _asset_to_section (so a book on
--- a "decorator" CDI bookcase still resolves to the right home section).
+-- When a case's RowStatus length grows, we walk PlacingBookInfo on that
+-- case to find which AssetIdx now has count >= expected_volumes and hasn't
+-- already been fired. Where on the case (which bookcase slot) the series
+-- lives doesn't matter — the game's RowStatus already validated it. We
+-- only need to identify the AssetIdx for the AP location lookup.
 function M.detect_completed_rows()
     if not M._cases_indexed then return 0 end
     if not M._slot_data then return 0 end
     local row_loc_map = M._slot_data.row_location_map
     if type(row_loc_map) ~= "table" then return 0 end
 
+    M._case_row_status_count = M._case_row_status_count or {}
+    M._case_fired_per_aidx   = M._case_fired_per_aidx or {}
+
     local sent_count = 0
     for sid, cases in pairs(M._section_to_cases) do
         for _, case in ipairs(cases) do
             if case and case:IsValid() then
-                local key = tostring(case)
+                local case_key = tostring(case)
 
-                -- Build per-AssetIdx placement count by walking PlacingBookInfo.
-                local current = {}
-                pcall(function()
-                    local pbi = case.PlacingBookInfo
-                    if pbi then
-                        local n = 0; pcall(function() n = #pbi end)
-                        for i = 1, n do
-                            local book = pbi[i]
-                            if book and book:IsValid() then
-                                local aidx
-                                pcall(function() aidx = tonumber(book.ItemInfo.AssetIdx) end)
-                                if aidx and aidx >= 0 then
-                                    current[aidx] = (current[aidx] or 0) + 1
+                -- Game's authoritative completion counter for this case.
+                local current_rows = 0
+                pcall(function() current_rows = #case.RowStatus end)
+                local prev_rows = M._case_row_status_count[case_key] or 0
+
+                if current_rows > prev_rows then
+                    -- One or more rows newly complete on this case. Walk
+                    -- PlacingBookInfo to find which AssetIdx(s) now meet
+                    -- their volume count.
+                    local current = {}
+                    pcall(function()
+                        local pbi = case.PlacingBookInfo
+                        if pbi then
+                            local n = 0; pcall(function() n = #pbi end)
+                            for i = 1, n do
+                                local book = pbi[i]
+                                if book and book:IsValid() then
+                                    local aidx
+                                    pcall(function()
+                                        aidx = tonumber(book.ItemInfo.AssetIdx)
+                                    end)
+                                    if aidx and aidx >= 0 then
+                                        current[aidx] = (current[aidx] or 0) + 1
+                                    end
                                 end
                             end
                         end
+                    end)
+
+                    -- Candidates: AssetIdx with full volume count, not yet
+                    -- fired for this case, AND whose home section matches
+                    -- this case's physical section. The home-section
+                    -- filter is the key correctness check: the player
+                    -- could have piled a different section's books onto
+                    -- this case (game rejects them as part of any row),
+                    -- but our count would still see them. Without the
+                    -- filter we could fire the wrong-section series's AP
+                    -- check when an adjacent correctly-placed series's
+                    -- row triggers RowStatus growth on the same case.
+                    --
+                    -- Sort by AssetIdx so multi-completion cases (rare)
+                    -- are deterministic.
+                    local fired = M._case_fired_per_aidx[case_key] or {}
+                    local candidates = {}
+                    for aidx, count in pairs(current) do
+                        local expected = M._asset_to_volumes[aidx] or 0
+                        if expected > 0
+                                and count >= expected
+                                and not fired[aidx]
+                                and M._asset_to_section[aidx] == sid then
+                            candidates[#candidates + 1] = aidx
+                        end
                     end
-                end)
+                    table.sort(candidates)
 
-                local prev = M._case_completion_snapshot[key] or {}
-
-                for aidx, count in pairs(current) do
-                    local expected = M._asset_to_volumes[aidx] or 0
-                    local prev_count = prev[aidx] or 0
-                    if expected > 0 and count >= expected and prev_count < expected then
-                        -- Newly complete!
+                    -- Fire up to (current_rows - prev_rows) checks — the
+                    -- number of new completions the game just registered.
+                    local newly_finished = current_rows - prev_rows
+                    local to_fire = math.min(newly_finished, #candidates)
+                    for k = 1, to_fire do
+                        local aidx = candidates[k]
                         local series_name = M._asset_to_series[aidx]
                         local home_sid = M._asset_to_section[aidx]
                         if series_name and home_sid then
@@ -1816,8 +2035,9 @@ function M.detect_completed_rows()
                             local loc_id = row_loc_map[map_key]
                             if loc_id and not M._sent_row_locations[loc_id] then
                                 M._sent_row_locations[loc_id] = true
-                                log(("[row-detect] %s / %s (AssetIdx %d, %d/%d vols) → loc %d"):format(
-                                    home_sid, series_name, aidx, count, expected, loc_id))
+                                fired[aidx] = true
+                                log(("[row-detect] %s / %s (AssetIdx %d) → loc %d"):format(
+                                    home_sid, series_name, aidx, loc_id))
                                 local APClient = package.loaded["AP/APClient"]
                                 if APClient and APClient.send_check then
                                     APClient:send_check(loc_id)
@@ -1832,18 +2052,86 @@ function M.detect_completed_rows()
                                 aidx, sid))
                         end
                     end
+                    M._case_fired_per_aidx[case_key] = fired
                 end
 
-                M._case_completion_snapshot[key] = current
+                M._case_row_status_count[case_key] = current_rows
             end
         end
     end
     return sent_count
 end
 
+--- Fire any unfired "Complete N Rows" location checks whose threshold the
+--- player has now reached. `total_rows` is the game's authoritative
+--- correct-row counter (FinishRow event parameter or
+--- GameSaveData.CurrentFinishedRowNum). Returns the number of checks sent.
+function M.fire_row_completion_checks(total_rows)
+    if not M._slot_data then return 0 end
+    if not total_rows or total_rows <= 0 then return 0 end
+    local thresholds = M._slot_data.row_completion_thresholds
+    if type(thresholds) ~= "table" then return 0 end
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient.send_check) then return 0 end
+
+    local sent = 0
+    for i = 1, #thresholds do
+        local t = tonumber(thresholds[i])
+        if t and total_rows >= t and not M._sent_row_completions[t] then
+            M._sent_row_completions[t] = true
+            local loc_id = AP_LOC_ROW_COMPLETION_FIRST + (i - 1)
+            log(("[row-completion] %d rows finished → loc %d ('Complete %d Rows')"):format(
+                total_rows, loc_id, t))
+            APClient:send_check(loc_id)
+            sent = sent + 1
+        end
+    end
+    return sent
+end
+
 -- ============================================================================
 -- Progress sync (level-ups + milestones)
 -- ============================================================================
+
+-- Live book-placement counter from BP hook. Currently dormant — none of the
+-- BP function-name candidates we registered fired in testing. The widget
+-- read below is the real source. Kept around in case we add a pak-side BP
+-- hook later that forwards a per-book event.
+M._books_placed_observed = 0
+
+-- Highest book count we've seen this session. The widget counter can DROP
+-- when the player removes books from a shelf, but milestones should never
+-- un-fire — once you've placed N books total, the threshold is achieved.
+-- Reset on slot-connect.
+M._books_placed_peak = 0
+
+-- Read the live "books placed" count from the in-game HUD widget. There are
+-- multiple WBP_PlayerInfo_C instances in the world; FindFirstOf returns a
+-- stale title-screen one that always reads 0. We walk FindAllOf and take
+-- the max — the active gameplay widget has the live count, stale ones read
+-- 0. Returns nil if no widget is available yet.
+function M._read_widget_book_count()
+    local best = -1
+    local infos = FindAllOf("WBP_PlayerInfo_C")
+    if not infos then return nil end
+    local n = 0
+    pcall(function() n = #infos end)
+    for i = 1, n do
+        local info = infos[i]
+        if info and info:IsValid() then
+            pcall(function()
+                local t = info.Text_CurrentBookNum
+                if t and t:IsValid() then
+                    local s = t:GetText():ToString()
+                    local v = tonumber(s)
+                    if v and v > best then best = v end
+                end
+            end)
+        end
+    end
+    if best < 0 then return nil end
+    return best
+end
 
 -- Increments `_levels_reached` by 1 and sends the corresponding AP location
 -- check. Called from main.lua's OnLevelUp BP hook — one event per in-game
@@ -1871,18 +2159,34 @@ end
 function M.sync_progress_state()
     if not M._slot_data then return 0, 0 end
 
-    -- Read CurrentFinishedRowNum + InsertedBookNum from GameSaveData.
-    local rows_finished, books_placed = 0, 0
+    -- Live book count: read from the active WBP_PlayerInfo HUD widget's
+    -- Text_CurrentBookNum (the on-screen counter). The save struct's
+    -- InsertedBookNum is a fallback for the first frame and for the
+    -- moment right after each save event.
+    --
+    -- Books placed never logically decreases for milestone purposes — a
+    -- threshold crossed is a threshold crossed even if the player later
+    -- removes books from a shelf. So we track the peak observed value
+    -- and use that for milestone evaluation.
+    local rows_finished = 0
+    local books_placed_save = 0
     pcall(function()
         local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
         if gi and gi:IsValid() then
             local sg = gi.GameSaveData
             if sg and sg:IsValid() then
-                pcall(function() rows_finished = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0 end)
-                pcall(function() books_placed  = tonumber(sg.GameProgressData.InsertedBookNum) or 0 end)
+                pcall(function() rows_finished     = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0 end)
+                pcall(function() books_placed_save = tonumber(sg.GameProgressData.InsertedBookNum) or 0 end)
             end
         end
     end)
+    local books_placed_widget = M._read_widget_book_count() or 0
+    local books_placed_current = math.max(books_placed_save, books_placed_widget,
+                                          M._books_placed_observed or 0)
+    if books_placed_current > (M._books_placed_peak or 0) then
+        M._books_placed_peak = books_placed_current
+    end
+    local books_placed = M._books_placed_peak or 0
 
     -- Read XP curve from player to compute current level. SkillLevelUpRowNum
     -- values are CUMULATIVE thresholds: Level N is reached at rows >= arr[N].

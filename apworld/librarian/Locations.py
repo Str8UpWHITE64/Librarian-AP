@@ -1,11 +1,19 @@
 """
 Librarian: Tidy Up the Arcane Library — Archipelago locations
 
-Location pool composition (492 real + 1 goal event = 493 entries):
+Location pool composition (554 real + 1 goal event = 555 entries):
 
     Shelf Rows (400)
         One per series. Fires when the series is correctly placed.
         Name format: "Shelf: <SectionId> - <Series Name>"
+
+    Row Completions (50)
+        Cumulative row-completion-count milestones. Fires when the player
+        has correctly completed N total rows (any combination of series).
+        Hand-tuned distribution — dense early, sparser late — to balance
+        coverage against per-rule fill cost (each rule calls
+        feasible_rows, which is O(active_sections)).
+        Name format: "Complete <N> Rows"
 
     Section Completions (31)
         Fires when every series in a section is correctly placed.
@@ -24,9 +32,12 @@ Location pool composition (492 real + 1 goal event = 493 entries):
         open the chest; the AP check fires on the chest's grant of the
         ability, not on the key pickup itself.
 
-    Milestones (10)
-        Cumulative book-placement thresholds:
-        50, 100, 250, 500, 750, 1000, 1500, 2000, 2500, 3000.
+    Milestones (22)
+        Cumulative book-placement thresholds. Any book on a shelf counts —
+        correct placement isn't required — so milestones are reachable as
+        soon as the player has enough unlocked-series books to pick up
+        and enough open shelf capacity to drop them. Spread densely at
+        the early end (where most fill routing happens).
 
     Goal — "Library Tidied" (1, event-typed, no AP ID)
         Fires when the game's EndGame UFunction is observed.
@@ -37,7 +48,8 @@ ID layout within LOCATION_ID_BASE:
     550–559    Floor completions (2 used: 550-551)
     560–619    Level-ups (45 used: 560..604)
     620–639    Chest openings (4 used: 620..623)
-    640–679    Milestones (10 used: 640..649)
+    640–679    Milestones (22 used: 640..661; 662-679 reserved for future)
+    1000–1199  Row completions (50 used: 1000..1049; 1050-1199 reserved)
 """
 
 from enum import IntEnum
@@ -51,14 +63,20 @@ LOCATION_ID_BASE: int = 1910000
 
 
 class LibrarianLocationCategory(IntEnum):
-    EVENT      = 0
-    ROW        = 1   # per-series shelf-row completion
-    SECTION    = 2   # whole-section completion
-    FLOOR      = 3   # whole-floor completion
-    LEVEL_UP   = 4   # player level threshold reached
-    CHEST      = 5   # minor magic chest opened (Crimson/Emerald/Azure/Golden)
-    MILESTONE  = 6   # cumulative book-placement count
-    GOAL       = 7   # EndGame (event-typed; no AP ID)
+    EVENT          = 0
+    ROW            = 1   # per-series shelf-row completion
+    SECTION        = 2   # whole-section completion
+    FLOOR          = 3   # whole-floor completion
+    LEVEL_UP       = 4   # player level threshold reached
+    CHEST          = 5   # minor magic chest opened (Crimson/Emerald/Azure/Golden)
+    MILESTONE      = 6   # cumulative book-placement count
+    GOAL           = 7   # EndGame (event-typed; no AP ID)
+    ROW_COMPLETION = 8   # cumulative rows-correctly-completed count (any
+                         # combination of series). Access rule uses
+                         # feasible_rows(state) >= N — same per-series
+                         # item-availability check we already do for
+                         # primary row locations. Lua client tracks total
+                         # rows completed and fires each threshold.
 
 
 class LibrarianLocationData(NamedTuple):
@@ -98,6 +116,36 @@ for _section in data.SECTIONS:
             LibrarianLocationCategory.ROW,
         ))
         _row_idx += 1
+
+
+# --- Row-completion count milestones: 50 entries (1000..1049) ---
+#
+# Each fires when the player has correctly completed N total rows (any
+# series, any combination — the count is global, not per-series). Tuned
+# distribution: dense early (where AP fill benefits most from extra
+# sphere-0/1 slots) and sparser late. Each rule calls feasible_rows()
+# which is O(active_sections), so the count is kept modest to keep
+# generation fast in multi-player seeds.
+ROW_COMPLETION_THRESHOLDS: tuple[int, ...] = (
+    # Dense early (sphere-0 / 1 territory)
+    2, 4, 6, 8, 10, 12, 14, 16, 18, 20,
+    # Medium granularity through mid-game
+    25, 30, 35, 40, 45, 50, 60, 70, 80, 90,
+    100, 115, 130, 145, 160, 175, 190, 205, 220, 235,
+    # Coarser toward the late game
+    245, 250, 265, 280, 295, 310, 325, 340, 355, 360,
+    # Final approach
+    365, 372, 379, 385, 390, 393, 396, 398, 399, 400,
+)
+
+_row_completion_locations: list[LibrarianLocationData] = [
+    LibrarianLocationData(
+        f"Complete {thresh} Rows",
+        1000 + idx,
+        LibrarianLocationCategory.ROW_COMPLETION,
+    )
+    for idx, thresh in enumerate(ROW_COMPLETION_THRESHOLDS)
+]
 
 
 # --- Section completions: 31 entries (500..530) ---
@@ -142,10 +190,17 @@ _chest_locations: list[LibrarianLocationData] = [
 ]
 
 
-# --- Cumulative book-placement milestones: 10 entries (640..649) ---
-
+# --- Cumulative book-placement milestones: 22 entries (640..661) ---
+#
+# Reserved 640..679 (40 slots) — room for further milestones in future
+# updates. Thresholds are denser at the early end where most fill-routing
+# happens, and reach 3072 (= all books across all sections) at the top.
 MILESTONE_THRESHOLDS: tuple[int, ...] = (
-    50, 100, 250, 500, 750, 1000, 1500, 2000, 2500, 3000,
+    25, 50, 100, 150, 200,
+    300, 400, 500, 600, 750,
+    900, 1100, 1300, 1500, 1700,
+    1900, 2100, 2300, 2500, 2700,
+    2900, 3072,
 )
 
 _milestone_locations: list[LibrarianLocationData] = [
@@ -169,6 +224,7 @@ _goal_locations: list[LibrarianLocationData] = [
 
 _all_locations: list[LibrarianLocationData] = (
     _row_locations
+    + _row_completion_locations
     + _section_locations
     + _floor_locations
     + _levelup_locations
@@ -187,13 +243,14 @@ location_dictionary: dict[str, LibrarianLocationData] = {
 # ============================================================================
 
 location_name_groups: dict[str, set[str]] = {
-    "Shelf Rows": {loc.name for loc in _row_locations},
-    "Sections":   {loc.name for loc in _section_locations},
-    "Floors":     {loc.name for loc in _floor_locations},
-    "Level-Ups":  {loc.name for loc in _levelup_locations},
-    "Chests":     {loc.name for loc in _chest_locations},
-    "Milestones": {loc.name for loc in _milestone_locations},
-    "Goal":       {loc.name for loc in _goal_locations},
+    "Shelf Rows":      {loc.name for loc in _row_locations},
+    "Row Completions": {loc.name for loc in _row_completion_locations},
+    "Sections":        {loc.name for loc in _section_locations},
+    "Floors":          {loc.name for loc in _floor_locations},
+    "Level-Ups":       {loc.name for loc in _levelup_locations},
+    "Chests":          {loc.name for loc in _chest_locations},
+    "Milestones":      {loc.name for loc in _milestone_locations},
+    "Goal":            {loc.name for loc in _goal_locations},
 }
 
 # Per-section row groupings — useful for the World's region-building.
@@ -244,14 +301,15 @@ def chest_open_name(chest_name: str) -> str:
 # ============================================================================
 
 assert len(_row_locations) == 400, f"Expected 400 row locations, got {len(_row_locations)}"
+assert len(_row_completion_locations) == 50, f"Expected 50 row-completion locations, got {len(_row_completion_locations)}"
 assert len(_section_locations) == 31
 assert len(_floor_locations) == 2
 assert len(_levelup_locations) == 45
 assert len(_chest_locations) == 4
-assert len(_milestone_locations) == 10
+assert len(_milestone_locations) == 22
 assert len(_goal_locations) == 1
-assert total_real_locations() == 492, f"Expected 492 real locations, got {total_real_locations()}"
-assert total_locations() == 493
+assert total_real_locations() == 554, f"Expected 554 real locations, got {total_real_locations()}"
+assert total_locations() == 555
 
 # Codes unique
 _codes = [loc.code for loc in _all_locations if loc.code is not None]
@@ -263,12 +321,13 @@ assert len(_names) == len(set(_names)), "Duplicate location name"
 
 # Code ranges are within their declared category bounds
 for cat, lo, hi in [
-    (LibrarianLocationCategory.ROW,        1,   499),
-    (LibrarianLocationCategory.SECTION,    500, 549),
-    (LibrarianLocationCategory.FLOOR,      550, 559),
-    (LibrarianLocationCategory.LEVEL_UP,   560, 619),
-    (LibrarianLocationCategory.CHEST,      620, 639),
-    (LibrarianLocationCategory.MILESTONE,  640, 679),
+    (LibrarianLocationCategory.ROW,        1,    499),
+    (LibrarianLocationCategory.SECTION,    500,  549),
+    (LibrarianLocationCategory.FLOOR,      550,  559),
+    (LibrarianLocationCategory.LEVEL_UP,   560,  619),
+    (LibrarianLocationCategory.CHEST,      620,  639),
+    (LibrarianLocationCategory.MILESTONE,      640,  679),
+    (LibrarianLocationCategory.ROW_COMPLETION, 1000, 1199),
 ]:
     for loc in _all_locations:
         if loc.category == cat:
@@ -285,6 +344,7 @@ if __name__ == "__main__":
     print("Librarian — Locations.py summary")
     print("=" * 60)
     print(f"Shelf rows:         {len(_row_locations):4d}")
+    print(f"Row completions:    {len(_row_completion_locations):4d}")
     print(f"Section completions:{len(_section_locations):4d}")
     print(f"Floor completions:  {len(_floor_locations):4d}")
     print(f"Level-ups:          {len(_levelup_locations):4d}")

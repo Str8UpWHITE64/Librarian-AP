@@ -50,7 +50,9 @@ from .Locations import (
     levelup_name,
     chest_open_name,
     MILESTONE_THRESHOLDS,
+    ROW_COMPLETION_THRESHOLDS,
     _row_locations,
+    _row_completion_locations,
     _section_locations,
     _floor_locations,
     _levelup_locations,
@@ -166,6 +168,7 @@ class LibrarianWorld(World):
     series_order: list[str]
     shelf_order: dict[str, list[int]]
     starting_section: str
+    starting_section_b: "str | None"
     starting_series: list[str]
     series_req: dict[str, int]
     shelf_req: dict[tuple[str, str], int]
@@ -175,6 +178,7 @@ class LibrarianWorld(World):
         self.series_order = []
         self.shelf_order = {}
         self.starting_section = ""
+        self.starting_section_b: str | None = None
         self.starting_series = []
         self.series_req = {}
         self.shelf_req = {}
@@ -267,6 +271,7 @@ class LibrarianWorld(World):
         pt = self._ut_passthrough()
         if pt:
             self.starting_section = pt.get("starting_section", "")
+            self.starting_section_b = pt.get("starting_section_b", None)
             self.starting_series = list(pt.get("starting_series", []))
             self.series_order = list(pt.get("series_order", []))
             self.shelf_order = {sid: list(v) for sid, v in pt.get("shelf_order", {}).items()}
@@ -284,11 +289,17 @@ class LibrarianWorld(World):
         # entirely within the chosen floor.
         active = self.active_sections
 
-        # 1. Pick a random starting section (purely cosmetic for slot_data /
-        #    Lua starting-state; access rules don't reference an order).
+        # 1. Pick two random starting sections (different from each other
+        #    when active scope allows). Each gets one precollected shelf
+        #    unlock — opening the first bookcase of each at sphere 0.
+        #    Two sections (vs. two bookcases in one section) is what
+        #    actually gives the player sphere-1 progression diversity:
+        #    AP fill can route progression through items that gate either
+        #    section's rows, not just one.
         section_ids = [s.id for s in active]
         rng.shuffle(section_ids)
         self.starting_section = section_ids[0]
+        self.starting_section_b = section_ids[1] if len(section_ids) >= 2 else None
 
         # 2. Per-section bookcase order — ordinal for now; can randomize later.
         for section in active:
@@ -306,33 +317,49 @@ class LibrarianWorld(World):
         for section in active:
             self.shelf_req.update(_compute_shelf_req(section, CELLS_PER_CASE))
 
-        # 4. Build series order with the "≥1 fits starting bookcase" guarantee.
-        # The guaranteed series MUST live in the section's first VISIBLE case
-        # (shelf_req=1) so the player can actually place it with their single
-        # starting Progressive Shelf Unlock. data.py declaration order is
-        # AssetIdx-ascending, which puts large-vol series first for sections
-        # like 2M — but Lua reveals 4x5 cases first, so we filter by shelf_req.
-        starting_section_obj = data.SECTIONS_BY_ID[self.starting_section]
-        starting_bookcase_series = [
-            s.name for s in starting_section_obj.series
-            if self.shelf_req[(self.starting_section, s.name)] == 1
-        ]
-        if not starting_bookcase_series:
-            # Defensive fallback: shouldn't happen, but if it did pick anything.
-            starting_bookcase_series = [s.name for s in starting_section_obj.series]
-
+        # 4. Build series order with one guaranteed series in each starting
+        # section's first bookcase. The guarantee ensures that the player
+        # can complete a row in each of their starting sections before any
+        # AP item arrives — two distinct sphere-0 progression paths, not
+        # just one. Series must live in the section's first bookcase
+        # (shelf_req == 1) so the single precollected shelf unlock per
+        # section makes them placeable.
         starting_count = self.options.starting_series_count.value
-        guaranteed = rng.choice(starting_bookcase_series)
+
+        def _guarantee_for_section(sid: str | None) -> str | None:
+            if sid is None:
+                return None
+            sec_obj = data.SECTIONS_BY_ID[sid]
+            reachable = [
+                s.name for s in sec_obj.series
+                if self.shelf_req[(sid, s.name)] == 1
+            ]
+            if not reachable:
+                # Defensive fallback: pick any series in the section.
+                reachable = [s.name for s in sec_obj.series]
+            return rng.choice(reachable) if reachable else None
+
+        guaranteed: list[str] = []
+        primary_pick = _guarantee_for_section(self.starting_section)
+        if primary_pick and len(guaranteed) < starting_count:
+            guaranteed.append(primary_pick)
+        secondary_pick = _guarantee_for_section(self.starting_section_b)
+        if (secondary_pick
+                and secondary_pick not in guaranteed
+                and len(guaranteed) < starting_count):
+            guaranteed.append(secondary_pick)
 
         all_series = [s.name for sec in active for s in sec.series]
-        other_pool = [n for n in all_series if n != guaranteed]
+        guaranteed_set = set(guaranteed)
+        other_pool = [n for n in all_series if n not in guaranteed_set]
         rng.shuffle(other_pool)
 
-        # First `starting_count - 1` from the shuffled pool, then guaranteed
-        # inserted at a random position within the starting set.
-        starting = other_pool[: starting_count - 1] + [guaranteed]
+        # Fill remaining starting slots from the shuffled non-guaranteed pool,
+        # then mix guaranteed entries in at random positions.
+        non_guaranteed_count = max(0, starting_count - len(guaranteed))
+        starting = other_pool[:non_guaranteed_count] + guaranteed
         rng.shuffle(starting)
-        rest = other_pool[starting_count - 1 :]
+        rest = other_pool[non_guaranteed_count:]
 
         self.starting_series = starting
         self.series_order = starting + rest
@@ -363,7 +390,7 @@ class LibrarianWorld(World):
             self.multiworld.regions.append(region)
             library.connect(region, f"Open Section {section.id}")
 
-            # Row locations for this section
+            # Row locations for this section.
             for series in section.series:
                 loc_name = f"Shelf: {section.id} - {series.name}"
                 loc = LibrarianLocation(
@@ -397,16 +424,46 @@ class LibrarianWorld(World):
             if data.XP_CURVE[idx] <= max_rows
         ]
 
-        # Milestones: same idea, but threshold is in books. The access
-        # rule converts to feasible_rows via ceil(thresh / 8).
-        active_milestone_locs = [
-            loc for idx, loc in enumerate(_milestone_locations)
-            if math.ceil(MILESTONE_THRESHOLDS[idx] / 8) <= max_rows
+        # Milestones: keep only those reachable given the seed's active
+        # sections. A milestone fires on cumulative books placed, and any
+        # book on any shelf counts — so the cap is the sum of volumes in
+        # the active scope (3072 for full/custom, less for floor goals).
+        #
+        # When only_unward_shelfable_books is enabled, drop milestone
+        # locations entirely. The strict gating means the player's
+        # pickable_books grows in lockstep with shelf/series unlocks, and
+        # AP fill's closure-based "in logic" view can over-promise: a
+        # milestone may show reachable in a tracker but require the
+        # player to collect many more items before they can physically
+        # place that many books. Removing the locations avoids any risk
+        # of the seed gating progression behind a milestone the player
+        # can't realistically claim.
+        max_books_in_scope = sum(
+            s.volumes for sec in self.active_sections for s in sec.series
+        )
+        only_shelfable = bool(self.options.only_unward_shelfable_books.value)
+        if only_shelfable:
+            active_milestone_locs: list = []
+        else:
+            active_milestone_locs = [
+                loc for idx, loc in enumerate(_milestone_locations)
+                if MILESTONE_THRESHOLDS[idx] <= max_books_in_scope
+            ]
+
+        # Row-completion count milestones: each fires when the player has
+        # correctly completed N total rows. Filter by max_rows the same
+        # way level-ups do — a milestone of "Complete 300 Rows" is
+        # unreachable if the seed only has 200 rows in scope.
+        active_row_completion_locs = [
+            loc for idx, loc in enumerate(_row_completion_locations)
+            if ROW_COMPLETION_THRESHOLDS[idx] <= max_rows
         ]
 
-        # Library-attached: floor completions, level-ups, chest openings, milestones.
+        # Library-attached: floor completions, level-ups, chest openings,
+        # milestones, row-completion milestones.
         for category in (active_floor_locs, active_levelup_locs,
-                         _chest_locations, active_milestone_locs):
+                         _chest_locations, active_milestone_locs,
+                         active_row_completion_locs):
             for loc_data in category:
                 loc = LibrarianLocation(
                     self.player, loc_data.name,
@@ -437,13 +494,22 @@ class LibrarianWorld(World):
         active_series_count = sum(len(s.series) for s in self.active_sections)
         per_unlock = self.options.series_per_unlock.value
 
-        # Precollect: 1 starting-section shelf unlock + N starting-series worth of unlocks.
+        # Precollect: one shelf unlock for each of the two starting sections
+        # + N starting-series worth of Progressive Series Unlock items.
+        #
+        # We pre-grant ONE shelf in each of two different sections rather
+        # than two shelves in one section. Two distinct sections matter
+        # for sphere-1 fill flexibility — AP fill can route progression
+        # through items that gate either section's rows, not just one.
+        # Two bookcases in a single section adds locations but they all
+        # gate behind the same shelf-unlock chain, so they don't actually
+        # broaden the early-sphere routing surface.
         starting_count = self.options.starting_series_count.value
         starting_unlock_count = math.ceil(starting_count / per_unlock)
 
-        precollect_names: list[str] = [
-            shelf_unlock_name(self.starting_section),
-        ]
+        precollect_names: list[str] = [shelf_unlock_name(self.starting_section)]
+        if self.starting_section_b is not None:
+            precollect_names.append(shelf_unlock_name(self.starting_section_b))
         precollect_names.extend([ITEM_PROG_SERIES] * starting_unlock_count)
 
         for name in precollect_names:
@@ -470,6 +536,44 @@ class LibrarianWorld(World):
         # Subtract precollected.
         for name in precollect_names:
             quantities[name] = max(0, quantities.get(name, 0) - 1)
+
+        # Major Magic cap: each player needs at most (levels_kept - 1)
+        # Major Magic items to reach their highest reachable level. Any
+        # extras are redundant progression-classified items — they don't
+        # gate anything beyond what's already needed, but AP fill still
+        # has to find homes for them. In multi-player seeds with mixed
+        # goals (especially floor / low-custom configs that filter out
+        # level-ups), those extras starve the cross-world progression
+        # pool and produce "Not enough locations for progression items"
+        # fill failures.
+        #
+        # We shrink the pool by the excess; filler fills the freed slots
+        # below, keeping per-player |items| == |locations|. The player
+        # never sees the removed items — they were never accessible to
+        # them in the first place.
+        major_magic_names = (
+            "Progressive Sort", "Progressive Shelf Guide",
+            "Progressive Insight", "Progressive Auto-Shelving",
+            "Progressive Assemble",
+        )
+        levels_kept = sum(
+            1 for idx in range(data.MAX_PLAYER_LEVEL)
+            if data.XP_CURVE[idx] <= self.max_reachable_rows
+        )
+        max_major_magic_needed = max(0, levels_kept - 1)
+        total_major_magic = sum(quantities.get(n, 0) for n in major_magic_names)
+        excess_magic = total_major_magic - max_major_magic_needed
+        if excess_magic > 0:
+            # Drop excess copies, taking from skills with the most
+            # remaining quantity first (keeps each skill's available
+            # count roughly proportional to its cap).
+            removed = 0
+            while removed < excess_magic:
+                drop_skill = max(major_magic_names, key=lambda n: quantities.get(n, 0))
+                if quantities.get(drop_skill, 0) <= 0:
+                    break  # nothing left to remove (shouldn't happen)
+                quantities[drop_skill] -= 1
+                removed += 1
 
         # Pool-overshoot guard. Happens with combinations like
         # series_per_unlock=2 + starting_count near max + custom goal with
@@ -543,6 +647,91 @@ class LibrarianWorld(World):
     def set_rules(self) -> None:
         mw = self.multiworld
         p = self.player
+        per_unlock = self.options.series_per_unlock.value
+        active_sections = self.active_sections
+        series_req = self.series_req
+        shelf_req = self.shelf_req
+
+        # Precomputed lookup tables — fill_restrictive invokes the access
+        # rules below millions of times, and tightening these inner loops
+        # is the single biggest wall-clock generation win. Each table
+        # replaces a per-call computation:
+        #
+        #   shelf_names[sid]    — formatted "Progressive Shelf Unlock (X)"
+        #                         strings (vs string-formatting per call)
+        #   section_series_reqs[sid] — tuple of series_req values for that
+        #                         section, in declaration order (vs dict
+        #                         lookup per series per rule call)
+        #   section_row_reqs[sid]    — list of (shelf_n, series_n) tuples
+        #                         per series; powers feasible_rows
+        #   floor_sections[fn]  — list of sections on each floor (vs
+        #                         iterating ALL active sections and
+        #                         filtering inside the floor rule)
+        shelf_names = {sec.id: shelf_unlock_name(sec.id) for sec in active_sections}
+        section_series_reqs = {
+            sec.id: tuple(series_req[s.name] for s in sec.series)
+            for sec in active_sections
+        }
+        section_row_reqs = {
+            sec.id: [
+                (shelf_req[(sec.id, s.name)], series_req[s.name])
+                for s in sec.series
+            ]
+            for sec in active_sections
+        }
+        floor_sections: dict[int, list] = {}
+        for sec in active_sections:
+            floor_sections.setdefault(sec.floor, []).append(sec)
+
+        # Precomputed 2D reachable-rows table per section.
+        #
+        # section_reach[sid] is a 2D list. section_reach[sid][shelf_count]
+        # is itself a 1D list indexed by series_count. The cell value is
+        # the number of rows in that section reachable given exactly that
+        # many shelf and series unlocks. We clamp shelf_count to bookcase
+        # count and series_count to len(series_order) so out-of-range
+        # state counts are handled by capping at the table edges.
+        #
+        # This lets feasible_rows compute its result with just one direct
+        # prog_items dict access per section + a 2D list lookup. With 31
+        # active sections, each call is ~62 dict ops, no string formatting
+        # and no state.count method calls. The level-up + row-completion
+        # rules together fire ~250x per state during fill sweeps, so the
+        # one-time precompute pays for itself many times over.
+        max_series_idx = len(self.series_order)
+        section_reach: dict[str, list[list[int]]] = {}
+        for sec in active_sections:
+            bc_count = sec.bookcase_count
+            row_reqs = section_row_reqs[sec.id]
+            table_2d: list[list[int]] = []
+            for shelf_count in range(bc_count + 1):
+                row_for_shelves: list[int] = [0] * (max_series_idx + 1)
+                # Pass 1: per series_count, count how many series reqs
+                # are met. Incremental — sort by series_n and run a
+                # cumulative count.
+                ready_at: list[int] = []  # series_n values that pass shelf
+                for shelf_n, series_n in row_reqs:
+                    if shelf_count >= shelf_n:
+                        ready_at.append(series_n)
+                ready_at.sort()
+                idx = 0
+                count_so_far = 0
+                for series_count in range(max_series_idx + 1):
+                    while idx < len(ready_at) and ready_at[idx] <= series_count:
+                        count_so_far += 1
+                        idx += 1
+                    row_for_shelves[series_count] = count_so_far
+                table_2d.append(row_for_shelves)
+            section_reach[sec.id] = table_2d
+
+        # Same idea, but flatten the per-section lookup into a flat list
+        # of (shelf_unlock_name, table_2d, bc_count) tuples. The
+        # feasible_rows hot loop iterates this list directly instead of
+        # going through active_sections + dict[sec.id] every call.
+        section_reach_list: list[tuple[str, list[list[int]], int]] = [
+            (shelf_names[sec.id], section_reach[sec.id], sec.bookcase_count)
+            for sec in active_sections
+        ]
 
         # Helper: state-only check for "section X is fully cleared"
         # — every bookcase opened (= bookcase_count shelf unlocks for X),
@@ -550,76 +739,166 @@ class LibrarianWorld(World):
         # Hoist series-count read outside the inner all(): fill calls this
         # rule a LOT during sweeps; saving N-1 state lookups per call adds
         # up across a multi-player generation.
-        series_req = self.series_req
         def section_done(state, sec) -> bool:
-            if not state.has(shelf_unlock_name(sec.id), p, sec.bookcase_count):
+            if not state.has(shelf_names[sec.id], p, sec.bookcase_count):
                 return False
             series_unlocked = state.count(ITEM_PROG_SERIES, p)
-            for s in sec.series:
-                if series_unlocked < series_req[s.name]:
+            for needed in section_series_reqs[sec.id]:
+                if series_unlocked < needed:
                     return False
             return True
 
-        # Lenient counter for level-up / milestone gating: sum of all shelf
-        # unlocks across active sections, capped per-section at the section's
-        # actual bookcase count (extra unlocks beyond bookcase_count are
-        # cosmetic in-game; they shouldn't inflate the "progression depth").
-        active_sections_local = self.active_sections
-        def total_shelves_open(state) -> int:
-            return sum(
-                min(state.count(shelf_unlock_name(sec.id), p), sec.bookcase_count)
-                for sec in active_sections_local
-            )
-
-        # How many distinct rows can the player FINISH right now? Each row =
-        # 1 series in 1 section. The row is reachable iff BOTH:
-        #   (a) state.has(shelf_unlock_name(sec.id), shelf_req[(sec, series)])
-        #   (b) state.has(Progressive Series Unlock,  series_req[series])
+        # How many distinct rows can the player FINISH right now? Powered
+        # by the precomputed section_reach table — each call is O(active
+        # sections) direct-dict lookups (no state.count method calls,
+        # no string formatting, no inner per-series iteration).
         #
-        # Per-series check (not per-section aggregate): a single unlocked
-        # series whose case is still hidden is NOT a reachable row, even if
-        # other cases in that section are open. This catches edge cases like
-        # "1J has 2 cases open but the only unlocked 1J series lives in
-        # case 3" — count = 0, not min(structural=8, unlocked=1) = 1.
-        per_unlock = self.options.series_per_unlock.value
-        active_sections = self.active_sections
-        shelf_req = self.shelf_req
+        # Reads state.prog_items[p] directly to skip the state.count
+        # method-call overhead (which itself is two dict lookups). That
+        # leaves the function as essentially "load prog_items, sum table
+        # values across active sections."
+        # feasible_rows is called by 96 separate access rules (50 row-
+        # completion + 45 level-up + 1 goal). When fill evaluates these
+        # against the same state in sequence, recomputing the table-walk
+        # 96 times is wasted work.
+        #
+        # We cache the result *on the state object itself* under a unique
+        # attribute name. The cache marker includes the series count AND
+        # the sum of relevant shelf counts — incrementing any tracked
+        # item invalidates the marker, so we never serve a stale value.
+        # The check is two dict accesses + a tuple compare on hit, much
+        # cheaper than re-running the table walk.
+        #
+        # State objects are reused via state.copy() in AP fill, so the
+        # cached attribute travels with copies. New states post-collect
+        # have a different marker (different counts) and trigger refresh.
+        cache_attr = f"_librarian_feasible_{p}"
+        shelf_names_only = [name for name, _, _ in section_reach_list]
+
         def feasible_rows(state) -> int:
-            # Hoist counts outside loops: state.count is O(1) but fill
-            # calls this rule heavily. One count per section + one count
-            # for series cuts ~3x the lookups vs the prior implementation.
-            series_unlocked = state.count(ITEM_PROG_SERIES, p)
+            prog = state.prog_items[p]
+            series_count = prog[ITEM_PROG_SERIES]
+            # Cheap freshness marker: (series count, sum of shelf counts).
+            # Any state mutation that affects feasible_rows must change at
+            # least one of these — they all feed into the lookup table.
+            # Construction is ~32 dict reads vs ~31 table lookups + adds
+            # in the full path, so cache hits save ~2/3 of the work.
+            shelf_sum = 0
+            for sn in shelf_names_only:
+                shelf_sum += prog[sn]
+            marker = (series_count, shelf_sum)
+            cached = state.__dict__.get(cache_attr)
+            if cached is not None and cached[0] == marker:
+                return cached[1]
+
+            # Cache miss — compute fully.
+            if series_count > max_series_idx:
+                series_count = max_series_idx
+            total = 0
+            for shelf_name, table_2d, bc_count in section_reach_list:
+                shelf_count = prog[shelf_name]
+                if shelf_count > bc_count:
+                    shelf_count = bc_count
+                total += table_2d[shelf_count][series_count]
+            state.__dict__[cache_attr] = (marker, total)
+            return total
+
+        # Milestone helpers. Milestones fire on cumulative books PLACED, and
+        # any book on any shelf counts — correct placement isn't required —
+        # so the threshold is reachable as soon as the player has enough
+        # unlocked-series books to pick up AND enough open shelf capacity
+        # to drop them. Both totals are cumulative and monotonic.
+        #
+        # Precompute lookup arrays so each rule call is O(active_sections)
+        # rather than O(series): fill invokes these rules frequently and
+        # the extra setup pays for itself.
+        only_shelfable = bool(self.options.only_unward_shelfable_books.value)
+        series_volumes_by_name = {
+            ser.name: ser.volumes
+            for sec in data.SECTIONS for ser in sec.series
+        }
+        # cumulative_books_unlocked[k] = total volumes in series_order[:k]
+        cumulative_books_unlocked: list[int] = [0]
+        for name in self.series_order:
+            cumulative_books_unlocked.append(
+                cumulative_books_unlocked[-1]
+                + series_volumes_by_name.get(name, 0)
+            )
+        # section_cumulative_slots[sid][n] = total shelf-slot capacity of
+        # the first n bookcases of section sid. Capacity per bookcase is the
+        # sum of volumes of the series that live on it (via shelf_req).
+        section_cumulative_slots: dict[str, list[int]] = {}
+        for sec in active_sections:
+            per_bookcase_volumes: dict[int, int] = {}
+            for ser in sec.series:
+                bc_idx = shelf_req[(sec.id, ser.name)]
+                per_bookcase_volumes[bc_idx] = (
+                    per_bookcase_volumes.get(bc_idx, 0) + ser.volumes
+                )
+            cumulative: list[int] = [0]
+            for bc_idx in sorted(per_bookcase_volumes):
+                cumulative.append(cumulative[-1] + per_bookcase_volumes[bc_idx])
+            section_cumulative_slots[sec.id] = cumulative
+
+        # Hoist len(...)-1 sentinels out of the per-call hot path so each
+        # rule invocation just compares ints rather than calling len() and
+        # subtracting on every iteration.
+        _books_unlocked_max_idx = len(cumulative_books_unlocked) - 1
+        _books_unlocked_max = cumulative_books_unlocked[-1]
+        # Pre-extract (table, max_idx, max_value) tuples per section so
+        # the hot-path loop in shelf_slots_open only does dict lookup once
+        # and reuses the precomputed per-section bounds.
+        section_slots_table = {
+            sec.id: (
+                section_cumulative_slots[sec.id],
+                len(section_cumulative_slots[sec.id]) - 1,
+                section_cumulative_slots[sec.id][-1],
+            )
+            for sec in active_sections
+        }
+
+        def books_unlocked(state) -> int:
+            n_series = state.count(ITEM_PROG_SERIES, p) * per_unlock
+            if n_series >= _books_unlocked_max_idx:
+                return _books_unlocked_max
+            return cumulative_books_unlocked[n_series]
+
+        def shelf_slots_open(state) -> int:
             total = 0
             for sec in active_sections:
-                shelf_count = state.count(shelf_unlock_name(sec.id), p)
-                if shelf_count == 0:
-                    continue
-                sid = sec.id
-                for series in sec.series:
-                    shelf_n = shelf_req[(sid, series.name)]
-                    series_n = series_req[series.name]
-                    if shelf_count >= shelf_n and series_unlocked >= series_n:
-                        total += 1
+                n = state.count(shelf_names[sec.id], p)
+                table, max_idx, max_val = section_slots_table[sec.id]
+                if n >= max_idx:
+                    total += max_val
+                else:
+                    total += table[n]
             return total
 
         # Section region access — gated by ≥1 Progressive Shelf Unlock for X.
+        # Capture the precomputed shelf-unlock name string in the lambda
+        # closure so the rule doesn't re-format the section id every call.
         for section in active_sections:
             entrance = mw.get_entrance(f"Open Section {section.id}", p)
-            sid = section.id
             entrance.access_rule = (
-                lambda state, sid=sid: state.has(shelf_unlock_name(sid), p, 1)
+                lambda state, sname=shelf_names[section.id]:
+                state.has(sname, p, 1)
             )
 
-            # Per-row: shelf unlock count + series unlock
+            # Per-row: shelf unlock count + series unlock.
+            sec_shelf_name = shelf_names[section.id]
             for series in section.series:
+                shelf_n = shelf_req[(section.id, series.name)]
+                series_n = series_req[series.name]
+
+                def make_row_rule(sname, sn, sni):
+                    return lambda state: (
+                        state.has(sname, p, sn)
+                        and state.has(ITEM_PROG_SERIES, p, sni)
+                    )
+                rule = make_row_rule(sec_shelf_name, shelf_n, series_n)
+
                 row_loc = mw.get_location(f"Shelf: {section.id} - {series.name}", p)
-                shelf_n = self.shelf_req[(section.id, series.name)]
-                series_n = self.series_req[series.name]
-                row_loc.access_rule = (
-                    lambda state, sn=shelf_n, sni=series_n, sid=section.id:
-                    state.has(shelf_unlock_name(sid), p, sn)
-                    and state.has(ITEM_PROG_SERIES, p, sni)
-                )
+                row_loc.access_rule = rule
 
             # Section completion: state-only check (no can_reach recursion)
             sec_loc = mw.get_location(section_completion_name(section.id), p)
@@ -628,26 +907,25 @@ class LibrarianWorld(World):
             )
 
         # Floor completions — only the active floor(s) were created in
-        # create_regions, so iterate those. Inlined section-check so the
-        # series-unlock count gets read just once per rule invocation
-        # (vs once per section in the prior `all(section_done(...))` form).
-        active_floors = {s.floor for s in active_sections}
-        def make_floor_rule(fn):
-            def rule(state):
-                series_unlocked = state.count(ITEM_PROG_SERIES, p)
-                for s in active_sections:
-                    if s.floor != fn:
-                        continue
-                    if not state.has(shelf_unlock_name(s.id), p, s.bookcase_count):
-                        return False
-                    for ser in s.series:
-                        if series_unlocked < series_req[ser.name]:
-                            return False
-                return True
-            return rule
-        for floor_n in active_floors:
+        # create_regions, so iterate those. The pre-bucketed floor_sections
+        # table avoids re-filtering active_sections by floor on every rule
+        # invocation, and the precomputed shelf_names + section_series_reqs
+        # cut the per-section work to one state.has + one tuple iteration.
+        for floor_n, sections_in_floor in floor_sections.items():
             floor_loc = mw.get_location(f"Floor {floor_n} Complete", p)
-            floor_loc.access_rule = make_floor_rule(floor_n)
+
+            def make_floor_rule(secs):
+                def rule(state):
+                    series_unlocked = state.count(ITEM_PROG_SERIES, p)
+                    for s in secs:
+                        if not state.has(shelf_names[s.id], p, s.bookcase_count):
+                            return False
+                        for needed in section_series_reqs[s.id]:
+                            if series_unlocked < needed:
+                                return False
+                    return True
+                return rule
+            floor_loc.access_rule = make_floor_rule(sections_in_floor)
 
         # Minor Magic abilities are NOT AP items — the player gets each
         # ability natively from the chest it's stored in. The chest opening
@@ -658,8 +936,17 @@ class LibrarianWorld(World):
         # actually created (create_regions drops ones beyond max_reachable_rows).
         # • feasible_rows(state) >= XP_CURVE[N-1]: the player can actually
         #   finish that many rows (per-series shelf+series check).
-        # • count_group("Major Magic") >= N-1: each post-level-1 level
-        #   requires one more Major Magic item.
+        # • Major Magic total >= N-1: each post-level-1 level requires one
+        #   more Major Magic item. We sum the five state.count calls
+        #   directly rather than going through state.count_group("Major
+        #   Magic", p) — count_group walks the player's full item list
+        #   on each call, which becomes a real hot-path cost when fill
+        #   evaluates this rule across many sweeps. count() is O(1).
+        major_magic_names = ("Progressive Sort", "Progressive Shelf Guide",
+                             "Progressive Insight", "Progressive Auto-Shelving",
+                             "Progressive Assemble")
+        def major_magic_total(state) -> int:
+            return sum(state.count(n, p) for n in major_magic_names)
         max_rows = self.max_reachable_rows
         for level_n in range(1, data.MAX_PLAYER_LEVEL + 1):
             if data.XP_CURVE[level_n - 1] > max_rows:
@@ -670,20 +957,43 @@ class LibrarianWorld(World):
             loc.access_rule = (
                 lambda state, n=rows_needed, mm=major_magic_needed:
                 feasible_rows(state) >= n
-                and state.count_group("Major Magic", p) >= mm
+                and major_magic_total(state) >= mm
             )
 
-        # Milestone access rules — only for milestones whose threshold is
-        # reachable in the active pool. Each row is 3, 5, or 10 volumes
-        # (avg 3072/400 ≈ 7.68); we use 8 as a conservative divisor.
-        for thresh in MILESTONE_THRESHOLDS:
-            rows_needed = max(1, math.ceil(thresh / 8))
-            if rows_needed > max_rows:
+        # Milestone access rules. Reachable iff the player has enough
+        # pickable books AND enough open shelf capacity to drop them on.
+        # Books don't need to be correctly placed — any book on any shelf
+        # counts toward the in-game counter — so this is much less strict
+        # than feasible_rows(state) >= thresh/8 was, giving AP fill many
+        # more sphere-0/1 slots in early milestones.
+        #
+        # When only_unward_shelfable_books is enabled, milestone locations
+        # are removed entirely (see create_regions) so this loop is a
+        # no-op and we don't try to look up locations that weren't created.
+        if not only_shelfable:
+            max_books_in_scope = sum(
+                s.volumes for sec in active_sections for s in sec.series
+            )
+            for thresh in MILESTONE_THRESHOLDS:
+                if thresh > max_books_in_scope:
+                    continue  # location was not created
+                loc = mw.get_location(f"Milestone: {thresh} Books Placed", p)
+                loc.access_rule = (
+                    lambda state, n=thresh:
+                    books_unlocked(state) >= n and shelf_slots_open(state) >= n
+                )
+
+        # Row-completion milestones. Each fires when the player has
+        # correctly completed N total rows. Reachable when feasible_rows
+        # (the same per-series item-availability check we already use)
+        # is at least N. feasible_rows is cached, so the 200 rules share
+        # one underlying computation per state.
+        for thresh in ROW_COMPLETION_THRESHOLDS:
+            if thresh > max_rows:
                 continue  # location was not created
-            loc = mw.get_location(f"Milestone: {thresh} Books Placed", p)
+            loc = mw.get_location(f"Complete {thresh} Rows", p)
             loc.access_rule = (
-                lambda state, n=rows_needed:
-                feasible_rows(state) >= n
+                lambda state, n=thresh: feasible_rows(state) >= n
             )
 
         # All four chest openings (Crimson, Emerald, Azure, Golden) have
@@ -710,10 +1020,10 @@ class LibrarianWorld(World):
             def goal_rule(state):
                 series_unlocked = state.count(ITEM_PROG_SERIES, p)
                 for s in active_sections:
-                    if not state.has(shelf_unlock_name(s.id), p, s.bookcase_count):
+                    if not state.has(shelf_names[s.id], p, s.bookcase_count):
                         return False
-                    for ser in s.series:
-                        if series_unlocked < series_req[ser.name]:
+                    for needed in section_series_reqs[s.id]:
+                        if series_unlocked < needed:
                             return False
                 return True
             goal.access_rule = goal_rule
@@ -731,12 +1041,18 @@ class LibrarianWorld(World):
         # active sections — for floor goals, the other floor's rows aren't
         # actual locations and shouldn't appear here.
         row_location_map: dict[str, int] = {}
+        # Per-series shelf-unlock requirement: how many bookcases need to be
+        # opened in the series' section before its row is accessible. The Lua
+        # client uses this to gate book unwarding — a book is only pickable
+        # when BOTH its series is received and its bookcase is open.
+        shelf_req_map: dict[str, int] = {}
         for section in self.active_sections:
             for series in section.series:
                 loc_name = f"Shelf: {section.id} - {series.name}"
                 loc_id = self.location_name_to_id.get(loc_name)
                 if loc_id is not None:
                     row_location_map[f"{section.id}|{series.name}"] = loc_id
+                shelf_req_map[series.name] = self.shelf_req[(section.id, series.name)]
 
         # Compute the row count at which the Lua client should fire the
         # goal. Floor goals fire when their floor's section count is
@@ -756,7 +1072,7 @@ class LibrarianWorld(World):
             goal_row_threshold = sum(s.shelf_count for s in data.SECTIONS)
 
         return {
-            "version": "1.0.0",
+            "version": "1.0.1",
             "goal": goal_value,
             # Row count at which the Lua client should send STATUS_GOAL.
             # Ignored for the "full" goal (the game's EndGame fires it).
@@ -765,6 +1081,7 @@ class LibrarianWorld(World):
             # so each AP seed has its own Sav_AP_<seed>_<slot>.sav file.
             "seed": str(self.multiworld.seed_name),
             "starting_section": self.starting_section,
+            "starting_section_b": self.starting_section_b,
             "starting_series": self.starting_series,
             "starting_series_count": self.options.starting_series_count.value,
             "series_per_unlock": self.options.series_per_unlock.value,
@@ -778,8 +1095,28 @@ class LibrarianWorld(World):
             "bookcase_counts": {s.id: s.bookcase_count for s in self.active_sections},
             # Row-completion location lookup: "<sid>|<series_name>" → AP location id.
             "row_location_map": row_location_map,
+            # Per-series shelf-unlock requirement (series_name → bookcase index
+            # needed for its row). Lua uses this in Pass 1 of book-warding to
+            # require BOTH series unlock AND its bookcase open before a book
+            # becomes pickable. Only consulted when only_unward_shelfable_books
+            # is 1; in the default mode the shelf_req_map is ignored by Lua.
+            "shelf_req_map": shelf_req_map,
+            # Toggle: when 1, Lua wards a book unless BOTH its series and its
+            # bookcase have been unlocked. When 0 (default), only the series
+            # unlock matters and the book becomes pickable as soon as the
+            # series is received.
+            "only_unward_shelfable_books": int(self.options.only_unward_shelfable_books.value),
             # Milestone thresholds shipped so the Lua side knows when to fire each.
-            "milestone_thresholds": list(MILESTONE_THRESHOLDS),
+            # When only_unward_shelfable_books is enabled, milestones are removed
+            # from the location pool (see create_regions) — send an empty list
+            # so the Lua client's milestone-fire loop is a no-op.
+            "milestone_thresholds": (
+                [] if int(self.options.only_unward_shelfable_books.value) else
+                list(MILESTONE_THRESHOLDS)
+            ),
+            # Row-completion thresholds. Lua tracks total correctly-completed
+            # rows and fires each threshold's check when the count reaches it.
+            "row_completion_thresholds": list(ROW_COMPLETION_THRESHOLDS),
             # How locked-series books should look. "stacks" = visible-but-disabled
             # (preserves visual density; collision off so player walks through).
             # The hidden-mode code path is still present in the Lua client for

@@ -7,7 +7,7 @@ Options dataclasses use positional fields by name only.
 
 from dataclasses import dataclass
 
-from Options import Choice, Range, PerGameCommonOptions
+from Options import Choice, Range, Toggle, PerGameCommonOptions
 
 
 class Goal(Choice):
@@ -63,14 +63,36 @@ class SeriesPerUnlock(Range):
     Lower values mean more granular gating (more items, each smaller in
     impact). Higher values mean fewer items, each more impactful.
 
-    Minimum is 2 -- a value of 1 creates a 400-deep linear progression
-    chain (each item gates the next), which Archipelago's fill algorithm
-    struggles to route inside a reasonable time on multi-player seeds.
+    Minimum is 3 -- lower values produce a deep linear progression
+    chain (each item gates the next) that Archipelago's fill algorithm
+    struggles to route on tight configs (multi-player seeds, accessibility:
+    minimal, or low custom_goal_row_count). At 3 the chain depth caps at
+    134, which fill handles reliably across all goal / accessibility /
+    player-count combinations we've tested.
     """
     display_name = "Series Per Unlock"
-    range_start = 2
+    range_start = 3
     range_end = 10
     default = 5
+
+
+class OnlyUnwardShelfableBooks(Toggle):
+    """Require BOTH the series unlock AND its target bookcase before books
+    are pickable.
+
+    Off (default): a book becomes pickable as soon as its series has been
+    received, regardless of whether its bookcase is open yet. The player
+    can pick books up and stash them on any open shelf -- mis-shelving and
+    moving them later is part of the loop.
+
+    On: a book stays warded until both its series is received AND the
+    bookcase it belongs in has been unlocked. Stricter logic; book-
+    placement milestones fire later in seeds where shelf and series
+    unlocks are spread apart, since the player can't pick anything up
+    until both have arrived for at least one row.
+    """
+    display_name = "Only Unward Shelfable Books"
+    default = 0
 
 
 @dataclass
@@ -79,3 +101,4 @@ class LibrarianOptions(PerGameCommonOptions):
     custom_goal_row_count: CustomGoalRowCount
     starting_series_count: StartingSeriesCount
     series_per_unlock: SeriesPerUnlock
+    only_unward_shelfable_books: OnlyUnwardShelfableBooks

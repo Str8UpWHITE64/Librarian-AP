@@ -105,13 +105,23 @@ _shelf_items: list[LibrarianItemData] = [
 ]
 
 # --- Major Magic (progressive) ---
-
+#
+# Marked progression_skip_balancing rather than plain progression: these
+# items gate only the 45 level-up locations (one Major Magic copy required
+# per level after level 1), and have NO row/section/floor/goal dependency.
+# AP fill's progression-balancing pass adds a meaningful sweep cost when
+# there are lots of "progression" items, and including the 45 Major Magic
+# copies in that balancing inflates routing work without actually helping
+# routing — they have no downstream consequences for series/shelf access.
+# skip_balancing keeps them in the progression-priority pool (so they're
+# placed before filler / useful items) but takes them out of the balancing
+# loop, which is one of the bigger single fill-speedup wins available.
 _major_skill_items: list[LibrarianItemData] = [
-    LibrarianItemData("Progressive Sort",          200, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression),
-    LibrarianItemData("Progressive Shelf Guide",   201, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression),
-    LibrarianItemData("Progressive Insight",       202, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression),
-    LibrarianItemData("Progressive Auto-Shelving", 203, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression),
-    LibrarianItemData("Progressive Assemble",      204, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression),
+    LibrarianItemData("Progressive Sort",          200, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),
+    LibrarianItemData("Progressive Shelf Guide",   201, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),
+    LibrarianItemData("Progressive Insight",       202, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),
+    LibrarianItemData("Progressive Auto-Shelving", 203, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),
+    LibrarianItemData("Progressive Assemble",      204, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),
 ]
 
 # --- Filler (themed) ---
@@ -146,13 +156,6 @@ item_name_groups: dict[str, set[str]] = {
     "Major Magic":      {it.name for it in _major_skill_items},
     "Skills":           {it.name for it in _major_skill_items},
     "Filler":           {it.name for it in _filler_items},
-    # Used by level-up / milestone access rules to count "how much progression
-    # has the player received so far" without enumerating every item by name.
-    "All Progression":  (
-        {it.name for it in _series_items}
-        | {it.name for it in _shelf_items}
-        | {it.name for it in _major_skill_items}
-    ),
 }
 
 

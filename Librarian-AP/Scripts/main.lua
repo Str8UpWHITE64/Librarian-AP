@@ -200,7 +200,7 @@ end
 -- isn't in TESTED_GAME_VERSIONS, append "(UNTESTED)" so the player knows
 -- compatibility isn't validated against their game build.
 
-local MOD_VERSION = "1.0.0"
+local MOD_VERSION = "1.0.1"
 local TESTED_GAME_VERSIONS = { "1.0.8" }
 
 local function get_game_version()
@@ -661,6 +661,35 @@ local function start_gameplay_loops()
         return false
     end)
 
+    -- Periodic milestone / level sync. Book-placement milestones fire from
+    -- GameSaveData.GameProgressData.InsertedBookNum, which the game updates
+    -- as the player places books. The FinishRow hook above only fires when
+    -- a ROW completes — so a player who places many books without finishing
+    -- rows (mid-sort, mis-shelving and recovering, etc.) wouldn't trigger
+    -- their milestones until the next row completion. This 3-second poll
+    -- closes that gap. Level-ups are event-driven via OnLevelUp, so this
+    -- loop is mostly milestones in practice.
+    LoopAsync(3000, function()
+        local IA = package.loaded["AP/ItemApply"]
+        if not IA then return false end
+        -- Stop only when fully out of gameplay/pre-apply context (matches
+        -- the 5-second loop's lifecycle above). Returning true here ENDS
+        -- the loop permanently; the early-exit-on-gameplay-false bug we
+        -- shipped originally killed the loop at startup before gameplay
+        -- ever became active, so progress sync never ran.
+        if not (IA._gameplay_active or IA._allow_pre_apply) then
+            _gameplay_loops_started = false   -- allow restart on next entry
+            return true
+        end
+        -- During pre-apply (title menu), keep the loop alive but skip the
+        -- sync — InsertedBookNum / level data aren't meaningful yet.
+        if not IA._gameplay_active then return false end
+        if not IA._apply_safe then return false end
+        if not IA._slot_data then return false end
+        pcall(function() IA.sync_progress_state() end)
+        return false
+    end)
+
     -- Periodic book straggler re-walk every 3 minutes (hidden mode only).
     -- The initial tree-walk can miss a component or two — e.g., a book
     -- whose mesh sub-components weren't fully streamed in when its
@@ -942,6 +971,15 @@ RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:SaveGameData", functio
     pcall(function() n = tostring(slot_num_param:get()) end)
     log(("[AP][save-probe] GI.SaveGameData(slot=%s) — current SaveGameName='%s'")
         :format(n, tostring(read_save_slot())))
+    -- After save, GameSaveData.InsertedBookNum is fresh — re-run the
+    -- progress sync so book milestones catch up. This is a safety net for
+    -- the in-between window where our own BP-hook counter might miss an
+    -- event (or hasn't been wired correctly yet).
+    local IA = package.loaded["AP/ItemApply"]
+    if IA and IA.sync_progress_state and IA._gameplay_active
+            and IA._apply_safe and IA._slot_data then
+        pcall(function() IA.sync_progress_state() end)
+    end
 end)
 
 -- /Script/Librarian.LibrarianGameInstanceBase:LoadGameData(loadSlotNum) → bool
@@ -1312,6 +1350,17 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
         pcall(function() sent = IA.detect_completed_rows() end)
         log(("[AP] row-detect: sent %d location check(s)"):format(sent or 0))
     end
+    -- Fire any "Complete N Rows" milestone checks the player has now
+    -- reached. `row` is the game's authoritative correct-row counter
+    -- (FinishRow only fires when a row is actually completed in-game,
+    -- so we trust this value).
+    if IA and IA.fire_row_completion_checks and row then
+        local rc_sent = 0
+        pcall(function() rc_sent = IA.fire_row_completion_checks(row) end)
+        if rc_sent > 0 then
+            log(("[AP] row-completion: sent %d location check(s)"):format(rc_sent))
+        end
+    end
     -- Also sync milestones (book count) and any level-ups whose threshold
     -- was crossed during this row's completion.
     if IA and IA.sync_progress_state then
@@ -1339,6 +1388,8 @@ RegisterHook("/Script/Librarian.LibrarianGameMode:EndGame", function(self)
     log("[AP] sending STATUS_GOAL")
     ap_send_goal()
 end)
+
+
 
 -- ============================================================
 -- Keybinds
