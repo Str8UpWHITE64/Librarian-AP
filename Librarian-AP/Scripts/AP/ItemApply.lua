@@ -141,22 +141,6 @@ M._case_to_section  = {}
 -- runs every 5s and was spamming the log with identical lines.
 M._last_apply_log_key = nil
 
--- Per-case row-status length snapshot. `case.RowStatus` is the game's own
--- per-case list of completed rows (a row is "complete" only when the
--- right series's volumes are placed in volume order — the game validates
--- order + section internally). When the list's length grows we know the
--- game has just registered a new row on that case. Combined with the
--- per-AssetIdx count walk, we identify exactly which series completed,
--- without false fires from wrong-order placements.
-M._case_row_status_count = {}
-
--- Tracks which AssetIdx values we've already fired AP checks for, per
--- bookcase. Avoids re-firing if the player removes and re-completes the
--- same row on the same case. Combined with M._sent_row_locations (the
--- global de-dupe set), gives us belt-and-suspenders protection against
--- duplicate row checks across reconnect / save reload.
-M._case_fired_per_aidx = {}
-
 -- Already-sent row location IDs in this session (de-dupe defense).
 M._sent_row_locations = {}
 
@@ -351,8 +335,6 @@ function M.set_gameplay_active(state)
             log("Clearing bookcase index (left gameplay)")
             M._section_to_cases = {}
             M._case_to_section = {}
-            M._case_row_status_count = {}
-            M._case_fired_per_aidx = {}
             M._stray_cases = {}
             M._last_apply_log_key = nil
             M._cases_indexed = false
@@ -1464,8 +1446,6 @@ end
 function M._index_bookcases(silent)
     M._section_to_cases = {}
     M._case_to_section  = {}
-    M._case_row_status_count = {}
-    M._case_fired_per_aidx = {}
 
     -- Step 1: build boi → BP_BookCase_C map. The wrappers (PillarCabinet,
     -- Cabinet_01) reference their child bookcases via BookOrderIndex (matches
@@ -1958,24 +1938,21 @@ function M.detect_completed_rows()
     local row_loc_map = M._slot_data.row_location_map
     if type(row_loc_map) ~= "table" then return 0 end
 
-    M._case_row_status_count = M._case_row_status_count or {}
-    M._case_fired_per_aidx   = M._case_fired_per_aidx or {}
-
     local sent_count = 0
     for sid, cases in pairs(M._section_to_cases) do
         for _, case in ipairs(cases) do
             if case and case:IsValid() then
-                local case_key = tostring(case)
-
-                -- Game's authoritative completion counter for this case.
+                -- Game's authoritative completion count for this case.
                 local current_rows = 0
                 pcall(function() current_rows = #case.RowStatus end)
-                local prev_rows = M._case_row_status_count[case_key] or 0
 
-                if current_rows > prev_rows then
-                    -- One or more rows newly complete on this case. Walk
-                    -- PlacingBookInfo to find which AssetIdx(s) now meet
-                    -- their volume count.
+                if current_rows > 0 then
+                    -- At least one row is complete on this case. Walk
+                    -- PlacingBookInfo to find which AssetIdx(s) have a
+                    -- full volume count placed. We always re-sweep (not
+                    -- gated on count diff) so a "complete -> remove ->
+                    -- recomplete in same case" cycle fires the new
+                    -- series's check correctly.
                     local current = {}
                     pcall(function()
                         local pbi = case.PlacingBookInfo
@@ -1996,66 +1973,66 @@ function M.detect_completed_rows()
                         end
                     end)
 
-                    -- Candidates: AssetIdx with full volume count, not yet
-                    -- fired for this case, AND whose home section matches
-                    -- this case's physical section. The home-section
-                    -- filter is the key correctness check: the player
-                    -- could have piled a different section's books onto
-                    -- this case (game rejects them as part of any row),
-                    -- but our count would still see them. Without the
-                    -- filter we could fire the wrong-section series's AP
-                    -- check when an adjacent correctly-placed series's
-                    -- row triggers RowStatus growth on the same case.
+                    -- Sweep full-count, home-section series in the case
+                    -- and split them into:
+                    --   • candidates  = unfired, eligible to fire this pass
+                    --   • already_fired = previously-sent series still
+                    --                     occupying RowStatus slots
                     --
-                    -- Sort by AssetIdx so multi-completion cases (rare)
-                    -- are deterministic.
-                    local fired = M._case_fired_per_aidx[case_key] or {}
+                    -- already_fired comes from the CURRENT PBI state (NOT
+                    -- a sticky per-case flag), so a series we fired earlier
+                    -- and the player has since removed no longer counts
+                    -- against the cap. That's what unblocks the
+                    -- "complete A → remove A → complete B in same case"
+                    -- case the old count-diff guard missed.
+                    --
+                    -- Home-section filter rejects misplaced cross-section
+                    -- books. Sort by AssetIdx so deterministic order when
+                    -- multiple series happen to be complete at once.
                     local candidates = {}
+                    local already_fired = 0
                     for aidx, count in pairs(current) do
                         local expected = M._asset_to_volumes[aidx] or 0
-                        if expected > 0
-                                and count >= expected
-                                and not fired[aidx]
+                        if expected > 0 and count >= expected
                                 and M._asset_to_section[aidx] == sid then
-                            candidates[#candidates + 1] = aidx
-                        end
-                    end
-                    table.sort(candidates)
-
-                    -- Fire up to (current_rows - prev_rows) checks — the
-                    -- number of new completions the game just registered.
-                    local newly_finished = current_rows - prev_rows
-                    local to_fire = math.min(newly_finished, #candidates)
-                    for k = 1, to_fire do
-                        local aidx = candidates[k]
-                        local series_name = M._asset_to_series[aidx]
-                        local home_sid = M._asset_to_section[aidx]
-                        if series_name and home_sid then
-                            local map_key = home_sid .. "|" .. series_name
+                            local series_name = M._asset_to_series[aidx]
+                            local map_key = sid .. "|" .. (series_name or "")
                             local loc_id = row_loc_map[map_key]
-                            if loc_id and not M._sent_row_locations[loc_id] then
-                                M._sent_row_locations[loc_id] = true
-                                fired[aidx] = true
-                                log(("[row-detect] %s / %s (AssetIdx %d) → loc %d"):format(
-                                    home_sid, series_name, aidx, loc_id))
-                                local APClient = package.loaded["AP/APClient"]
-                                if APClient and APClient.send_check then
-                                    APClient:send_check(loc_id)
-                                    sent_count = sent_count + 1
+                            if loc_id then
+                                if M._sent_row_locations[loc_id] then
+                                    already_fired = already_fired + 1
+                                else
+                                    candidates[#candidates + 1] = {
+                                        aidx = aidx,
+                                        loc_id = loc_id,
+                                        name = series_name,
+                                    }
                                 end
-                            elseif not loc_id then
-                                log(("[row-detect] %s / %s — no loc_id in row_location_map"):format(
-                                    home_sid, series_name))
+                            elseif series_name then
+                                log(("[row-detect] %s / %s -- no loc_id in row_location_map"):format(
+                                    sid, series_name))
                             end
-                        else
-                            log(("[row-detect] AssetIdx %d: missing series_name or section (case sid=%s)"):format(
-                                aidx, sid))
                         end
                     end
-                    M._case_fired_per_aidx[case_key] = fired
-                end
+                    table.sort(candidates, function(a, b) return a.aidx < b.aidx end)
 
-                M._case_row_status_count[case_key] = current_rows
+                    -- Cap fires by remaining RowStatus capacity.
+                    local cap = current_rows - already_fired
+                    if cap > 0 and #candidates > 0 then
+                        local to_fire = math.min(cap, #candidates)
+                        for k = 1, to_fire do
+                            local c = candidates[k]
+                            M._sent_row_locations[c.loc_id] = true
+                            log(("[row-detect] %s / %s (AssetIdx %d) -> loc %d"):format(
+                                sid, c.name, c.aidx, c.loc_id))
+                            local APClient = package.loaded["AP/APClient"]
+                            if APClient and APClient.send_check then
+                                APClient:send_check(c.loc_id)
+                                sent_count = sent_count + 1
+                            end
+                        end
+                    end
+                end
             end
         end
     end

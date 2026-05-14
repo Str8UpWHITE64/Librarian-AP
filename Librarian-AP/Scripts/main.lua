@@ -200,7 +200,7 @@ end
 -- isn't in TESTED_GAME_VERSIONS, append "(UNTESTED)" so the player knows
 -- compatibility isn't validated against their game build.
 
-local MOD_VERSION = "1.0.1"
+local MOD_VERSION = "1.0.2"
 local TESTED_GAME_VERSIONS = { "1.0.8" }
 
 local function get_game_version()
@@ -687,6 +687,15 @@ local function start_gameplay_loops()
         if not IA._apply_safe then return false end
         if not IA._slot_data then return false end
         pcall(function() IA.sync_progress_state() end)
+        -- Also re-run row-completion detection periodically. FinishRow
+        -- only fires when the global row count INCREASES — so if the
+        -- player removes a completed series and replaces it with a
+        -- different one in the same row slot, the new completion goes
+        -- undetected until the count grows again. Polling here catches
+        -- those swap completions promptly. detect_completed_rows is
+        -- idempotent (de-dup via _sent_row_locations), so re-running
+        -- when nothing has changed is a no-op.
+        pcall(function() IA.detect_completed_rows() end)
         return false
     end)
 
