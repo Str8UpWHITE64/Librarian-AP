@@ -14,10 +14,18 @@ open up new series and bookcases.
 
 - **Librarian: Tidy Up the Arcane Library!** https://store.steampowered.com/app/4197610/Librarian_Tidy_Up_the_Arcane_Library/
 - **Archipelago** 0.6.x or newer on the server side.
-- **UE4SS — experimental build**. The stable release isn't new enough;
-  download the experimental build directly:
+- **UE4SS (experimental build)**. The stable UE4SS release isn't new
+  enough; an experimental build is required. A known-good copy is
+  bundled with every Librarian-AP release zip and with the source repo
+  itself (at `third_party/UE4SS/`), so no separate UE4SS download is
+  needed.
 
-  <https://github.com/UE4SS-RE/RE-UE4SS/releases/download/experimental-latest/UE4SS_v3.0.1-949-gdd6777a8.zip>
+  We bundle UE4SS because upstream overwrites their
+  `experimental-latest` release in place with every new build, so a
+  direct link to a specific working build stops resolving once that
+  build is superseded. The bundled copy is unmodified; see
+  [`third_party/UE4SS/README.md`](third_party/UE4SS/README.md) for the
+  exact version and license details (MIT).
 
   UE4SS ships with `BPModLoaderMod` already included; that's the loader
   that picks up the `.pak` mod below.
@@ -26,27 +34,75 @@ open up new series and bookcases.
 
 ## Installation
 
+There are two paths. Pick whichever matches how you got Librarian-AP:
+
+- **Quick install (from a GitHub release)** — for most players. One
+  drag-drop into Steam plus one file copy into Archipelago.
+- **Manual install (from a source checkout)** — for developers or
+  anyone running unreleased changes from a `git clone`.
+
 The Steam install is normally at:
 
 ```
 C:\Program Files (x86)\Steam\steamapps\common\Librarian Tidy Up the Arcane Library!\
 ```
 
-The folder you'll be copying files into a lot is:
+referred to below as `<Game>`.
 
-```
-<Game>\Librarian\Binaries\Win64\
-```
+### Quick install (from a GitHub release)
 
-referred to below as `<Win64>`.
+1. Download **both** files from the latest release on GitHub:
+   - `Librarian-AP_v<version>.zip` (the game-side bundle)
+   - `librarian.apworld` (the AP server module)
 
-### 1. Install UE4SS
+2. Extract the zip somewhere temporary. You'll see a top-level
+   `Librarian/` folder and an `INSTALL.txt`.
 
-1. Download the experimental zip from the link in **Requirements**.
-2. Unzip it somewhere temporary.
-3. Copy `dwmapi.dll` and the **contents** of the `ue4ss` folder
-   (NOT the folder itself — its inner files: `UE4SS.dll`, `Mods\`, etc.)
-   into `<Win64>\`.
+3. Drag the `Librarian/` folder onto `<Game>\`. Windows will ask whether
+   to merge folders — say yes. The UE4SS bootstrap, all required mods,
+   and the companion `.pak` all land in the right places in one shot:
+
+   ```
+   <Game>\Librarian\Binaries\Win64\dwmapi.dll          (UE4SS bootstrap)
+   <Game>\Librarian\Binaries\Win64\UE4SS.dll           (UE4SS main)
+   <Game>\Librarian\Binaries\Win64\Mods\               (UE4SS mods + Librarian-AP)
+   <Game>\Librarian\Content\Paks\LogicMods\LibrarianAPHUDFix.pak
+   ```
+
+4. Copy `librarian.apworld` into your Archipelago install:
+
+   ```
+   <Archipelago>\custom_worlds\librarian.apworld
+   ```
+
+That's it — skip to **Playing**.
+
+### Manual install (from a source checkout)
+
+If you're working from a repo clone, you can either:
+
+- **Build the release zip locally** and follow the Quick install above:
+
+  ```
+  python tools/build_release.py
+  ```
+
+  This produces `dist/Librarian-AP_v<version>.zip` and
+  `dist/librarian.apworld` from the current source tree.
+
+- **Or copy files in place by hand** — useful while iterating on a
+  single file. The four steps below cover that flow. The folder you'll
+  be copying files into a lot is `<Game>\Librarian\Binaries\Win64\`,
+  referred to as `<Win64>`.
+
+#### 1. Install UE4SS
+
+UE4SS is bundled in this repository at `third_party/UE4SS/`:
+
+1. Copy `third_party/UE4SS/dwmapi.dll` into `<Win64>\`.
+2. Copy the **contents** of `third_party/UE4SS/ue4ss/` (its inner files:
+   `UE4SS.dll`, `UE4SS-settings.ini`, `Mods\`, `LICENSE`, etc. — not the
+   `ue4ss` folder itself) into `<Win64>\`.
 
 After this step `<Win64>\` should contain at least:
 
@@ -58,11 +114,11 @@ After this step `<Win64>\` should contain at least:
 ... (other stock UE4SS bits)
 ```
 
-### 2. Install the Lua mod
+#### 2. Install the Lua mod
 
-Copy the `Librarian-AP/` folder from this repository into `<Win64>\Mods\`,
-and copy this repo's `mods.txt` into `<Win64>\Mods\` to **overwrite** the
-stock one (it has `Librarian-AP : 1` added to enable the mod).
+Copy the `Librarian-AP/` folder from this repo into `<Win64>\Mods\`,
+and copy this repo's `mods.txt` into `<Win64>\Mods\` to **overwrite**
+the stock one (it has `Librarian-AP : 1` added to enable the mod).
 
 So you end up with:
 
@@ -70,12 +126,12 @@ So you end up with:
 <Win64>\Mods\mods.txt                          (our version)
 <Win64>\Mods\Librarian-AP\Scripts\main.lua
 <Win64>\Mods\Librarian-AP\Scripts\AP\...
-<Win64>\Mods\Librarian-AP\ap_config.json 
+<Win64>\Mods\Librarian-AP\ap_config.json
 ```
 
-### 3. Install the BP companion pak
+#### 3. Install the BP companion pak
 
-Copy `LibrarianAPHUDFix.pak` into:
+Copy `LibrarianAPHUDFix.pak` from the repo root into:
 
 ```
 <Game>\Librarian\Content\Paks\LogicMods\
@@ -85,9 +141,12 @@ This pak contains the connection-menu widget, the HUD-refresh helper,
 and the ModActor that bridges Lua ↔ Blueprint. It auto-spawns at game
 start; nothing else to configure.
 
-### 4. Install the Archipelago apworld
+#### 4. Install the Archipelago apworld
 
-Copy `librarian.apworld` from Releases into your Archipelago install:
+Either run `python tools/build_release.py` (produces
+`dist/librarian.apworld`) and copy that file, or zip up
+`apworld/librarian/` manually and rename the result to
+`librarian.apworld`. Then copy it into your Archipelago install:
 
 ```
 <Archipelago>\custom_worlds\librarian.apworld
@@ -246,3 +305,10 @@ When reporting a problem, please include:
 AP integration: Str8UpWHITE64.
 Original game: Librarian: Tidy Up the Arcane Library! (developer credit
 remains with the game's publisher).
+
+## Third-party software
+
+This repository bundles **UE4SS** (Universal UE Script System) under its
+MIT License (copyright (c) 2022 Narknon). The bundled copy is unmodified.
+See [`third_party/UE4SS/README.md`](third_party/UE4SS/README.md) for the
+exact build, upstream link, and license text.

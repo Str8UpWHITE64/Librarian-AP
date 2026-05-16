@@ -1,6 +1,7 @@
 /.venv/
 /.idea/
 /dumps/
+/dist/
 *.zip
 *.apworld
 __pycache__/
