@@ -36,10 +36,38 @@ local function log(msg) print(LOG_PREFIX .. " " .. tostring(msg)) end
 
 -- AP location ID layout (mirrors apworld/librarian/Locations.py)
 local AP_BASE              = 1910000
+local AP_LOC_SECTION_FIRST = AP_BASE + 500   -- 31 entries: section completions
 local AP_LOC_LEVEL_FIRST   = AP_BASE + 560   -- 45 entries: Level 1..45
 local AP_LOC_MILESTONE_FIRST = AP_BASE + 640 -- 22 entries: aligned to MILESTONE_THRESHOLDS order
 local AP_LOC_ROW_COMPLETION_FIRST = AP_BASE + 1000 -- 50 entries: aligned to ROW_COMPLETION_THRESHOLDS order
 local AP_MAX_PLAYER_LEVEL  = 45
+
+-- section_id → ordinal position in data.SECTIONS (apworld/librarian/data.py).
+-- Used as a fallback when slot_data doesn't ship section_location_map
+-- (legacy 1.0.x seeds generated before the section-completion fix). The
+-- AP location id for "Section Complete: <id>" is AP_LOC_SECTION_FIRST +
+-- SECTION_IDX[id]. Keep in lockstep with the SECTIONS tuple ordering.
+local SECTION_IDX = {
+    ["1A"] =  0, ["1B"] =  1, ["1C"] =  2, ["1D"] =  3, ["1E"] =  4,
+    ["1F"] =  5, ["1G"] =  6, ["1H"] =  7, ["1I"] =  8, ["1J"] =  9,
+    ["1K"] = 10, ["1L"] = 11, ["1M"] = 12, ["1N"] = 13,
+    ["2A"] = 14, ["2B"] = 15, ["2C"] = 16, ["2D"] = 17, ["2E"] = 18,
+    ["2F"] = 19, ["2G"] = 20, ["2H"] = 21, ["2I"] = 22, ["2J"] = 23,
+    ["2K"] = 24, ["2L"] = 25, ["2M"] = 26, ["2N"] = 27, ["2O"] = 28,
+    ["2P"] = 29, ["2Q"] = 30,
+}
+
+-- Cumulative XP curve, mirrored from apworld/librarian/data.py:XP_CURVE.
+-- Used as a fallback for run_baseline_sync's level-up catch-up when
+-- player.SkillLevelUpRowNum isn't accessible at baseline time. The live
+-- BP read remains the primary source — this is just so the baseline
+-- doesn't silently compute xp_level=0 for a player who has 14 rows
+-- finished offline. Keep in lockstep with data.py XP_CURVE.
+local XP_CURVE = {
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 19, 22, 25, 29, 33, 37, 41,
+    46, 50, 55, 61, 66, 72, 78, 84, 91, 98, 105, 112, 120, 127, 135,
+    152, 161, 170, 179, 189, 200, 212, 225, 239, 254,
+}
 
 local UPGRADE = {
     JUMP                = 0,
@@ -110,6 +138,19 @@ M._pre_apply_complete = false
 -- the FINAL state (instead of N wasteful per-item flushes).
 M._last_item_apply_tick = 0
 
+-- Mid-gameplay reconnect window. When the player disconnects then
+-- reconnects WHILE PLAYING, the AP server re-sends every received item
+-- one at a time. Without this flag, each apply_item would call
+-- flush_apply on partial state (most shelves not yet re-unlocked),
+-- causing every bookcase to flash to hidden and the placed books to
+-- look stranded until the next 5-second re-apply rebuilds the world.
+--
+-- Set true by set_slot_data() when it fires mid-gameplay; cleared by
+-- main.lua's reconnect-settle watcher once items quiet down. While
+-- true, apply_item only recomputes state and skips flush_apply — the
+-- watcher fires ONE flush_apply at the end with the fully rebuilt state.
+M._reconnect_settle_active = false
+
 -- Skill grants requested while not in gameplay queue here and replay on
 -- the gameplay-active transition.
 M._pending_skill_grants = {}
@@ -148,10 +189,25 @@ M._sent_row_locations = {}
 -- Keyed by threshold value (matches slot_data.row_completion_thresholds entries).
 M._sent_row_completions = {}
 
+-- Already-fired "Section Complete: <id>" sections this session (de-dupe
+-- defense, keyed by section_id). Section completion fires when every
+-- row location in that section is in _sent_row_locations.
+M._sent_section_completions = {}
+
+-- section_id → list of row location IDs in that section. Built once from
+-- slot_data.row_location_map at slot-data setup so check_section_completions
+-- can iterate cheaply.
+M._section_to_row_locs = {}
+
 -- Highest player level we've sent a "Reached Level N" check for. Synced from
--- GameSaveData ONCE at apply-safe (baseline) so loaded saves catch up to
--- their actual level. Subsequent level-ups arrive via the OnLevelUp BP
--- hook → on_level_up_event(), which increments and sends per-event.
+-- (a) the player's XP curve vs GameSaveData.CurrentFinishedRowNum, AND
+-- (b) APClient._sent_checks (the server's view of which level locations
+--     have been checked in any prior session for this slot).
+-- Max of the two is taken so loaded saves catch up to their actual level
+-- even when GameSaveData hasn't fully loaded yet at baseline time.
+-- Subsequent level-ups arrive via the OnLevelUp BP hook →
+-- on_level_up_event(), which catches up from _sent_checks before
+-- incrementing — so it self-heals if baseline missed for any reason.
 -- (Avoids reading GameSaveData.CurrentFinishedRowNum at OnLevelUp time —
 -- empirically that field hasn't updated yet when the event fires.)
 M._levels_reached = 0
@@ -236,6 +292,8 @@ function M.set_slot_data(slot_data)
     M._applied_skill_counts = {}
     M._sent_row_locations = {}
     M._sent_row_completions = {}
+    M._sent_section_completions = {}
+    M._section_to_row_locs = {}
     M._last_applied_series_unlocked = {}
     M._levels_reached = 0
     M._level_baseline_done = false
@@ -248,13 +306,83 @@ function M.set_slot_data(slot_data)
         log("WARNING: slot data set but asset data not loaded; init incomplete")
         return
     end
+
+    -- v1.0.3 warding rule gate. The shelf-req-based warding behavior
+    -- changed in v1.0.3: with only_unward_shelfable_books OFF, we
+    -- restrict pickable books to series whose shelf_req <= max(1,
+    -- cases_open). v1.0.2 and earlier seeds keep their original lenient
+    -- behavior so mid-game saves don't suddenly re-ward placed books.
+    do
+        local v = slot_data.version or "0.0.0"
+        local maj, min, pat = v:match("^(%d+)%.(%d+)%.(%d+)")
+        maj = tonumber(maj) or 0
+        min = tonumber(min) or 0
+        pat = tonumber(pat) or 0
+        M._use_v103_warding = (maj > 1)
+            or (maj == 1 and min > 0)
+            or (maj == 1 and min == 0 and pat >= 3)
+        log(("Apworld version=%s → warding rule: %s"):format(
+            v, M._use_v103_warding and "v1.0.3 (shelf-req gated)" or "v1.0.2 (lenient)"))
+    end
+
+    -- Derived lookups built from asset_idx_to_series.json + slot_data so
+    -- the per-book warding decision is cheap. Built once on slot_connect
+    -- since the underlying data is per-seed.
+    --   _series_to_section[name] = section_id
+    --   _series_to_asset_idx[name] = numeric AssetIdx (for any future
+    --                                  asset-ordered tiebreaks)
+    --   _section_bookcase_count[sid] = how many bookcases that section has
+    M._series_to_section = {}
+    M._series_to_asset_idx = {}
+    for aidx, sname in pairs(M._asset_to_series) do
+        M._series_to_section[sname] = M._asset_to_section[aidx]
+        M._series_to_asset_idx[sname] = aidx
+    end
+    M._section_bookcase_count = {}
+    if type(slot_data.bookcase_counts) == "table" then
+        for sid, n in pairs(slot_data.bookcase_counts) do
+            M._section_bookcase_count[sid] = tonumber(n) or 0
+        end
+    end
+
+    -- Build section_id → list of row location IDs from row_location_map keys.
+    -- Used by fire_section_completions() to determine when all rows of a
+    -- section are complete. Skipped for seeds without row_location_map.
+    M._section_to_row_locs = {}
+    if type(slot_data.row_location_map) == "table" then
+        for key, loc_id in pairs(slot_data.row_location_map) do
+            local sid = type(key) == "string" and key:match("^([^|]+)|") or nil
+            local lid = tonumber(loc_id)
+            if sid and lid then
+                local list = M._section_to_row_locs[sid]
+                if not list then
+                    list = {}
+                    M._section_to_row_locs[sid] = list
+                end
+                list[#list + 1] = lid
+            end
+        end
+    end
     -- Allow pre-apply: the OpenLevel-on-connect that main.lua fires right
     -- after this will trigger a fresh M01 LoadMap → apply-gate retry loop.
     -- main.lua's title-button logic keeps Continue disabled until
     -- _pre_apply_complete flips true (after the deferred tree-walk drains).
     M._allow_pre_apply = true
     M._pre_apply_complete = false
-    log("Slot data set; per-connection state reset; pre-apply enabled")
+
+    -- Mid-gameplay reconnect: AP server is about to re-send every item the
+    -- player already received. Without this flag, each apply_item would
+    -- call flush_apply with partial state (zero shelves open at first,
+    -- then 1, then 2, ...), causing every bookcase to flicker to hidden.
+    -- main.lua's reconnect-settle watcher fires ONE flush_apply once items
+    -- quiet down and clears this flag.
+    if M._gameplay_active then
+        M._reconnect_settle_active = true
+        log("Slot data set; per-connection state reset; reconnect-settle window opened (mid-gameplay)")
+    else
+        M._reconnect_settle_active = false
+        log("Slot data set; per-connection state reset; pre-apply enabled")
+    end
 
     -- Goal-scope verification: log series_order's section coverage so the
     -- player can confirm at-a-glance that no off-floor series can be
@@ -398,15 +526,21 @@ function M.apply_item(name)
         log(("queued (not initialized): %s × %d"):format(name, M._received_counts[name]))
         return
     end
-    -- During pre-apply (post-connect title, before player clicks Continue),
-    -- skip the per-item world flush. The starting-item dump can be 14+
-    -- items; flushing per item is wasteful (each iterates all 3072 books)
-    -- AND causes visual flicker because earlier items see "everything
-    -- warded" state and later items un-ward incrementally. Instead, just
-    -- update derived state here — the pre-apply settle loop in main.lua
-    -- fires ONE flush_apply once items quiet down, so the world is warded
-    -- exactly once with the FINAL post-starting-items state.
-    if M._allow_pre_apply and not M._gameplay_active then
+    -- Defer the world-apply during two settle windows:
+    --   • Pre-apply (post-connect title): the starting-item dump is 14+
+    --     items; flushing per item is wasteful (each iterates all 3072
+    --     books) and visually flickers as books are unwarded one series
+    --     at a time. main.lua's pre-apply settle loop fires ONE
+    --     flush_apply once items quiet, with the FINAL state.
+    --   • Reconnect settle (mid-gameplay): the AP server re-sends all
+    --     received items on (re)connect. Per-item flush_apply would
+    --     hide every bookcase mid-rebuild as shelves_open grows back
+    --     from zero. main.lua's reconnect-settle watcher fires ONE
+    --     flush_apply once items quiet and clears the flag.
+    -- Either way, we still recompute_state() so derived counters track
+    -- correctly while the world apply is deferred.
+    if (M._allow_pre_apply and not M._gameplay_active)
+            or M._reconnect_settle_active then
         M._recompute_state()
         return
     end
@@ -464,6 +598,28 @@ function M.run_baseline_sync()
         log(("Row baseline sync: sent %d check(s) for already-completed rows"):format(row_synced))
     end
 
+    -- Hydrate _sent_row_locations from the server's view of checked
+    -- locations so fire_section_completions() can recognize sections that
+    -- were fully completed in a prior session. Without this, a player
+    -- who finished a section in session A and reconnects in session B
+    -- would never get the Section Complete check — detect_completed_rows
+    -- correctly skips already-checked row locs (so they aren't resent),
+    -- but they also never get added to _sent_row_locations in session B
+    -- without a separate sync.
+    local prior_row_synced = 0
+    pcall(function() prior_row_synced = M._sync_sent_row_locations_from_server() end)
+    if prior_row_synced and prior_row_synced > 0 then
+        log(("Row-location server sync: mirrored %d prior-session check(s) into _sent_row_locations"):format(
+            prior_row_synced))
+    end
+
+    local sec_synced = 0
+    pcall(function() sec_synced = M.fire_section_completions() end)
+    if sec_synced and sec_synced > 0 then
+        log(("Section-completion baseline sync: sent %d check(s) for already-complete sections"):format(
+            sec_synced))
+    end
+
     -- Read the game's CurrentFinishedRowNum and fire any
     -- "Complete N Rows" thresholds the saved game has already passed.
     -- Without this, a save loaded mid-run would silently skip those
@@ -485,6 +641,81 @@ function M.run_baseline_sync()
         log(("Row-completion baseline sync: sent %d check(s) for thresholds <= %d rows"):format(
             rc_synced, rows_finished))
     end
+
+    -- Level-up baseline. Compute the player's actual current level from
+    -- TWO independent signals and take the max:
+    --   • xp_level  — walk player.SkillLevelUpRowNum vs rows_finished.
+    --     The "correct" answer when GameSaveData and the player BP are
+    --     both fully loaded.
+    --   • sent_level — highest level location already in
+    --     APClient._sent_checks. Populated by the server at slot_connect,
+    --     so it works even when GameSaveData isn't ready yet.
+    --
+    -- Without this, _levels_reached resets to 0 on every slot_connect.
+    -- The first OnLevelUp queues "Reached Level 1" → APClient.send_check
+    -- silently drops (the server's set_location_checked_handler already
+    -- marked it sent from a prior session, putting it in _sent_checks).
+    -- The actual new-level the player just reached (Level N) never gets
+    -- sent because by the time _levels_reached catches up to N, every
+    -- earlier attempt was deduped. Using _sent_checks as the floor here
+    -- makes the baseline robust even if rows_finished reads 0 or the
+    -- player BP's SkillLevelUpRowNum is empty at this moment.
+    --
+    -- We also re-send checks for every level <= current_level. The AP
+    -- server dedupes resends, so this is belt-and-suspenders for any
+    -- levels missed during a disconnect window in a prior session.
+    local xp_level = 0
+    do
+        local player = FindFirstOf("BP_LibrarianCharacter_C")
+        if player and player:IsValid() then
+            pcall(function()
+                local arr = player.SkillLevelUpRowNum
+                local n = 0; pcall(function() n = #arr end)
+                for i = 1, math.min(n, AP_MAX_PLAYER_LEVEL) do
+                    local needed = tonumber(arr[i]) or 0
+                    if rows_finished >= needed then
+                        xp_level = i
+                    else
+                        return  -- XP curve is monotonic; short-circuit
+                    end
+                end
+            end)
+        end
+    end
+    -- Static-curve fallback: if the BP read returned 0 (player BP not
+    -- fully resolved despite first-movement having fired, or the array
+    -- read errored), recompute from the hardcoded XP_CURVE so we still
+    -- credit every level the player has earned offline. Mirrors the
+    -- runtime values verified against the in-game SkillLevelUpRowNum
+    -- dump.
+    if xp_level == 0 and rows_finished > 0 then
+        local static_level = 0
+        for i = 1, #XP_CURVE do
+            if rows_finished >= XP_CURVE[i] then
+                static_level = i
+            else
+                break
+            end
+        end
+        if static_level > 0 then
+            log(("Level-up baseline: BP read returned 0; static XP_CURVE fallback → Level %d at %d rows"):format(
+                static_level, rows_finished))
+            xp_level = static_level
+        end
+    end
+    local sent_level = M._compute_sent_level_baseline()
+    local current_level = math.max(xp_level, sent_level)
+    log(("Level-up baseline sync: rows_finished=%d, xp_level=%d, sent_level=%d → current_level=%d"):format(
+        rows_finished, xp_level, sent_level, current_level))
+    if current_level > 0 then
+        local APClient = package.loaded["AP/APClient"]
+        if APClient and APClient.send_check then
+            for level = 1, current_level do
+                APClient:send_check(AP_LOC_LEVEL_FIRST + (level - 1))
+            end
+        end
+    end
+    M._levels_reached = current_level
 
     local lvl_sent, ms_sent = 0, 0
     pcall(function() lvl_sent, ms_sent = M.sync_progress_state() end)
@@ -817,13 +1048,13 @@ function M._initialize_hism_book_mapping()
     end
 
     -- Phase 2: classify books as warded/unwarded/uninitialized. We only
-    -- mark warded books (the ones we'll need to hide). Same rule as
-    -- _apply_books_to_world Pass 1 — the only_unward_shelfable_books
-    -- toggle gates whether the bookcase-side check is added on top of
-    -- the series unlock.
+    -- mark warded books (the ones we'll need to hide). Uses the same
+    -- precomputed set as _apply_books_to_world so all warding decisions
+    -- agree on the v1.0.3 rule (or fall back to v1.0.2 legacy via the
+    -- version gate inside _compute_unwarded_set).
     local only_shelfable = M._slot_data
         and M._slot_data.only_unward_shelfable_books == 1
-    local shelf_req_map = (M._slot_data and M._slot_data.shelf_req_map) or {}
+    local unwarded_set = M._compute_unwarded_set(only_shelfable)
     local is_warded_book = {}
     local warded_count, unwarded_count, uninit_count = 0, 0, 0
     for i = 1, bn do
@@ -832,16 +1063,7 @@ function M._initialize_hism_book_mapping()
             local asset_idx = _book_valid_asset_idx(b)
             if asset_idx ~= nil then
                 local series = M._asset_to_series[asset_idx]
-                local section_id = M._asset_to_section[asset_idx]
-                local series_open = series and M._series_unlocked[series]
-                local should_unward = series_open
-                if only_shelfable and series_open and section_id then
-                    local needed = shelf_req_map[series]
-                    if needed and needed > 0 then
-                        local open = M._shelves_open[section_id] or 0
-                        if open < needed then should_unward = false end
-                    end
-                end
+                local should_unward = series and unwarded_set[series]
                 if should_unward then
                     unwarded_count = unwarded_count + 1
                 else
@@ -1169,9 +1391,70 @@ function M._set_book_mesh_visible(book, visible)
     end
 end
 
+--- Compute the set of series that should be unwarded right now, given the
+--- player's current item state and the warding mode in effect.
+---
+--- Returns {[series_name] = true}. Recomputed each call to
+--- _apply_books_to_world (cheap: walks unlocked series once).
+---
+--- Rules:
+---   v1.0.3+ seeds (M._use_v103_warding == true):
+---     - default mode (only_unward_shelfable_books = false):
+---         unward iff shelf_req <= max(1, cases_open)
+---         (the "first 4" of every section — the shelf_req=1 series —
+---          unward as soon as their series item arrives, regardless of
+---          whether any bookcase has been opened yet. Higher shelf_req
+---          requires the corresponding shelves to actually be open.)
+---     - strict mode (only_unward_shelfable_books = true):
+---         unward iff shelf_req <= cases_open
+---         (no visibility floor; series in a section with 0 cases open
+---          stay warded.)
+---     Note: single-bookcase sections have shelf_req=1 for every series,
+---     so the formula naturally unwards all unlocked series in them
+---     (default and strict alike, once any case is open in strict).
+---
+---   v1.0.2 and earlier seeds (legacy):
+---     - default mode: unward all unlocked (no shelf gating at all)
+---     - strict mode:  unward iff shelf_req <= cases_open
+---     Preserves existing mid-game saves; no in-place behavior change.
+function M._compute_unwarded_set(only_shelfable)
+    local unwarded = {}
+    local shelf_req_map = (M._slot_data and M._slot_data.shelf_req_map) or {}
+
+    if not M._use_v103_warding then
+        -- Legacy: replicate v1.0.2 behavior bit-for-bit.
+        for series_name, _ in pairs(M._series_unlocked) do
+            if only_shelfable then
+                local section_id = M._series_to_section[series_name]
+                local cases_open = M._shelves_open[section_id] or 0
+                local needed = shelf_req_map[series_name] or 1
+                if cases_open >= needed then unwarded[series_name] = true end
+            else
+                unwarded[series_name] = true
+            end
+        end
+        return unwarded
+    end
+
+    -- v1.0.3+ unified rule: cases_open with a default-mode floor of 1.
+    for series_name, _ in pairs(M._series_unlocked) do
+        local section_id = M._series_to_section[series_name]
+        if section_id then
+            local cases_open = M._shelves_open[section_id] or 0
+            local needed = shelf_req_map[series_name] or 1
+            local effective = only_shelfable
+                and cases_open
+                or math.max(1, cases_open)
+            if effective >= needed then unwarded[series_name] = true end
+        end
+    end
+    return unwarded
+end
+
 --- Walk every BP_GrabbingBook_C in the level and ward/unward based on
---- whether its series is in _series_unlocked. Section is NOT part of the
---- per-book gate — section unlocks affect bookcase/shelf visibility (phase 2).
+--- whether its series is in the current unwarded set. Section is NOT part
+--- of the per-book gate — section unlocks affect bookcase/shelf visibility
+--- (phase 2).
 function M._apply_books_to_world()
     local books = FindAllOf("BP_GrabbingBook_C")
     if not books then
@@ -1188,15 +1471,12 @@ function M._apply_books_to_world()
     local hide_mesh = M._slot_data
         and M._slot_data.book_visibility == "hidden"
 
-    -- only_unward_shelfable_books (YAML toggle, default off): when set, a
-    -- book is only unwarded if BOTH its series is received AND its target
-    -- bookcase is open. The shelf_req_map is the per-series bookcase index
-    -- needed (series_name → required shelf count). Disabled by default to
-    -- preserve the "pick up any unlocked-series book, mis-shelf and recover"
-    -- gameplay loop.
+    -- Compute the unwarded set once per apply call. The rules (v1.0.2
+    -- legacy vs v1.0.3 unified) are encapsulated in _compute_unwarded_set;
+    -- per-book code just does a table lookup.
     local only_shelfable = M._slot_data
         and M._slot_data.only_unward_shelfable_books == 1
-    local shelf_req_map = (M._slot_data and M._slot_data.shelf_req_map) or {}
+    local unwarded_set = M._compute_unwarded_set(only_shelfable)
 
     -- Sanity check: are book actors INITIALIZED yet? When M01 first loads,
     -- BP_GrabbingBook actors are spawned but their ItemInfo.AssetIdx is the
@@ -1252,23 +1532,9 @@ function M._apply_books_to_world()
             local asset_idx = _book_valid_asset_idx(book)
             if asset_idx ~= nil then
                 local series_name = M._asset_to_series[asset_idx]
-                local section_id = M._asset_to_section[asset_idx]
-                -- Default rule: any book in an unlocked series is pickable
-                -- (the player can mis-shelve and recover). With the YAML
-                -- toggle only_unward_shelfable_books = 1, ADD a
-                -- shelf-side check — the book stays warded until its
-                -- own bookcase is also open. The Python world's
-                -- milestone access rule is paired with this toggle so
-                -- the two stay in sync.
-                local series_open = series_name and M._series_unlocked[series_name]
-                local should_unward = series_open
-                if only_shelfable and series_open and section_id then
-                    local needed = shelf_req_map[series_name]
-                    if needed and needed > 0 then
-                        local open = M._shelves_open[section_id] or 0
-                        if open < needed then should_unward = false end
-                    end
-                end
+                -- Single-table lookup encapsulates v1.0.2-legacy and
+                -- v1.0.3-unified rules. See _compute_unwarded_set above.
+                local should_unward = series_name and unwarded_set[series_name]
                 local key = book:GetFullName()
                 local is_warded = M._books_warded[key] or false
                 local ok = pcall(function()
@@ -1309,19 +1575,8 @@ function M._apply_books_to_world()
                 local asset_idx = _book_valid_asset_idx(book)
                 if asset_idx ~= nil then
                     local series_name = M._asset_to_series[asset_idx]
-                    local section_id = M._asset_to_section[asset_idx]
-                    -- Same rule as Pass 1 — toggle gates the shelf-side
-                    -- intersection. Default off keeps the old visibility
-                    -- behavior; on adds the shelf check.
-                    local series_open = series_name and M._series_unlocked[series_name]
-                    local should_unward = series_open
-                    if only_shelfable and series_open and section_id then
-                        local needed = shelf_req_map[series_name]
-                        if needed and needed > 0 then
-                            local open = M._shelves_open[section_id] or 0
-                            if open < needed then should_unward = false end
-                        end
-                    end
+                    -- Same precomputed unwarded set as Pass 1.
+                    local should_unward = series_name and unwarded_set[series_name]
                     local key = book:GetFullName()
                     local is_hidden_by_us = M._books_we_have_hidden[key] or false
                     pcall(function()
@@ -2039,6 +2294,94 @@ function M.detect_completed_rows()
     return sent_count
 end
 
+--- Walk APClient._sent_checks and mark every matching row location in
+--- _sent_row_locations. This recovers row-completion state across reconnects:
+--- prior-session row checks the server already knows about end up populating
+--- _sent_row_locations so fire_section_completions() can see that all rows
+--- of a section are complete without having to re-discover each one via
+--- detect_completed_rows. Returns the number of newly-marked entries.
+function M._sync_sent_row_locations_from_server()
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient._sent_checks) then return 0 end
+    if not M._slot_data then return 0 end
+    local map = M._slot_data.row_location_map
+    if type(map) ~= "table" then return 0 end
+    local synced = 0
+    for _, loc_id in pairs(map) do
+        local lid = tonumber(loc_id)
+        if lid and APClient._sent_checks[lid] and not M._sent_row_locations[lid] then
+            M._sent_row_locations[lid] = true
+            synced = synced + 1
+        end
+    end
+    return synced
+end
+
+--- Fire any unfired "Section Complete: <id>" location checks whose section
+--- has had every row location marked sent. Tracks the firing in
+--- _sent_section_completions so we don't re-send during the same session.
+---
+--- Section completion is derived from _sent_row_locations rather than a
+--- distinct in-game event because (a) the game emits no "section complete"
+--- signal, and (b) row-completion is the only authoritative trigger we
+--- have for "this series's row is done" — checking that every row in the
+--- section has fired is equivalent to "every series in the section was
+--- correctly shelved".
+---
+--- Called from:
+---   • The FinishRow hook (after detect_completed_rows) — catches new
+---     section completions right when the player finishes the section's
+---     last row.
+---   • run_baseline_sync — fires any sections that were already complete
+---     in a prior session (we sync _sent_row_locations from the server's
+---     _sent_checks first so this works on reload).
+function M.fire_section_completions()
+    if not M._slot_data then return 0 end
+    if not M._section_to_row_locs then return 0 end
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient.send_check) then return 0 end
+
+    -- Prefer slot_data's authoritative section_location_map (new seeds).
+    -- Fall back to AP_LOC_SECTION_FIRST + SECTION_IDX[sid] for legacy
+    -- seeds generated before this fix shipped — the section_location_map
+    -- key won't be present in their slot_data, but the location ids are
+    -- still allocated identically by the apworld so the fallback maps
+    -- to the right AP location regardless.
+    local sec_loc_map = M._slot_data.section_location_map
+    local use_slot_map = (type(sec_loc_map) == "table")
+
+    local sent = 0
+    for sid, row_locs in pairs(M._section_to_row_locs) do
+        local complete_loc
+        if use_slot_map then
+            complete_loc = sec_loc_map[sid]
+            complete_loc = complete_loc and tonumber(complete_loc) or nil
+        else
+            local idx = SECTION_IDX[sid]
+            complete_loc = idx and (AP_LOC_SECTION_FIRST + idx) or nil
+        end
+        if complete_loc and not M._sent_section_completions[sid]
+                and #row_locs > 0 then
+            local all_done = true
+            for _, loc_id in ipairs(row_locs) do
+                if not M._sent_row_locations[loc_id] then
+                    all_done = false
+                    break
+                end
+            end
+            if all_done then
+                M._sent_section_completions[sid] = true
+                log(("[section] All %d row(s) complete for section %s → loc %d%s"):format(
+                    #row_locs, sid, complete_loc,
+                    use_slot_map and "" or " (legacy fallback)"))
+                APClient:send_check(complete_loc)
+                sent = sent + 1
+            end
+        end
+    end
+    return sent
+end
+
 --- Fire any unfired "Complete N Rows" location checks whose threshold the
 --- player has now reached. `total_rows` is the game's authoritative
 --- correct-row counter (FinishRow event parameter or
@@ -2110,15 +2453,95 @@ function M._read_widget_book_count()
     return best
 end
 
+-- Returns the highest level-up location currently marked as sent in
+-- APClient._sent_checks. The server's set_location_checked_handler
+-- populates _sent_checks with every previously-checked location at
+-- slot_connect, so this is the truth source for "what level has this
+-- slot reached" across session boundaries — independent of GameSaveData
+-- and the in-memory player BP.
+--
+-- Scans the full 1..AP_MAX_PLAYER_LEVEL range (not contiguous-only) so
+-- that any prior-session gap (e.g., a Level N check that failed to send
+-- because _levels_reached was stale) still produces a correct upper
+-- bound — we'd rather over-credit than under-credit.
+function M._compute_sent_level_baseline()
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient._sent_checks) then return 0 end
+    local max_sent = 0
+    for level = 1, AP_MAX_PLAYER_LEVEL do
+        if APClient._sent_checks[AP_LOC_LEVEL_FIRST + (level - 1)] then
+            max_sent = level
+        end
+    end
+    return max_sent
+end
+
 -- Increments `_levels_reached` by 1 and sends the corresponding AP location
 -- check. Called from main.lua's OnLevelUp BP hook — one event per in-game
 -- level-up, so the counter stays in lockstep without depending on
 -- GameSaveData being synchronously updated.
+--
+-- Self-heals from _sent_checks BEFORE incrementing: if baseline sync
+-- never fired (or fired with stale GameSaveData and computed 0), the
+-- first OnLevelUp after a reload would have used _levels_reached=0 and
+-- queued "Reached Level 1" → APClient.send_check silently drops because
+-- the server's set_location_checked_handler already marked it sent in
+-- a prior session. Then the next OnLevelUp queues Level 2 (also
+-- dropped), etc. — _levels_reached lags the player's actual level
+-- forever. By catching up to the server's view of sent levels here, we
+-- guarantee the very next increment fires a new, unsent level location.
 function M.on_level_up_event()
     if not M._slot_data then return end
+    -- Defensive: only fire if we're actually in gameplay. BP-level
+    -- events should never fire at title, but being explicit prevents a
+    -- stale callback or timing edge from spuriously claiming a level
+    -- check during title-screen save flushes.
+    if not M._gameplay_active then return end
     if M._levels_reached >= AP_MAX_PLAYER_LEVEL then return end
+
+    local sent_level = M._compute_sent_level_baseline()
+    if sent_level > M._levels_reached then
+        log(("[progress] level-up event: catch-up _levels_reached %d → %d (server's _sent_checks reflects prior-session levels)"):format(
+            M._levels_reached, sent_level))
+        M._levels_reached = sent_level
+    end
+
     M._levels_reached = M._levels_reached + 1
     local loc = AP_LOC_LEVEL_FIRST + (M._levels_reached - 1)
+
+    -- Calibration diagnostic: log the GameSaveData row count + XP-curve
+    -- prediction at the moment OnLevelUp fires. The comment in main.lua
+    -- warns that CurrentFinishedRowNum may be stale at OnLevelUp time
+    -- (the game hasn't committed the row update yet), so the printed
+    -- row may lag by 1 — but for calibration we mainly care whether
+    -- the row count at which the game ACTUALLY level-ups matches our
+    -- xp_curve prediction. Player report: at ~56-59 rows the game only
+    -- granted Level 17, but XP_CURVE predicts Level 23 at row 55. This
+    -- log gives us paired (row, level) data points to verify whether
+    -- XP_CURVE is miscalibrated or the user was reading a different
+    -- "level" number from the HUD.
+    pcall(function()
+        local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
+        if not (gi and gi:IsValid()) then return end
+        local sg = gi.GameSaveData
+        if not (sg and sg:IsValid()) then return end
+        local rf = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or -1
+        local xp_pred = 0
+        local player = FindFirstOf("BP_LibrarianCharacter_C")
+        if player and player:IsValid() then
+            pcall(function()
+                local arr = player.SkillLevelUpRowNum
+                local n = 0; pcall(function() n = #arr end)
+                for i = 1, math.min(n, AP_MAX_PLAYER_LEVEL) do
+                    local needed = tonumber(arr[i]) or 0
+                    if rf >= needed then xp_pred = i else return end
+                end
+            end)
+        end
+        log(("[calibration] OnLevelUp fired: _levels_reached=%d (just incremented), rows_finished=%d (may lag 1), xp_curve predicts Level %d"):format(
+            M._levels_reached, rf, xp_pred))
+    end)
+
     log(("[progress] level-up event: Reached Level %d → loc %d"):format(
         M._levels_reached, loc))
     local APClient = package.loaded["AP/APClient"]
@@ -2136,6 +2559,16 @@ end
 function M.sync_progress_state()
     if not M._slot_data then return 0, 0 end
 
+    -- Defensive: never sync state when the player isn't actively in
+    -- gameplay. The 3-second poll loop in main.lua already guards on
+    -- _gameplay_active before calling us, but several other call sites
+    -- (FinishRow hook, SaveGameData hook) hit this function too, and a
+    -- bad-timing fire while the player is transitioning to title screen
+    -- has been seen to read save data belonging to the wrong save slot
+    -- (causing a flood of book-milestone checks to fire).
+    if not M._gameplay_active then return 0, 0 end
+    if not M._apply_safe then return 0, 0 end
+
     -- Live book count: read from the active WBP_PlayerInfo HUD widget's
     -- Text_CurrentBookNum (the on-screen counter). The save struct's
     -- InsertedBookNum is a fallback for the first frame and for the
@@ -2145,18 +2578,46 @@ function M.sync_progress_state()
     -- threshold crossed is a threshold crossed even if the player later
     -- removes books from a shelf. So we track the peak observed value
     -- and use that for milestone evaluation.
-    local rows_finished = 0
-    local books_placed_save = 0
+    --
+    -- Save-slot guard: only read GameSaveData fields if the current
+    -- SaveGameName is OUR AP slot (Sav_AP_<seed>_<slot>). If the player
+    -- is mid-transition to title screen, the game can revert
+    -- SaveGameName to the default "Sav" — which holds the user's
+    -- non-AP save state and might have books=3072 already, blowing
+    -- past every milestone threshold spuriously.
+    local current_slot = nil
     pcall(function()
         local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
         if gi and gi:IsValid() then
-            local sg = gi.GameSaveData
-            if sg and sg:IsValid() then
-                pcall(function() rows_finished     = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0 end)
-                pcall(function() books_placed_save = tonumber(sg.GameProgressData.InsertedBookNum) or 0 end)
-            end
+            pcall(function() current_slot = gi.SaveGameName:ToString() end)
         end
     end)
+    local is_ap_slot = current_slot and current_slot:find("^Sav_AP_") ~= nil
+
+    local rows_finished = 0
+    local books_placed_save = 0
+    if is_ap_slot then
+        pcall(function()
+            local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
+            if gi and gi:IsValid() then
+                local sg = gi.GameSaveData
+                if sg and sg:IsValid() then
+                    pcall(function() rows_finished     = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0 end)
+                    pcall(function() books_placed_save = tonumber(sg.GameProgressData.InsertedBookNum) or 0 end)
+                end
+            end
+        end)
+    else
+        -- Log once per save-slot mismatch so we can diagnose in user
+        -- reports without spamming the heartbeat. The user may have
+        -- entered a state where SaveGameName isn't pointed at our AP
+        -- slot; the fix is to not trust GameSaveData in that window.
+        if M._last_skipped_save_slot ~= current_slot then
+            M._last_skipped_save_slot = current_slot
+            log(("[progress] skipping GameSaveData read — current slot %q is not our AP slot"):format(
+                tostring(current_slot)))
+        end
+    end
     local books_placed_widget = M._read_widget_book_count() or 0
     local books_placed_current = math.max(books_placed_save, books_placed_widget,
                                           M._books_placed_observed or 0)
@@ -2188,18 +2649,46 @@ function M.sync_progress_state()
         end
     end
 
-    -- Level-up checks are sent ONLY via on_level_up_event() during play.
-    -- We don't baseline-sync from CurrentFinishedRowNum because that field
-    -- has been observed to return non-zero on fresh saves (semantics
-    -- unclear or stale-read at apply-safe time), which spuriously fires
-    -- "Reached Level 1" on new games. Trade-off: a save loaded mid-run
-    -- doesn't replay missed level checks, but the AP server already has
-    -- those from the prior session if OnLevelUp fired correctly.
+    -- Level-up baseline is primarily handled by run_baseline_sync
+    -- (first-movement trigger), which sets _levels_reached to the
+    -- player's actual current level computed from rows_finished +
+    -- SkillLevelUpRowNum, falling back to APClient._sent_checks.
+    -- After that, on_level_up_event correctly maps the NEXT OnLevelUp
+    -- to the right next-level location.
+    --
+    -- Belt-and-suspenders here: if at any point _levels_reached
+    -- regresses below either the XP-curve level or the server's view
+    -- of sent levels, raise it back up. This guards against any path
+    -- that leaves the counter stale (e.g., a future code change that
+    -- resets state mid-session, or a missed baseline-sync window).
     local levels_sent = 0
     if not M._level_baseline_done then
-        log(("[progress] baseline rows=%d (level-sync skipped — will track via OnLevelUp events)"):format(
-            rows_finished))
+        log(("[progress] baseline rows=%d current_level=%d (sync delegated to run_baseline_sync)"):format(
+            rows_finished, current_level))
         M._level_baseline_done = true
+    end
+    local sent_level_floor = M._compute_sent_level_baseline()
+    local floor_level = math.max(current_level, sent_level_floor)
+    if floor_level > M._levels_reached then
+        local prev_levels_reached = M._levels_reached
+        log(("[progress] sync catch-up: _levels_reached %d → %d (xp=%d sent=%d) — firing send_check for missed levels"):format(
+            prev_levels_reached, floor_level, current_level, sent_level_floor))
+        M._levels_reached = floor_level
+        -- Fire send_check for every level in the catch-up range. Without
+        -- this, the counter advances but the actual location checks for
+        -- the skipped levels never transmit — and if on_level_up_event
+        -- fires next (player levels to N+1), it sees _levels_reached
+        -- already at N and only sends Level N+1, stranding 1..N forever.
+        -- send_check is idempotent (dedupes against _sent_checks), so
+        -- re-firing already-sent low levels is a silent no-op; only the
+        -- genuinely-missing levels in the catch-up range transmit.
+        local APClient = package.loaded["AP/APClient"]
+        if APClient and APClient.send_check then
+            for level = 1, floor_level do
+                APClient:send_check(AP_LOC_LEVEL_FIRST + (level - 1))
+            end
+            levels_sent = floor_level - prev_levels_reached
+        end
     end
 
     -- Send milestone checks for crossed thresholds. milestone_thresholds is a
@@ -2411,6 +2900,52 @@ function M._apply_skill(name)
     else
         log(("Skill grant FAILED: %s — %s"):format(name, tostring(err)))
     end
+end
+
+--- Periodic skill-state resync. Compares "items the player has received"
+--- (_received_counts) against "successful UpgradePlayer calls we've made"
+--- (_applied_skill_counts). If the latter lags the former, retry the
+--- missing levels via _apply_skill.
+---
+--- IMPORTANT: this trusts _applied_skill_counts as truth, NOT
+--- GameSaveData.PlayerExtraData.SkillData. The save's SkillData only
+--- refreshes on actual save events — between saves it can read 0 even
+--- though the in-game player is at level 5+ (UpgradePlayer's effect
+--- lives in runtime state, not the save struct). A previous version of
+--- this function used save state for the comparison and over-granted
+--- catastrophically (every tick read save_level=0 and re-applied the
+--- entire target, pushing every skill to level 10 within ~30 seconds).
+---
+--- _applied_skill_counts is bumped only when UpgradePlayer's pcall
+--- returns ok. If the pcall fails or the skill grant otherwise drops
+--- before _applied_skill_counts increments, this resync will pick up
+--- the gap on the next tick and retry. If UpgradePlayer succeeds at the
+--- Lua call level but the in-game effect somehow doesn't land
+--- (silent BP-side drop), this resync won't catch it — we'd need a
+--- separate runtime-state read for that. Worth revisiting if we see
+--- the original "Progressive Insight never applied" bug recur.
+---
+--- Conservative: only ever applies UP to the received count. Never
+--- over-grants.
+function M.resync_skill_state()
+    if not M._gameplay_active or not M._apply_safe then return 0 end
+    if not M._slot_data then return 0 end
+
+    local retried_total = 0
+    for item_name, ability_idx in pairs(SKILL_ITEM_TO_ABILITY) do
+        local target = M._received_counts[item_name] or 0
+        local applied = M._applied_skill_counts[item_name] or 0
+        if target > applied then
+            local missing = target - applied
+            log(("[skill-resync] %s (ability=%d): applied=%d received=%d → re-applying %d"):format(
+                item_name, ability_idx, applied, target, missing))
+            for _ = 1, missing do
+                M._apply_skill(item_name)
+            end
+            retried_total = retried_total + missing
+        end
+    end
+    return retried_total
 end
 
 -- ============================================================================

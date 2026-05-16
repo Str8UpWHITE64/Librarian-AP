@@ -200,7 +200,7 @@ end
 -- isn't in TESTED_GAME_VERSIONS, append "(UNTESTED)" so the player knows
 -- compatibility isn't validated against their game build.
 
-local MOD_VERSION = "1.0.2"
+local MOD_VERSION = "1.0.3"
 local TESTED_GAME_VERSIONS = { "1.0.8" }
 
 local function get_game_version()
@@ -500,6 +500,7 @@ local m01_load_count = 0
 local _suppress_next_m01_load_count = false
 local _gameplay_loops_started = false
 local _pre_apply_settle_state = nil  -- {empty_ticks, reapplies_done} during pre-apply settle
+local _reconnect_settle_state = nil  -- {last_item_tick, quiet_ticks, total_ticks} during mid-game reconnect
 
 local function start_gameplay_loops()
     if _gameplay_loops_started then return end
@@ -642,6 +643,67 @@ local function start_gameplay_loops()
         return false
     end)
 
+    -- Reconnect-settle watcher. While ItemApply has its
+    -- _reconnect_settle_active flag set (mid-gameplay slot_data refresh),
+    -- the AP server is re-sending every received item one at a time. We
+    -- want to apply them all THEN do one flush_apply with the fully
+    -- rebuilt state — otherwise bookcases flicker hidden as
+    -- shelves_open[X] grows back from zero per item. apply_item already
+    -- defers flush_apply while the flag is set; this watcher fires the
+    -- single flush_apply once the item storm has quieted and clears the
+    -- flag. Mirrors the pre-apply settle loop but is gated on a
+    -- different flag and runs alongside the rest of the gameplay loops.
+    LoopAsync(500, function()
+        local IA = package.loaded["AP/ItemApply"]
+        if not IA then return false end
+        -- Tie lifecycle to the same "are we still in gameplay context"
+        -- check the 5-second loop uses — die when we leave gameplay so
+        -- the next entry can spawn a fresh one.
+        if not (IA._gameplay_active or IA._allow_pre_apply) then
+            _reconnect_settle_state = nil
+            return true
+        end
+
+        if not IA._reconnect_settle_active then
+            -- Idle: no reconnect storm in progress. Reset settle state
+            -- so the NEXT reconnect starts the wait from scratch.
+            _reconnect_settle_state = nil
+            return false
+        end
+
+        if not _reconnect_settle_state then
+            _reconnect_settle_state = {
+                last_item_tick = -1,
+                quiet_ticks = 0,
+                total_ticks = 0,
+            }
+        end
+        local s = _reconnect_settle_state
+        s.total_ticks = s.total_ticks + 1
+
+        local cur = IA._last_item_apply_tick or 0
+        if cur ~= s.last_item_tick then
+            s.last_item_tick = cur
+            s.quiet_ticks = 0
+            return false
+        end
+        s.quiet_ticks = s.quiet_ticks + 1
+
+        -- Fire once items have been quiet for ≥2 ticks (1s) OR we've
+        -- waited 10 ticks (5s) total as a safety net. Either way, one
+        -- flush_apply runs with the fully-rebuilt state and we clear
+        -- the settle flag so subsequent apply_item calls go through
+        -- the normal per-item path again.
+        if s.quiet_ticks >= 2 or s.total_ticks >= 10 then
+            log(("[reconnect-settle] items quiet (%d total apply ticks, %d settle ticks); firing single flush_apply"):format(
+                cur, s.total_ticks))
+            IA._reconnect_settle_active = false
+            pcall(function() IA.flush_apply() end)
+            _reconnect_settle_state = nil
+        end
+        return false
+    end)
+
     -- Periodic re-index + force re-apply every 5s. The re-index catches
     -- bookcases that may have lazy-spawned. The force re-apply is a safety
     -- net for any visibility drift (rare but observed). Both are cheap.
@@ -696,6 +758,38 @@ local function start_gameplay_loops()
         -- idempotent (de-dup via _sent_row_locations), so re-running
         -- when nothing has changed is a no-op.
         pcall(function() IA.detect_completed_rows() end)
+        -- Row-completion threshold catch-up: read rows_finished from the
+        -- save and re-fire any "Complete N Rows" threshold whose value
+        -- the player has now reached. Belt-and-suspenders for cases
+        -- where run_baseline_sync ran with stale GameSaveData and
+        -- silently skipped thresholds; fire_row_completion_checks is
+        -- idempotent (de-dup via _sent_row_completions) and send_check
+        -- itself dedupes against the server's _sent_checks, so this is
+        -- a safe periodic re-evaluation.
+        pcall(function()
+            local rf = 0
+            local gi = FindFirstOf("BP_LibrarianGameInstance_C")
+                or FindFirstOf("LibrarianGameInstanceBase")
+            if gi and gi:IsValid() then
+                local sg = gi.GameSaveData
+                if sg and sg:IsValid() then
+                    rf = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
+                end
+            end
+            if rf > 0 then IA.fire_row_completion_checks(rf) end
+        end)
+        -- Section-completion check: detect_completed_rows above may have
+        -- just added the last row of a section to _sent_row_locations
+        -- (swap-completion path that doesn't go through FinishRow).
+        -- Re-run the section-completion sweep so its location fires
+        -- without waiting for the next FinishRow event. Idempotent —
+        -- _sent_section_completions guards against re-firing.
+        pcall(function() IA.fire_section_completions() end)
+        -- Skill resync: if save-side level lags the received item count
+        -- (e.g., a UpgradePlayer call dropped silently when the player
+        -- was mid-transition), retry the missing applies. Idempotent
+        -- and conservative — never over-grants past received counts.
+        pcall(function() IA.resync_skill_state() end)
         return false
     end)
 
@@ -1368,6 +1462,19 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
         pcall(function() rc_sent = IA.fire_row_completion_checks(row) end)
         if rc_sent > 0 then
             log(("[AP] row-completion: sent %d location check(s)"):format(rc_sent))
+        end
+    end
+    -- Fire any "Section Complete: <id>" checks whose section just hit
+    -- 100% row completion. detect_completed_rows above populates
+    -- _sent_row_locations for the rows finished this tick, so checking
+    -- whether the section is now fully shelved is cheap. The server's
+    -- _sent_checks won't have the section loc yet (we never sent it
+    -- without this hook), so APClient.send_check will actually transmit.
+    if IA and IA.fire_section_completions then
+        local sec_sent = 0
+        pcall(function() sec_sent = IA.fire_section_completions() end)
+        if sec_sent > 0 then
+            log(("[AP] section-completion: sent %d location check(s)"):format(sec_sent))
         end
     end
     -- Also sync milestones (book count) and any level-ups whose threshold

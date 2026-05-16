@@ -424,31 +424,19 @@ class LibrarianWorld(World):
             if data.XP_CURVE[idx] <= max_rows
         ]
 
-        # Milestones: keep only those reachable given the seed's active
-        # sections. A milestone fires on cumulative books placed, and any
-        # book on any shelf counts — so the cap is the sum of volumes in
-        # the active scope (3072 for full/custom, less for floor goals).
-        #
-        # When only_unward_shelfable_books is enabled, drop milestone
-        # locations entirely. The strict gating means the player's
-        # pickable_books grows in lockstep with shelf/series unlocks, and
-        # AP fill's closure-based "in logic" view can over-promise: a
-        # milestone may show reachable in a tracker but require the
-        # player to collect many more items before they can physically
-        # place that many books. Removing the locations avoids any risk
-        # of the seed gating progression behind a milestone the player
-        # can't realistically claim.
-        max_books_in_scope = sum(
-            s.volumes for sec in self.active_sections for s in sec.series
-        )
-        only_shelfable = bool(self.options.only_unward_shelfable_books.value)
-        if only_shelfable:
-            active_milestone_locs: list = []
-        else:
-            active_milestone_locs = [
-                loc for idx, loc in enumerate(_milestone_locations)
-                if MILESTONE_THRESHOLDS[idx] <= max_books_in_scope
-            ]
+        # Book-placement milestones ("Milestone: N Books Placed") were
+        # removed entirely in v1.0.3. They had two recurring problems:
+        # (a) closure-based "in logic" leakage meant trackers and fill
+        # could mark high-threshold milestones reachable from sphere 0
+        # even when the player can only physically place a fraction of
+        # the seed's books at that point, and (b) the lenient default-
+        # mode warding in v1.0.2 made them swap-exploitable. v1.0.3
+        # replaces the 22 milestone slots with finer row-completion
+        # thresholds (see Locations.py) so fill keeps the same location
+        # count to work with. MILESTONE_THRESHOLDS is still exported
+        # from Locations.py as data, in case we wire something up to it
+        # again later.
+        active_milestone_locs: list = []
 
         # Row-completion count milestones: each fires when the player has
         # correctly completed N total rows. Filter by max_rows the same
@@ -960,28 +948,10 @@ class LibrarianWorld(World):
                 and major_magic_total(state) >= mm
             )
 
-        # Milestone access rules. Reachable iff the player has enough
-        # pickable books AND enough open shelf capacity to drop them on.
-        # Books don't need to be correctly placed — any book on any shelf
-        # counts toward the in-game counter — so this is much less strict
-        # than feasible_rows(state) >= thresh/8 was, giving AP fill many
-        # more sphere-0/1 slots in early milestones.
-        #
-        # When only_unward_shelfable_books is enabled, milestone locations
-        # are removed entirely (see create_regions) so this loop is a
-        # no-op and we don't try to look up locations that weren't created.
-        if not only_shelfable:
-            max_books_in_scope = sum(
-                s.volumes for sec in active_sections for s in sec.series
-            )
-            for thresh in MILESTONE_THRESHOLDS:
-                if thresh > max_books_in_scope:
-                    continue  # location was not created
-                loc = mw.get_location(f"Milestone: {thresh} Books Placed", p)
-                loc.access_rule = (
-                    lambda state, n=thresh:
-                    books_unlocked(state) >= n and shelf_slots_open(state) >= n
-                )
+        # Book-placement milestones were removed in v1.0.3 (see
+        # create_regions). No access_rule loop needed here; if any are
+        # ever re-added, books_unlocked + shelf_slots_open are still
+        # defined above as helpers.
 
         # Row-completion milestones. Each fires when the player has
         # correctly completed N total rows. Reachable when feasible_rows
@@ -1046,6 +1016,12 @@ class LibrarianWorld(World):
         # client uses this to gate book unwarding — a book is only pickable
         # when BOTH its series is received and its bookcase is open.
         shelf_req_map: dict[str, int] = {}
+        # section_id → AP location id for "Section Complete: <id> (<name>)".
+        # Lua fires the corresponding check when every row in the section has
+        # been completed. Only active sections — floor goals exclude the other
+        # floor's sections (so they have no Lua-side trigger and won't appear
+        # in the pool anyway).
+        section_location_map: dict[str, int] = {}
         for section in self.active_sections:
             for series in section.series:
                 loc_name = f"Shelf: {section.id} - {series.name}"
@@ -1053,6 +1029,10 @@ class LibrarianWorld(World):
                 if loc_id is not None:
                     row_location_map[f"{section.id}|{series.name}"] = loc_id
                 shelf_req_map[series.name] = self.shelf_req[(section.id, series.name)]
+            sec_loc_name = section_completion_name(section.id)
+            sec_loc_id = self.location_name_to_id.get(sec_loc_name)
+            if sec_loc_id is not None:
+                section_location_map[section.id] = sec_loc_id
 
         # Compute the row count at which the Lua client should fire the
         # goal. Floor goals fire when their floor's section count is
@@ -1072,7 +1052,7 @@ class LibrarianWorld(World):
             goal_row_threshold = sum(s.shelf_count for s in data.SECTIONS)
 
         return {
-            "version": "1.0.2",
+            "version": "1.0.3",
             "goal": goal_value,
             # Row count at which the Lua client should send STATUS_GOAL.
             # Ignored for the "full" goal (the game's EndGame fires it).
@@ -1101,19 +1081,25 @@ class LibrarianWorld(World):
             # becomes pickable. Only consulted when only_unward_shelfable_books
             # is 1; in the default mode the shelf_req_map is ignored by Lua.
             "shelf_req_map": shelf_req_map,
+            # Section completion lookup: section_id → AP location id for
+            # "Section Complete: <id> (<name>)". Lua fires the corresponding
+            # check when every row in the section has been completed. Absent
+            # from pre-1.0.3 seeds (the Lua client treats a missing key as
+            # "no section-completion firing", maintaining backward compat).
+            "section_location_map": section_location_map,
             # Toggle: when 1, Lua wards a book unless BOTH its series and its
             # bookcase have been unlocked. When 0 (default), only the series
             # unlock matters and the book becomes pickable as soon as the
             # series is received.
             "only_unward_shelfable_books": int(self.options.only_unward_shelfable_books.value),
-            # Milestone thresholds shipped so the Lua side knows when to fire each.
-            # When only_unward_shelfable_books is enabled, milestones are removed
-            # from the location pool (see create_regions) — send an empty list
-            # so the Lua client's milestone-fire loop is a no-op.
-            "milestone_thresholds": (
-                [] if int(self.options.only_unward_shelfable_books.value) else
-                list(MILESTONE_THRESHOLDS)
-            ),
+            # Milestone thresholds shipped so the Lua side knows when to
+            # fire each. As of v1.0.3 we no longer create book-placement
+            # milestone LOCATIONS (see create_regions), so the list ships
+            # empty and the Lua client's milestone-fire loop is a no-op.
+            # The Lua-side counter infrastructure stays around for future
+            # use; that's why we send an empty list instead of removing
+            # the key.
+            "milestone_thresholds": [],
             # Row-completion thresholds. Lua tracks total correctly-completed
             # rows and fires each threshold's check when the count reaches it.
             "row_completion_thresholds": list(ROW_COMPLETION_THRESHOLDS),

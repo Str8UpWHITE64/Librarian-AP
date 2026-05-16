@@ -179,20 +179,34 @@ be picked up or collided with — you walk through them, and the
 
 ### `only_unward_shelfable_books`
 
-Toggle (default `false`). Default behavior is that any book in an
-unlocked series is pickable, even if the bookcase it belongs in is still
-locked — you can grab it, stash it on a different open shelf, and move
-it later. Turning this on adds a second condition: a book stays warded
-until both its series **and** its target bookcase have been unlocked.
+Toggle (default `false`). Controls how strictly books are gated by
+shelf unlocks.
 
-Stricter logic; the player's pickable-book pool grows in lockstep with
-shelf + series unlocks. To avoid the risk of book-placement milestones
-gating progression behind counts the player struggles to physically
-reach, **the 22 "Milestone: N Books Placed" locations are removed from
-the seed entirely when this option is on**. Row-completion locations
-("Complete N Rows") and all other checks stay; only the cumulative-
-books-placed milestones go away. The pool shrinks by 22 locations and
-fill compensates by dropping 22 of the lowest-impact items.
+**Off (default)** — A series's books are pickable as soon as either
+(a) the section's first bookcase is open, or (b) the series has
+`shelf_req == 1` (lives on bookcase 1 of its section). In other words,
+the "first 4" series of every section — the ones that would naturally
+live on bookcase 1 — become pickable as soon as you receive their
+series unlock, regardless of whether any shelf in that section is
+actually open yet. Higher-`shelf_req` series stay warded until their
+target bookcase is open.
+
+**On** — Stricter. A series's books stay warded until you have **both**
+the series unlock **and** enough Progressive Shelf Unlocks for that
+section to reach the series's home bookcase. No visibility floor; if
+a section has zero bookcases open, none of its series are pickable yet
+(even the ones that would naturally live on bookcase 1).
+
+The difference only matters for sections that haven't been opened at
+all yet — once you have any shelf unlock in a section, both modes
+behave identically.
+
+> **v1.0.3 note**: cumulative-book-placement milestones
+> (`Milestone: N Books Placed`) were removed from the seed entirely in
+> v1.0.3, regardless of this option. The 22 milestone slots were
+> replaced with finer-grained row-completion thresholds
+> (`Complete N Rows`) so the pool size stays the same. The book-count
+> tracking infrastructure on the Lua side is preserved for future use.
 
 ---
 
@@ -202,7 +216,7 @@ When you launch the game, the UE4SS log
 (`<Game>\Librarian\Binaries\Win64\UE4SS.log`) should include lines like:
 
 ```
-[Lua] [LibrarianAP] LibAP v1.0.2 — Game v1.0.8 (verified compatible)
+[Lua] [LibrarianAP] LibAP v1.0.3 — Game v1.0.8 (verified compatible)
 [Lua] [BPModLoaderMod] Actor: ModActor_C /Game/Librarian/Map/...
 [Lua] [LibrarianAP] Press F4 to toggle the connection menu.
 [Lua] [LibrarianAP] Press F12 to connect to Archipelago.

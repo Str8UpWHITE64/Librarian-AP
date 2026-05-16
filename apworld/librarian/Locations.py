@@ -118,24 +118,31 @@ for _section in data.SECTIONS:
         _row_idx += 1
 
 
-# --- Row-completion count milestones: 50 entries (1000..1049) ---
+# --- Row-completion count milestones: 72 entries (1000..1071) ---
 #
 # Each fires when the player has correctly completed N total rows (any
 # series, any combination — the count is global, not per-series). Tuned
-# distribution: dense early (where AP fill benefits most from extra
+# distribution: very dense early (where AP fill benefits most from extra
 # sphere-0/1 slots) and sparser late. Each rule calls feasible_rows()
 # which is O(active_sections), so the count is kept modest to keep
 # generation fast in multi-player seeds.
+#
+# Expanded from 50 to 72 entries in v1.0.3 to replace the 22 book-
+# placement milestone slots that were removed. Adds every row 1-20, plus
+# every-5 in the 25-100 range that was previously every-10.
 ROW_COMPLETION_THRESHOLDS: tuple[int, ...] = (
-    # Dense early (sphere-0 / 1 territory)
-    2, 4, 6, 8, 10, 12, 14, 16, 18, 20,
-    # Medium granularity through mid-game
-    25, 30, 35, 40, 45, 50, 60, 70, 80, 90,
-    100, 115, 130, 145, 160, 175, 190, 205, 220, 235,
-    # Coarser toward the late game
-    245, 250, 265, 280, 295, 310, 325, 340, 355, 360,
-    # Final approach
-    365, 372, 379, 385, 390, 393, 396, 398, 399, 400,
+    # Every row 1-20 (densest part — most fill routing happens here)
+    1,   2,   3,   4,   5,   6,   7,   8,   9,  10,
+    11,  12,  13,  14,  15,  16,  17,  18,  19,  20,
+    # Mid-frequent through 50
+    22,  24,  26,  28,  30,  35,  40,  45,  50,
+    # Every 5 through 100
+    55,  60,  65,  70,  75,  80,  85,  90,  95, 100,
+    # Steady on to 250
+    105, 110, 115, 120, 130, 140, 145, 160, 175, 190, 205, 220, 235, 245,
+    # Existing late-game distribution
+    250, 265, 280, 295, 310, 325, 340, 355, 360, 365,
+    372, 379, 385, 390, 393, 396, 398, 399, 400,
 )
 
 _row_completion_locations: list[LibrarianLocationData] = [
@@ -221,6 +228,10 @@ _goal_locations: list[LibrarianLocationData] = [
 
 
 # --- Combined ---
+# v1.0.3: _milestone_locations no longer added to _all_locations — the
+# 22 book-placement milestones were replaced by 22 additional row-
+# completion thresholds. MILESTONE_THRESHOLDS + _milestone_locations
+# stay defined above so future code can opt back in.
 
 _all_locations: list[LibrarianLocationData] = (
     _row_locations
@@ -229,7 +240,6 @@ _all_locations: list[LibrarianLocationData] = (
     + _floor_locations
     + _levelup_locations
     + _chest_locations
-    + _milestone_locations
     + _goal_locations
 )
 
@@ -301,7 +311,7 @@ def chest_open_name(chest_name: str) -> str:
 # ============================================================================
 
 assert len(_row_locations) == 400, f"Expected 400 row locations, got {len(_row_locations)}"
-assert len(_row_completion_locations) == 50, f"Expected 50 row-completion locations, got {len(_row_completion_locations)}"
+assert len(_row_completion_locations) == 72, f"Expected 72 row-completion locations, got {len(_row_completion_locations)}"
 assert len(_section_locations) == 31
 assert len(_floor_locations) == 2
 assert len(_levelup_locations) == 45
