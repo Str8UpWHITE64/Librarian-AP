@@ -7,12 +7,13 @@ Location pool composition (554 real + 1 goal event = 555 entries):
         One per series. Fires when the series is correctly placed.
         Name format: "Shelf: <SectionId> - <Series Name>"
 
-    Row Completions (50)
+    Row Completions (72)
         Cumulative row-completion-count milestones. Fires when the player
         has correctly completed N total rows (any combination of series).
         Hand-tuned distribution — dense early, sparser late — to balance
         coverage against per-rule fill cost (each rule calls
-        feasible_rows, which is O(active_sections)).
+        feasible_rows, which is O(active_sections)). Expanded from 50 to
+        72 in v1.0.3 to replace the 22 removed book-placement milestones.
         Name format: "Complete <N> Rows"
 
     Section Completions (31)
@@ -32,15 +33,16 @@ Location pool composition (554 real + 1 goal event = 555 entries):
         open the chest; the AP check fires on the chest's grant of the
         ability, not on the key pickup itself.
 
-    Milestones (22)
-        Cumulative book-placement thresholds. Any book on a shelf counts —
-        correct placement isn't required — so milestones are reachable as
-        soon as the player has enough unlocked-series books to pick up
-        and enough open shelf capacity to drop them. Spread densely at
-        the early end (where most fill routing happens).
-
     Goal — "Library Tidied" (1, event-typed, no AP ID)
         Fires when the game's EndGame UFunction is observed.
+
+Defined but NOT in the active pool:
+
+    Milestones (22, removed in v1.0.3)
+        Cumulative book-placement thresholds. Any book on a shelf counts —
+        correct placement isn't required. Removed from _all_locations in
+        v1.0.3; the 22 slots were replaced by additional row-completion
+        thresholds. Definitions retained for possible future re-enable.
 
 ID layout within LOCATION_ID_BASE:
     1–499      Shelf rows (400 used: 1..400; 401-499 reserved for future)
@@ -48,8 +50,9 @@ ID layout within LOCATION_ID_BASE:
     550–559    Floor completions (2 used: 550-551)
     560–619    Level-ups (45 used: 560..604)
     620–639    Chest openings (4 used: 620..623)
-    640–679    Milestones (22 used: 640..661; 662-679 reserved for future)
-    1000–1199  Row completions (50 used: 1000..1049; 1050-1199 reserved)
+    640–679    Milestones (22 used: 640..661; 662-679 reserved for future;
+                            defined but not in active pool as of v1.0.3)
+    1000–1199  Row completions (72 used: 1000..1071; 1072-1199 reserved)
 """
 
 from enum import IntEnum
@@ -71,12 +74,11 @@ class LibrarianLocationCategory(IntEnum):
     CHEST          = 5   # minor magic chest opened (Crimson/Emerald/Azure/Golden)
     MILESTONE      = 6   # cumulative book-placement count
     GOAL           = 7   # EndGame (event-typed; no AP ID)
-    ROW_COMPLETION = 8   # cumulative rows-correctly-completed count (any
-                         # combination of series). Access rule uses
-                         # feasible_rows(state) >= N — same per-series
-                         # item-availability check we already do for
-                         # primary row locations. Lua client tracks total
-                         # rows completed and fires each threshold.
+    ROW_COMPLETION = 8   # cumulative rows-correctly-completed count.
+                         # Access rule: feasible_rows(state) >= N (same
+                         # check as primary row locations). Lua client
+                         # tracks total rows completed and fires each
+                         # threshold.
 
 
 class LibrarianLocationData(NamedTuple):
@@ -120,16 +122,12 @@ for _section in data.SECTIONS:
 
 # --- Row-completion count milestones: 72 entries (1000..1071) ---
 #
-# Each fires when the player has correctly completed N total rows (any
-# series, any combination — the count is global, not per-series). Tuned
-# distribution: very dense early (where AP fill benefits most from extra
-# sphere-0/1 slots) and sparser late. Each rule calls feasible_rows()
-# which is O(active_sections), so the count is kept modest to keep
-# generation fast in multi-player seeds.
-#
-# Expanded from 50 to 72 entries in v1.0.3 to replace the 22 book-
-# placement milestone slots that were removed. Adds every row 1-20, plus
-# every-5 in the 25-100 range that was previously every-10.
+# Fires when the player has correctly completed N total rows (any series).
+# Hand-tuned distribution: very dense early (where fill benefits most
+# from extra sphere-0/1 slots), sparser late. Each rule calls
+# feasible_rows() (O(active_sections)) — count kept modest for multi-
+# player gen speed. Expanded from 50 to 72 in v1.0.3 to replace the 22
+# removed book-placement slots (every row 1-20, every-5 through 100).
 ROW_COMPLETION_THRESHOLDS: tuple[int, ...] = (
     # Every row 1-20 (densest part — most fill routing happens here)
     1,   2,   3,   4,   5,   6,   7,   8,   9,  10,

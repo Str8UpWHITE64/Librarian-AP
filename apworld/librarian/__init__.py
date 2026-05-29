@@ -1,27 +1,25 @@
 """
 Librarian: Tidy Up the Arcane Library — Archipelago World implementation.
 
-Wires Items + Locations + Options into the AP machinery and produces a
-solvable, playable seed.
+Wires Items + Locations + Options into AP and produces a solvable seed.
 
-Per-seed orderings are randomized in generate_early():
-  - series_order[i]       = series name unlocked at position i in the
-                            global series queue. Each Progressive Series
-                            Unlock advances the queue by `series_per_unlock`
-                            (default 5).
-  - shelf_order[s][i]     = bookcase index opened by the (i+1)-th
-                            Progressive Shelf Unlock (s) item.
+Per-seed orderings randomized in generate_early():
+  - series_order[i]   = series name unlocked at position i in the global
+                        series queue. Each Progressive Series Unlock
+                        advances the queue by `series_per_unlock` (default 5).
+  - shelf_order[s][i] = bookcase index opened by the (i+1)-th Progressive
+                        Shelf Unlock (s) item.
 
-Section access is implicit: a section is reachable as soon as the player
-holds ≥1 Progressive Shelf Unlock for it. Each subsequent unlock reveals
-the next bookcase within that section.
+Section access is implicit: a section is reachable once the player holds
+≥1 Progressive Shelf Unlock for it. Each subsequent unlock reveals the
+next bookcase within that section.
 
 Starting state (precollected):
   - 1× Progressive Shelf Unlock (starting_section) → first bookcase visible
   - 2× Progressive Series Unlock                   → 10 starting series
 
-Solvability is enforced by access rules; AP's generator places progression
-items in spheres that satisfy the rules.
+Access rules enforce solvability; AP's generator places progression items
+in spheres that satisfy the rules.
 """
 
 from typing import Any
@@ -74,13 +72,12 @@ def _compute_shelf_req(section, cells_per_case: int) -> dict[tuple[str, str], in
     """Compute shelf_req for every series in a section.
 
     Strategy:
-      - If the section is uniform-volume (all series have the same volume
-        count): spread series evenly across bookcase_count cases.
-      - If mixed volume AND the per-volume cases fit into bookcase_count:
-        smaller-vol cases unlock first. Each volume group occupies
-        ceil(group_count / cells_per_case) cases, ordered ascending.
+      - Uniform-volume section: spread series evenly across bookcase_count.
+      - Mixed volume that fits in bookcase_count: smaller-vol cases unlock
+        first; each volume group occupies ceil(group_count / cells_per_case)
+        cases, ordered ascending.
       - Otherwise (e.g. 1-case sections that mix vols): all series get
-        shelf_req=1, since there's only one case to unlock.
+        shelf_req=1 (only one case to unlock).
     """
     out: dict[tuple[str, str], int] = {}
     by_vol: dict[int, list] = {}
@@ -144,12 +141,11 @@ class LibrarianWeb(WebWorld):
 
 class LibrarianWorld(World):
     """
-    Librarian: Tidy Up the Arcane Library!  Sort 3072 books across 400 shelves
-    in 31 themed sections, gated by AP-delivered series/shelf unlocks. Major
-    Magic skills are progression items (gating level-ups). Minor Magic
-    abilities (Jump/Run/Bag/Bag2) are NOT AP items — the player gets each
-    ability natively by opening its chest; the chest opening is what fires
-    the AP location check.
+    Sort 3072 books across 400 shelves in 31 themed sections, gated by
+    AP-delivered series/shelf unlocks. Major Magic skills are progression
+    items (gate level-ups). Minor Magic abilities (Jump/Run/Bag/Bag2) are
+    NOT AP items — the player gets each ability natively by opening its
+    chest; the chest opening fires the AP location check.
     """
 
     game = "Librarian Tidy Up the Arcane Library"
@@ -211,12 +207,11 @@ class LibrarianWorld(World):
         """Upper bound on rows finishable in this seed. Drives the
         level-up + milestone filter in create_regions:
         - Floor goals: rows on that floor only.
-        - Custom goal: the player's chosen row threshold (player can play
-          past it in-game, but AP only tracks levels/milestones up to
-          that point).
+        - Custom goal: the player's chosen row threshold (the player can
+          play past it in-game, but AP only tracks up to that point).
         - Full goal: all 400 rows."""
-        # UT passthrough: respect goal from slot_data (options are defaults
-        # during UT regen; passthrough has the real value).
+        # UT passthrough: options hold defaults during regen; slot_data
+        # has the real value.
         pt = self._ut_passthrough()
         if pt:
             goal_v = pt.get("goal")
@@ -264,10 +259,10 @@ class LibrarianWorld(World):
     def generate_early(self) -> None:
         rng = self.random
 
-        # Universal Tracker regen path: reconstruct the seed's state from
-        # slot_data (stored in re_gen_passthrough by interpret_slot_data)
-        # rather than randomizing. Without this, UT's logic doesn't match
-        # the actual seed and reachability info is wrong.
+        # UT regen path: reconstruct the seed's state from slot_data
+        # (stored in re_gen_passthrough by interpret_slot_data) rather
+        # than randomizing. Without this, UT's reachability info wouldn't
+        # match the actual seed.
         pt = self._ut_passthrough()
         if pt:
             self.starting_section = pt.get("starting_section", "")
@@ -292,10 +287,9 @@ class LibrarianWorld(World):
         # 1. Pick two random starting sections (different from each other
         #    when active scope allows). Each gets one precollected shelf
         #    unlock — opening the first bookcase of each at sphere 0.
-        #    Two sections (vs. two bookcases in one section) is what
-        #    actually gives the player sphere-1 progression diversity:
-        #    AP fill can route progression through items that gate either
-        #    section's rows, not just one.
+        #    Two distinct sections (vs two bookcases in one) is what gives
+        #    sphere-1 fill flexibility: AP can route progression through
+        #    items gating either section's rows.
         section_ids = [s.id for s in active]
         rng.shuffle(section_ids)
         self.starting_section = section_ids[0]
@@ -305,25 +299,21 @@ class LibrarianWorld(World):
         for section in active:
             self.shelf_order[section.id] = list(range(section.bookcase_count))
 
-        # 3. shelf_req must come BEFORE the starting-series guarantee, since
-        # we use it to identify which series live in the first VISIBLE case
-        # (Lua sorts cases by vol-tier ascending; series with shelf_req=1 are
-        # exactly those in the smallest unlocked case).
-        #
-        # For mixed-vol sections (e.g. 1M with 2×4x5 + 3×plain), smaller-vol
-        # cases unlock first — so a 10-vol series in 1M needs ≥3 unlocks
-        # before it's reachable. The Lua side mirrors this ordering.
+        # 3. shelf_req must come BEFORE the starting-series guarantee — we
+        # use it to identify which series live in the first VISIBLE case
+        # (Lua sorts cases by vol-tier ascending; shelf_req=1 ⇔ smallest
+        # unlocked case). Mixed-vol sections like 1M (2×4x5 + 3×plain) have
+        # smaller-vol cases unlock first, so a 10-vol series in 1M needs ≥3
+        # unlocks before reachable. Lua side mirrors this ordering.
         CELLS_PER_CASE = 4  # standard BookCase capacity (4 series per case)
         for section in active:
             self.shelf_req.update(_compute_shelf_req(section, CELLS_PER_CASE))
 
         # 4. Build series order with one guaranteed series in each starting
-        # section's first bookcase. The guarantee ensures that the player
-        # can complete a row in each of their starting sections before any
-        # AP item arrives — two distinct sphere-0 progression paths, not
-        # just one. Series must live in the section's first bookcase
-        # (shelf_req == 1) so the single precollected shelf unlock per
-        # section makes them placeable.
+        # section's first bookcase — so the player can complete a row in
+        # each starting section before any AP item arrives (two distinct
+        # sphere-0 paths). shelf_req must == 1 so the single precollected
+        # shelf unlock per section makes them placeable.
         starting_count = self.options.starting_series_count.value
 
         def _guarantee_for_section(sid: str | None) -> str | None:
@@ -424,18 +414,11 @@ class LibrarianWorld(World):
             if data.XP_CURVE[idx] <= max_rows
         ]
 
-        # Book-placement milestones ("Milestone: N Books Placed") were
-        # removed entirely in v1.0.3. They had two recurring problems:
-        # (a) closure-based "in logic" leakage meant trackers and fill
-        # could mark high-threshold milestones reachable from sphere 0
-        # even when the player can only physically place a fraction of
-        # the seed's books at that point, and (b) the lenient default-
-        # mode warding in v1.0.2 made them swap-exploitable. v1.0.3
-        # replaces the 22 milestone slots with finer row-completion
-        # thresholds (see Locations.py) so fill keeps the same location
-        # count to work with. MILESTONE_THRESHOLDS is still exported
-        # from Locations.py as data, in case we wire something up to it
-        # again later.
+        # Book-placement milestones removed in v1.0.3 — closure-based
+        # "in logic" leakage marked high thresholds reachable too early,
+        # and the v1.0.2 default-mode warding made them swap-exploitable.
+        # Replaced 1:1 by row-completion thresholds (see Locations.py).
+        # MILESTONE_THRESHOLDS is still exported in case we re-add later.
         active_milestone_locs: list = []
 
         # Row-completion count milestones: each fires when the player has
@@ -485,13 +468,10 @@ class LibrarianWorld(World):
         # Precollect: one shelf unlock for each of the two starting sections
         # + N starting-series worth of Progressive Series Unlock items.
         #
-        # We pre-grant ONE shelf in each of two different sections rather
-        # than two shelves in one section. Two distinct sections matter
-        # for sphere-1 fill flexibility — AP fill can route progression
-        # through items that gate either section's rows, not just one.
-        # Two bookcases in a single section adds locations but they all
-        # gate behind the same shelf-unlock chain, so they don't actually
-        # broaden the early-sphere routing surface.
+        # Two DIFFERENT sections (vs two bookcases in one section) is what
+        # broadens sphere-1 fill flexibility — AP fill can route progression
+        # through items that gate either section's rows. Multiple bookcases
+        # in one section all gate behind the same shelf-unlock chain.
         starting_count = self.options.starting_series_count.value
         starting_unlock_count = math.ceil(starting_count / per_unlock)
 
@@ -525,20 +505,28 @@ class LibrarianWorld(World):
         for name in precollect_names:
             quantities[name] = max(0, quantities.get(name, 0) - 1)
 
+        # Subtract items the user requested via start_inventory_from_pool.
+        # AP's framework removes these from the pool AFTER create_items
+        # returns; without pre-adjusting quantities here, the Major Magic
+        # cap below can drop ALL copies of a skill the user wanted from
+        # the pool, leaving zero copies for AP to precollect — silently
+        # losing the user's request. Fixes "adding magic skills to
+        # starting inventory does not work."
+        sifp = self.multiworld.start_inventory_from_pool[self.player].value
+        for name, count in sifp.items():
+            if name in quantities:
+                quantities[name] = max(0, quantities[name] - count)
+
         # Major Magic cap: each player needs at most (levels_kept - 1)
-        # Major Magic items to reach their highest reachable level. Any
-        # extras are redundant progression-classified items — they don't
-        # gate anything beyond what's already needed, but AP fill still
-        # has to find homes for them. In multi-player seeds with mixed
-        # goals (especially floor / low-custom configs that filter out
-        # level-ups), those extras starve the cross-world progression
-        # pool and produce "Not enough locations for progression items"
-        # fill failures.
+        # Major Magic items to reach their highest reachable level. Extras
+        # are redundant progression-classified items — AP still has to
+        # place them, and in multi-player seeds with mixed goals (floor /
+        # low-custom configs that drop level-ups) they starve the cross-
+        # world progression pool and trigger "Not enough locations for
+        # progression items" fill failures.
         #
-        # We shrink the pool by the excess; filler fills the freed slots
-        # below, keeping per-player |items| == |locations|. The player
-        # never sees the removed items — they were never accessible to
-        # them in the first place.
+        # Shrink the pool by the excess; filler fills the freed slots
+        # below to keep per-player |items| == |locations|.
         major_magic_names = (
             "Progressive Sort", "Progressive Shelf Guide",
             "Progressive Insight", "Progressive Auto-Shelving",
@@ -563,18 +551,15 @@ class LibrarianWorld(World):
                 quantities[drop_skill] -= 1
                 removed += 1
 
-        # Pool-overshoot guard. Happens with combinations like
+        # Pool-overshoot guard. Triggers on combinations like
         # series_per_unlock=2 + starting_count near max + custom goal with
         # low row_count (drops level-up + milestone locations from target
         # while pool stays full).
         #
-        # Skills are always preserved — players expect a full set of skill
-        # items even if the rest of the world is constrained. The relief
-        # valve instead is to lift extra Series Unlock items into starting
-        # inventory: that strictly improves the player's starting state
-        # (more series unlocked from the outset) while shrinking the
-        # in-pool item count by the same number. No filler is added until
-        # the static pool fits.
+        # Relief valve: lift extra Series Unlocks into starting inventory.
+        # That strictly improves the player's starting state while
+        # shrinking the in-pool item count 1-for-1. Skills are always
+        # preserved — players expect a full set.
         total = sum(quantities.values())
         if total > target:
             excess = total - target
@@ -640,21 +625,14 @@ class LibrarianWorld(World):
         series_req = self.series_req
         shelf_req = self.shelf_req
 
-        # Precomputed lookup tables — fill_restrictive invokes the access
-        # rules below millions of times, and tightening these inner loops
-        # is the single biggest wall-clock generation win. Each table
-        # replaces a per-call computation:
-        #
-        #   shelf_names[sid]    — formatted "Progressive Shelf Unlock (X)"
-        #                         strings (vs string-formatting per call)
-        #   section_series_reqs[sid] — tuple of series_req values for that
-        #                         section, in declaration order (vs dict
-        #                         lookup per series per rule call)
-        #   section_row_reqs[sid]    — list of (shelf_n, series_n) tuples
-        #                         per series; powers feasible_rows
-        #   floor_sections[fn]  — list of sections on each floor (vs
-        #                         iterating ALL active sections and
-        #                         filtering inside the floor rule)
+        # Precomputed lookup tables — fill_restrictive invokes access
+        # rules millions of times; hoisting these out is the biggest
+        # wall-clock generation win. Each table replaces a per-call op:
+        #   shelf_names[sid]         — pre-formatted unlock-item strings
+        #   section_series_reqs[sid] — tuple of series_req values in order
+        #   section_row_reqs[sid]    — (shelf_n, series_n) per series;
+        #                              powers feasible_rows
+        #   floor_sections[fn]       — pre-bucketed by floor
         shelf_names = {sec.id: shelf_unlock_name(sec.id) for sec in active_sections}
         section_series_reqs = {
             sec.id: tuple(series_req[s.name] for s in sec.series)
@@ -672,20 +650,14 @@ class LibrarianWorld(World):
             floor_sections.setdefault(sec.floor, []).append(sec)
 
         # Precomputed 2D reachable-rows table per section.
+        # section_reach[sid][shelf_count][series_count] = rows in that
+        # section reachable given that many shelf/series unlocks. Clamps
+        # the indices so out-of-range counts cap at the table edges.
         #
-        # section_reach[sid] is a 2D list. section_reach[sid][shelf_count]
-        # is itself a 1D list indexed by series_count. The cell value is
-        # the number of rows in that section reachable given exactly that
-        # many shelf and series unlocks. We clamp shelf_count to bookcase
-        # count and series_count to len(series_order) so out-of-range
-        # state counts are handled by capping at the table edges.
-        #
-        # This lets feasible_rows compute its result with just one direct
-        # prog_items dict access per section + a 2D list lookup. With 31
-        # active sections, each call is ~62 dict ops, no string formatting
-        # and no state.count method calls. The level-up + row-completion
-        # rules together fire ~250x per state during fill sweeps, so the
-        # one-time precompute pays for itself many times over.
+        # Lets feasible_rows do one prog_items dict read per section + a
+        # 2D list lookup — ~62 dict ops total, no string formatting, no
+        # state.count calls. Level-up + row-completion rules fire ~250x
+        # per state during fill sweeps, so the precompute pays for itself.
         max_series_idx = len(self.series_order)
         section_reach: dict[str, list[list[int]]] = {}
         for sec in active_sections:
@@ -737,29 +709,18 @@ class LibrarianWorld(World):
             return True
 
         # How many distinct rows can the player FINISH right now? Powered
-        # by the precomputed section_reach table — each call is O(active
-        # sections) direct-dict lookups (no state.count method calls,
-        # no string formatting, no inner per-series iteration).
+        # by section_reach — O(active sections) direct-dict lookups, no
+        # state.count calls, no string formatting. Reads prog_items
+        # directly to skip state.count's two-dict-lookup overhead.
         #
-        # Reads state.prog_items[p] directly to skip the state.count
-        # method-call overhead (which itself is two dict lookups). That
-        # leaves the function as essentially "load prog_items, sum table
-        # values across active sections."
         # feasible_rows is called by 96 separate access rules (50 row-
         # completion + 45 level-up + 1 goal). When fill evaluates these
-        # against the same state in sequence, recomputing the table-walk
-        # 96 times is wasted work.
-        #
-        # We cache the result *on the state object itself* under a unique
-        # attribute name. The cache marker includes the series count AND
-        # the sum of relevant shelf counts — incrementing any tracked
-        # item invalidates the marker, so we never serve a stale value.
-        # The check is two dict accesses + a tuple compare on hit, much
-        # cheaper than re-running the table walk.
-        #
-        # State objects are reused via state.copy() in AP fill, so the
-        # cached attribute travels with copies. New states post-collect
-        # have a different marker (different counts) and trigger refresh.
+        # against the same state in sequence, recomputing 96x is wasted.
+        # We cache the result on the state object itself under a unique
+        # attr name; marker = (series_count, sum of shelf counts). Any
+        # tracked-item increment invalidates the marker, so stale reads
+        # are impossible. State.copy() carries the attribute, and new
+        # states post-collect get a different marker → refresh.
         cache_attr = f"_librarian_feasible_{p}"
         shelf_names_only = [name for name, _, _ in section_reach_list]
 
@@ -791,15 +752,12 @@ class LibrarianWorld(World):
             state.__dict__[cache_attr] = (marker, total)
             return total
 
-        # Milestone helpers. Milestones fire on cumulative books PLACED, and
-        # any book on any shelf counts — correct placement isn't required —
-        # so the threshold is reachable as soon as the player has enough
-        # unlocked-series books to pick up AND enough open shelf capacity
-        # to drop them. Both totals are cumulative and monotonic.
-        #
-        # Precompute lookup arrays so each rule call is O(active_sections)
-        # rather than O(series): fill invokes these rules frequently and
-        # the extra setup pays for itself.
+        # Milestone helpers. Milestones fire on cumulative books PLACED;
+        # any book on any shelf counts — correct placement isn't required.
+        # Threshold is reachable once the player has enough unlocked-series
+        # books to pick up AND enough open shelf capacity to drop them.
+        # Both totals are cumulative and monotonic. Precompute lookup
+        # arrays so each rule call is O(active_sections) rather than O(series).
         only_shelfable = bool(self.options.only_unward_shelfable_books.value)
         series_volumes_by_name = {
             ser.name: ser.volumes
@@ -895,10 +853,9 @@ class LibrarianWorld(World):
             )
 
         # Floor completions — only the active floor(s) were created in
-        # create_regions, so iterate those. The pre-bucketed floor_sections
-        # table avoids re-filtering active_sections by floor on every rule
-        # invocation, and the precomputed shelf_names + section_series_reqs
-        # cut the per-section work to one state.has + one tuple iteration.
+        # create_regions, so iterate those. The pre-bucketed floor_sections,
+        # shelf_names and section_series_reqs cut per-section work in the
+        # rule to one state.has + one tuple iteration.
         for floor_n, sections_in_floor in floor_sections.items():
             floor_loc = mw.get_location(f"Floor {floor_n} Complete", p)
 
@@ -922,14 +879,12 @@ class LibrarianWorld(World):
 
         # Level-up access rules — only for level-up locations that were
         # actually created (create_regions drops ones beyond max_reachable_rows).
-        # • feasible_rows(state) >= XP_CURVE[N-1]: the player can actually
-        #   finish that many rows (per-series shelf+series check).
-        # • Major Magic total >= N-1: each post-level-1 level requires one
-        #   more Major Magic item. We sum the five state.count calls
-        #   directly rather than going through state.count_group("Major
-        #   Magic", p) — count_group walks the player's full item list
-        #   on each call, which becomes a real hot-path cost when fill
-        #   evaluates this rule across many sweeps. count() is O(1).
+        # • feasible_rows(state) >= XP_CURVE[N-1]: player can finish that
+        #   many rows (per-series shelf+series check).
+        # • Major Magic total >= N-1: each post-level-1 level requires
+        #   one Major Magic. Sum five state.count calls directly rather
+        #   than count_group("Major Magic", p) — count_group walks the
+        #   full item list per call, a hot-path cost during fill sweeps.
         major_magic_names = ("Progressive Sort", "Progressive Shelf Guide",
                              "Progressive Insight", "Progressive Auto-Shelving",
                              "Progressive Assemble")
@@ -1005,22 +960,17 @@ class LibrarianWorld(World):
     # ------------------------------------------------------------------
 
     def fill_slot_data(self) -> dict[str, Any]:
-        # Build (section_id|series_name) → location_id map so the Lua client
-        # can resolve the correct AP location when the in-game FinishRow event
-        # tells us a particular series's row has been completed. Only includes
-        # active sections — for floor goals, the other floor's rows aren't
-        # actual locations and shouldn't appear here.
+        # (section_id|series_name) → location_id. Lua resolves the AP
+        # location when FinishRow fires for a particular series. Active
+        # sections only — floor goals exclude the other floor entirely.
         row_location_map: dict[str, int] = {}
-        # Per-series shelf-unlock requirement: how many bookcases need to be
-        # opened in the series' section before its row is accessible. The Lua
-        # client uses this to gate book unwarding — a book is only pickable
-        # when BOTH its series is received and its bookcase is open.
+        # series_name → bookcase index. Lua gates book unwarding so a book
+        # is pickable only when BOTH its series is received and its
+        # bookcase is open.
         shelf_req_map: dict[str, int] = {}
-        # section_id → AP location id for "Section Complete: <id> (<name>)".
-        # Lua fires the corresponding check when every row in the section has
-        # been completed. Only active sections — floor goals exclude the other
-        # floor's sections (so they have no Lua-side trigger and won't appear
-        # in the pool anyway).
+        # section_id → location id for "Section Complete: <id> (<name>)".
+        # Lua fires when every row in the section is complete. Active
+        # sections only — floor goals exclude the other floor's sections.
         section_location_map: dict[str, int] = {}
         for section in self.active_sections:
             for series in section.series:
@@ -1034,12 +984,23 @@ class LibrarianWorld(World):
             if sec_loc_id is not None:
                 section_location_map[section.id] = sec_loc_id
 
-        # Compute the row count at which the Lua client should fire the
-        # goal. Floor goals fire when their floor's section count is
-        # finished (Lua tracks rows globally, but with pool filtered to
-        # one floor, those are the only checks possible). Custom uses
-        # the player-chosen row count. Full lets the game's natural
-        # EndGame trigger fire.
+        # str(floor) → location id for "Floor N Complete". Lua fires when
+        # every row in the floor's active sections is complete. Only
+        # active-goal floors. Keys stringified to match convention and
+        # avoid the JSON-roundtrip "int keys become strings" Lua quirk.
+        floor_location_map: dict[str, int] = {}
+        active_floors_set = {s.floor for s in self.active_sections}
+        for floor_n in sorted(active_floors_set):
+            floor_loc_name = f"Floor {floor_n} Complete"
+            floor_loc_id = self.location_name_to_id.get(floor_loc_name)
+            if floor_loc_id is not None:
+                floor_location_map[str(floor_n)] = floor_loc_id
+
+        # Row count at which Lua should fire the goal. Floor goals fire
+        # when their floor's section count is met (Lua tracks rows
+        # globally; pool filtering to one floor makes those the only
+        # checks anyway). Custom uses the player-chosen count. Full lets
+        # the game's natural EndGame trigger fire.
         goal_value = int(self.options.goal.value)
         if goal_value == self.options.goal.option_floor_1:
             goal_row_threshold = sum(s.shelf_count for s in data.SECTIONS if s.floor == 1)
@@ -1052,7 +1013,7 @@ class LibrarianWorld(World):
             goal_row_threshold = sum(s.shelf_count for s in data.SECTIONS)
 
         return {
-            "version": "1.0.3",
+            "version": "1.0.4",
             "goal": goal_value,
             # Row count at which the Lua client should send STATUS_GOAL.
             # Ignored for the "full" goal (the game's EndGame fires it).
@@ -1067,47 +1028,45 @@ class LibrarianWorld(World):
             "series_per_unlock": self.options.series_per_unlock.value,
             "series_order": self.series_order,
             "shelf_order": self.shelf_order,
-            # Per-section bookcase counts — Lua uses this to size the per-section
-            # shelf-unlock cap (Progressive Shelf Unlock items beyond this count
-            # have no visible effect). Only active sections; for floor goals,
-            # the other floor's bookcases stay hidden in-game (no shelf
-            # unlocks ever arrive for them).
+            # Per-section bookcase counts. Sizes the per-section shelf-
+            # unlock cap (excess Progressive Shelf Unlocks have no visible
+            # effect). Active sections only; for floor goals, the other
+            # floor's bookcases stay hidden in-game.
             "bookcase_counts": {s.id: s.bookcase_count for s in self.active_sections},
-            # Row-completion location lookup: "<sid>|<series_name>" → AP location id.
+            # "<sid>|<series_name>" → AP location id.
             "row_location_map": row_location_map,
-            # Per-series shelf-unlock requirement (series_name → bookcase index
-            # needed for its row). Lua uses this in Pass 1 of book-warding to
-            # require BOTH series unlock AND its bookcase open before a book
-            # becomes pickable. Only consulted when only_unward_shelfable_books
-            # is 1; in the default mode the shelf_req_map is ignored by Lua.
+            # series_name → bookcase index needed for its row. Lua uses
+            # this in Pass 1 of book-warding to require BOTH series unlock
+            # AND its bookcase open before a book becomes pickable. Only
+            # consulted when only_unward_shelfable_books=1.
             "shelf_req_map": shelf_req_map,
-            # Section completion lookup: section_id → AP location id for
-            # "Section Complete: <id> (<name>)". Lua fires the corresponding
-            # check when every row in the section has been completed. Absent
-            # from pre-1.0.3 seeds (the Lua client treats a missing key as
-            # "no section-completion firing", maintaining backward compat).
+            # section_id → AP location id for "Section Complete". Lua
+            # fires when every row in the section is complete. Absent
+            # from pre-1.0.3 seeds (Lua treats missing key as "no
+            # section-completion firing"; backward compat).
             "section_location_map": section_location_map,
-            # Toggle: when 1, Lua wards a book unless BOTH its series and its
-            # bookcase have been unlocked. When 0 (default), only the series
-            # unlock matters and the book becomes pickable as soon as the
-            # series is received.
+            # str(floor) → AP location id for "Floor N Complete". Lua
+            # fires when every row in the floor's active sections is
+            # complete. Active-goal floors only. Absent from pre-1.0.4
+            # seeds; Lua falls back to a static FLOOR_IDX constant.
+            "floor_location_map": floor_location_map,
+            # Toggle: when 1, Lua wards a book unless BOTH its series and
+            # its bookcase are unlocked. When 0 (default), only series
+            # unlock matters.
             "only_unward_shelfable_books": int(self.options.only_unward_shelfable_books.value),
-            # Milestone thresholds shipped so the Lua side knows when to
-            # fire each. As of v1.0.3 we no longer create book-placement
-            # milestone LOCATIONS (see create_regions), so the list ships
-            # empty and the Lua client's milestone-fire loop is a no-op.
-            # The Lua-side counter infrastructure stays around for future
-            # use; that's why we send an empty list instead of removing
-            # the key.
+            # As of v1.0.3 we don't create book-placement milestone
+            # locations (see create_regions), so this ships empty and
+            # Lua's milestone-fire loop is a no-op. Lua-side counter
+            # infrastructure stays around for future use — that's why
+            # we send an empty list instead of dropping the key.
             "milestone_thresholds": [],
-            # Row-completion thresholds. Lua tracks total correctly-completed
-            # rows and fires each threshold's check when the count reaches it.
+            # Lua tracks correctly-completed rows and fires each threshold.
             "row_completion_thresholds": list(ROW_COMPLETION_THRESHOLDS),
-            # How locked-series books should look. "stacks" = visible-but-disabled
-            # (preserves visual density; collision off so player walks through).
-            # The hidden-mode code path is still present in the Lua client for
-            # possible future re-introduction, but the YAML option was removed
-            # for v1.0 because the HISM per-instance limitations left ~5-10
-            # books visible in walls/floors.
+            # Locked-series book appearance. "stacks" = visible-but-
+            # disabled (preserves visual density; collision off so player
+            # walks through). Hidden-mode code path still present in Lua
+            # for possible re-introduction, but the YAML option was
+            # removed for v1.0 because HISM per-instance limitations
+            # left ~5-10 books visible in walls/floors.
             "book_visibility": "stacks",
         }

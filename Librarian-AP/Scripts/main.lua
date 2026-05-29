@@ -200,7 +200,7 @@ end
 -- isn't in TESTED_GAME_VERSIONS, append "(UNTESTED)" so the player knows
 -- compatibility isn't validated against their game build.
 
-local MOD_VERSION = "1.0.3"
+local MOD_VERSION = "1.0.4"
 local TESTED_GAME_VERSIONS = { "1.0.8" }
 
 local function get_game_version()
@@ -529,11 +529,20 @@ local function start_gameplay_loops()
             for i = 1, math.min(APPLY_SAMPLE_SIZE, n) do
                 local b = books[i]
                 if b and b:IsValid() then
-                    local idx
-                    pcall(function() idx = b.ItemInfo.AssetIdx end)
-                    if idx and idx > 0 and not sample[idx] then
-                        sample[idx] = true
-                        distinct = distinct + 1
+                    -- Split ItemInfo access to defend against a UE4SS
+                    -- reflection-layer AV (Failure.Hash e40fc030...).
+                    -- Direct b.ItemInfo.AssetIdx hands a possibly-stale
+                    -- sub-UObject ref to UE4SS, which crashes in IsA /
+                    -- resolve_function_address before pcall can catch it.
+                    local item_info
+                    pcall(function() item_info = b.ItemInfo end)
+                    if item_info and item_info:IsValid() then
+                        local idx
+                        pcall(function() idx = item_info.AssetIdx end)
+                        if idx and idx > 0 and not sample[idx] then
+                            sample[idx] = true
+                            distinct = distinct + 1
+                        end
                     end
                 end
             end
@@ -619,7 +628,11 @@ local function start_gameplay_loops()
         end
 
         if s.phase == "draining" then
-            if IA._deferred_worker_running then
+            -- Hold the draining phase while either the chunked Pass-1
+            -- flush is still running OR the hidden-mode deferred
+            -- tree-walk worker is still draining. Both are async; the
+            -- world isn't truly settled until both have idled.
+            if IA._flush_in_progress or IA._deferred_worker_running then
                 s.quiet_ticks = 0
                 return false
             end
@@ -785,6 +798,12 @@ local function start_gameplay_loops()
         -- without waiting for the next FinishRow event. Idempotent —
         -- _sent_section_completions guards against re-firing.
         pcall(function() IA.fire_section_completions() end)
+        -- Floor-completion check: same reasoning at a coarser
+        -- granularity. The section-sweep above may have just closed
+        -- out the last section in a floor; re-run the floor sweep
+        -- so its check fires this tick instead of waiting for the
+        -- next FinishRow. Idempotent.
+        pcall(function() IA.fire_floor_completions() end)
         -- Skill resync: if save-side level lags the received item count
         -- (e.g., a UpgradePlayer call dropped silently when the player
         -- was mid-transition), retry the missing applies. Idempotent
@@ -1426,13 +1445,15 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
 
     -- Goal trigger by row count (for non-full goals). Full goal lets the
     -- game's natural EndGame fire when the player walks through the end
-    -- door. Half / floor goals fire STATUS_GOAL as soon as their threshold
-    -- row is finished.
+    -- door. Custom / floor_1 / floor_2 goals fire STATUS_GOAL as soon
+    -- as their threshold row is finished.
+    -- Options.py defines option_full=0 (the others are 1/2/3) — must
+    -- compare goal against 0, not 1, or custom goals never fire.
     if not _goal_sent and row then
         local APClient_mod = package.loaded["AP/APClient"]
         local sd = APClient_mod and APClient_mod.slot_data
-        if sd and sd.goal_row_threshold and sd.goal then
-            local is_full = (sd.goal == 1)  -- option_full = 1
+        if sd and sd.goal_row_threshold and sd.goal ~= nil then
+            local is_full = (sd.goal == 0)  -- option_full = 0
             local threshold = tonumber(sd.goal_row_threshold) or 400
             if not is_full and row >= threshold then
                 _goal_sent = true
@@ -1475,6 +1496,17 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
         pcall(function() sec_sent = IA.fire_section_completions() end)
         if sec_sent > 0 then
             log(("[AP] section-completion: sent %d location check(s)"):format(sec_sent))
+        end
+    end
+    -- Fire "Floor N Complete" if this row closed out the last section
+    -- on a floor. fire_floor_completions uses _sent_row_locations as
+    -- the truth source so order-of-firing with section-complete above
+    -- doesn't matter.
+    if IA and IA.fire_floor_completions then
+        local floor_sent = 0
+        pcall(function() floor_sent = IA.fire_floor_completions() end)
+        if floor_sent > 0 then
+            log(("[AP] floor-completion: sent %d location check(s)"):format(floor_sent))
         end
     end
     -- Also sync milestones (book count) and any level-ups whose threshold

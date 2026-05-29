@@ -63,12 +63,11 @@ class SeriesPerUnlock(Range):
     Lower values mean more granular gating (more items, each smaller in
     impact). Higher values mean fewer items, each more impactful.
 
-    Minimum is 3 -- lower values produce a deep linear progression
-    chain (each item gates the next) that Archipelago's fill algorithm
-    struggles to route on tight configs (multi-player seeds, accessibility:
-    minimal, or low custom_goal_row_count). At 3 the chain depth caps at
-    134, which fill handles reliably across all goal / accessibility /
-    player-count combinations we've tested.
+    Minimum is 3 -- values below 3 produce a deep linear progression chain
+    that fill struggles to route on tight configs (multi-player,
+    accessibility: minimal, low custom_goal_row_count). At 3 the chain
+    depth caps at 134, which fill handles reliably across all tested
+    goal / accessibility / player-count combinations.
     """
     display_name = "Series Per Unlock"
     range_start = 3

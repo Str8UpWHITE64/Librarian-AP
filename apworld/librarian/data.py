@@ -81,11 +81,48 @@ class Section:
         return _BOOKCASE_COUNT_BY_SECTION[self.id]
 
 
-# Per-section bookcase actor counts, observed at runtime via the F10 probe.
-# Sums to 73 (matches FindAllOf("BookCaseBase") cardinality in M01).
+# Per-section bookcase actor counts. Drives Progressive Shelf Unlock item
+# quantity per section and the logic rules that gate section access.
+# Each value = number of physical bookcase actors in the section in M01.
+#
+# Physical bookcase types in M01:
+#
+#   Standard       — 10-vol-series capacity (~4 series per case). Used in
+#                    all uniform 10-vol sections and the large cases of
+#                    mixed-volume sections.
+#   Small          — 5-vol-series capacity (~4 series per case, narrower
+#                    physical footprint). Used for the small cases of
+#                    mixed-volume sections.
+#   Cabinet (tall) — single-case sections wrapped in a Cabinet_01_C alcove.
+#                    Hold ~18 series mixing 10-vol and 3-vol:
+#                    1C, 1D, 1G, 1H (Floor 1) and
+#                    2C, 2D, 2G, 2H, 2K, 2L (Floor 2).
+#
+# Mixed-volume sections (series of different lengths in one section). Lower
+# case indices hold the smaller-volume groups; _compute_shelf_req in
+# __init__.py packs them this way so smaller-volume series unlock first.
+#
+#   1M  5 cases  →  cases 1-2: small (5-vol),  cases 3-5: standard (10-vol)
+#   1N  5 cases  →  cases 1-2: small (5-vol),  cases 3-5: standard (10-vol)
+#   2M  2 cases  →  case 1:    small (5-vol),  case 2:   standard (10-vol)
+#   2N  2 cases  →  case 1:    small (5-vol),  case 2:   standard (10-vol)
+#   2O  3 cases  →  cases 1+2: small (5-vol),  case 3:   standard (10-vol)
+#                   (game's CountBookCase order for this section is
+#                   left-outer / right-outer / middle, NOT left/middle/right;
+#                   physical layout is small | standard | small with the
+#                   outer pair narrower than the regular small variant —
+#                   use BP_WardCover_Smallest on these)
+#   2P  2 cases  →  case 1:    small (5-vol),  case 2:   standard (10-vol)
+#   2Q  2 cases  →  case 1:    small (5-vol),  case 2:   standard (10-vol)
+#
+# Tall cabinet sections (single case mixing 10-vol and 3-vol, all series get
+# shelf_req=1 since there's only one case to unlock):
+#
+#   1C, 1D, 1G, 1H  — Floor 1 cabinet sections
+#   2C, 2D, 2G, 2H, 2K, 2L  — Floor 2 cabinet sections
 _BOOKCASE_COUNT_BY_SECTION: dict[str, int] = {
     "1A": 3, "1B": 3, "1C": 1, "1D": 1, "1E": 3, "1F": 3, "1G": 1,
-    "1H": 1, "1I": 3, "1J": 3, "1K": 3, "1L": 3, "1M": 5, "1N": 5,
+    "1H": 1, "1I": 3, "1J": 3, "1K": 2, "1L": 2, "1M": 5, "1N": 5,
     "2A": 3, "2B": 3, "2C": 1, "2D": 1, "2E": 3, "2F": 3, "2G": 1,
     "2H": 1, "2I": 3, "2J": 3, "2K": 1, "2L": 1, "2M": 2, "2N": 2,
     "2O": 3, "2P": 2, "2Q": 2,

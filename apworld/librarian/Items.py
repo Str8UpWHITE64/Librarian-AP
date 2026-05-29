@@ -15,12 +15,11 @@ Item pool composition (matches the design from data.py):
     holds ≥1 Progressive Shelf Unlock for it. Each subsequent unlock reveals
     one more bookcase within that section.
 
-    Note: Minor Magic abilities (Jump / Jogging / two bag upgrades) are
-    NOT items in this world — the player gets each ability natively from
-    the Minor Magic chest it's stored in (Crimson Octagon / Emerald Club /
-    Azure Star / Golden Diamond). The chest opening is tracked as a
-    location check; the matching key remains an in-game pickup that gates
-    when its chest is reachable.
+    Minor Magic abilities (Jump / Jogging / two bag upgrades) are NOT AP
+    items — the player gets each natively from its Minor Magic chest
+    (Crimson Octagon / Emerald Club / Azure Star / Golden Diamond). The
+    chest opening is tracked as a location check; the matching key is
+    an in-game pickup that gates chest reachability.
 
     FILLER (varies — fills the remaining slots up to total location count)
         Whisper of Lore, Library Token, Magical Polish,
@@ -106,16 +105,13 @@ _shelf_items: list[LibrarianItemData] = [
 
 # --- Major Magic (progressive) ---
 #
-# Marked progression_skip_balancing rather than plain progression: these
-# items gate only the 45 level-up locations (one Major Magic copy required
-# per level after level 1), and have NO row/section/floor/goal dependency.
-# AP fill's progression-balancing pass adds a meaningful sweep cost when
-# there are lots of "progression" items, and including the 45 Major Magic
-# copies in that balancing inflates routing work without actually helping
-# routing — they have no downstream consequences for series/shelf access.
-# skip_balancing keeps them in the progression-priority pool (so they're
-# placed before filler / useful items) but takes them out of the balancing
-# loop, which is one of the bigger single fill-speedup wins available.
+# progression_skip_balancing rather than plain progression: these items
+# gate ONLY the 45 level-up locations (one copy per post-level-1 level)
+# and have no row/section/floor/goal dependency. Including 45 progression
+# copies in fill's balancing pass inflates routing work without helping
+# routing — skip_balancing keeps them progression-priority (placed before
+# filler) but out of the balancing loop. One of the bigger single fill
+# speedup wins available.
 _major_skill_items: list[LibrarianItemData] = [
     LibrarianItemData("Progressive Sort",          200, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),
     LibrarianItemData("Progressive Shelf Guide",   201, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),

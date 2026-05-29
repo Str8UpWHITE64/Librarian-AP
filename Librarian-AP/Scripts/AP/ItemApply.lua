@@ -37,6 +37,7 @@ local function log(msg) print(LOG_PREFIX .. " " .. tostring(msg)) end
 -- AP location ID layout (mirrors apworld/librarian/Locations.py)
 local AP_BASE              = 1910000
 local AP_LOC_SECTION_FIRST = AP_BASE + 500   -- 31 entries: section completions
+local AP_LOC_FLOOR_FIRST   = AP_BASE + 550   -- 2 entries: Floor 1, Floor 2
 local AP_LOC_LEVEL_FIRST   = AP_BASE + 560   -- 45 entries: Level 1..45
 local AP_LOC_MILESTONE_FIRST = AP_BASE + 640 -- 22 entries: aligned to MILESTONE_THRESHOLDS order
 local AP_LOC_ROW_COMPLETION_FIRST = AP_BASE + 1000 -- 50 entries: aligned to ROW_COMPLETION_THRESHOLDS order
@@ -55,6 +56,14 @@ local SECTION_IDX = {
     ["2F"] = 19, ["2G"] = 20, ["2H"] = 21, ["2I"] = 22, ["2J"] = 23,
     ["2K"] = 24, ["2L"] = 25, ["2M"] = 26, ["2N"] = 27, ["2O"] = 28,
     ["2P"] = 29, ["2Q"] = 30,
+}
+
+-- floor number → ordinal offset within AP_LOC_FLOOR_FIRST. Used as a
+-- fallback when slot_data doesn't ship floor_location_map (pre-1.0.4
+-- seeds). Floor 1 → loc 1910550, Floor 2 → loc 1910551.
+local FLOOR_IDX = {
+    [1] = 0,
+    [2] = 1,
 }
 
 -- Cumulative XP curve, mirrored from apworld/librarian/data.py:XP_CURVE.
@@ -199,17 +208,26 @@ M._sent_section_completions = {}
 -- can iterate cheaply.
 M._section_to_row_locs = {}
 
--- Highest player level we've sent a "Reached Level N" check for. Synced from
--- (a) the player's XP curve vs GameSaveData.CurrentFinishedRowNum, AND
--- (b) APClient._sent_checks (the server's view of which level locations
---     have been checked in any prior session for this slot).
--- Max of the two is taken so loaded saves catch up to their actual level
--- even when GameSaveData hasn't fully loaded yet at baseline time.
--- Subsequent level-ups arrive via the OnLevelUp BP hook →
--- on_level_up_event(), which catches up from _sent_checks before
--- incrementing — so it self-heals if baseline missed for any reason.
--- (Avoids reading GameSaveData.CurrentFinishedRowNum at OnLevelUp time —
--- empirically that field hasn't updated yet when the event fires.)
+-- Already-fired "Floor N Complete" floors this session (de-dupe defense,
+-- keyed by integer floor number 1 or 2). Floor completion fires when
+-- every row location across the floor's active sections is in
+-- _sent_row_locations.
+M._sent_floor_completions = {}
+
+-- floor number (int) → list of row location IDs in that floor's active
+-- sections. Built from _section_to_row_locs at slot-data setup. For
+-- floor-goal seeds, only the active floor has an entry (the inactive
+-- floor has no rows in row_location_map and so contributes nothing).
+M._floor_to_row_locs = {}
+
+-- Highest player level we've sent a "Reached Level N" check for. Synced
+-- from max of: (a) XP curve vs GameSaveData.CurrentFinishedRowNum,
+-- (b) APClient._sent_checks (server's view of prior sessions). Max
+-- guards against stale GameSaveData at baseline time. Subsequent
+-- level-ups arrive via the OnLevelUp BP hook → on_level_up_event(),
+-- which catches up from _sent_checks before incrementing — self-heals
+-- if baseline missed. (Reading CurrentFinishedRowNum at OnLevelUp time
+-- is unreliable — the field hasn't updated yet when the event fires.)
 M._levels_reached = 0
 M._level_baseline_done = false
 
@@ -294,6 +312,8 @@ function M.set_slot_data(slot_data)
     M._sent_row_completions = {}
     M._sent_section_completions = {}
     M._section_to_row_locs = {}
+    M._sent_floor_completions = {}
+    M._floor_to_row_locs = {}
     M._last_applied_series_unlocked = {}
     M._levels_reached = 0
     M._level_baseline_done = false
@@ -359,6 +379,28 @@ function M.set_slot_data(slot_data)
                     list = {}
                     M._section_to_row_locs[sid] = list
                 end
+                list[#list + 1] = lid
+            end
+        end
+    end
+
+    -- Build floor_number → flat list of row location IDs by re-bucketing
+    -- _section_to_row_locs. Section IDs are encoded as "<floor><letter>"
+    -- (e.g. "1A", "2Q"), so the first character is the floor number.
+    -- Floor-goal seeds only have one floor's worth of sections in
+    -- _section_to_row_locs, so the other floor naturally drops out (its
+    -- "Floor N Complete" location isn't in the pool either, per
+    -- create_regions's active_floor_locs filter).
+    M._floor_to_row_locs = {}
+    for sid, row_locs in pairs(M._section_to_row_locs) do
+        local floor_n = tonumber(sid:sub(1, 1))
+        if floor_n then
+            local list = M._floor_to_row_locs[floor_n]
+            if not list then
+                list = {}
+                M._floor_to_row_locs[floor_n] = list
+            end
+            for _, lid in ipairs(row_locs) do
                 list[#list + 1] = lid
             end
         end
@@ -466,6 +508,10 @@ function M.set_gameplay_active(state)
             M._stray_cases = {}
             M._last_apply_log_key = nil
             M._cases_indexed = false
+            -- WardCover actors (v1.1.0) are tied to the old world's case
+            -- actors; both are destroyed when the world unloads. Just
+            -- drop our refs so the next apply re-spawns fresh covers.
+            M._case_covers = {}
         end
         -- Drop pending skill grants — they'll be re-queued on the next
         -- slot_connect via set_slot_data's reset + AP item re-dump.
@@ -527,18 +573,15 @@ function M.apply_item(name)
         return
     end
     -- Defer the world-apply during two settle windows:
-    --   • Pre-apply (post-connect title): the starting-item dump is 14+
-    --     items; flushing per item is wasteful (each iterates all 3072
-    --     books) and visually flickers as books are unwarded one series
-    --     at a time. main.lua's pre-apply settle loop fires ONE
+    --   • Pre-apply (post-connect title): 14+ starting items; per-item
+    --     flush is wasteful (each iterates all 3072 books) and visually
+    --     flickers. main.lua's pre-apply settle loop fires ONE
     --     flush_apply once items quiet, with the FINAL state.
-    --   • Reconnect settle (mid-gameplay): the AP server re-sends all
-    --     received items on (re)connect. Per-item flush_apply would
-    --     hide every bookcase mid-rebuild as shelves_open grows back
-    --     from zero. main.lua's reconnect-settle watcher fires ONE
-    --     flush_apply once items quiet and clears the flag.
-    -- Either way, we still recompute_state() so derived counters track
-    -- correctly while the world apply is deferred.
+    --   • Reconnect settle (mid-gameplay): AP re-sends all received
+    --     items on reconnect; per-item flush would hide every bookcase
+    --     mid-rebuild. main.lua's reconnect-settle watcher fires ONE
+    --     flush_apply once items quiet, clearing the flag.
+    -- recompute_state() still runs so counters track during the defer.
     if (M._allow_pre_apply and not M._gameplay_active)
             or M._reconnect_settle_active then
         M._recompute_state()
@@ -620,6 +663,13 @@ function M.run_baseline_sync()
             sec_synced))
     end
 
+    local floor_synced = 0
+    pcall(function() floor_synced = M.fire_floor_completions() end)
+    if floor_synced and floor_synced > 0 then
+        log(("Floor-completion baseline sync: sent %d check(s) for already-complete floors"):format(
+            floor_synced))
+    end
+
     -- Read the game's CurrentFinishedRowNum and fire any
     -- "Complete N Rows" thresholds the saved game has already passed.
     -- Without this, a save loaded mid-run would silently skip those
@@ -642,28 +692,20 @@ function M.run_baseline_sync()
             rc_synced, rows_finished))
     end
 
-    -- Level-up baseline. Compute the player's actual current level from
-    -- TWO independent signals and take the max:
-    --   • xp_level  — walk player.SkillLevelUpRowNum vs rows_finished.
-    --     The "correct" answer when GameSaveData and the player BP are
-    --     both fully loaded.
+    -- Level-up baseline. Compute current level as max of:
+    --   • xp_level   — walk player.SkillLevelUpRowNum vs rows_finished
+    --     (correct when GameSaveData + player BP are loaded).
     --   • sent_level — highest level location already in
-    --     APClient._sent_checks. Populated by the server at slot_connect,
-    --     so it works even when GameSaveData isn't ready yet.
+    --     APClient._sent_checks (server-populated at slot_connect,
+    --     works even when GameSaveData isn't ready).
     --
-    -- Without this, _levels_reached resets to 0 on every slot_connect.
-    -- The first OnLevelUp queues "Reached Level 1" → APClient.send_check
-    -- silently drops (the server's set_location_checked_handler already
-    -- marked it sent from a prior session, putting it in _sent_checks).
-    -- The actual new-level the player just reached (Level N) never gets
-    -- sent because by the time _levels_reached catches up to N, every
-    -- earlier attempt was deduped. Using _sent_checks as the floor here
-    -- makes the baseline robust even if rows_finished reads 0 or the
-    -- player BP's SkillLevelUpRowNum is empty at this moment.
+    -- Without _sent_checks as a floor, _levels_reached resets to 0 on
+    -- reconnect; the first OnLevelUp queues "Reached Level 1" which
+    -- the server dedupes, and the actual new level never gets sent
+    -- because every earlier attempt was deduped.
     --
-    -- We also re-send checks for every level <= current_level. The AP
-    -- server dedupes resends, so this is belt-and-suspenders for any
-    -- levels missed during a disconnect window in a prior session.
+    -- We also re-send checks for every level <= current_level (server
+    -- dedupes; belt-and-suspenders for prior-session disconnects).
     local xp_level = 0
     do
         local player = FindFirstOf("BP_LibrarianCharacter_C")
@@ -756,23 +798,25 @@ end
 -- Apply: Books
 -- ============================================================================
 
---- Return the BP_GrabbingBook_C actor's AssetIdx if the book is
---- initialized (real game data), or nil if it's an orphan / uninitialized
---- actor whose ItemInfo has default field values.
+--- Return the BP_GrabbingBook_C actor's AssetIdx if initialized, or
+--- nil if it's an orphan with default ItemInfo.
 ---
---- AssetIdx=0 is a VALID game asset ("Monsterology: An Introduction to
---- Forbidden Beast" in section 1A — the first declared series in
---- data.py). Gating on `AssetIdx > 0` therefore skips that series and
---- leaves its 10 books permanently un-warded, even when they're in
---- off-floor scope. We disambiguate by checking ItemInfo.Mesh: real
---- books have a populated UStaticMesh*, orphan actors from the
---- OpenLevel-on-connect reload leave it nil. For AssetIdx > 0 we trust
---- the value directly — default-constructed ItemInfo can't produce a
---- non-zero index, so any non-zero AssetIdx implies an initialized book.
+--- AssetIdx=0 is a VALID asset ("Monsterology: An Introduction to
+--- Forbidden Beast", section 1A's first series). Gating on `AssetIdx > 0`
+--- would leave its 10 books permanently un-warded. We disambiguate via
+--- ItemInfo.Mesh: real books have a populated UStaticMesh*; orphans
+--- from the OpenLevel-on-connect reload leave it nil. AssetIdx > 0 is
+--- trusted directly — a default-constructed ItemInfo can't produce a
+--- non-zero index.
 local function _book_valid_asset_idx(book)
     if not book or not book:IsValid() then return nil end
     local info; pcall(function() info = book.ItemInfo end)
-    if not info then return nil end
+    -- Also IsValid the ItemInfo sub-UObject. Crash reports (Failure.Hash
+    -- e40fc030...) faulted inside UE4SS reflection reading sub-UObject
+    -- properties — book:IsValid() alone is not enough; ItemInfo can be
+    -- a stale ref and the next .AssetIdx read crashes in IsA on garbage
+    -- (pcall doesn't catch native AVs). Guards nine downstream call sites.
+    if not info or not info:IsValid() then return nil end
     local aidx; pcall(function() aidx = info.AssetIdx end)
     if aidx == nil then return nil end
     if aidx > 0 then return aidx end
@@ -890,6 +934,45 @@ M._hism_initialized = false
 M._book_captured_transforms = {}         -- key → HISM original transform
 M._books_we_have_hidden = {}             -- key → true if our hide moved this book
 M._books_warded = {}                     -- key → true if actor.bHidden + collision-off applied
+M._material_update_queue = {}            -- list of {book, opacity} for deferred MID updates
+M._material_worker_running = false
+
+-- Diagnostic probe for B10 / B9. For each bookcase we touched on the
+-- previous _apply_bookcases_to_world call, remember what we set
+-- `bHidden` to. On the next apply, before writing, we compare the
+-- case's current `bHidden` against this map and log `[bookcase-drift]`
+-- if they disagree — gives us hard data on whether the game's BP tick
+-- reverts our visibility flag.
+--
+-- Keyed by `case:GetFullName()`. Value is BOOLEAN bHidden (true =
+-- hidden, false = visible).
+M._case_last_applied_hidden = {}
+
+-- v1.1.0 B10 fix: per-case WardCover actor reference. For each warded
+-- bookcase, we spawn a BP_WardCover (chain-link fence overlay) via
+-- ModActor:SpawnWardCover. Keyed by case:GetFullName(); value is the
+-- spawned cover actor.
+--
+-- We KEEP the legacy SetActorHiddenInGame on the case itself (it can
+-- stop working when the BP tick reverts, but doesn't hurt). The cover
+-- is the durable visual ward — its tick is disabled at the
+-- BP_WardCover class level so the game's BP can't revert it.
+--
+-- If the new pak isn't installed (no SpawnWardCover function), the
+-- pcall fails silently and the case is managed by the legacy bHidden
+-- path alone — degraded but functional.
+M._case_covers = {}
+
+-- Diagnostic flags for v1.1.0 pak functions. Set true the first time we
+-- successfully call into a new pak function so we don't spam the log.
+-- The "_error" variants log the FIRST failure so we can diagnose
+-- missing-function or argument-type-mismatch issues on the new pak.
+M._diag_spawnwardcover_ok    = false
+M._diag_spawnwardcover_err   = false
+M._diag_pak_probed           = false
+M._diag_no_modactor_logged   = false
+M._diag_spawnwardcover_table_dumped = false
+M._diag_geometry_dumped             = false
 
 -- Books we couldn't HISM-map (no canonical and AddInstance failed). These
 -- can't be hidden via HISM teleport — their mesh renders via the actor's
@@ -917,6 +1000,24 @@ M._last_applied_series_unlocked = {}
 -- doesn't propagate to a child component.
 M._deferred_visibility_queue = {}  -- list of {book, visible}
 M._deferred_worker_running = false
+
+-- B7: chunked Pass-1 flush state.
+--
+-- _apply_books_to_world walks ~3000 book actors and toggles bHidden +
+-- collision on each. Doing this in one tick blocks LoopAsync long
+-- enough that AP times out on big item bursts (initial connect /
+-- reconnect re-dump). We chunk the walk via LoopAsync so the poll
+-- thread can pump c:poll() between chunks.
+--
+-- _flush_in_progress is set at chunk-1 start, cleared in the
+-- post-Pass-1 finalizer. _flush_pending records "another flush was
+-- requested while one was running" — the finalizer self-re-fires
+-- if set so the newer state gets a fresh apply.
+--
+-- Pattern lifted from Crab Champions AP's _apply_pending_items /
+-- FLUSH_BATCH chunking. See HANDOFF for design notes.
+M._flush_in_progress = false
+M._flush_pending     = false
 
 local function _drain_visibility_queue()
     local q = M._deferred_visibility_queue
@@ -988,6 +1089,13 @@ function M.reset_hism_state()
     M._books_warded = {}
     M._unmapped_warded_books = {}
     M._last_applied_series_unlocked = {}
+    -- Bookcase drift tracking: also stale across world reloads since
+    -- actor identities (UE GetFullName paths) change.
+    M._case_last_applied_hidden = {}
+    -- WardCover actors get destroyed by UE when the world reloads, so
+    -- our references are dangling. Drop them. Next _apply_bookcases_to_world
+    -- pass will re-spawn covers for warded sections.
+    M._case_covers = {}
     log("[hism-reset] cleared HISM mapping state (will re-init on next apply-safe)")
 end
 
@@ -1011,6 +1119,139 @@ function M._initialize_hism_book_mapping()
     if bn == 0 then return end
 
     log(("[hism-init] brute-force mapping start: %d HISMs, %d books"):format(hn, bn))
+
+    -- ONE-SHOT DIAGNOSTIC v2: enumerate class properties via reflection
+    -- + probe BP_HISM_Manager. UE4SS exposes class->ForEachProperty so we
+    -- can list every property name BP_GrabbingBook actually has, instead
+    -- of guessing names that all return mystery UObject wrappers.
+    if not M._diag_iteminfo_probed then
+        M._diag_iteminfo_probed = true
+
+        local sample_book = books[1]
+        if sample_book and sample_book:IsValid() then
+            -- 1. Control test: probe a clearly-bogus name. If it ALSO
+            -- returns UObject:0x..., we know UE4SS returns wrappers for
+            -- non-existent properties (and prior probe results were
+            -- meaningless).
+            local bogus
+            pcall(function() bogus = sample_book.ThisDefinitelyDoesNotExist123 end)
+            log(("[iteminfo-probe] CONTROL actor.ThisDefinitelyDoesNotExist123 = %s"):format(tostring(bogus)))
+
+            -- 2. Enumerate the actor's class properties via reflection.
+            local cls
+            pcall(function() cls = sample_book:GetClass() end)
+            if cls then
+                local cls_name
+                pcall(function() cls_name = cls:GetFullName() end)
+                log(("[iteminfo-probe] actor class: %s"):format(tostring(cls_name)))
+                -- ForEachProperty signature (UE4SS):
+                --   class:ForEachProperty(function(prop) ... return LoopAction.Continue end)
+                local prop_count = 0
+                local ok_iter = pcall(function()
+                    cls:ForEachProperty(function(prop)
+                        local pn
+                        pcall(function() pn = prop:GetFName():ToString() end)
+                        if not pn then
+                            pcall(function() pn = prop:GetName() end)
+                        end
+                        local cn
+                        pcall(function() cn = prop:GetClass():GetFName():ToString() end)
+                        log(("[iteminfo-probe]   actor-prop %s : %s"):format(
+                            tostring(pn), tostring(cn)))
+                        prop_count = prop_count + 1
+                        return 0  -- LoopAction.Continue is typically 0
+                    end)
+                end)
+                log(("[iteminfo-probe] actor properties iterated: ok=%s count=%d"):format(
+                    tostring(ok_iter), prop_count))
+            end
+
+            -- 3. Same for ItemInfo struct.
+            local info
+            pcall(function() info = sample_book.ItemInfo end)
+            if info then
+                local icls
+                pcall(function() icls = info:GetClass() end)
+                if icls then
+                    local icn
+                    pcall(function() icn = icls:GetFullName() end)
+                    log(("[iteminfo-probe] info class: %s"):format(tostring(icn)))
+                    local ipc = 0
+                    pcall(function()
+                        icls:ForEachProperty(function(prop)
+                            local pn
+                            pcall(function() pn = prop:GetFName():ToString() end)
+                            local cn
+                            pcall(function() cn = prop:GetClass():GetFName():ToString() end)
+                            log(("[iteminfo-probe]   info-prop %s : %s"):format(
+                                tostring(pn), tostring(cn)))
+                            ipc = ipc + 1
+                            return 0
+                        end)
+                    end)
+                end
+            end
+        end
+
+        -- 4. Probe BP_HISM_Manager_C — find the BookInfo→(HISM,idx)
+        -- lookup table that mgr:UpdateInstance(info, transform) uses.
+        if mgr and mgr:IsValid() then
+            local mcls
+            pcall(function() mcls = mgr:GetClass() end)
+            if mcls then
+                local mcn
+                pcall(function() mcn = mcls:GetFullName() end)
+                log(("[iteminfo-probe] manager class: %s"):format(tostring(mcn)))
+                local mpc = 0
+                pcall(function()
+                    mcls:ForEachProperty(function(prop)
+                        local pn
+                        pcall(function() pn = prop:GetFName():ToString() end)
+                        local cn
+                        pcall(function() cn = prop:GetClass():GetFName():ToString() end)
+                        log(("[iteminfo-probe]   manager-prop %s : %s"):format(
+                            tostring(pn), tostring(cn)))
+                        mpc = mpc + 1
+                        return 0
+                    end)
+                end)
+                -- ALSO list manager FUNCTIONS (UFunctions). These are
+                -- BP-callable methods. Maybe one is HideBook(info) or
+                -- similar — would let us hide books without touching
+                -- HISM instances directly.
+                local mfc = 0
+                pcall(function()
+                    mcls:ForEachFunction(function(fn)
+                        local fname
+                        pcall(function() fname = fn:GetFName():ToString() end)
+                        log(("[iteminfo-probe]   manager-fn %s"):format(tostring(fname)))
+                        mfc = mfc + 1
+                        return 0
+                    end)
+                end)
+                log(("[iteminfo-probe] manager functions iterated: count=%d"):format(mfc))
+            end
+        end
+
+        -- 5. Probe BP_GrabbingBook functions too.
+        if sample_book and sample_book:IsValid() then
+            local cls2
+            pcall(function() cls2 = sample_book:GetClass() end)
+            if cls2 then
+                local afc = 0
+                pcall(function()
+                    cls2:ForEachFunction(function(fn)
+                        local fname
+                        pcall(function() fname = fn:GetFName():ToString() end)
+                        log(("[iteminfo-probe]   actor-fn %s"):format(tostring(fname)))
+                        afc = afc + 1
+                        return 0
+                    end)
+                end)
+                log(("[iteminfo-probe] actor functions iterated: count=%d"):format(afc))
+            end
+        end
+    end
 
     -- Phase 1: capture every HISM instance's current transform. We'll
     -- need these to restore unwarded books later.
@@ -1111,6 +1352,11 @@ function M._initialize_hism_book_mapping()
     -- mgr:UpdateInstance).
     M._book_captured_transforms = {}
     M._book_hism_refs = {}
+    -- Winner lookup by AssetIdx, built alongside the main scan. Used as a
+    -- fallback in Phase 5 to AddInstance using a winner's known-good
+    -- transform when mark-and-scan fails to relocate the canonical
+    -- (empirically 100% of Phase 5 loser cases).
+    local winner_by_aidx = {}
     local mapped = 0
     for hi = 1, hn do
         local h = hism_array[hi]
@@ -1135,6 +1381,18 @@ function M._initialize_hism_book_mapping()
                                             M._book_captured_transforms[key] = orig
                                             M._book_hism_refs[key] = { hism = h, idx = ji - 1 }
                                             mapped = mapped + 1
+                                            -- Build aidx -> winner lookup
+                                            local winner_book = books[book_idx]
+                                            if winner_book and winner_book:IsValid() then
+                                                local waidx = _book_valid_asset_idx(winner_book)
+                                                if waidx ~= nil and not winner_by_aidx[waidx] then
+                                                    winner_by_aidx[waidx] = {
+                                                        hism = h,
+                                                        idx = ji - 1,
+                                                        transform = orig,
+                                                    }
+                                                end
+                                            end
                                         end
                                     end
                                 end
@@ -1146,25 +1404,66 @@ function M._initialize_hism_book_mapping()
         end
     end
 
-    -- Phase 5: for warded books that didn't get mapped (BookInfo-canonical
-    -- collisions where another book "stole" their canonical via the bulk
-    -- mark), spawn a NEW HISM instance per book using
-    -- ModActor.AddHISMInstance. Each loser book ends up with its own
-    -- (HISM, idx), enabling independent hide/show.
+    -- Phase 4.5: Restore Phase-4 winners' canonicals to natural transforms
+    -- BEFORE Phase 5 runs. mgr:UpdateInstance(BookInfo, marker) silently
+    -- fails when the BookInfo's canonical HISM instance has been moved
+    -- from its natural position — Phase 3 leaves every canonical at its
+    -- marker Z (-1M range), so Phase 5's re-mark step would never succeed
+    -- (717/717 losers failed with `no_canonical` before this fix).
+    -- Restoring each winner's canonical here lets Phase 5 work.
     --
-    -- Process per unmapped book:
-    --   1. Mark with a Phase-5-unique Z so we can find which HISM's
-    --      canonical it owns.
-    --   2. Scan HISMs for that Z → (H, idx) is the canonical.
-    --   3. AddHISMInstance(H, captured_transform) → new instance idx.
-    --   4. Restore the canonical to natural via mgr:UpdateInstance so
-    --      the dupe partner (the winning book at this canonical) is back
-    --      at its rendered position.
-    --   5. Record loser book → (H, new_idx, captured_transform).
+    -- Iterates warded books (not unique BookInfos): only the WINNER's
+    -- slot has a ref recorded in M._book_hism_refs at this point, so
+    -- each unique canonical gets exactly one restore call. Loser books
+    -- have no refs yet and are handled by Phase 5.
+    local restored = 0
+    for i = 1, bn do
+        if is_warded_book[i] then
+            local key = book_keys[i]
+            local ref = M._book_hism_refs[key]
+            local orig = ref and M._book_captured_transforms[key]
+            if orig then
+                local b = books[i]
+                if b and b:IsValid() then
+                    local info; pcall(function() info = b.ItemInfo end)
+                    if info then
+                        pcall(function() mgr:UpdateInstance(info, orig) end)
+                        restored = restored + 1
+                    end
+                end
+            end
+        end
+    end
+    log(("[hism-init] Phase4.5: restored %d winner canonical(s) to natural before Phase 5"):format(restored))
+
+    -- Phase 5: for warded books not mapped in Phase 4 (BookInfo-canonical
+    -- collisions), AddInstance via the winner-by-AssetIdx lookup built in
+    -- Phase 4. The legacy mark-and-scan approach failed 100% of the time
+    -- (`mgr:UpdateInstance` silently no-ops after Phase 3 has used it).
+    --
+    -- Approach:
+    --   1. Look up winner_by_aidx[loser.AssetIdx] for a known-good
+    --      (hism, transform) pair.
+    --   2. AddInstance(winner.hism, winner.transform) directly — creates
+    --      a new HISM slot adjacent to the winner's at the same location.
+    --   3. Record loser book → (winner.hism, new_idx, winner.transform).
+    --
+    -- Multiple losers sharing AssetIdx with a single winner each get
+    -- their own new HISM slot, all initially overlapping at the winner's
+    -- natural position. Pass 2 teleports each warded loser independently
+    -- to -1M Z; per-instance UpdateHISMInstance brings them back when
+    -- the series unwards.
     local mod_actor = FindFirstOf("ModActor_C")
-    local added, add_failed_no_canonical, add_failed_addinstance = 0, 0, 0
+    local added, add_failed_no_winner, add_failed_addinstance = 0, 0, 0
     local first_add_logged = 0
-    local PHASE5_BASE = -3000000.0  -- separate range from Phase 3 markers
+    local FAIL_LOG_CAP = 15
+    local nowinner_logged, addinst_logged = 0, 0
+    -- Phase 5b async work queue + per-HISM allocation counter. Workers
+    -- defined at module scope (M._start_phase5b_worker) consume the queue
+    -- after Phase 5a finishes building it.
+    M._phase5_queue = {}
+    M._phase5_pending_per_hism = {}
+    local queued = 0
     for i = 1, bn do
         if is_warded_book[i] then
             local key = book_keys[i]
@@ -1173,52 +1472,10 @@ function M._initialize_hism_book_mapping()
                 if b and b:IsValid() then
                     local info; pcall(function() info = b.ItemInfo end)
                     if info then
-                        local marker_z = PHASE5_BASE - i
-                        local marker = {
-                            Rotation    = {X=0, Y=0, Z=0, W=1},
-                            Translation = {X=0, Y=0, Z=marker_z},
-                            Scale3D     = {X=1, Y=1, Z=1},
-                        }
-                        pcall(function() mgr:UpdateInstance(info, marker) end)
-
-                        -- Scan for this unique Z. Short-circuit on first hit.
-                        local found_h, found_idx_lua, found_orig = nil, nil, nil
-                        for hi = 1, hn do
-                            local h = hism_array[hi]
-                            if h and h:IsValid() then
-                                local sm_data; pcall(function() sm_data = h.PerInstanceSMData end)
-                                if sm_data then
-                                    local sn = 0; pcall(function() sn = #sm_data end)
-                                    for ji = 1, sn do
-                                        local entry = sm_data[ji]
-                                        if entry then
-                                            local t; pcall(function() t = entry.Transform end)
-                                            if t then
-                                                local wp; pcall(function() wp = t.WPlane end)
-                                                if wp then
-                                                    local z; pcall(function() z = wp.Z end)
-                                                    if z and math.abs(z - marker_z) < 0.5 then
-                                                        found_h = h
-                                                        found_idx_lua = ji
-                                                        found_orig = captured[hi] and captured[hi][ji]
-                                                        break
-                                                    end
-                                                end
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                            if found_h then break end
-                        end
-
-                        -- Capture diagnostic fields for this book up-front. If
-                        -- we end up failing to map it, we want to know which
-                        -- specific book is stuck so the user can verify it's
-                        -- the same set across runs. AssetIdx=0 is a valid game
-                        -- index (Monsterology series), so we don't gate on > 0.
+                        -- Capture diagnostic fields for this book up-front.
                         local diag_aidx
                         pcall(function() diag_aidx = info.AssetIdx end)
+                        local loser_aidx = diag_aidx  -- canonical lookup key
                         local diag_series  = (diag_aidx ~= nil and M._asset_to_series[diag_aidx])  or "?"
                         local diag_section = (diag_aidx ~= nil and M._asset_to_section[diag_aidx]) or "?"
                         diag_aidx = diag_aidx or -1
@@ -1240,38 +1497,42 @@ function M._initialize_hism_book_mapping()
                             }
                         end
 
-                        if not (found_h and found_orig) then
-                            add_failed_no_canonical = add_failed_no_canonical + 1
+                        -- New: queue loser for async AddInstance in Phase 5b.
+                        -- The synchronous AddInstance approach crashed at
+                        -- offset 0x8 with 708 back-to-back render-state
+                        -- updates; chunking 10/tick at 100ms gives the
+                        -- render thread time to process each batch.
+                        local winner = loser_aidx and winner_by_aidx[loser_aidx]
+
+                        if not winner then
+                            add_failed_no_winner = add_failed_no_winner + 1
                             record_unmapped()
-                        else
-                            -- Try direct AddInstance on the HISM first; fall
-                            -- back to ModActor wrapper if direct call fails.
-                            local new_idx = nil
-                            pcall(function() new_idx = found_h:AddInstance(found_orig, true) end)
-                            local via = "direct"
-                            if not new_idx and mod_actor and mod_actor:IsValid() then
-                                pcall(function()
-                                    new_idx = mod_actor:AddHISMInstance(found_h, found_orig)
-                                end)
-                                via = "modactor"
+                            if nowinner_logged < FAIL_LOG_CAP then
+                                nowinner_logged = nowinner_logged + 1
+                                log(("[hism-init][orphan/no-winner] book i=%d aidx=%s series='%s' section=%s actor_xyz=(%.0f,%.0f,%.0f) winner_in_lookup=%s"):format(
+                                    i, tostring(loser_aidx), diag_series, diag_section,
+                                    diag_x, diag_y, diag_z,
+                                    tostring(winner ~= nil)))
                             end
+                        else
+                            -- Enqueue for chunked AddInstance.
+                            table.insert(M._phase5_queue, {
+                                key = key,
+                                hism = winner.hism,
+                                transform = winner.transform,
+                                aidx = loser_aidx,
+                            })
+                            -- Track per-HISM allocation count so we can
+                            -- PreAllocateInstancesMemory before the worker
+                            -- starts adding (avoids reallocation crashes).
+                            M._phase5_pending_per_hism[winner.hism] =
+                                (M._phase5_pending_per_hism[winner.hism] or 0) + 1
+                            queued = queued + 1
                             if first_add_logged < 3 then
                                 first_add_logged = first_add_logged + 1
-                                log(("[hism-init] Phase5 sample: book i=%d marker_z=%.1f found_idx_lua=%s new_idx=%s via=%s"):format(
-                                    i, marker_z, tostring(found_idx_lua),
-                                    tostring(new_idx), via))
+                                log(("[hism-init] Phase5 sample: book i=%d aidx=%s queued for async AddInstance"):format(
+                                    i, tostring(loser_aidx)))
                             end
-                            if new_idx then
-                                M._book_hism_refs[key] = { hism = found_h, idx = new_idx }
-                                M._book_captured_transforms[key] = found_orig
-                                added = added + 1
-                            else
-                                add_failed_addinstance = add_failed_addinstance + 1
-                                record_unmapped()
-                            end
-                            -- Restore canonical to natural (so the winning dupe
-                            -- partner's rendered mesh is back in place).
-                            pcall(function() mgr:UpdateInstance(info, found_orig) end)
                         end
                     end
                 end
@@ -1279,9 +1540,135 @@ function M._initialize_hism_book_mapping()
         end
     end
 
-    log(("[hism-init] captured=%d marked=%d mapped=%d added=%d (no_canonical=%d addinstance_failed=%d)"):format(
-        cap_count, marked_count, mapped, added,
-        add_failed_no_canonical, add_failed_addinstance))
+    log(("[hism-init] captured=%d marked=%d mapped=%d queued=%d (no_winner=%d)"):format(
+        cap_count, marked_count, mapped, queued, add_failed_no_winner))
+
+    -- Phase 5a finish: PreAllocate per HISM, then kick off the async
+    -- AddInstance worker. PreAllocateInstancesMemory tells the HISM to
+    -- grow its internal array once instead of on every AddInstance,
+    -- avoiding render-thread issues from concurrent reallocation.
+    local prealloc_hisms = 0
+    for hism, count in pairs(M._phase5_pending_per_hism) do
+        if hism and hism:IsValid() and count > 0 then
+            pcall(function() hism:PreAllocateInstancesMemory(count) end)
+            prealloc_hisms = prealloc_hisms + 1
+        end
+    end
+    -- Phase 5b disabled. AddInstance bursts (even chunked) crashed the
+    -- game 8+ minutes later with a 0x8 null-deref. Phase 8 replaces it
+    -- using actor.HISMController (per-actor lookup, no new instances).
+    if queued > 0 then
+        log(("[hism-init] Phase5a done: %d queued (Phase5b WORKER NOT STARTED — Phase 8 will handle losers via HISMController)"):format(
+            queued))
+        -- M._start_phase5b_worker()  -- DISABLED: see comment above
+    end
+
+    -- Phase 8: per-actor HISMController-based instance claim. For every
+    -- warded book actor, get its HISMController (the specific HISM it
+    -- renders through, exposed as actor.HISMController via reflection).
+    -- Scan that HISM for an unclaimed natural-Z instance and record it
+    -- as the actor's hide/show target.
+    --
+    -- This replaces Phases 3-7 entirely for hide ref discovery. Phase 3's
+    -- mark-and-scan via mgr:UpdateInstance only found 1158/1880 because
+    -- the manager has BookInfo-canonical collisions. Phases 6/7 (position
+    -- scans) found 0/1 matches because dupes are at separate floor
+    -- positions from canonicals AND actor.GetActorLocation is the
+    -- trigger location, not the HISM render position. Phase 8 sidesteps
+    -- both problems by reading the per-actor HISM reference directly.
+    local p8_claimed = 0
+    local p8_no_hismcontroller = 0
+    local p8_no_natural = 0
+    local p8_claimed_per_hism = {}  -- hism full name → set of claimed idx
+    local p8_diag_logged = 0
+    for i = 1, bn do
+        if is_warded_book[i] then
+            local key = book_keys[i]
+            if key then
+                local b = books[i]
+                if b and b:IsValid() then
+                    local hc
+                    pcall(function() hc = b.HISMController end)
+                    -- One-shot diagnostic on first 5 warded books: what
+                    -- IS HISMController? Class? Instance count?
+                    if p8_diag_logged < 5 and hc then
+                        p8_diag_logged = p8_diag_logged + 1
+                        local hc_class
+                        pcall(function() hc_class = hc:GetClass():GetFullName() end)
+                        local sm_data_check
+                        pcall(function() sm_data_check = hc.PerInstanceSMData end)
+                        local sn_check = -1
+                        if sm_data_check then
+                            pcall(function() sn_check = #sm_data_check end)
+                        end
+                        local hc_valid = hc:IsValid()
+                        log(("[Phase8-diag] book i=%d HISMController class=%s isvalid=%s PerInstanceSMData count=%s"):format(
+                            i, tostring(hc_class), tostring(hc_valid),
+                            tostring(sn_check)))
+                    end
+                    if hc and hc:IsValid() then
+                        local h_name
+                        pcall(function() h_name = hc:GetFullName() end)
+                        h_name = h_name or "?"
+                        local claimed_set = p8_claimed_per_hism[h_name] or {}
+                        p8_claimed_per_hism[h_name] = claimed_set
+                        local sm_data
+                        pcall(function() sm_data = hc.PerInstanceSMData end)
+                        if sm_data then
+                            local sn = 0
+                            pcall(function() sn = #sm_data end)
+                            local found_idx = nil
+                            local found_orig = nil
+                            for ji = 1, sn do
+                                if not claimed_set[ji] then
+                                    local entry = sm_data[ji]
+                                    if entry then
+                                        local t
+                                        pcall(function() t = entry.Transform end)
+                                        if t then
+                                            local wp
+                                            pcall(function() wp = t.WPlane end)
+                                            if wp then
+                                                local zv = wp.Z or 0
+                                                if zv > -500000.0 then
+                                                    -- Natural Z, claim it
+                                                    local xp, yp, zp
+                                                    pcall(function() xp = t.XPlane end)
+                                                    pcall(function() yp = t.YPlane end)
+                                                    pcall(function() zp = t.ZPlane end)
+                                                    if xp and yp and zp then
+                                                        local d = _decompose_matrix(xp, yp, zp, wp)
+                                                        if d then
+                                                            claimed_set[ji] = true
+                                                            found_idx = ji - 1
+                                                            found_orig = d
+                                                            break
+                                                        end
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                            if found_idx ~= nil then
+                                -- Overwrite any prior refs from Phase 4/5b
+                                M._book_hism_refs[key] = { hism = hc, idx = found_idx }
+                                M._book_captured_transforms[key] = found_orig
+                                p8_claimed = p8_claimed + 1
+                            else
+                                p8_no_natural = p8_no_natural + 1
+                            end
+                        end
+                    else
+                        p8_no_hismcontroller = p8_no_hismcontroller + 1
+                    end
+                end
+            end
+        end
+    end
+    log(("[hism-init] Phase8 complete: claimed=%d no_hismcontroller=%d no_natural=%d"):format(
+        p8_claimed, p8_no_hismcontroller, p8_no_natural))
 
     -- Group unmapped books by series so the player can verify which
     -- specific series may have "stuck" books and whether the same set
@@ -1313,6 +1700,357 @@ function M._initialize_hism_book_mapping()
     end
 
     M._hism_initialized = true
+end
+
+--- Phase 5b worker. Drains M._phase5_queue at 10 items per 100ms tick,
+--- AddInstance + immediate-teleport-to-deep-Z per loser. Marks each loser
+--- as hidden in M._books_we_have_hidden so future _hide_book_in_hism calls
+--- (and any re-flush) skip them.
+---
+--- Why chunked: synchronous AddInstance for 700+ losers in one tick
+--- crashed the render thread with EXCEPTION_ACCESS_VIOLATION at offset 0x8
+--- (likely accessing a not-yet-initialized render proxy member). Chunking
+--- 10/tick at 100ms gives the render thread time to process each batch.
+--- PreAllocateInstancesMemory in Phase 5a ensures no mid-batch
+--- reallocation that could invalidate proxy pointers.
+function M._start_phase5b_worker()
+    if M._phase5b_running then return end
+    if not M._phase5_queue or #M._phase5_queue == 0 then return end
+    M._phase5b_running = true
+    M._phase5b_added = 0
+    M._phase5b_failed = 0
+    local CHUNK = 10
+    local TICK_MS = 100
+    -- LoopAsync return semantics (matches _drain_visibility_queue):
+    --   true  → stop the loop (one-shot done)
+    --   false → keep running, schedule next tick
+    LoopAsync(TICK_MS, function()
+        local mod_actor = FindFirstOf("ModActor_C")
+        for _ = 1, CHUNK do
+            local item = table.remove(M._phase5_queue, 1)
+            if not item then
+                M._phase5b_running = false
+                log(("[hism-init] Phase5b complete: added=%d failed=%d"):format(
+                    M._phase5b_added, M._phase5b_failed))
+                -- Kick off Phase 6: find and hide pre-existing co-located
+                -- HISM instances that share natural position with a warded
+                -- BookInfo's canonical (the "dupe extras" that mgr:UpdateInstance
+                -- doesn't move because it only moves the one canonical per
+                -- BookInfo).
+                M._start_phase6_scan()
+                return true  -- queue drained, stop the loop
+            end
+            local new_idx = nil
+            pcall(function()
+                new_idx = item.hism:AddInstance(item.transform, true)
+            end)
+            if not new_idx and mod_actor and mod_actor:IsValid() then
+                pcall(function()
+                    new_idx = mod_actor:AddHISMInstance(item.hism, item.transform)
+                end)
+            end
+            if new_idx then
+                M._book_hism_refs[item.key] = {
+                    hism = item.hism,
+                    idx = new_idx,
+                }
+                M._book_captured_transforms[item.key] = item.transform
+                M._phase5b_added = M._phase5b_added + 1
+                -- Immediately teleport the new instance to deep-Z so it
+                -- never renders at the visible natural position.
+                local rot = item.transform.Rotation or {X=0, Y=0, Z=0, W=1}
+                local far_t = {
+                    Rotation    = rot,
+                    Translation = {X=0, Y=0, Z=-1000000.0},
+                    Scale3D     = {X=1, Y=1, Z=1},
+                }
+                if mod_actor and mod_actor:IsValid() then
+                    pcall(function()
+                        mod_actor:UpdateHISMInstance(item.hism, new_idx, far_t)
+                    end)
+                end
+                M._books_we_have_hidden[item.key] = true
+            else
+                M._phase5b_failed = M._phase5b_failed + 1
+            end
+            -- Periodic progress log so we can see the worker making
+            -- forward progress even on long drains.
+            if (M._phase5b_added + M._phase5b_failed) % 100 == 0 then
+                log(("[hism-init] Phase5b progress: %d added, %d failed, %d remaining"):format(
+                    M._phase5b_added, M._phase5b_failed, #M._phase5_queue))
+            end
+        end
+        return false  -- more items in queue, schedule next tick
+    end)
+end
+
+--- Phase 6: scan all HISM instances and hide any natural-position
+--- instance whose position matches a warded BookInfo's canonical natural
+--- position. This finds the pre-existing dupe instances that mgr:UpdateInstance
+--- (per-BookInfo) doesn't move because it only operates on the one canonical.
+---
+--- After Phase 5b's 708 AddInstance calls, ~30 books were still visible.
+--- AddInstance creates NEW HISM slots, but every warded BookInfo with
+--- multiple book actors has pre-existing "dupe extras" at natural floor
+--- positions that we never moved.
+---
+--- Strategy: for each warded BookInfo winner ref, get the canonical's
+--- captured natural position. Bucket those by integer X/Y/Z (10 unit
+--- granularity) for fast lookup. Then walk every HISM instance and check
+--- if it's near a warded canonical position. If yes, teleport to -1M.
+---
+--- Chunked over HISMs (one HISM per tick) to avoid render-thread burst.
+function M._start_phase6_scan()
+    if M._phase6_running then return end
+    M._phase6_running = true
+    -- Build position bucket: key = "x,y,z" rounded to 10 units. Lets us
+    -- ask "any warded canonical near this position?" in O(1).
+    local TOLERANCE = 5.0  -- units of position match
+    local function bucket_key(x, y, z)
+        return string.format("%d,%d,%d",
+            math.floor(x / 10 + 0.5),
+            math.floor(y / 10 + 0.5),
+            math.floor(z / 10 + 0.5))
+    end
+    local warded_positions = {}
+    local pos_count = 0
+    for key, _ in pairs(M._book_hism_refs) do
+        local orig = M._book_captured_transforms[key]
+        if orig and orig.Translation then
+            local tr = orig.Translation
+            local bk = bucket_key(tr.X or 0, tr.Y or 0, tr.Z or 0)
+            warded_positions[bk] = true
+            pos_count = pos_count + 1
+        end
+    end
+    log(("[hism-init] Phase6 start: %d warded positions bucketed, scanning HISMs..."):format(
+        pos_count))
+
+    -- Collect HISM list for chunked iteration
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then
+        log("[hism-init] Phase6: no BP_HISM_Manager_C, abort")
+        M._phase6_running = false
+        return
+    end
+    local hism_array
+    pcall(function() hism_array = mgr.HISMArray end)
+    if not hism_array then
+        M._phase6_running = false
+        return
+    end
+    local hn = 0; pcall(function() hn = #hism_array end)
+
+    M._phase6_total_hidden = 0
+    M._phase6_hism_cursor = 1
+    LoopAsync(50, function()
+        local mod_actor = FindFirstOf("ModActor_C")
+        -- Process up to 5 HISMs per tick
+        local last = math.min(M._phase6_hism_cursor + 4, hn)
+        for hi = M._phase6_hism_cursor, last do
+            local h = hism_array[hi]
+            if h and h:IsValid() then
+                local sm_data; pcall(function() sm_data = h.PerInstanceSMData end)
+                if sm_data then
+                    local sn = 0; pcall(function() sn = #sm_data end)
+                    for ji = 1, sn do
+                        local entry = sm_data[ji]
+                        if entry then
+                            local t; pcall(function() t = entry.Transform end)
+                            if t then
+                                local wp; pcall(function() wp = t.WPlane end)
+                                if wp then
+                                    local zv = wp.Z or 0
+                                    -- Skip instances already at deep Z
+                                    -- (Phase 3 canonicals + Phase 5b new
+                                    -- slots are all at -1M range).
+                                    if zv > -500000.0 then
+                                        local xv = wp.X or 0
+                                        local yv = wp.Y or 0
+                                        local bk = bucket_key(xv, yv, zv)
+                                        if warded_positions[bk] then
+                                            -- Match: this is a dupe of a
+                                            -- warded BookInfo. Hide it.
+                                            local far_t = {
+                                                Rotation = {X=0, Y=0, Z=0, W=1},
+                                                Translation = {X=0, Y=0, Z=-1000000.0},
+                                                Scale3D = {X=1, Y=1, Z=1},
+                                            }
+                                            if mod_actor and mod_actor:IsValid() then
+                                                pcall(function()
+                                                    mod_actor:UpdateHISMInstance(h, ji - 1, far_t)
+                                                end)
+                                                M._phase6_total_hidden = M._phase6_total_hidden + 1
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        M._phase6_hism_cursor = last + 1
+        if M._phase6_hism_cursor > hn then
+            log(("[hism-init] Phase6 complete: hidden %d co-located dupe instance(s)"):format(
+                M._phase6_total_hidden))
+            M._phase6_running = false
+            -- Phase 7: per-actor scan for dupes at actor-location positions
+            -- (catches dupes that Phase 6 missed because they're at their
+            -- own floor position, not co-located with the canonical).
+            M._start_phase7_scan()
+            return true  -- stop loop
+        end
+        return false  -- continue
+    end)
+end
+
+--- Phase 7: per-actor HISM-instance scan. For each warded book actor,
+--- get its world location and find an HISM instance at that exact spot.
+--- Teleport found instances to -1M. This catches the dupe extras that
+--- Phase 6's "co-located with canonical natural" scan missed, because
+--- dupes are at their OWN floor positions (different from canonical).
+---
+--- Strategy:
+--- 1. Build a spatial index of every HISM instance at natural Z, keyed
+---    by integer-bucketed position. Buckets at 10-unit granularity.
+--- 2. For each warded book actor, bucket its location and look up the
+---    matching HISM instance(s). Teleport the FIRST one found to -1M.
+---    (If multiple, we hide only one per actor — matches the 1:1
+---    actor:visible-instance assumption.)
+--- 3. Skip actors whose HISM ref is already known (winners) — those
+---    are already hidden by Pass 2.
+--- 4. Chunked over actors (50 per tick at 50ms) to avoid burst.
+function M._start_phase7_scan()
+    if M._phase7_running then return end
+    M._phase7_running = true
+
+    -- Bucket helper. Coarse enough to absorb float jitter, fine enough
+    -- to distinguish neighbouring books.
+    local function bucket_key(x, y, z)
+        return string.format("%d,%d,%d",
+            math.floor((x or 0) / 10 + 0.5),
+            math.floor((y or 0) / 10 + 0.5),
+            math.floor((z or 0) / 10 + 0.5))
+    end
+
+    -- Step 1: spatial index of natural-Z instances.
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then
+        log("[hism-init] Phase7: no BP_HISM_Manager_C, abort")
+        M._phase7_running = false
+        return
+    end
+    local hism_array
+    pcall(function() hism_array = mgr.HISMArray end)
+    if not hism_array then
+        M._phase7_running = false
+        return
+    end
+    local hn = 0; pcall(function() hn = #hism_array end)
+
+    local pos_index = {}  -- bucket_key → list of {hism, idx}
+    local indexed = 0
+    for hi = 1, hn do
+        local h = hism_array[hi]
+        if h and h:IsValid() then
+            local sm_data; pcall(function() sm_data = h.PerInstanceSMData end)
+            if sm_data then
+                local sn = 0; pcall(function() sn = #sm_data end)
+                for ji = 1, sn do
+                    local entry = sm_data[ji]
+                    if entry then
+                        local t; pcall(function() t = entry.Transform end)
+                        if t then
+                            local wp; pcall(function() wp = t.WPlane end)
+                            if wp then
+                                local zv = wp.Z or 0
+                                if zv > -500000.0 then
+                                    local bk = bucket_key(wp.X, wp.Y, zv)
+                                    pos_index[bk] = pos_index[bk] or {}
+                                    table.insert(pos_index[bk], {
+                                        hism = h, idx = ji - 1,
+                                    })
+                                    indexed = indexed + 1
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    log(("[hism-init] Phase7 index built: %d natural-Z instances bucketed"):format(indexed))
+
+    -- Step 2: iterate warded book actors, look up instance by position.
+    local books = FindAllOf("BP_GrabbingBook_C")
+    if not books then
+        M._phase7_running = false
+        return
+    end
+    local bn = 0; pcall(function() bn = #books end)
+    local only_shelfable = M._slot_data
+        and M._slot_data.only_unward_shelfable_books == 1
+    local unwarded_set = M._compute_unwarded_set(only_shelfable)
+
+    M._phase7_hidden = 0
+    M._phase7_no_match = 0
+    M._phase7_cursor = 1
+    local CHUNK = 50
+    LoopAsync(50, function()
+        local mod_actor = FindFirstOf("ModActor_C")
+        local last = math.min(M._phase7_cursor + CHUNK - 1, bn)
+        for i = M._phase7_cursor, last do
+            local b = books[i]
+            if b and b:IsValid() then
+                local asset_idx = _book_valid_asset_idx(b)
+                if asset_idx ~= nil then
+                    local series_name = M._asset_to_series[asset_idx]
+                    local should_unward = series_name and unwarded_set[series_name]
+                    if not should_unward then
+                        -- Warded book: look up its position in the index
+                        local x, y, z = 0, 0, 0
+                        pcall(function()
+                            local loc = b:K2_GetActorLocation()
+                            if loc then
+                                x = loc.X or 0
+                                y = loc.Y or 0
+                                z = loc.Z or 0
+                            end
+                        end)
+                        local bk = bucket_key(x, y, z)
+                        local candidates = pos_index[bk]
+                        if candidates and #candidates > 0 then
+                            -- Pop first candidate and hide it
+                            local cand = table.remove(candidates, 1)
+                            local far_t = {
+                                Rotation = {X=0, Y=0, Z=0, W=1},
+                                Translation = {X=0, Y=0, Z=-1000000.0},
+                                Scale3D = {X=1, Y=1, Z=1},
+                            }
+                            if mod_actor and mod_actor:IsValid() then
+                                pcall(function()
+                                    mod_actor:UpdateHISMInstance(cand.hism, cand.idx, far_t)
+                                end)
+                                M._phase7_hidden = M._phase7_hidden + 1
+                            end
+                        else
+                            M._phase7_no_match = M._phase7_no_match + 1
+                        end
+                    end
+                end
+            end
+        end
+        M._phase7_cursor = last + 1
+        if M._phase7_cursor > bn then
+            log(("[hism-init] Phase7 complete: hidden=%d no_match=%d"):format(
+                M._phase7_hidden, M._phase7_no_match))
+            M._phase7_running = false
+            return true
+        end
+        return false
+    end)
 end
 
 --- Hide a book's HISM instance. Uses per-instance UpdateHISMInstance
@@ -1451,11 +2189,45 @@ function M._compute_unwarded_set(only_shelfable)
     return unwarded
 end
 
+-- B7 chunked-flush tuning.
+-- Pass 1 walks ~3000 BP_GrabbingBook actors toggling SetActorHiddenInGame
+-- + SetActorEnableCollision. All-in-one tick blocks the AP poll loop
+-- long enough to drop the server connection on big item bursts.
+--
+-- BOOK_APPLY_CHUNK_SIZE       — books per tick (300 ≈ 10 chunks for a
+--                                typical full flush).
+-- BOOK_APPLY_CHUNK_DELAY_MS   — yield between chunks so the LoopAsync
+--                                poll thread can pump c:poll() once.
+--                                50ms < the 100-150ms AP heartbeat.
+-- Total wall-clock ~10 chunks * 50ms = ~500ms, comparable to the
+-- previous synchronous walk but split across 10 non-blocking ticks.
+local BOOK_APPLY_CHUNK_SIZE     = 300
+local BOOK_APPLY_CHUNK_DELAY_MS = 50
+
 --- Walk every BP_GrabbingBook_C in the level and ward/unward based on
 --- whether its series is in the current unwarded set. Section is NOT part
 --- of the per-book gate — section unlocks affect bookcase/shelf visibility
 --- (phase 2).
+---
+--- Pass 1 is chunked (see BOOK_APPLY_CHUNK_SIZE) so the LoopAsync poll
+--- thread can pump c:poll() between chunks, keeping the AP socket alive
+--- during big item-application bursts. The post-pass finalizer (Pass 2
+--- in hidden mode, diff logging, state summary) runs after the last
+--- chunk completes.
+---
+--- Re-entry: if a second flush is requested while one is in progress,
+--- M._flush_pending is set; the finalizer self-re-fires once done so
+--- the latest state is captured. Concurrent flushes are NOT supported
+--- (no benefit + harder reasoning about state consistency).
 function M._apply_books_to_world()
+    -- Re-entry guard. If a flush is already running, just mark a
+    -- follow-up and return — the in-flight flush's finalizer will
+    -- pick it up.
+    if M._flush_in_progress then
+        M._flush_pending = true
+        return
+    end
+
     local books = FindAllOf("BP_GrabbingBook_C")
     if not books then
         log("(FindAllOf returned nil; no books to apply)")
@@ -1468,12 +2240,13 @@ function M._apply_books_to_world()
         return
     end
 
-    local hide_mesh = M._slot_data
-        and M._slot_data.book_visibility == "hidden"
+    local hide_mesh = M._slot_data and M._slot_data.book_visibility == "hidden"
 
     -- Compute the unwarded set once per apply call. The rules (v1.0.2
     -- legacy vs v1.0.3 unified) are encapsulated in _compute_unwarded_set;
-    -- per-book code just does a table lookup.
+    -- per-book code just does a table lookup. Snapshot stays consistent
+    -- across all chunks of THIS flush; if state changes mid-flight, the
+    -- _flush_pending re-fire path captures it next.
     local only_shelfable = M._slot_data
         and M._slot_data.only_unward_shelfable_books == 1
     local unwarded_set = M._compute_unwarded_set(only_shelfable)
@@ -1490,12 +2263,18 @@ function M._apply_books_to_world()
         for i = 1, math.min(20, n) do
             local b = books[i]
             if b and b:IsValid() then
-                local idx
-                pcall(function() idx = b.ItemInfo.AssetIdx end)
-                if idx and idx > 0 and not sample[idx] then
-                    sample[idx] = true
-                    distinct = distinct + 1
-                    if distinct >= 2 then break end
+                -- Split ItemInfo access (see detect_completed_rows for
+                -- the full rationale). Same UE4SS reflection AV class.
+                local item_info
+                pcall(function() item_info = b.ItemInfo end)
+                if item_info and item_info:IsValid() then
+                    local idx
+                    pcall(function() idx = item_info.AssetIdx end)
+                    if idx and idx > 0 and not sample[idx] then
+                        sample[idx] = true
+                        distinct = distinct + 1
+                        if distinct >= 2 then break end
+                    end
                 end
             end
         end
@@ -1512,90 +2291,293 @@ function M._apply_books_to_world()
         M._initialize_hism_book_mapping()
     end
 
-    local warded, unwarded, skipped = 0, 0, 0
+    -- We're committed to a flush now. Take the in-progress lock and
+    -- start the chunked Pass-1 driver.
+    M._flush_in_progress = true
+    local stats = { warded = 0, unwarded = 0, skipped = 0, gate_skipped_unwards = 0 }
+    local cursor = 1
 
-    -- Pass 1 (fast, both modes): actor.bHidden + collision toggles in one
-    -- tight loop across all books. This stops pickup on every soon-to-be-
-    -- warded book before the slow Pass 2 visual hide drains — so the
-    -- player can't grab a doomed book while warding is still animating.
-    -- Each call is idempotent (UE no-ops if the flag is already correct);
-    -- M._books_warded tracks state to keep redundant calls cheap on
-    -- subsequent applies.
-    for i = 1, n do
-        local book = books[i]
-        if book and book:IsValid() then
-            -- Skip uninitialized books (orphan actors from the
-            -- OpenLevel-on-connect reload have default BookInfo and
-            -- trying to ward them via mgr.UpdateInstance corrupts HISM
-            -- state). _book_valid_asset_idx returns nil for orphans
-            -- but 0 for the real Monsterology series (section 1A).
-            local asset_idx = _book_valid_asset_idx(book)
-            if asset_idx ~= nil then
-                local series_name = M._asset_to_series[asset_idx]
-                -- Single-table lookup encapsulates v1.0.2-legacy and
-                -- v1.0.3-unified rules. See _compute_unwarded_set above.
-                local should_unward = series_name and unwarded_set[series_name]
-                local key = book:GetFullName()
-                local is_warded = M._books_warded[key] or false
-                local ok = pcall(function()
-                    if should_unward then
-                        if is_warded then
-                            book:SetActorHiddenInGame(false)
-                            book:SetActorEnableCollision(true)
-                            M._books_warded[key] = nil
-                        end
-                    else
-                        if not is_warded then
-                            book:SetActorHiddenInGame(true)
-                            book:SetActorEnableCollision(false)
-                            M._books_warded[key] = true
-                        end
-                    end
-                end)
-                if ok then
-                    if should_unward then unwarded = unwarded + 1
-                    else warded = warded + 1 end
-                else
-                    skipped = skipped + 1
+    -- v1.1.0 (B10 book material swap): cache ModActor once per flush so
+    -- we don't FindFirstOf for every one of ~3000 books. Captured by the
+    -- _apply_one_book closure below. May be nil if the pre-v1.1.0 pak is
+    -- installed (no ModActor exposed) or if pak failed to load — in that
+    -- case the legacy SetActorHiddenInGame approach is the only ward.
+    local mod_actor = FindFirstOf("ModActor_C")
+    if not (mod_actor and mod_actor:IsValid()) then mod_actor = nil end
+
+    -- v1.1.0: cache the BP_HISM_Manager for the new UpdateWPO call. WPO
+    -- displaces book vertices via material parameter — invisible at deep
+    -- Z without touching bHidden (which the game toggles view-dependently).
+    local mgr_for_wpo = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr_for_wpo and mgr_for_wpo:IsValid()) then mgr_for_wpo = nil end
+
+    -- v1.1.0: cache any valid BP_BookCase_C so we can call
+    -- book:MoveToBookCase(deep_transform, any_case) — the function needs
+    -- a non-null AttchedActor and any valid bookcase serves as the
+    -- attachment target. Books animate to the deep-Z target and attach
+    -- to the bookcase actor, hopefully keeping them out of view.
+    local any_case
+    do
+        local cases = FindAllOf("BP_BookCase_C")
+        if cases then
+            local n = 0; pcall(function() n = #cases end)
+            for i = 1, n do
+                local c = cases[i]
+                if c and c:IsValid() then
+                    any_case = c
+                    break
+                end
+            end
+        end
+    end
+
+    -- One-shot diagnostic: introspect the ModActor for the new pak's
+    -- ModActor BP function probe. Logs which expected functions are
+    -- present so we can distinguish "pak loaded but functions missing"
+    -- (cook issue) from "pak not loaded" (install issue) from "functions
+    -- present but spawn fails at call time" (BP graph issue).
+    if mod_actor and not M._diag_pak_probed then
+        M._diag_pak_probed = true
+        local found = {
+            SpawnWardCover          = false,
+            SpawnWardCover_Cabinet  = false,
+            SpawnWardCover_Small    = false,
+            SpawnWardCover_Smallest = false,
+            DespawnWardCover        = false,
+        }
+        for fname, _ in pairs(found) do
+            local probe_ok = pcall(function()
+                local fn = mod_actor[fname]
+                if fn ~= nil then found[fname] = true end
+            end)
+            if not probe_ok then
+                found[fname] = false
+            end
+        end
+        log(("[ward-diag] ModActor function probe: SpawnWardCover=%s SpawnWardCover_Cabinet=%s SpawnWardCover_Small=%s SpawnWardCover_Smallest=%s DespawnWardCover=%s"):format(
+            tostring(found.SpawnWardCover),
+            tostring(found.SpawnWardCover_Cabinet),
+            tostring(found.SpawnWardCover_Small),
+            tostring(found.SpawnWardCover_Smallest),
+            tostring(found.DespawnWardCover)))
+    elseif not mod_actor and not M._diag_no_modactor_logged then
+        M._diag_no_modactor_logged = true
+        log("[ward-diag] No ModActor_C found in world — cover features disabled. Pak missing or not yet loaded?")
+    end
+
+    --- Process a single book at index i. Extracted so the chunk loop
+    --- body stays readable.
+    local function _apply_one_book(book)
+        if not (book and book:IsValid()) then
+            stats.skipped = stats.skipped + 1
+            return
+        end
+        -- Skip uninitialized books (orphan actors from the
+        -- OpenLevel-on-connect reload have default BookInfo and
+        -- trying to ward them via mgr.UpdateInstance corrupts HISM
+        -- state). _book_valid_asset_idx returns nil for orphans
+        -- but 0 for the real Monsterology series (section 1A).
+        local asset_idx = _book_valid_asset_idx(book)
+        if asset_idx == nil then
+            stats.skipped = stats.skipped + 1
+            return
+        end
+        local series_name = M._asset_to_series[asset_idx]
+        -- Single-table lookup encapsulates v1.0.2-legacy and
+        -- v1.0.3-unified rules. See _compute_unwarded_set above.
+        local should_unward = series_name and unwarded_set[series_name]
+        local key = book:GetFullName()
+        local is_warded = M._books_warded[key] or false
+        local ok = pcall(function()
+            if should_unward then
+                -- Unconditional unward (no `if is_warded` gate). UE
+                -- SetActorHiddenInGame / SetActorEnableCollision are
+                -- idempotent. The previous gate left books un-pickable
+                -- ("last 1-2 of a series stayed stuck") in two cases:
+                --   1. Book had AssetIdx=0 at first apply → skipped,
+                --      no tracker entry; later when AssetIdx populated,
+                --      gate kept us from unwarding (is_warded=false).
+                --   2. Actor destroyed + respawned by lazy streaming;
+                --      new GetFullName key → no tracker entry.
+                -- gate_skipped_unwards counts cases the previous gate
+                -- would have skipped (high on first flush, near-zero
+                -- in steady state = real drift catches).
+                if not is_warded then
+                    stats.gate_skipped_unwards = stats.gate_skipped_unwards + 1
+                end
+                book:SetActorHiddenInGame(false)
+                book:SetActorEnableCollision(true)
+                M._books_warded[key] = nil
+            else
+                if not is_warded then
+                    book:SetActorHiddenInGame(true)
+                    book:SetActorEnableCollision(false)
+                    M._books_warded[key] = true
+                    -- Per-book cover spawning was explored but visually
+                    -- unsatisfactory (covers cluttered the scene,
+                    -- didn't hide books in stacks). Books remain
+                    -- visible-but-non-interactable.
+                end
+            end
+        end)
+        if ok then
+            if should_unward then stats.unwarded = stats.unwarded + 1
+            else stats.warded = stats.warded + 1 end
+        else
+            stats.skipped = stats.skipped + 1
+        end
+    end
+
+    --- Finalizer: runs after the last Pass-1 chunk. Handles Pass 2
+    --- (hidden mode only) inline (it's a much cheaper walk — just
+    --- HISM teleport calls that queue to the existing deferred
+    --- worker), then diff logging, state summary, and the
+    --- in-progress/pending bookkeeping.
+    --- Pass 2 single-book worker: HISM teleport + deferred tree-walk
+    --- queue. Same logic as the legacy synchronous Pass 2 loop, just
+    --- factored out so the chunker can call it one book at a time.
+    local function _apply_pass2_one_book(book)
+        if not (book and book:IsValid()) then return end
+        local asset_idx = _book_valid_asset_idx(book)
+        if asset_idx == nil then return end
+        local series_name = M._asset_to_series[asset_idx]
+        -- Same precomputed unwarded set as Pass 1.
+        local should_unward = series_name and unwarded_set[series_name]
+        local key = book:GetFullName()
+        local is_hidden_by_us = M._books_we_have_hidden[key] or false
+        pcall(function()
+            if should_unward then
+                if is_hidden_by_us then
+                    M._show_book_in_hism(book)
+                    M._queue_book_visibility(book, true)
                 end
             else
-                skipped = skipped + 1
+                if not is_hidden_by_us then
+                    M._hide_book_in_hism(book)
+                    M._queue_book_visibility(book, false)
+                end
             end
+        end)
+    end
+
+    --- After all Pass 2 chunks have run (or immediately, if Pass 2 was
+    --- skipped because hide_mesh=false), this finalises diff logging
+    --- and clears the in-flight flag.
+    local function _finalize_after_pass2()
+        M._finalize_apply_books(books, n, stats)
+        M._flush_in_progress = false
+
+        -- Re-flush if a request landed mid-flight. Each re-flush
+        -- clears _flush_pending first, so this won't loop forever.
+        if M._flush_pending then
+            M._flush_pending = false
+            M.flush_apply()
         end
     end
 
-    -- Pass 2 (slow, hidden mode only): HISM teleport + deferred tree-walk
-    -- queue. Skipped entirely in stacked mode — Pass 1 is sufficient there.
-    -- Idempotency tracked separately via M._books_we_have_hidden, which
-    -- the _hide_book_in_hism / _show_book_in_hism helpers maintain.
-    if hide_mesh then
-        for i = 1, n do
-            local book = books[i]
-            if book and book:IsValid() then
-                local asset_idx = _book_valid_asset_idx(book)
-                if asset_idx ~= nil then
-                    local series_name = M._asset_to_series[asset_idx]
-                    -- Same precomputed unwarded set as Pass 1.
-                    local should_unward = series_name and unwarded_set[series_name]
-                    local key = book:GetFullName()
-                    local is_hidden_by_us = M._books_we_have_hidden[key] or false
-                    pcall(function()
-                        if should_unward then
-                            if is_hidden_by_us then
-                                M._show_book_in_hism(book)
-                                M._queue_book_visibility(book, true)
-                            end
-                        else
-                            if not is_hidden_by_us then
-                                M._hide_book_in_hism(book)
-                                M._queue_book_visibility(book, false)
-                            end
-                        end
-                    end)
-                end
-            end
+    --- Pass 2 chunker. Same chunk size + delay as Pass 1 so the
+    --- LoopAsync poll thread can pump c:poll() between chunks and so
+    --- mass UpdateHISMInstance calls don't burst the render thread —
+    --- a single-tick Pass 2 with 1866 UpdateHISMInstance calls plus
+    --- newly-added HISM slots crashed the game (offset-8 null-deref
+    --- in shipping binary, likely a not-yet-registered HISM slot).
+    local pass2_cursor = 1
+    local function _process_pass2_chunk()
+        local chunk_end = math.min(pass2_cursor + BOOK_APPLY_CHUNK_SIZE - 1, n)
+        for i = pass2_cursor, chunk_end do
+            _apply_pass2_one_book(books[i])
+        end
+        pass2_cursor = chunk_end + 1
+        if pass2_cursor <= n then
+            LoopAsync(BOOK_APPLY_CHUNK_DELAY_MS, function()
+                _process_pass2_chunk()
+                return true  -- one-shot
+            end)
+        else
+            _finalize_after_pass2()
         end
     end
+
+    local function _finalize()
+        -- Pass 2 (HISM teleport via _hide_book_in_hism) DISABLED. Its
+        -- mass UpdateHISMInstance calls cause 0x8 null-deref crashes
+        -- on the render thread seconds after the burst. HISM init's
+        -- Phase 3 markers already moved 1158 canonicals to -1M and
+        -- Pass 1's BookMatInst opacity hides the rest; Pass 2 redundant.
+        _finalize_after_pass2()
+    end
+
+    --- One chunk of Pass 1. Schedules itself for the next tick via
+    --- LoopAsync(one-shot) until the cursor runs past `n`, at which
+    --- point it calls the finalizer instead of rescheduling.
+    local function _process_chunk()
+        local chunk_end = math.min(cursor + BOOK_APPLY_CHUNK_SIZE - 1, n)
+        for i = cursor, chunk_end do
+            _apply_one_book(books[i])
+        end
+        cursor = chunk_end + 1
+        if cursor <= n then
+            LoopAsync(BOOK_APPLY_CHUNK_DELAY_MS, function()
+                _process_chunk()
+                return true  -- one-shot
+            end)
+        else
+            _finalize()
+        end
+    end
+
+    _process_chunk()
+end
+
+-- Material-opacity worker. Drains M._material_update_queue at a slow
+-- rate to avoid render-thread overload when many books need per-MID
+-- updates.
+--
+-- Currently no producer pushes to this queue — kept as scaffolding
+-- for a future "pak-author-time hiding" approach: ship a pak where
+-- BookMatInst.Opacity defaults to 0 (books born invisible), then this
+-- worker reveals books for unwarded series by setting Opacity = 1.
+-- That flips the work direction and dodges the render-thread overload,
+-- init race, and false-positive validation issues we hit trying to
+-- runtime-hide already-visible books. See ROADMAP.md.
+function M._start_material_worker()
+    if M._material_worker_running then return end
+    if #M._material_update_queue == 0 then return end
+    M._material_worker_running = true
+    local CHUNK = 5
+    M._material_worker_processed = 0
+    LoopAsync(200, function()
+        for _ = 1, CHUNK do
+            local item = table.remove(M._material_update_queue, 1)
+            if not item then
+                M._material_worker_running = false
+                log(("[material-worker] complete: processed %d items"):format(
+                    M._material_worker_processed))
+                return true  -- queue drained, stop loop
+            end
+            local b = item.book
+            if b and b:IsValid() then
+                pcall(function()
+                    local mat = b.BookMatInst
+                    if mat and mat:IsValid() then
+                        mat:SetScalarParameterValue("Opacity", item.opacity)
+                    end
+                end)
+                M._material_worker_processed = M._material_worker_processed + 1
+            end
+        end
+        -- Periodic progress log every ~5 seconds
+        if M._material_worker_processed % 125 == 0 then
+            log(("[material-worker] progress: %d processed, %d remaining"):format(
+                M._material_worker_processed, #M._material_update_queue))
+        end
+        return false  -- continue
+    end)
+end
+
+--- Pass-1 finalizer: diff log, state summary.
+function M._finalize_apply_books(books, n, stats)
+    M._start_material_worker()
 
     -- Diff: which series were newly unwarded this apply? Diff
     -- _series_unlocked against the last applied snapshot. Logs per-series
@@ -1667,24 +2649,23 @@ function M._apply_books_to_world()
     end
     local series_n = 0
     for _ in pairs(M._series_unlocked) do series_n = series_n + 1 end
-    log(("State: sections-active=%d series=%d | applied: unwarded=%d warded=%d skipped=%d"):format(
-        section_n, series_n, unwarded, warded, skipped))
+    log(("State: sections-active=%d series=%d | applied: unwarded=%d warded=%d skipped=%d gate-skipped-unwards=%d"):format(
+        section_n, series_n, stats.unwarded, stats.warded, stats.skipped, stats.gate_skipped_unwards))
 end
 
 -- ============================================================================
 -- Apply: Bookcases (Phase 2a — section-gated visibility)
 -- ============================================================================
 
--- Each section has exactly one BP_M01_CabinetLabel_01_C in the world. The
--- label's `Label Number` (int32) ordinally maps to a section: 1..14 → 1A..1N,
--- 21..37 → 2A..2Q (the gap 15-20 reflects unused slots from level design).
--- Each label's `CountBookCase` (TArray<AActor>) holds the actors that fill
--- that section — sometimes direct BookCases, sometimes wrapper actors
--- (BP_M01_PillarCabinet_01_01_C, BP_M01_Cabinet_01_C).
+-- Each section has exactly one BP_M01_CabinetLabel_01_C. Its `Label Number`
+-- (int32) maps ordinally to a section: 1..14 → 1A..1N, 21..37 → 2A..2Q
+-- (gap 15-20 = unused). `CountBookCase` (TArray<AActor>) holds either
+-- direct BookCases or wrapper actors (BP_M01_PillarCabinet_01_01_C,
+-- BP_M01_Cabinet_01_C).
 --
--- This is the authoritative mapping. CDI[1]-based derivation was unreliable
--- because data.py's series→section assignments are wrong for ~10 sections
--- (series mistakenly grouped under 2E/1B that actually live in 1C/1D/1G/1H/
+-- This is the authoritative mapping. CDI[1]-based derivation was
+-- unreliable — data.py's series→section assignments are wrong for ~10
+-- sections (series grouped under 2E/1B actually live in 1C/1D/1G/1H/
 -- 2C/2D/2G/2H/2K/2L per the in-game labels).
 local function _label_num_to_section(n)
     if n == nil then return nil end
@@ -1826,15 +2807,13 @@ function M._index_bookcases(silent)
         end
     end
 
-    -- Stray-case sweep: every BookCase actor in the level that wasn't
-    -- added via a CabinetLabel walk is treated as a "stray" — a level-
-    -- design artifact (e.g., a case tucked into a wall corner) that
-    -- isn't part of any AP section. The game's placement system can
-    -- still find these by aim angle and accept books on them, but the
-    -- player can't navigate back to retrieve those books — softlock.
-    -- We collect them here and keep them permanently hidden + collision-
-    -- off via _apply_bookcases_to_world. _case_key matches the add_case
-    -- key so already-indexed cases aren't re-classified as strays.
+    -- Stray-case sweep: any BookCase actor not added via a CabinetLabel
+    -- walk is a "stray" — a level-design artifact (case tucked into a
+    -- wall corner) not part of any AP section. The placement system
+    -- can still find these by aim angle and accept books there, but
+    -- the player can't reach them — softlock. Kept permanently hidden
+    -- + collision-off by _apply_bookcases_to_world. _case_key matches
+    -- add_case's key so indexed cases aren't reclassified.
     M._stray_cases = {}
     local all_cases = FindAllOf("BookCaseBase")
     if not all_cases or (function() local nn = 0; pcall(function() nn = #all_cases end); return nn end)() == 0 then
@@ -1989,6 +2968,51 @@ local function _case_accepted_assets(case, sid)
     return out
 end
 
+-- Fence cover variants. Each warded case gets a chain-link fence in front,
+-- but case sizes differ — bookcases come in standard, small (5-vol case
+-- of a mixed-volume section), smallest (the even-narrower outer cases
+-- of 2O), and cabinet (tall alcove-wrapped single-case sections that
+-- need wider collision so books can't be physics-thrown through the
+-- chain-link sides). Four Blueprint variants:
+--   standard — BP_WardCover (existing): 10-vol case or uniform section
+--   cabinet  — BP_WardCover_Cabinet: 1C/1D/1G/1H and 2C/2D/2G/2H/2K/2L
+--   small    — BP_WardCover_Small: 5-vol case of a mixed section
+--   smallest — BP_WardCover_Smallest: 2O outer cases (narrower than small)
+--
+-- FENCE_PER_CASE maps section → { [case_idx] = variant_name }. Cases not
+-- listed (or any case in a section not in the table) default to standard
+-- unless the section is in FENCE_CABINET_SECTIONS. Note the case_idx
+-- order is the game's CabinetLabel.CountBookCase order, which doesn't
+-- always match left-to-right physical layout — verify visually after
+-- changes.
+local FENCE_CABINET_SECTIONS = {
+    ["1C"] = true, ["1D"] = true, ["1G"] = true, ["1H"] = true,
+    ["2C"] = true, ["2D"] = true, ["2G"] = true,
+    ["2H"] = true, ["2K"] = true, ["2L"] = true,
+}
+local FENCE_PER_CASE = {
+    ["1M"] = { [1] = "small",    [2] = "small" },               -- 5 cases: 1-2 small, 3-5 standard
+    ["1N"] = { [1] = "small",    [2] = "small" },               -- 5 cases: 1-2 small, 3-5 standard
+    ["2M"] = { [1] = "small" },                                 -- 2 cases: 1 small, 2 standard
+    ["2N"] = { [1] = "small" },                                 -- 2 cases: 1 small, 2 standard
+    ["2O"] = { [1] = "smallest", [2] = "smallest" },            -- 3 cases: 1-2 smallest (outer L+R), 3 standard (middle)
+    ["2P"] = { [1] = "small" },                                 -- 2 cases: 1 small, 2 standard
+    ["2Q"] = { [1] = "small" },                                 -- 2 cases: 1 small, 2 standard
+}
+local FENCE_BP_FUNC = {
+    standard = "SpawnWardCover",
+    cabinet  = "SpawnWardCover_Cabinet",
+    small    = "SpawnWardCover_Small",
+    smallest = "SpawnWardCover_Smallest",
+}
+
+local function _fence_variant_for_case(section_id, case_idx)
+    if FENCE_CABINET_SECTIONS[section_id] then return "cabinet" end
+    local per_case = FENCE_PER_CASE[section_id]
+    if per_case and per_case[case_idx] then return per_case[case_idx] end
+    return "standard"
+end
+
 --- Per-section visibility: cases sorted by (vol_tier asc, BookOrderIdx asc),
 --- with visible_count = min(shelves_open[section], n_cases).
 --- The first `visible_count` cases of each section are shown, the rest hidden.
@@ -2021,20 +3045,45 @@ function M._apply_bookcases_to_world()
         for i, case in ipairs(sorted) do
             local visible = i <= visible_count
             if case and case:IsValid() then
+                local case_key
+                pcall(function() case_key = case:GetFullName() end)
+
+                -- Drift probe (B10 diagnostic). Logs when a case's
+                -- bHidden no longer matches what we last set — likely
+                -- the game's BP tick reverting our flag.
+                if case_key then
+                    local last_applied = M._case_last_applied_hidden[case_key]
+                    if last_applied ~= nil then
+                        local actual_hidden
+                        pcall(function() actual_hidden = case.bHidden end)
+                        if actual_hidden ~= nil and actual_hidden ~= last_applied then
+                            log(("[bookcase-drift] section=%s case_idx=%d last_applied=%s actual=%s"):format(
+                                section_id, i, tostring(last_applied),
+                                tostring(actual_hidden)))
+                        end
+                    end
+                end
+
                 local ok = pcall(function()
-                    case:SetActorHiddenInGame(not visible)
+                    -- Warded cases: keep visible (so the fence cover
+                    -- looks like a gate over real shelving) with
+                    -- collision OFF so the placement raycast doesn't
+                    -- find PreviewBookLocation through the chain-link
+                    -- holes. The fence's own collision (sized per
+                    -- variant — see fence dispatch below) blocks the
+                    -- player from walking up to the case and from
+                    -- physics-throwing books past the gate.
+                    -- Unlocked cases: visible + collision on for normal
+                    -- placement.
+                    case:SetActorHiddenInGame(false)
                     case:SetActorEnableCollision(visible)
-                    -- Tree-walk child components too. SetActorHiddenInGame
-                    -- doesn't always propagate (same issue as BP_GrabbingBook).
-                    -- BP_BookCase has UStaticMeshComponent children (StaticMesh,
-                    -- PreviewBookLocation) that can stay in the previous state
-                    -- otherwise. Symmetric: hide-children when hiding the
-                    -- case, show-children when revealing it (a shelf unlock
-                    -- that flips a case from hidden->visible needs the show
-                    -- pass or the case stays invisible despite the actor flag).
+                    -- Tree-walk child components to ensure visibility
+                    -- propagates. BP_BookCase children
+                    -- (StaticMesh, PreviewBookLocation) don't always
+                    -- inherit the actor flag.
                     local root = case:K2_GetRootComponent()
                     if root and root:IsValid() then
-                        _walk_set_visibility(root, visible)
+                        _walk_set_visibility(root, true)
                     end
                     local comps
                     pcall(function() comps = case.BlueprintCreatedComponents end)
@@ -2043,17 +3092,176 @@ function M._apply_bookcases_to_world()
                         for j = 1, cn do
                             local c = comps[j]
                             if c and c:IsValid() then
-                                pcall(function() c:SetVisibility(visible, false) end)
-                                pcall(function() c:SetHiddenInGame(not visible, false) end)
+                                pcall(function() c:SetVisibility(true, false) end)
+                                pcall(function() c:SetHiddenInGame(false, false) end)
                                 pcall(function() c:MarkRenderStateDirty() end)
                             end
                         end
                     end
                 end)
                 if ok then
+                    if case_key then
+                        -- Tracker now always records "not hidden" since
+                        -- we don't hide warded cases anymore. Kept for
+                        -- the bookcase-drift probe above.
+                        M._case_last_applied_hidden[case_key] = false
+                    end
                     if visible then shown = shown + 1 else hidden = hidden + 1 end
                 else
                     dead = dead + 1
+                end
+
+                -- Cover-actor overlay. If the pak is loaded, ModActor
+                -- exposes SpawnWardCover / SpawnWardCover_Cabinet /
+                -- SpawnWardCover_Small + DespawnWardCover. We pick the
+                -- variant per (section, case_idx) so cabinet alcoves get
+                -- the taller fence with wider collision, and 5-vol cases
+                -- of mixed sections get the narrower fence sized for the
+                -- smaller bookcase. All wrapped in pcall so an older pak
+                -- without the new variants falls back to standard
+                -- SpawnWardCover where possible.
+                if case_key then
+                    local mod_actor = FindFirstOf("ModActor_C")
+                    if mod_actor and mod_actor:IsValid() then
+                        if visible then
+                            -- Should be visible: despawn cover if any.
+                            local existing_cover = M._case_covers[case_key]
+                            if existing_cover and existing_cover:IsValid() then
+                                pcall(function()
+                                    mod_actor:DespawnWardCover(existing_cover)
+                                end)
+                            end
+                            M._case_covers[case_key] = nil
+                        else
+                            -- Should be warded: spawn cover if not present.
+                            local existing_cover = M._case_covers[case_key]
+                            if not existing_cover or not existing_cover:IsValid() then
+                                local variant = _fence_variant_for_case(section_id, i)
+                                local fn_name = FENCE_BP_FUNC[variant] or "SpawnWardCover"
+                                -- One-shot per (section, case_idx) log
+                                -- so we can confirm the variant assignment
+                                -- matches the in-game bookcases.
+                                M._diag_fence_dispatch_logged = M._diag_fence_dispatch_logged or {}
+                                local diag_key = section_id .. "|" .. tostring(i)
+                                if not M._diag_fence_dispatch_logged[diag_key] then
+                                    M._diag_fence_dispatch_logged[diag_key] = true
+                                    log(("[fence-dispatch] section=%s case_idx=%d variant=%s (%s)"):format(
+                                        section_id, i, variant, fn_name))
+                                end
+                                local spawned
+                                local out_table = {}
+                                local pcall_ok, pcall_err = pcall(function()
+                                    -- UE4SS BP out-params: pass an EMPTY
+                                    -- TABLE that UE4SS populates with
+                                    -- the output value under the BP
+                                    -- parameter's name. Passing nil fails
+                                    -- with "no table was on the stack";
+                                    -- {} works and the value lands in
+                                    -- out_table.spawned_cover.
+                                    local fn = mod_actor[fn_name]
+                                    if fn ~= nil then
+                                        fn(mod_actor, case, out_table)
+                                    else
+                                        -- Variant not in this pak; fall
+                                        -- back to standard so the player
+                                        -- still gets some kind of gate.
+                                        mod_actor:SpawnWardCover(case, out_table)
+                                    end
+                                end)
+                                spawned = out_table.spawned_cover
+                                    or out_table.SpawnedCover
+                                    or out_table[1]
+                                    or out_table.ReturnValue
+                                -- One-shot dump of table keys on first
+                                -- call so we can see what UE4SS actually
+                                -- populated, in case the field name we
+                                -- assumed is wrong.
+                                if not M._diag_spawnwardcover_table_dumped then
+                                    M._diag_spawnwardcover_table_dumped = true
+                                    local keys = {}
+                                    for k, v in pairs(out_table) do
+                                        keys[#keys + 1] = tostring(k) .. "=" .. tostring(v)
+                                    end
+                                    log(("[ward-diag] SpawnWardCover out_table keys: {%s}"):format(
+                                        table.concat(keys, ", ")))
+                                end
+                                -- One-shot geometry diagnostic. Each step in
+                                -- its own pcall + log so we get partial
+                                -- output even when one accessor throws.
+                                -- Uses tostring() (UE4SS wrapper has a
+                                -- friendly tostring); .X/.Y/.Z field access
+                                -- previously failed silently with no output.
+                                -- +25 X in BP_WardCover places the fence in
+                                -- front of the bookcase. Mesh component
+                                -- access (spawned.MeshFence) and
+                                -- GetActorBounds don't work cleanly from
+                                -- UE4SS Lua, so we rely on fixed BP
+                                -- component defaults instead.
+                                if spawned and spawned:IsValid()
+                                        and not M._diag_geometry_dumped then
+                                    M._diag_geometry_dumped = true
+                                    local ok_a, val_a = pcall(function()
+                                        return tostring(case:K2_GetActorLocation())
+                                    end)
+                                    local ok_b, val_b = pcall(function()
+                                        return tostring(spawned:K2_GetActorLocation())
+                                    end)
+                                    log(("[ward-diag] case_loc=%s cover_loc=%s (ok=%s/%s)"):format(
+                                        tostring(val_a), tostring(val_b),
+                                        tostring(ok_a), tostring(ok_b)))
+                                end
+                                if pcall_ok and spawned and spawned:IsValid() then
+                                    M._case_covers[case_key] = spawned
+                                    if not M._diag_spawnwardcover_ok then
+                                        M._diag_spawnwardcover_ok = true
+                                        local sname
+                                        pcall(function() sname = spawned:GetFullName() end)
+                                        log(("[ward-diag] SpawnWardCover SUCCEEDED for first time: section=%s case_idx=%d -> %s"):format(
+                                            section_id, i, tostring(sname)))
+                                    end
+                                    -- Runtime override: BP saved values for the BlockerBox keep
+                                    -- coming through as Overlap (1) at runtime even when the
+                                    -- editor shows Block. Force-set every channel to Block
+                                    -- (ECR_Block = 2) on the BlockerBox component directly.
+                                    -- Idempotent — re-setting an already-Block channel is free.
+                                    pcall(function()
+                                        local force_comps = spawned.BlueprintCreatedComponents
+                                        local fn = 0; pcall(function() fn = #force_comps end)
+                                        for fj = 1, fn do
+                                            local c = force_comps[fj]
+                                            if c and c:IsValid() then
+                                                local cname
+                                                pcall(function() cname = c:GetFName():ToString() end)
+                                                if cname == "BlockerBox" then
+                                                    pcall(function() c:SetCollisionResponseToAllChannels(2) end)
+                                                    if not M._diag_blocker_forced then
+                                                        M._diag_blocker_forced = true
+                                                        log("[ward-diag] BlockerBox responses force-set to Block on first spawned cover")
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end)
+                                else
+                                    if not M._diag_spawnwardcover_err then
+                                        M._diag_spawnwardcover_err = true
+                                        local kind
+                                        if not pcall_ok then
+                                            kind = "pcall ERROR: " .. tostring(pcall_err)
+                                        elseif spawned == nil then
+                                            kind = "returned nil (function may not exist on ModActor)"
+                                        elseif not spawned:IsValid() then
+                                            kind = "returned invalid actor"
+                                        else
+                                            kind = "unknown failure"
+                                        end
+                                        log(("[ward-diag] SpawnWardCover FAILED on first attempt: section=%s case_idx=%d — %s"):format(
+                                            section_id, i, kind))
+                                    end
+                                end
+                            end
+                        end
+                    end
                 end
             else
                 dead = dead + 1
@@ -2175,18 +3383,14 @@ end
 -- ============================================================================
 
 -- Walks every indexed bookcase and detects newly-complete series.
+-- Authoritative trigger: the game's per-case RowStatus list, which only
+-- grows when the game considers a row complete (correct series, all
+-- volumes, in order). Wrong order, wrong section, or split rows = no
+-- growth, no fire.
 --
--- Authoritative trigger: the game's own per-case RowStatus list. The game
--- only appends to a case's RowStatus when it considers a row complete on
--- that case — correct series, all volumes, in volume order. If the player
--- places books in the wrong order, or in the wrong section, or splits a
--- series across rows, RowStatus does not grow and we don't fire.
---
--- When a case's RowStatus length grows, we walk PlacingBookInfo on that
--- case to find which AssetIdx now has count >= expected_volumes and hasn't
--- already been fired. Where on the case (which bookcase slot) the series
--- lives doesn't matter — the game's RowStatus already validated it. We
--- only need to identify the AssetIdx for the AP location lookup.
+-- When RowStatus grows, walk PlacingBookInfo to find AssetIdx(s) with
+-- count >= expected_volumes and not already fired. Slot position on
+-- the case doesn't matter — RowStatus already validated.
 function M.detect_completed_rows()
     if not M._cases_indexed then return 0 end
     if not M._slot_data then return 0 end
@@ -2216,12 +3420,30 @@ function M.detect_completed_rows()
                             for i = 1, n do
                                 local book = pbi[i]
                                 if book and book:IsValid() then
-                                    local aidx
-                                    pcall(function()
-                                        aidx = tonumber(book.ItemInfo.AssetIdx)
-                                    end)
-                                    if aidx and aidx >= 0 then
-                                        current[aidx] = (current[aidx] or 0) + 1
+                                    -- Split the property walk into
+                                    -- validated steps. Crash reports
+                                    -- (Failure.Hash e40fc030-fde3-5dbb-
+                                    -- d6fb-06aad7d0ab97) faulted inside
+                                    -- UE4SS!UObjectBase::IsA /
+                                    -- resolve_function_address_from_potential_jmp
+                                    -- during FinishRow → detect_completed_rows.
+                                    -- book:IsValid() passes but
+                                    -- book.ItemInfo can be transiently
+                                    -- freed mid-row-completion while the
+                                    -- game animates the final book. pcall
+                                    -- doesn't catch native AVs — only
+                                    -- defense is to never hand UE4SS a
+                                    -- stale sub-object ref.
+                                    local item_info
+                                    pcall(function() item_info = book.ItemInfo end)
+                                    if item_info and item_info:IsValid() then
+                                        local aidx
+                                        pcall(function()
+                                            aidx = tonumber(item_info.AssetIdx)
+                                        end)
+                                        if aidx and aidx >= 0 then
+                                            current[aidx] = (current[aidx] or 0) + 1
+                                        end
                                     end
                                 end
                             end
@@ -2321,12 +3543,10 @@ end
 --- has had every row location marked sent. Tracks the firing in
 --- _sent_section_completions so we don't re-send during the same session.
 ---
---- Section completion is derived from _sent_row_locations rather than a
---- distinct in-game event because (a) the game emits no "section complete"
---- signal, and (b) row-completion is the only authoritative trigger we
---- have for "this series's row is done" — checking that every row in the
---- section has fired is equivalent to "every series in the section was
---- correctly shelved".
+--- Derived from _sent_row_locations rather than an in-game event:
+--- the game emits no "section complete" signal, and row-completion is
+--- the only authoritative "this series's row is done" trigger we have.
+--- Every row fired = every series in the section was correctly shelved.
 ---
 --- Called from:
 ---   • The FinishRow hook (after detect_completed_rows) — catches new
@@ -2341,12 +3561,10 @@ function M.fire_section_completions()
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient.send_check) then return 0 end
 
-    -- Prefer slot_data's authoritative section_location_map (new seeds).
-    -- Fall back to AP_LOC_SECTION_FIRST + SECTION_IDX[sid] for legacy
-    -- seeds generated before this fix shipped — the section_location_map
-    -- key won't be present in their slot_data, but the location ids are
-    -- still allocated identically by the apworld so the fallback maps
-    -- to the right AP location regardless.
+    -- Prefer slot_data's section_location_map (new seeds). Fall back
+    -- to AP_LOC_SECTION_FIRST + SECTION_IDX[sid] for legacy seeds —
+    -- location ids are allocated identically apworld-side, so the
+    -- fallback maps correctly.
     local sec_loc_map = M._slot_data.section_location_map
     local use_slot_map = (type(sec_loc_map) == "table")
 
@@ -2373,6 +3591,67 @@ function M.fire_section_completions()
                 M._sent_section_completions[sid] = true
                 log(("[section] All %d row(s) complete for section %s → loc %d%s"):format(
                     #row_locs, sid, complete_loc,
+                    use_slot_map and "" or " (legacy fallback)"))
+                APClient:send_check(complete_loc)
+                sent = sent + 1
+            end
+        end
+    end
+    return sent
+end
+
+--- Fire any unfired "Floor N Complete" location checks whose floor has had
+--- every row location in its active sections marked sent. Mirrors
+--- fire_section_completions but at the floor granularity.
+---
+--- Locations: AP IDs 1910550 (Floor 1) and 1910551 (Floor 2). Defined in
+--- apworld/librarian/Locations.py:_floor_locations.
+---
+--- Called from:
+---   • The FinishRow hook (after fire_section_completions) — catches the
+---     final row that closes out a floor.
+---   • The 3s detect_completed_rows poll (for swap completions that
+---     don't go through FinishRow).
+---   • run_baseline_sync — fires any floors that were already complete in
+---     a prior session, after _sync_sent_row_locations_from_server has
+---     hydrated _sent_row_locations from the server's _sent_checks.
+function M.fire_floor_completions()
+    if not M._slot_data then return 0 end
+    if not M._floor_to_row_locs then return 0 end
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient.send_check) then return 0 end
+
+    -- Prefer slot_data's authoritative floor_location_map (post-1.0.4
+    -- seeds). Fall back to AP_LOC_FLOOR_FIRST + FLOOR_IDX[floor_n] for
+    -- legacy seeds. Map keys are stringified ints ("1", "2") per the
+    -- apworld-side convention, but try the int key first defensively in
+    -- case any AP client surface delivers them unwrapped.
+    local floor_loc_map = M._slot_data.floor_location_map
+    local use_slot_map = (type(floor_loc_map) == "table")
+
+    local sent = 0
+    for floor_n, row_locs in pairs(M._floor_to_row_locs) do
+        local complete_loc
+        if use_slot_map then
+            local v = floor_loc_map[floor_n] or floor_loc_map[tostring(floor_n)]
+            complete_loc = v and tonumber(v) or nil
+        else
+            local idx = FLOOR_IDX[floor_n]
+            complete_loc = idx and (AP_LOC_FLOOR_FIRST + idx) or nil
+        end
+        if complete_loc and not M._sent_floor_completions[floor_n]
+                and #row_locs > 0 then
+            local all_done = true
+            for _, loc_id in ipairs(row_locs) do
+                if not M._sent_row_locations[loc_id] then
+                    all_done = false
+                    break
+                end
+            end
+            if all_done then
+                M._sent_floor_completions[floor_n] = true
+                log(("[floor] All %d row(s) complete for Floor %d -> loc %d%s"):format(
+                    #row_locs, floor_n, complete_loc,
                     use_slot_map and "" or " (legacy fallback)"))
                 APClient:send_check(complete_loc)
                 sent = sent + 1
@@ -2453,17 +3732,15 @@ function M._read_widget_book_count()
     return best
 end
 
--- Returns the highest level-up location currently marked as sent in
--- APClient._sent_checks. The server's set_location_checked_handler
--- populates _sent_checks with every previously-checked location at
--- slot_connect, so this is the truth source for "what level has this
--- slot reached" across session boundaries — independent of GameSaveData
--- and the in-memory player BP.
+-- Returns the highest level-up location marked sent in
+-- APClient._sent_checks. The server populates _sent_checks with every
+-- previously-checked location at slot_connect, making this the truth
+-- source for "what level has this slot reached" across sessions —
+-- independent of GameSaveData and the player BP.
 --
--- Scans the full 1..AP_MAX_PLAYER_LEVEL range (not contiguous-only) so
--- that any prior-session gap (e.g., a Level N check that failed to send
--- because _levels_reached was stale) still produces a correct upper
--- bound — we'd rather over-credit than under-credit.
+-- Scans the full 1..AP_MAX_PLAYER_LEVEL range (not contiguous-only)
+-- so prior-session gaps still produce a correct upper bound — better
+-- to over-credit than under-credit.
 function M._compute_sent_level_baseline()
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient._sent_checks) then return 0 end
@@ -2476,20 +3753,16 @@ function M._compute_sent_level_baseline()
     return max_sent
 end
 
--- Increments `_levels_reached` by 1 and sends the corresponding AP location
--- check. Called from main.lua's OnLevelUp BP hook — one event per in-game
--- level-up, so the counter stays in lockstep without depending on
--- GameSaveData being synchronously updated.
+-- Increments `_levels_reached` by 1 and sends the corresponding AP
+-- location check. Called from main.lua's OnLevelUp BP hook — one event
+-- per in-game level-up, no dependency on GameSaveData being synced.
 --
 -- Self-heals from _sent_checks BEFORE incrementing: if baseline sync
--- never fired (or fired with stale GameSaveData and computed 0), the
--- first OnLevelUp after a reload would have used _levels_reached=0 and
--- queued "Reached Level 1" → APClient.send_check silently drops because
--- the server's set_location_checked_handler already marked it sent in
--- a prior session. Then the next OnLevelUp queues Level 2 (also
--- dropped), etc. — _levels_reached lags the player's actual level
--- forever. By catching up to the server's view of sent levels here, we
--- guarantee the very next increment fires a new, unsent level location.
+-- missed and _levels_reached=0 after a reload, the first OnLevelUp
+-- would queue "Reached Level 1" which the server silently dedupes,
+-- then Level 2 (dedup), etc. — _levels_reached lags forever. Catching
+-- up to the server's view first guarantees the next increment fires a
+-- new, unsent level location.
 function M.on_level_up_event()
     if not M._slot_data then return end
     -- Defensive: only fire if we're actually in gameplay. BP-level
@@ -2509,17 +3782,13 @@ function M.on_level_up_event()
     M._levels_reached = M._levels_reached + 1
     local loc = AP_LOC_LEVEL_FIRST + (M._levels_reached - 1)
 
-    -- Calibration diagnostic: log the GameSaveData row count + XP-curve
-    -- prediction at the moment OnLevelUp fires. The comment in main.lua
-    -- warns that CurrentFinishedRowNum may be stale at OnLevelUp time
-    -- (the game hasn't committed the row update yet), so the printed
-    -- row may lag by 1 — but for calibration we mainly care whether
-    -- the row count at which the game ACTUALLY level-ups matches our
-    -- xp_curve prediction. Player report: at ~56-59 rows the game only
-    -- granted Level 17, but XP_CURVE predicts Level 23 at row 55. This
-    -- log gives us paired (row, level) data points to verify whether
-    -- XP_CURVE is miscalibrated or the user was reading a different
-    -- "level" number from the HUD.
+    -- Calibration diagnostic: log GameSaveData row count + XP-curve
+    -- prediction at OnLevelUp time. CurrentFinishedRowNum may lag by 1
+    -- (row update not committed yet) but we mainly care whether the
+    -- row count at which the game level-ups matches xp_curve. Player
+    -- report: at ~56-59 rows game granted only Level 17, but XP_CURVE
+    -- predicts Level 23 at row 55. Paired (row, level) data points
+    -- help verify whether XP_CURVE is miscalibrated.
     pcall(function()
         local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
         if not (gi and gi:IsValid()) then return end
@@ -2559,37 +3828,37 @@ end
 function M.sync_progress_state()
     if not M._slot_data then return 0, 0 end
 
-    -- Defensive: never sync state when the player isn't actively in
-    -- gameplay. The 3-second poll loop in main.lua already guards on
-    -- _gameplay_active before calling us, but several other call sites
-    -- (FinishRow hook, SaveGameData hook) hit this function too, and a
-    -- bad-timing fire while the player is transitioning to title screen
-    -- has been seen to read save data belonging to the wrong save slot
-    -- (causing a flood of book-milestone checks to fire).
+    -- Defensive: never sync state when not in gameplay. Multiple call
+    -- sites hit us (FinishRow / SaveGameData hooks); a bad-timing fire
+    -- mid-transition to title can read the WRONG save slot and flood
+    -- book-milestone checks.
     if not M._gameplay_active then return 0, 0 end
     if not M._apply_safe then return 0, 0 end
 
-    -- Live book count: read from the active WBP_PlayerInfo HUD widget's
-    -- Text_CurrentBookNum (the on-screen counter). The save struct's
-    -- InsertedBookNum is a fallback for the first frame and for the
-    -- moment right after each save event.
+    -- Live book count: WBP_PlayerInfo HUD widget's Text_CurrentBookNum.
+    -- Save struct's InsertedBookNum is a fallback (first frame, right
+    -- after each save). Track peak — a threshold crossed stays crossed
+    -- even if the player later removes books.
     --
-    -- Books placed never logically decreases for milestone purposes — a
-    -- threshold crossed is a threshold crossed even if the player later
-    -- removes books from a shelf. So we track the peak observed value
-    -- and use that for milestone evaluation.
+    -- Save-slot guard: only read GameSaveData when SaveGameName is our
+    -- AP slot (Sav_AP_<seed>_<slot>). Mid-transition to title can
+    -- revert it to the default "Sav" — the non-AP save might have
+    -- books=3072 already and blow past every milestone spuriously.
     --
-    -- Save-slot guard: only read GameSaveData fields if the current
-    -- SaveGameName is OUR AP slot (Sav_AP_<seed>_<slot>). If the player
-    -- is mid-transition to title screen, the game can revert
-    -- SaveGameName to the default "Sav" — which holds the user's
-    -- non-AP save state and might have books=3072 already, blowing
-    -- past every milestone threshold spuriously.
+    -- Crash dump (Failure.Hash same class as player reports) faulted at
+    -- null+10 in UE4SS reflection: autosave fired ~330ms before
+    -- FinishRow, then sync_progress_state ran while still writing.
+    -- sg:IsValid() passed but GameProgressData was being reallocated.
+    -- Split chained property reads into validated steps.
     local current_slot = nil
     pcall(function()
         local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
         if gi and gi:IsValid() then
-            pcall(function() current_slot = gi.SaveGameName:ToString() end)
+            local sgn
+            pcall(function() sgn = gi.SaveGameName end)
+            if sgn then
+                pcall(function() current_slot = sgn:ToString() end)
+            end
         end
     end)
     local is_ap_slot = current_slot and current_slot:find("^Sav_AP_") ~= nil
@@ -2600,18 +3869,25 @@ function M.sync_progress_state()
         pcall(function()
             local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
             if gi and gi:IsValid() then
-                local sg = gi.GameSaveData
+                local sg
+                pcall(function() sg = gi.GameSaveData end)
                 if sg and sg:IsValid() then
-                    pcall(function() rows_finished     = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0 end)
-                    pcall(function() books_placed_save = tonumber(sg.GameProgressData.InsertedBookNum) or 0 end)
+                    -- Split: capture GameProgressData sub-struct once
+                    -- and verify before reading its fields. Without this,
+                    -- a concurrent autosave reallocating GameProgressData
+                    -- crashes UE4SS's Lua VM on the chained field read.
+                    local gpd
+                    pcall(function() gpd = sg.GameProgressData end)
+                    if gpd then
+                        pcall(function() rows_finished     = tonumber(gpd.CurrentFinishedRowNum) or 0 end)
+                        pcall(function() books_placed_save = tonumber(gpd.InsertedBookNum) or 0 end)
+                    end
                 end
             end
         end)
     else
-        -- Log once per save-slot mismatch so we can diagnose in user
-        -- reports without spamming the heartbeat. The user may have
-        -- entered a state where SaveGameName isn't pointed at our AP
-        -- slot; the fix is to not trust GameSaveData in that window.
+        -- Log once per save-slot mismatch (no heartbeat spam). When
+        -- SaveGameName isn't our AP slot, don't trust GameSaveData.
         if M._last_skipped_save_slot ~= current_slot then
             M._last_skipped_save_slot = current_slot
             log(("[progress] skipping GameSaveData read — current slot %q is not our AP slot"):format(
@@ -2634,33 +3910,37 @@ function M.sync_progress_state()
     do
         local player = FindFirstOf("BP_LibrarianCharacter_C")
         if player and player:IsValid() then
-            pcall(function()
-                local arr = player.SkillLevelUpRowNum
-                local n = 0; pcall(function() n = #arr end)
-                for i = 1, math.min(n, AP_MAX_PLAYER_LEVEL) do
-                    local needed = tonumber(arr[i]) or 0
-                    if rows_finished >= needed then
-                        current_level = i
-                    else
-                        return
+            -- Split the array fetch from the iteration so the TArray
+            -- wrapper is captured once and re-validated — a reallocation
+            -- between fetch and iteration would crash UE4SS reading
+            -- arr[i] on stale memory.
+            local arr
+            pcall(function() arr = player.SkillLevelUpRowNum end)
+            if arr then
+                pcall(function()
+                    local n = 0; pcall(function() n = #arr end)
+                    for i = 1, math.min(n, AP_MAX_PLAYER_LEVEL) do
+                        local needed
+                        pcall(function() needed = tonumber(arr[i]) or 0 end)
+                        if needed == nil then break end
+                        if rows_finished >= needed then
+                            current_level = i
+                        else
+                            return
+                        end
                     end
-                end
-            end)
+                end)
+            end
         end
     end
 
-    -- Level-up baseline is primarily handled by run_baseline_sync
-    -- (first-movement trigger), which sets _levels_reached to the
-    -- player's actual current level computed from rows_finished +
-    -- SkillLevelUpRowNum, falling back to APClient._sent_checks.
-    -- After that, on_level_up_event correctly maps the NEXT OnLevelUp
-    -- to the right next-level location.
+    -- Level-up baseline is handled by run_baseline_sync (first-movement
+    -- trigger). After that, on_level_up_event maps the NEXT OnLevelUp
+    -- to the right level location.
     --
-    -- Belt-and-suspenders here: if at any point _levels_reached
-    -- regresses below either the XP-curve level or the server's view
-    -- of sent levels, raise it back up. This guards against any path
-    -- that leaves the counter stale (e.g., a future code change that
-    -- resets state mid-session, or a missed baseline-sync window).
+    -- Belt-and-suspenders here: if _levels_reached ever regresses below
+    -- either the XP-curve level or the server's sent floor, raise it
+    -- back up. Guards against any path that leaves the counter stale.
     local levels_sent = 0
     if not M._level_baseline_done then
         log(("[progress] baseline rows=%d current_level=%d (sync delegated to run_baseline_sync)"):format(
@@ -2675,13 +3955,10 @@ function M.sync_progress_state()
             prev_levels_reached, floor_level, current_level, sent_level_floor))
         M._levels_reached = floor_level
         -- Fire send_check for every level in the catch-up range. Without
-        -- this, the counter advances but the actual location checks for
-        -- the skipped levels never transmit — and if on_level_up_event
-        -- fires next (player levels to N+1), it sees _levels_reached
-        -- already at N and only sends Level N+1, stranding 1..N forever.
-        -- send_check is idempotent (dedupes against _sent_checks), so
-        -- re-firing already-sent low levels is a silent no-op; only the
-        -- genuinely-missing levels in the catch-up range transmit.
+        -- this, the counter advances but checks for skipped levels never
+        -- transmit — and the next OnLevelUp would only send N+1, leaving
+        -- 1..N stranded. send_check dedupes against _sent_checks, so
+        -- re-firing already-sent levels is a silent no-op.
         local APClient = package.loaded["AP/APClient"]
         if APClient and APClient.send_check then
             for level = 1, floor_level do
@@ -2776,12 +4053,10 @@ function M._init_applied_skill_counts_from_save()
         end
     end
 
-    -- HUD refresh: route through our LogicMod BP (ModActor_C). Calling
-    -- UpdateSkill from Lua direct crashed (EXCEPTION_ACCESS_VIOLATION,
-    -- UE4SS in stack) because the BP graph dereferences SkillObject
-    -- internals that Lua leaves in inconsistent state. Going via a BP
-    -- custom event keeps the call inside engine context, where dispatch
-    -- works the same as the game's natural UpgradePlayer flow.
+    -- HUD refresh via our LogicMod BP (ModActor_C). Direct UpdateSkill
+    -- from Lua crashes (AV, UE4SS in stack) — the BP graph dereferences
+    -- SkillObject internals Lua leaves inconsistent. The BP custom
+    -- event keeps the call inside engine context.
     M._refresh_hud_from_save()
 end
 
@@ -2820,14 +4095,12 @@ function M._refresh_hud_from_save()
     pcall(function() n = #skill_data end)
 
     local refreshed, failed = 0, 0
-    -- Refresh all skill icons EXCEPT the bag ones. UpgradeBag (1) and
-    -- UpgradeBag2 (2) have a side effect in RefreshSkillIcon's BP graph
-    -- that re-applies the bag-level increment, observed to double-bump
-    -- the player's bag capacity on reload (15 → 20). The game restores
-    -- the actual bag level from save data naturally on load. Jump (0)
-    -- and Jogging (4) don't have that side effect, so their icons (and
-    -- the five Major Magic icons) are still worth refreshing here —
-    -- otherwise they stay empty until the next in-game skill use.
+    -- Refresh all skill icons EXCEPT bags. UpgradeBag (1) / UpgradeBag2
+    -- (2) re-apply the bag-level increment via RefreshSkillIcon's BP
+    -- graph, double-bumping bag capacity on reload (15 → 20). Bag
+    -- levels restore naturally from save. Jump (0) and Jogging (4)
+    -- don't have that side effect, so their icons (and Major Magic
+    -- icons) ARE refreshed here — else they stay empty until next use.
     local SKIP_INDICES = { [1]=true, [2]=true }
     for i = 1, n do
         local entry
@@ -2837,10 +4110,9 @@ function M._refresh_hud_from_save()
             pcall(function() lvl = tonumber(entry.CurrentLevel) or 0 end)
             local ability_idx = i - 1  -- 1-based array → 0-based enum
             if lvl > 0 and ability_idx >= 0 and ability_idx <= 8 and not SKIP_INDICES[ability_idx] then
-                -- left=-1 (not 0). 0 crashes the UpdateSkill BP path; the
-                -- game itself passes -1 here, meaning "no banked points
-                -- credited" — correct for a load refresh;
-                -- 0 tells the HUD "0 points just spent" and desyncs state.
+                -- left=-1 (not 0). 0 crashes the UpdateSkill BP path;
+                -- -1 means "no banked points credited" (correct for a
+                -- load refresh). 0 means "0 points just spent" → desync.
                 local ok, err = pcall(function()
                     mod_actor:RefreshSkillIcon(player_info, ability_idx, lvl, -1)
                 end)
@@ -2907,26 +4179,19 @@ end
 --- (_applied_skill_counts). If the latter lags the former, retry the
 --- missing levels via _apply_skill.
 ---
---- IMPORTANT: this trusts _applied_skill_counts as truth, NOT
---- GameSaveData.PlayerExtraData.SkillData. The save's SkillData only
---- refreshes on actual save events — between saves it can read 0 even
---- though the in-game player is at level 5+ (UpgradePlayer's effect
---- lives in runtime state, not the save struct). A previous version of
---- this function used save state for the comparison and over-granted
---- catastrophically (every tick read save_level=0 and re-applied the
---- entire target, pushing every skill to level 10 within ~30 seconds).
+--- IMPORTANT: trusts _applied_skill_counts as truth, NOT
+--- GameSaveData.PlayerExtraData.SkillData. Save's SkillData only
+--- refreshes on save events; between saves it can read 0 while the
+--- in-game player is level 5+. A previous version used save state for
+--- the comparison and over-granted catastrophically (every tick read
+--- save_level=0 and re-applied the entire target → every skill to
+--- level 10 within ~30 seconds).
 ---
 --- _applied_skill_counts is bumped only when UpgradePlayer's pcall
---- returns ok. If the pcall fails or the skill grant otherwise drops
---- before _applied_skill_counts increments, this resync will pick up
---- the gap on the next tick and retry. If UpgradePlayer succeeds at the
---- Lua call level but the in-game effect somehow doesn't land
---- (silent BP-side drop), this resync won't catch it — we'd need a
---- separate runtime-state read for that. Worth revisiting if we see
---- the original "Progressive Insight never applied" bug recur.
+--- returns ok. Silent BP-side drops (pcall ok but no in-game effect)
+--- won't be caught here — would need a runtime-state read.
 ---
---- Conservative: only ever applies UP to the received count. Never
---- over-grants.
+--- Conservative: only ever applies UP to received count. Never over-grants.
 function M.resync_skill_state()
     if not M._gameplay_active or not M._apply_safe then return 0 end
     if not M._slot_data then return 0 end
@@ -3084,5 +4349,79 @@ function M.dump_unmapped_books()
             ud.x or 0, ud.y or 0, ud.z or 0, unlocked))
     end
 end
+
+-- ============================================================================
+-- Debug console commands
+-- ============================================================================
+-- Force-unward every book whose series name contains a substring (case-
+-- insensitive). Bypasses slot_data / _series_unlocked entirely — books just
+-- get SetActorHiddenInGame(false) + SetActorEnableCollision(true), and the
+-- tracker is cleared so the next normal apply won't re-ward them this session.
+-- The fence cover on the case stays in place (we don't touch _shelves_open or
+-- _case_covers), which is exactly what's needed for testing whether the fence
+-- collision is blocking grabs of books that don't physically stick past the
+-- case front.
+--
+-- Usage (UE4SS console / debug console):
+--   ap_unward_series Seduction Magic
+--   ap_unward_series Theological Research on Holy Magic
+--
+-- The pattern matches any series name containing the substring, so you can
+-- be as specific or loose as you want. Logs the matched series + count of
+-- books that were force-unwarded.
+function M.force_unward_series(pattern)
+    if type(pattern) ~= "string" or pattern == "" then
+        log("[ap_unward] usage: ap_unward_series <series-name-substring>")
+        return 0
+    end
+    local pat_lower = pattern:lower()
+    local matched_aidx = {}
+    for aidx, sname in pairs(M._asset_to_series) do
+        if sname:lower():find(pat_lower, 1, true) then
+            matched_aidx[aidx] = sname
+        end
+    end
+    if not next(matched_aidx) then
+        log(("[ap_unward] no series matching '%s'"):format(pattern))
+        return 0
+    end
+    for aidx, sname in pairs(matched_aidx) do
+        log(("[ap_unward] matched: '%s' (aidx=%d)"):format(sname, aidx))
+    end
+    local books = FindAllOf("BP_GrabbingBook_C")
+    if not books then return 0 end
+    local n = 0; pcall(function() n = #books end)
+    local count = 0
+    for i = 1, n do
+        local book = books[i]
+        if book and book:IsValid() then
+            local aidx = _book_valid_asset_idx(book)
+            if aidx and matched_aidx[aidx] then
+                pcall(function()
+                    book:SetActorHiddenInGame(false)
+                    book:SetActorEnableCollision(true)
+                end)
+                M._books_warded[book:GetFullName()] = nil
+                count = count + 1
+            end
+        end
+    end
+    log(("[ap_unward] force-unwarded %d book(s) across %d series"):format(
+        count, (function() local k = 0; for _ in pairs(matched_aidx) do k = k + 1 end; return k end)()))
+    return count
+end
+
+RegisterConsoleCommandHandler("ap_unward_series", function(_, params)
+    -- UE4SS passes parameters as a table of space-split tokens; rejoin
+    -- so multi-word series names like "Seduction Magic" work.
+    local pattern = ""
+    if type(params) == "table" then
+        pattern = table.concat(params, " ")
+    elseif type(params) == "string" then
+        pattern = params
+    end
+    pcall(function() M.force_unward_series(pattern) end)
+    return true
+end)
 
 return M

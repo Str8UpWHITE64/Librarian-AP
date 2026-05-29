@@ -17,22 +17,26 @@ open up new series and bookcases.
 - **UE4SS (experimental build)**. The stable UE4SS release isn't new
   enough; an experimental build is required. A known-good copy is
   bundled with every Librarian-AP release zip and with the source repo
-  itself (at `third_party/UE4SS/`), so no separate UE4SS download is
-  needed.
+  (at `third_party/UE4SS/`), so no separate download is needed.
 
-  We bundle UE4SS because upstream overwrites their
-  `experimental-latest` release in place with every new build, so a
-  direct link to a specific working build stops resolving once that
-  build is superseded. The bundled copy is unmodified; see
-  [`third_party/UE4SS/README.md`](third_party/UE4SS/README.md) for the
-  exact version and license details (MIT).
+  We bundle UE4SS because upstream overwrites `experimental-latest` in
+  place with every build — a direct link to a specific working build
+  stops resolving once superseded. The bundled copy is unmodified; see
+  [`third_party/UE4SS/README.md`](third_party/UE4SS/README.md) for
+  exact version and license (MIT).
 
-  UE4SS ships with `BPModLoaderMod` already included; that's the loader
-  that picks up the `.pak` mod below.
+  UE4SS ships with `BPModLoaderMod` included; that's the loader that
+  picks up the `.pak` mod below.
 
 ---
 
 ## Installation
+
+> **Steam Deck / Linux users:** the file copy alone is not enough.
+> Proton needs a Wine DLL override or UE4SS will not load and the mod
+> will appear to do nothing. Do the standard install below first, then
+> jump to [Steam Deck / Linux (Proton) — extra step](#steam-deck--linux-proton--extra-step)
+> before launching the game.
 
 There are two paths. Pick whichever matches how you got Librarian-AP:
 
@@ -75,7 +79,39 @@ referred to below as `<Game>`.
    <Archipelago>\custom_worlds\librarian.apworld
    ```
 
-That's it — skip to **Playing**.
+That's it — skip to **Playing** (unless you're on Steam Deck / Linux,
+in which case there's one more step below).
+
+### Steam Deck / Linux (Proton) — extra step
+
+Under Proton, the game won't load `dwmapi.dll` (the UE4SS proxy DLL)
+unless you tell Wine to. Without this, UE4SS silently fails to
+inject, no `UE4SS.log` is produced, and the mod looks like it isn't
+installed at all.
+
+In Steam, right-click the game → **Properties** → **General** →
+**Launch Options**, and paste:
+
+```
+WINEDLLOVERRIDES="dwmapi=n,b" %command%
+```
+
+The `%command%` placeholder is mandatory — without it, Steam ignores
+the override. `n,b` means "native, then built-in" — load our bundled
+`dwmapi.dll` first, fall back to Wine's stub only if missing.
+
+After launching the game once, check for a `UE4SS.log` at:
+
+```
+<Game>/Librarian/Binaries/Win64/UE4SS.log
+```
+
+If it exists, UE4SS is injecting correctly. If it's still missing
+after the override, you're likely hitting a Proton-version
+compatibility issue — try **Proton Experimental** in the game's
+compatibility settings, or **GE-Proton 10-12** if you're on
+GE-Proton. Some newer Proton builds have regressed UE4SS
+injection.
 
 ### Manual install (from a source checkout)
 
@@ -243,18 +279,16 @@ shelf unlocks.
 
 **Off (default)** — A series's books are pickable as soon as either
 (a) the section's first bookcase is open, or (b) the series has
-`shelf_req == 1` (lives on bookcase 1 of its section). In other words,
-the "first 4" series of every section — the ones that would naturally
-live on bookcase 1 — become pickable as soon as you receive their
-series unlock, regardless of whether any shelf in that section is
-actually open yet. Higher-`shelf_req` series stay warded until their
-target bookcase is open.
+`shelf_req == 1` (lives on bookcase 1 of its section). So the
+"first 4" series of every section become pickable as soon as you
+receive their series unlock, even if no shelf in that section is
+open yet. Higher-`shelf_req` series stay warded until their target
+bookcase is open.
 
 **On** — Stricter. A series's books stay warded until you have **both**
 the series unlock **and** enough Progressive Shelf Unlocks for that
-section to reach the series's home bookcase. No visibility floor; if
-a section has zero bookcases open, none of its series are pickable yet
-(even the ones that would naturally live on bookcase 1).
+section to reach the series's home bookcase. No visibility floor — if
+a section has zero bookcases open, none of its series are pickable.
 
 The difference only matters for sections that haven't been opened at
 all yet — once you have any shelf unlock in a section, both modes
@@ -275,7 +309,7 @@ When you launch the game, the UE4SS log
 (`<Game>\Librarian\Binaries\Win64\UE4SS.log`) should include lines like:
 
 ```
-[Lua] [LibrarianAP] LibAP v1.0.3 — Game v1.0.8 (verified compatible)
+[Lua] [LibrarianAP] LibAP v1.0.4 — Game v1.0.8 (verified compatible)
 [Lua] [BPModLoaderMod] Actor: ModActor_C /Game/Librarian/Map/...
 [Lua] [LibrarianAP] Press F4 to toggle the connection menu.
 [Lua] [LibrarianAP] Press F12 to connect to Archipelago.
