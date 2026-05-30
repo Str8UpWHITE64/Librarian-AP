@@ -3120,7 +3120,13 @@ function M._apply_bookcases_to_world()
                 -- smaller bookcase. All wrapped in pcall so an older pak
                 -- without the new variants falls back to standard
                 -- SpawnWardCover where possible.
-                if case_key then
+                -- v1.1.0 diagnostic: cover spawning is GATED OFF (M._covers_enabled
+                -- is nil/false). Runtime cover actors are the connect/quit crash
+                -- source — disabling them restores the stable connect path. The
+                -- [row-diag] probe above doesn't depend on covers. The rewrite
+                -- replaces this whole path; for now we just need stable play to
+                -- capture the row structure.
+                if case_key and M._covers_enabled then
                     local mod_actor = FindFirstOf("ModActor_C")
                     if mod_actor and mod_actor:IsValid() then
                         if visible then

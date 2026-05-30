@@ -512,7 +512,12 @@ class LibrarianWorld(World):
         # the pool, leaving zero copies for AP to precollect — silently
         # losing the user's request. Fixes "adding magic skills to
         # starting inventory does not work."
-        sifp = self.multiworld.start_inventory_from_pool[self.player].value
+        #
+        # multiworld.start_inventory_from_pool may not have an entry for
+        # this player when the YAML doesn't set the option; use .get() to
+        # default to an empty dict and skip the subtract step.
+        sifp_option = self.multiworld.start_inventory_from_pool.get(self.player)
+        sifp = sifp_option.value if sifp_option else {}
         for name, count in sifp.items():
             if name in quantities:
                 quantities[name] = max(0, quantities[name] - count)

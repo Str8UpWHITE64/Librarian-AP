@@ -10,6 +10,16 @@ local function log(msg)
     print(("[%s] %s\n"):format(MOD, tostring(msg)))
 end
 
+-- v1.1.0 (rewrite): emit a lifecycle state-machine event. No-op until the SM
+-- module is loaded (see the require below). The SM is OBSERVATIONAL for now —
+-- these events drive its state + [lifecycle] logging, but it gates nothing yet.
+local function lc_event(name)
+    pcall(function()
+        local L = package.loaded["AP/lifecycle"]
+        if L and L[name] then L[name]() end
+    end)
+end
+
 log("Loading Librarian-AP")
 
 -- Native level-up grants 1 free skill point. For AP play that's invalid
@@ -571,6 +581,7 @@ local function start_gameplay_loops()
             log(("LoadMap apply-gate PASSED (books=%d distinct=%d ticks=%d) → set_apply_safe (flush deferred to settle loop)")
                 :format(n, distinct, apply_attempts))
             pcall(function() IA.set_apply_safe(true) end)
+            lc_event("on_world_ready")  -- world populated → CONNECTING→PRE_APPLY
             -- During pre-apply: the settle loop below fires flush_apply once
             -- items quiet down. Otherwise (gameplay-active path): trigger
             -- the flush now as before.
@@ -883,6 +894,7 @@ end
 
 local function activate_gameplay(reason)
     log(("Activating gameplay (reason: %s)"):format(reason or "?"))
+    lc_event("on_continue")  -- PRE_APPLY→GAMEPLAY
     local APClient = package.loaded["AP/APClient"]
     if APClient and APClient.set_in_game then APClient:set_in_game(true) end
     local IA = package.loaded["AP/ItemApply"]
@@ -892,6 +904,7 @@ end
 
 local function deactivate_gameplay(reason)
     log(("Deactivating gameplay (reason: %s)"):format(reason or "?"))
+    lc_event("on_returned_to_title")  -- → TITLE
     local APClient = package.loaded["AP/APClient"]
     if APClient and APClient.set_in_game then APClient:set_in_game(false) end
     local IA = package.loaded["AP/ItemApply"]
@@ -1469,11 +1482,14 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
     end
 
     local IA = package.loaded["AP/ItemApply"]
-    if IA and IA.detect_completed_rows then
-        local sent = 0
-        pcall(function() sent = IA.detect_completed_rows() end)
-        log(("[AP] row-detect: sent %d location check(s)"):format(sent or 0))
-    end
+    -- detect_completed_rows() is deliberately NOT called here. It walks
+    -- PlacingBookInfo, and on the FinishRow frame the just-placed final book
+    -- is mid-conversion (freed sub-object) → native EXCEPTION_ACCESS_VIOLATION
+    -- that pcall cannot catch. This is THE row-completion crash. The 3s poll
+    -- (start_gameplay_loops) runs detection at a stable time instead — the
+    -- per-(section,series) checks fire within ~3s of completing a row, which is
+    -- fine for AP. The calls below use the row counter + Lua state only (no
+    -- book deref), so they stay here for immediacy.
     -- Fire any "Complete N Rows" milestone checks the player has now
     -- reached. `row` is the game's authoritative correct-row counter
     -- (FinishRow only fires when a row is actually completed in-game,
@@ -1553,6 +1569,21 @@ local APClient = require("AP/APClient")
 local ItemApply = require("AP/ItemApply")
 local APConfig = require("AP/APConfig")
 local HUD = require("AP/HUD")
+
+-- v1.1.0 (rewrite): the lifecycle state machine. Now driven by EVENTS at the
+-- real signal points (lc_event(...) calls below) rather than a polling derive
+-- loop. Still OBSERVATIONAL — it logs [lifecycle] transitions but gates nothing
+-- yet; once the event-driven flow is confirmed across connect/play/reconnect we
+-- cut the scattered gates over to it. The require is pcall'd so it can never
+-- break mod loading.
+do
+    local ok, Lifecycle = pcall(require, "AP/lifecycle")
+    if ok and Lifecycle then
+        Lifecycle.init(nil, log)
+        Lifecycle.on_title_loaded()  -- mod loads at the title screen → BOOT→TITLE
+        log("[lifecycle] event-driven observer started")
+    end
+end
 
 local AP_CONFIG_PATH = "Mods/Librarian-AP/Scripts/ap_config.json"
 local AP_GAME_NAME = "Librarian Tidy Up the Arcane Library"
@@ -1641,6 +1672,7 @@ APClient.on_check_sent = function(loc_id)
 end
 
 APClient.on_slot_connected = function(slot_data)
+    lc_event("on_slot_connected")  -- TITLE→CONNECTING (no-op if reconnect in GAMEPLAY)
     log("[AP] slot_connected — slot data summary:")
     pcall(function()
         if slot_data.starting_section then
