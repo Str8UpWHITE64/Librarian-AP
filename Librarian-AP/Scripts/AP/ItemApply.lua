@@ -513,6 +513,14 @@ function M.set_gameplay_active(state)
             -- drop our refs so the next apply re-spawns fresh covers.
             M._case_covers = {}
         end
+        -- Warding + sign-glow trackers are keyed to the old world's actors and to
+        -- our last-applied state. Drop them so the next gameplay entry (Continue,
+        -- which may not fully reload) re-wards every case and re-glows every sign
+        -- from scratch instead of apply-on-change skipping them as "unchanged".
+        M._case_ward_state = {}
+        M._section_to_label = nil
+        M._section_glow_state = {}
+        M._section_glow_orig = {}
         -- Drop pending skill grants — they'll be re-queued on the next
         -- slot_connect via set_slot_data's reset + AP item re-dump.
         if #M._pending_skill_grants > 0 then
@@ -520,6 +528,9 @@ function M.set_gameplay_active(state)
             M._pending_skill_grants = {}
         end
     end
+    -- Entering gameplay: glow the locked signs promptly instead of waiting for the
+    -- periodic loop (no-op if not yet apply-safe; the loop is the backstop).
+    M._maybe_glow_now()
 end
 
 --- Called by main.lua's LoadMap retry loop after the book sub-levels have
@@ -855,6 +866,133 @@ local function _walk_set_visibility(comp, visible)
     end
 end
 
+-- v1.1.0 Option 2c: ward via the bookcase's OWN StaticMesh collision — no runtime
+-- spawn, so no `(async)` world-leak crash. Refinement history (2026-05-30):
+--   2a  mesh OFF + `Box` set to block → FAILED: books + player passed through
+--       (the `Box` doesn't cover the footprint).
+--   2b  mesh PhysicsOnly → books bounce + un-interactable, BUT the player still
+--       walks through: character movement is a QUERY sweep (Pawn channel), and
+--       PhysicsOnly turns queries off. Placement is also a query, so we can't
+--       just turn queries back on (that re-enables placement).
+--   2c  InvisibleWall profile → FAILED: locked cases became placeable. Placement
+--       does NOT trace on Visibility (InvisibleWall blocks every channel except
+--       Visibility, yet placement came back). But the log resolved the real
+--       structure: TWO StaticMeshComponents — "StaticMesh" (solid body) and
+--       "PreviewBookLocation" (the named placement target).
+--   2d  Toggle ONLY "PreviewBookLocation" off, body left solid → FAILED: still
+--       placeable (preview_orig_enabled=1, so it WAS a collider, yet off didn't
+--       gate placement). So the placement trace hits the BODY, not the preview
+--       (2b body-query-off blocked placement; 2d body-query-on allowed it).
+--   2e  Per-channel responses (probe-confirmed, camera-resp 2→0): each LOCKED
+--       solid StaticMesh → QueryAndPhysics, BLOCK object channels (Pawn player +
+--       PhysicsBody/WorldDynamic books), IGNORE trace channels (Visibility/Camera/
+--       Game) so the placement line-trace misses → solid AND un-interactable.
+--       UNLOCKED → restore the captured profile. WORKS on regular/small cases.
+--       Large cases have MULTIPLE placement meshes, so treat ALL StaticMeshComponents
+--       (single-mesh left large cases placeable at angles hitting an unhandled
+--       mesh); `[ward-collision] N static meshes` logs each distinct structure.
+--       RISK: if placement uses TraceByObjectType (an object channel) rather than
+--       a trace channel, cases stay placeable → fall back to 2b PhysicsOnly.
+local function _ward_collision(case, case_key, locked)
+    if not (case and case:IsValid()) then return end
+    -- Actor-level collision MUST be on or per-component settings are ignored.
+    pcall(function() case:SetActorEnableCollision(true) end)
+
+    -- 2e (multi-mesh): the placement trace + the player sweep hit the bookcase
+    -- BODY, and the probe confirmed UE4SS can set per-channel responses. Large
+    -- bookcases have MORE than one placement-relevant StaticMeshComponent, so we
+    -- treat them ALL (the single-mesh version left large cases placeable at angles
+    -- hitting an unhandled mesh). LOCKED: each solid mesh → QueryAndPhysics, BLOCK
+    -- object channels (Pawn = player, PhysicsBody/WorldDynamic = thrown books),
+    -- IGNORE trace channels (Visibility/Camera/Game) so the placement line-trace
+    -- misses → solid yet un-interactable. UNLOCKED: restore each mesh's captured
+    -- profile (placement works at every angle again). NoCollision meshes untouched.
+    local meshes = {}
+    local seen, inventory = {}, {}
+    local function consider(c)
+        if not (c and c:IsValid()) then return end
+        local fk; pcall(function() fk = c:GetFullName() end)
+        if fk then if seen[fk] then return end seen[fk] = true end
+        local nm, cls = "?", "?"
+        pcall(function() nm = c:GetFName():ToString() end)
+        pcall(function() cls = c:GetClass():GetFName():ToString() end)
+        inventory[#inventory + 1] = nm .. ":" .. cls
+        -- Skip the small PreviewBookLocation marker: it isn't the placement target
+        -- and doesn't block, so warding it just wastes calls.
+        if cls == "StaticMeshComponent" and nm ~= "PreviewBookLocation" then
+            meshes[#meshes + 1] = c
+        end
+    end
+    local root; pcall(function() root = case:K2_GetRootComponent() end)
+    local function walk(c, depth)
+        if not (c and c:IsValid()) or depth > 8 then return end
+        consider(c)
+        local kids; pcall(function() kids = c.AttachChildren end)
+        if kids then
+            local n = 0; pcall(function() n = #kids end)
+            for i = 1, n do walk(kids[i], depth + 1) end
+        end
+    end
+    if root then walk(root, 0) end
+    local comps; pcall(function() comps = case.BlueprintCreatedComponents end)
+    if comps then
+        local n = 0; pcall(function() n = #comps end)
+        for i = 1, n do consider(comps[i]) end
+    end
+
+    -- Capture each mesh's original collision once (enabled + profile) for restore.
+    M._case_orig_collision = M._case_orig_collision or {}
+    if case_key and M._case_orig_collision[case_key] == nil then
+        local rec = {}
+        for i = 1, #meshes do
+            local en, pf = 3, "?"
+            pcall(function() en = meshes[i]:GetCollisionEnabled() end)
+            pcall(function() pf = meshes[i]:GetCollisionProfileName():ToString() end)
+            rec[i] = { en = tonumber(en) or 3, pf = pf }
+        end
+        M._case_orig_collision[case_key] = rec
+    end
+    local rec = (case_key and M._case_orig_collision[case_key]) or {}
+
+    -- Log the structure once per distinct static-mesh count (so large cases, if
+    -- they have extra meshes, are visible).
+    M._ward_logged_counts = M._ward_logged_counts or {}
+    if not M._ward_logged_counts[#meshes] then
+        M._ward_logged_counts[#meshes] = true
+        log(("[ward-collision] %d static meshes: %s"):format(#meshes, table.concat(inventory, ", ")))
+    end
+
+    -- Object channels (player + thrown books) that must keep blocking:
+    -- 0 WorldStatic, 1 WorldDynamic, 2 Pawn, 5 PhysicsBody, 6 Vehicle, 7 Destructible.
+    local OBJ_CHANNELS = { 0, 1, 2, 5, 6, 7 }
+    for i = 1, #meshes do
+        local r = rec[i] or { en = 3, pf = "?" }
+        if (r.en or 3) ~= 0 then
+            if locked then
+                -- Same end-state as setting all 32 channels, but ~8 calls instead
+                -- of 32 (the 32-call version was heavy enough to stall the load):
+                -- ignore EVERY channel (so the placement trace — whatever channel
+                -- it uses — misses → un-interactable), then re-block the object
+                -- channels (player Pawn + thrown books still bounce off).
+                pcall(function() meshes[i]:SetCollisionEnabled(3) end)
+                pcall(function() meshes[i]:SetCollisionResponseToAllChannels(0) end)
+                for _, ch in ipairs(OBJ_CHANNELS) do
+                    pcall(function() meshes[i]:SetCollisionResponseToChannel(ch, 2) end)
+                end
+                -- Remember one warded mesh as a drift canary: channel 4 (Camera) is
+                -- left at Ignore(0) here; if the game later resets it to Block, we
+                -- know an event-less transition (Menu→Continue) un-warded us.
+                M._ward_canary = meshes[i]
+            elseif r.pf and r.pf ~= "?" and r.pf ~= "Custom" and r.pf ~= "" then
+                pcall(function() meshes[i]:SetCollisionProfileName(r.pf) end)
+            else
+                pcall(function() meshes[i]:SetCollisionEnabled(r.en or 3) end)
+                pcall(function() meshes[i]:SetCollisionResponseToAllChannels(2) end)
+            end
+        end
+    end
+end
+
 --- Decompose UE FMatrix44f planes into a Lua FTransform table.
 --- UE FMatrix is row-major; rows 0-2 are basis vectors (X/Y/Z axes
 --- after rotation, scaled), row 3 is translation. We extract scale as
@@ -962,6 +1100,15 @@ M._case_last_applied_hidden = {}
 -- pcall fails silently and the case is managed by the legacy bHidden
 -- path alone — degraded but functional.
 M._case_covers = {}
+
+-- Option 2 warding: per-case captured original component collision (keyed by
+-- GetFullName). Cleared on world reload.
+M._case_orig_collision = {}
+
+-- Apply-on-change tracker: the last visible (lock) state we applied per case
+-- (by GetFullName), so the warding only re-touches a case when its state
+-- changes — perf + avoids racing the world teardown on quit. Cleared on reload.
+M._case_ward_state = {}
 
 -- Diagnostic flags for v1.1.0 pak functions. Set true the first time we
 -- successfully call into a new pak function so we don't spam the log.
@@ -1096,6 +1243,27 @@ function M.reset_hism_state()
     -- our references are dangling. Drop them. Next _apply_bookcases_to_world
     -- pass will re-spawn covers for warded sections.
     M._case_covers = {}
+    -- Per-case captured component collision (Option 2 warding). Cases reload at
+    -- their level-default collision and actor identities change, so drop the
+    -- captures — the next apply pass recaptures and re-applies.
+    M._case_orig_collision = {}
+    M._case_ward_state = {}
+    -- Section-sign glow: re-built by the indexer each session; drop stale state so
+    -- the new (post-reload) spotlights get re-glowed.
+    M._section_to_label = nil
+    M._section_glow_state = {}
+    M._section_glow_orig = {}
+    -- Bookcase index: the case refs point at the OLD world's actors. Keeping them
+    -- both pins the old world (preventing GC) and makes the next warding pass
+    -- operate on stale/invisible cases — so after Menu→Continue the visible new
+    -- cases stay UN-warded. set_gameplay_active(false) clears these on a normal
+    -- exit, but that path doesn't fire on the Menu→Continue LoadMap. Clear here too
+    -- and force a fresh re-index against the new world.
+    M._section_to_cases = {}
+    M._case_to_section = {}
+    M._stray_cases = {}
+    M._cases_indexed = false
+    M._ward_canary = nil
     log("[hism-reset] cleared HISM mapping state (will re-init on next apply-safe)")
 end
 
@@ -2682,6 +2850,15 @@ end
 function M._index_bookcases(silent)
     M._section_to_cases = {}
     M._case_to_section  = {}
+    -- A (re)index means the world (or our view of it) changed — e.g. after
+    -- quit→Continue, which reloads the world but REUSES actor paths, so the
+    -- apply-on-change tracker would otherwise match and skip re-warding. Drop the
+    -- warding tracker + sign-glow state so everything re-applies fresh.
+    M._case_ward_state = {}
+    M._section_to_label = nil
+    M._section_glow_state = {}
+    M._section_glow_orig = {}
+    M._ward_canary = nil
 
     -- Step 1: build boi → BP_BookCase_C map. The wrappers (PillarCabinet,
     -- Cabinet_01) reference their child bookcases via BookOrderIndex (matches
@@ -3022,8 +3199,123 @@ end
 --- cases become reachable before series in 10-vol cases.
 --- Operates only on BP_BookCase_C actors so structural wrapper meshes
 --- (pillars, walls) stay visible. Idempotent.
+-- ── Section sign (CabinetLabel) glow ───────────────────────────────────────
+-- Each section's BP_M01_CabinetLabel_01_C sign carries a SpotLight (the
+-- completion glow). We drive that spotlight RED on fully-locked sections as a
+-- "blocked" cue. The label→section map is built by the indexer (M._section_to_label,
+-- via the label's `Label Number`), so we just read it here — no FindAllOf / position
+-- matching. SAFE: gameplay-only (never the streaming window that AV'd),
+-- apply-on-change, and we DO NOT persistently hold the SpotLight component (a
+-- render-scene-tied reference held across teardown hung the game) — we look it up
+-- on the rare state-change and keep only primitives (original intensity/vis/units).
+
+-- Bright value by ELightUnits (0 Unitless, 1 Candelas, 2 Lumens, 3 EV). This
+-- game's signs use Candelas (1); tune that entry for brightness.
+local GLOW_INTENSITY = { [0] = 0.5, [1] = 0.5, [2] = 180.0, [3] = 1.0 }
+
+-- Glow the locked signs immediately when we're in gameplay AND apply-safe, instead
+-- of waiting up to 5s for the periodic loop. Forces a fresh map first (drops any
+-- stale label refs from the prior world) so it's safe right after Continue.
+function M._maybe_glow_now()
+    if not (M._gameplay_active and M._apply_safe) then return end
+    M._section_to_label = nil
+    M._section_glow_state = {}
+    M._section_glow_orig = {}
+    pcall(M._apply_label_glow)
+end
+
+function M._apply_label_glow()
+    -- One-time per session, IN GAMEPLAY: map sections → their CabinetLabel actor
+    -- via the label's `Label Number`. Done here (not at index/load time) so nothing
+    -- touches these label actors during the fragile streaming window.
+    if not M._section_to_label then
+        M._section_to_label = {}
+        local labels = FindAllOf("BP_M01_CabinetLabel_01_C")
+        local nl = 0; if labels then pcall(function() nl = #labels end) end
+        for i = 1, nl do
+            local lb = labels[i]
+            if lb and lb:IsValid() then
+                local num; pcall(function() num = lb["Label Number"] end)
+                local sid = _label_num_to_section(num)
+                if sid then M._section_to_label[sid] = lb end
+            end
+        end
+        local c = 0; for _ in pairs(M._section_to_label) do c = c + 1 end
+        log(("[label-glow] mapped %d sections to signs (gameplay)"):format(c))
+    end
+    M._section_glow_state = M._section_glow_state or {}
+    M._section_glow_orig = M._section_glow_orig or {}
+    for sid, lbl in pairs(M._section_to_label) do
+        local locked = (M._shelves_open[sid] or 0) == 0
+        if M._section_glow_state[sid] ~= locked then
+            if lbl and lbl:IsValid() then
+                -- Look the SpotLight up on-demand; never store the component.
+                local spot
+                local comps; pcall(function() comps = lbl.BlueprintCreatedComponents end)
+                local cn = 0; if comps then pcall(function() cn = #comps end) end
+                for j = 1, cn do
+                    local c = comps[j]
+                    if c then
+                        local cls = ""; pcall(function() cls = c:GetClass():GetFName():ToString() end)
+                        if cls == "SpotLightComponent" then spot = c; break end
+                    end
+                end
+                if spot and spot:IsValid() then
+                    if not M._section_glow_orig[sid] then
+                        local oi, ov, ou
+                        pcall(function() oi = spot.Intensity end)
+                        pcall(function() ov = spot:IsVisible() end)
+                        pcall(function() ou = spot.IntensityUnits end)
+                        M._section_glow_orig[sid] = { int = oi, vis = ov, units = ou }
+                    end
+                    local o = M._section_glow_orig[sid] or {}
+                    if locked then
+                        pcall(function() spot:SetLightColor({ R = 1.0, G = 0.0, B = 0.0, A = 1.0 }, true) end)
+                        local inten = GLOW_INTENSITY[o.units or 0] or 15.0
+                        pcall(function() spot:SetIntensity(inten) end)
+                        pcall(function() spot:SetVisibility(true, false) end)
+                    else
+                        -- Restore original light state; the game owns the real
+                        -- completion glow once the section is unlocked.
+                        pcall(function() spot:SetIntensity(o.int or 0.0) end)
+                        pcall(function() spot:SetVisibility(o.vis == true, false) end)
+                        pcall(function() spot:SetLightColor({ R = 1.0, G = 1.0, B = 1.0, A = 1.0 }, true) end)
+                    end
+                end
+            end
+            M._section_glow_state[sid] = locked
+        end
+    end
+end
+
 function M._apply_bookcases_to_world()
     if not M._cases_indexed then return end
+    -- Section sign glow: drive each fully-locked section's sign SpotLight red.
+    -- Gameplay-only (never during streaming), apply-on-change.
+    if M._gameplay_active and M._apply_safe then
+        pcall(M._apply_label_glow)
+    end
+    -- Drift canary: the game silently resets bookcase collision on some transitions
+    -- (e.g. Menu→Continue) that fire NO mod event, so apply-on-change would keep
+    -- skipping the now-unwarded cases forever. If our sample warded mesh's Camera
+    -- response is no longer Ignore, it's been reset — drop the warding + glow
+    -- trackers so this pass re-applies everything.
+    if M._ward_canary then
+        if M._ward_canary:IsValid() then
+            local resp
+            pcall(function() resp = M._ward_canary:GetCollisionResponseToChannel(4) end)
+            if resp ~= nil and resp ~= 0 then
+                log("[ward-canary] warding drift detected — re-warding + re-glowing")
+                M._case_ward_state = {}
+                M._section_to_label = nil
+                M._section_glow_state = {}
+                M._section_glow_orig = {}
+                M._ward_canary = nil
+            end
+        else
+            M._ward_canary = nil   -- stale (world reloaded); other paths re-ward
+        end
+    end
     local shown, hidden, dead = 0, 0, 0
     for section_id, cases in pairs(M._section_to_cases) do
         local shelves_open = M._shelves_open[section_id] or 0
@@ -3048,67 +3340,53 @@ function M._apply_bookcases_to_world()
                 local case_key
                 pcall(function() case_key = case:GetFullName() end)
 
-                -- Drift probe (B10 diagnostic). Logs when a case's
-                -- bHidden no longer matches what we last set — likely
-                -- the game's BP tick reverting our flag.
-                if case_key then
-                    local last_applied = M._case_last_applied_hidden[case_key]
-                    if last_applied ~= nil then
-                        local actual_hidden
-                        pcall(function() actual_hidden = case.bHidden end)
-                        if actual_hidden ~= nil and actual_hidden ~= last_applied then
-                            log(("[bookcase-drift] section=%s case_idx=%d last_applied=%s actual=%s"):format(
-                                section_id, i, tostring(last_applied),
-                                tostring(actual_hidden)))
-                        end
-                    end
-                end
+                -- Apply-on-change gate: only mutate this case when its visible
+                -- (lock) state actually changes. The warding STICKS once applied
+                -- (the BP doesn't fight our collision), so steady-state passes do
+                -- nothing per case — a big perf win that also removes the window
+                -- where a periodic poll could race the world teardown on quit and
+                -- deref a freeing mesh (the 0x0 quit crash). State resets on world
+                -- reload, so every case re-applies fresh next session.
+                M._case_ward_state = M._case_ward_state or {}
+                local changed = (not case_key) or (M._case_ward_state[case_key] ~= visible)
 
-                local ok = pcall(function()
-                    -- Warded cases: keep visible (so the fence cover
-                    -- looks like a gate over real shelving) with
-                    -- collision OFF so the placement raycast doesn't
-                    -- find PreviewBookLocation through the chain-link
-                    -- holes. The fence's own collision (sized per
-                    -- variant — see fence dispatch below) blocks the
-                    -- player from walking up to the case and from
-                    -- physics-throwing books past the gate.
-                    -- Unlocked cases: visible + collision on for normal
-                    -- placement.
-                    case:SetActorHiddenInGame(false)
-                    case:SetActorEnableCollision(visible)
-                    -- Tree-walk child components to ensure visibility
-                    -- propagates. BP_BookCase children
-                    -- (StaticMesh, PreviewBookLocation) don't always
-                    -- inherit the actor flag.
-                    local root = case:K2_GetRootComponent()
-                    if root and root:IsValid() then
-                        _walk_set_visibility(root, true)
-                    end
-                    local comps
-                    pcall(function() comps = case.BlueprintCreatedComponents end)
-                    if comps then
-                        local cn = 0; pcall(function() cn = #comps end)
-                        for j = 1, cn do
-                            local c = comps[j]
-                            if c and c:IsValid() then
-                                pcall(function() c:SetVisibility(true, false) end)
-                                pcall(function() c:SetHiddenInGame(false, false) end)
-                                pcall(function() c:MarkRenderStateDirty() end)
+                if changed then
+                    local ok = pcall(function()
+                        -- Warding (Lua-only, crash-free) — 2e: LOCKED cases keep their
+                        -- body meshes solid to OBJECT channels (block player + thrown
+                        -- books) but IGNORE trace channels so the placement line-trace
+                        -- misses → solid AND un-interactable. UNLOCKED restores them.
+                        -- See `_ward_collision`.
+                        case:SetActorHiddenInGame(false)
+                        _ward_collision(case, case_key, not visible)
+                        -- Tree-walk child components to ensure visibility
+                        -- propagates. BP_BookCase children
+                        -- (StaticMesh, PreviewBookLocation) don't always
+                        -- inherit the actor flag.
+                        local root = case:K2_GetRootComponent()
+                        if root and root:IsValid() then
+                            _walk_set_visibility(root, true)
+                        end
+                        local comps
+                        pcall(function() comps = case.BlueprintCreatedComponents end)
+                        if comps then
+                            local cn = 0; pcall(function() cn = #comps end)
+                            for j = 1, cn do
+                                local c = comps[j]
+                                if c and c:IsValid() then
+                                    pcall(function() c:SetVisibility(true, false) end)
+                                    pcall(function() c:SetHiddenInGame(false, false) end)
+                                    pcall(function() c:MarkRenderStateDirty() end)
+                                end
                             end
                         end
+                    end)
+                    if ok then
+                        if case_key then M._case_ward_state[case_key] = visible end
+                        if visible then shown = shown + 1 else hidden = hidden + 1 end
+                    else
+                        dead = dead + 1
                     end
-                end)
-                if ok then
-                    if case_key then
-                        -- Tracker now always records "not hidden" since
-                        -- we don't hide warded cases anymore. Kept for
-                        -- the bookcase-drift probe above.
-                        M._case_last_applied_hidden[case_key] = false
-                    end
-                    if visible then shown = shown + 1 else hidden = hidden + 1 end
-                else
-                    dead = dead + 1
                 end
 
                 -- Cover-actor overlay. If the pak is loaded, ModActor
@@ -3312,10 +3590,13 @@ function M._apply_bookcases_to_world()
 
     -- Only log when something changed vs the last apply (the periodic
     -- re-apply runs every 5s and used to spam identical lines).
-    local key = string.format("%d/%d/%d/%d", shown, hidden, dead, stray_disabled)
+    local _diag_total = 0
+    for _, _cs in pairs(M._section_to_cases) do _diag_total = _diag_total + #_cs end
+    local key = string.format("%d/%d/%d/%d/%d", _diag_total, shown, hidden, dead, stray_disabled)
     if M._last_apply_log_key ~= key then
-        log(("Bookcases: shown=%d hidden=%d dead=%d stray=%d"):format(
-            shown, hidden, dead, stray_disabled))
+        log(("Bookcases: cases=%d shown=%d hidden=%d dead=%d stray=%d (gp=%s as=%s)"):format(
+            _diag_total, shown, hidden, dead, stray_disabled,
+            tostring(M._gameplay_active), tostring(M._apply_safe)))
         M._last_apply_log_key = key
     end
 end

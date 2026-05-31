@@ -1,0 +1,12 @@
+1.0.0 Known Bugs:
+
+- Crash when running Special Stage.  Need to remove that as an option and fix the underlying issue.
+- Softlock caused by moving books to wrong section, making that section unusable until more shelves are granted.
+- Ghost shelves in certain areas.  If you place a book on the ghost shelf, you cant get it back.
+- Some settings cause more items than locations:
+"Filling the multiworld with 1475 items.
+Current fill step (Progression) at 1000/942 items placed."
+
+Feature Requests:
+
+- Remove posters.  They cause confusion when trying to look for books on the tables.

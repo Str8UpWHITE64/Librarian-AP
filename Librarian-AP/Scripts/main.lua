@@ -10,6 +10,605 @@ local function log(msg)
     print(("[%s] %s\n"):format(MOD, tostring(msg)))
 end
 
+-- TEMP DIAGNOSTIC (book-hiding validation, 2026-05-30): read the actually-loaded
+-- M_VariationProp's BlendMode to determine whether our LogicMod pak override won
+-- over the base (IoStore) material. One-shot; logs once in gameplay then stops.
+--   BlendMode 0 = Opaque      -> base material won (loose pak can't override IoStore)
+--   BlendMode 2 = Translucent -> OUR override won (so material/opacity is the issue)
+-- Safe to delete this block + the pcall(diag_varprop) line in the 5s loop afterward.
+local _varprop_diag_done = false
+local function diag_varprop()
+    if _varprop_diag_done then return end
+    local mat = nil
+    pcall(function()
+        mat = StaticFindObject("/Game/Librarian/Materials/BaseMaterial/Gimmick/M_VariationProp.M_VariationProp")
+    end)
+    -- Fallback: read a loaded book material instance's Parent.
+    if not (mat and mat:IsValid()) then
+        local insts = nil
+        pcall(function() insts = FindAllOf("MaterialInstanceConstant") end)
+        if insts then
+            for _, mi in ipairs(insts) do
+                local nm = nil
+                pcall(function() nm = mi:GetFullName() end)
+                if nm and nm:find("MI_G01_Book") then
+                    local p = nil
+                    pcall(function() p = mi.Parent end)
+                    if p and p:IsValid() then mat = p; break end
+                end
+            end
+        end
+    end
+    if not (mat and mat:IsValid()) then
+        log("[varprop-diag] M_VariationProp not loaded yet; will retry next pass")
+        return
+    end
+    _varprop_diag_done = true
+    local nm, bm, sm = "?", "?", "?"
+    pcall(function() nm = mat:GetFullName() end)
+    pcall(function() bm = tostring(mat.BlendMode) end)
+    pcall(function() sm = tostring(mat.ShadingModel) end)
+    log(("[varprop-diag] loaded=%s BlendMode=%s ShadingModel=%s"):format(nm, bm, sm))
+    log("[varprop-diag] BlendMode 0=Opaque(base won) 2=Translucent(our override won)")
+end
+
+-- TEMP DIAGNOSTIC (runtime book-hiding, step 1): read-only dump of the book
+-- HISM structure — per-component instance count, custom-data float slots, and
+-- assigned material — to design a SetMaterial + per-instance custom-data hide.
+-- One-shot in gameplay. Safe to delete with its pcall(diag_hism) call later.
+local _hism_diag_done = false
+local function diag_hism()
+    if _hism_diag_done then return end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return end
+    local arr = nil
+    pcall(function() arr = mgr.HISMArray end)
+    local n = 0; if arr then pcall(function() n = #arr end) end
+    if n == 0 then return end
+    _hism_diag_done = true
+    log(("[hism-diag] BP_HISM_Manager_C HISMArray = %d components"):format(n))
+    local shown = math.min(n, 14)
+    for i = 1, shown do
+        local h = nil
+        pcall(function() h = arr[i] end)
+        if h and h:IsValid() then
+            local cls, ic, ncd, mat0 = "?", "?", "?", "?"
+            pcall(function() cls = h:GetClass():GetFName():ToString() end)
+            pcall(function() ic = tostring(h:GetInstanceCount()) end)
+            pcall(function() ncd = tostring(h.NumCustomDataFloats) end)
+            pcall(function() local m = h:GetMaterial(0); if m and m:IsValid() then mat0 = m:GetFullName() end end)
+            log(("[hism-diag]  [%d] %s inst=%s customFloats=%s mat0=%s"):format(i, cls, ic, ncd, mat0))
+        end
+    end
+    if n > shown then log(("[hism-diag]  (+%d more components)"):format(n - shown)) end
+    local books = FindAllOf("BP_GrabbingBook_C")
+    local bn = 0; if books then pcall(function() bn = #books end) end
+    log(("[hism-diag] BP_GrabbingBook_C actors = %d"):format(bn))
+end
+
+-- TEMP DIAGNOSTIC (runtime book-hiding, step 2): crash-safety gate for the hide
+-- mechanism. Calls SetMaterial on a batch of book HISMs + SetCustomDataValue on
+-- some instances — the two NON-transform calls the real hide would use (transform
+-- updates are the ones that crashed the old "hidden" mode). If the game survives,
+-- incl. ~10s after for deferred render-thread crashes, the mechanism is viable.
+-- Visible side effect: ~1000 books change cover design. NOT persisted; relaunch reverts.
+local _hism_test_done = false
+local function test_hism_setmat()
+    if _hism_test_done then return end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return end
+    local arr = nil; pcall(function() arr = mgr.HISMArray end)
+    local n = 0; if arr then pcall(function() n = #arr end) end
+    if n == 0 then return end
+    _hism_test_done = true
+    local donor = nil
+    pcall(function() donor = arr[1]:GetMaterial(0) end)
+    if not (donor and donor:IsValid()) then log("[hism-test] no donor material; abort"); return end
+    local last = math.min(n, 100)
+    local setmat_ok = 0
+    for i = 2, last do
+        local h = nil; pcall(function() h = arr[i] end)
+        if h and h:IsValid() then
+            if pcall(function() h:SetMaterial(0, donor) end) then setmat_ok = setmat_ok + 1 end
+        end
+    end
+    local cd_ok = 0
+    local h1 = nil; pcall(function() h1 = arr[1] end)
+    if h1 and h1:IsValid() then
+        for inst = 0, 9 do
+            if pcall(function() h1:SetCustomDataValue(inst, 0, 0.5, true) end) then cd_ok = cd_ok + 1 end
+        end
+    end
+    log(("[hism-test] SetMaterial ok=%d/%d  SetCustomDataValue ok=%d/10"):format(setmat_ok, last - 1, cd_ok))
+    log("[hism-test] survived the calls; now watch ~10s for a deferred render-thread crash")
+end
+
+-- TEMP DIAGNOSTIC (runtime book-hiding, step 3): read-only property dump of the
+-- HISM manager + a book actor, to find the book->instance->series mapping (the
+-- manager's UpdateInstance(info,...) implies it keeps one). Looks for AssetIdx +
+-- any field linking an actor/info to its (HISM, instance index).
+local _mapprobe_done = false
+local function probe_mapping()
+    if _mapprobe_done then return end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return end
+    _mapprobe_done = true
+    local mcls = nil; pcall(function() mcls = mgr:GetClass() end)
+    if mcls then
+        log("[map-probe] === BP_HISM_Manager_C properties ===")
+        pcall(function()
+            mcls:ForEachProperty(function(prop)
+                local pn, cn = "?", "?"
+                pcall(function() pn = prop:GetFName():ToString() end)
+                pcall(function() cn = prop:GetClass():GetFName():ToString() end)
+                log(("[map-probe]   mgr.%s : %s"):format(pn, cn))
+                return 0
+            end)
+        end)
+    end
+    local books = FindAllOf("BP_GrabbingBook_C")
+    local b = books and books[1]
+    if b and b:IsValid() then
+        local bcls = nil; pcall(function() bcls = b:GetClass() end)
+        if bcls then
+            log("[map-probe] === BP_GrabbingBook_C properties ===")
+            pcall(function()
+                bcls:ForEachProperty(function(prop)
+                    local pn, cn = "?", "?"
+                    pcall(function() pn = prop:GetFName():ToString() end)
+                    pcall(function() cn = prop:GetClass():GetFName():ToString() end)
+                    log(("[map-probe]   book.%s : %s"):format(pn, cn))
+                    return 0
+                end)
+            end)
+        end
+    end
+end
+
+-- TEMP DIAGNOSTIC (runtime book-hiding, step 4): read book->HISM-instance->series
+-- mapping VALUES on real books. Confirms HISMController identifies the HISM and
+-- MovingIndex is the per-instance index. Uses split ItemInfo access (chained
+-- access AVs per ItemApply). Read-only.
+local _bookval_done = false
+local function probe_book_values()
+    if _bookval_done then return end
+    local books = FindAllOf("BP_GrabbingBook_C")
+    if not books then return end
+    local bn = 0; pcall(function() bn = #books end)
+    if bn == 0 then return end
+    local IA = package.loaded["AP/ItemApply"]
+    local logged, sawreal = 0, false
+    for i = 1, bn do
+        if logged >= 10 then break end
+        local b = books[i]
+        if b and b:IsValid() then
+            local info = nil; pcall(function() info = b.ItemInfo end)
+            local ai = nil
+            if info and info:IsValid() then pcall(function() ai = info.AssetIdx end) end
+            if ai ~= nil then
+                if ai > 0 then sawreal = true end
+                local hc, mi, ser = "?", "?", "?"
+                pcall(function() local c = b.HISMController; if c and c:IsValid() then hc = c:GetClass():GetFName():ToString()..":"..c:GetFName():ToString() end end)
+                pcall(function() mi = tostring(b.MovingIndex) end)
+                pcall(function() ser = tostring(IA and IA._asset_to_series and IA._asset_to_series[ai]) end)
+                log(("[book-val] [%d] AssetIdx=%s series=%s HISMController=%s MovingIndex=%s"):format(i, tostring(ai), ser, hc, mi))
+                logged = logged + 1
+            end
+        end
+    end
+    if sawreal then _bookval_done = true end
+end
+
+-- TEMP DIAGNOSTIC (runtime book-hiding, step 5): enumerate the HISM manager's and
+-- book actor's callable functions, hunting for a clean hide/show/visibility method
+-- (e.g. HideBook(info), SetInstanceVisible) that would dodge the hard book->instance
+-- spatial mapping. Read-only.
+local _fnprobe_done = false
+local function probe_functions()
+    if _fnprobe_done then return end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return end
+    _fnprobe_done = true
+    local mcls = nil; pcall(function() mcls = mgr:GetClass() end)
+    if mcls then
+        log("[fn-probe] === BP_HISM_Manager_C functions ===")
+        pcall(function()
+            mcls:ForEachFunction(function(fn)
+                local fname = "?"; pcall(function() fname = fn:GetFName():ToString() end)
+                log(("[fn-probe]   mgr:%s"):format(fname))
+                return 0
+            end)
+        end)
+    end
+    local books = FindAllOf("BP_GrabbingBook_C")
+    local b = books and books[1]
+    if b and b:IsValid() then
+        local bcls = nil; pcall(function() bcls = b:GetClass() end)
+        if bcls then
+            log("[fn-probe] === BP_GrabbingBook_C functions ===")
+            pcall(function()
+                bcls:ForEachFunction(function(fn)
+                    local fname = "?"; pcall(function() fname = fn:GetFName():ToString() end)
+                    log(("[fn-probe]   book:%s"):format(fname))
+                    return 0
+                end)
+            end)
+        end
+    end
+end
+
+-- TEMP DIAGNOSTIC (runtime book-hiding, step 6): dump parameter signatures of the
+-- manager's SetCustomData / UpdateInstance / UpdateWPO. If SetCustomData takes a
+-- BookInfo (vs raw HISM/instance indices), the manager owns the mapping and we can
+-- set per-book custom data by info — no spatial matching needed. Read-only.
+local _sigprobe_done = false
+local function probe_signatures()
+    if _sigprobe_done then return end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return end
+    _sigprobe_done = true
+    local mcls = nil; pcall(function() mcls = mgr:GetClass() end)
+    if not mcls then return end
+    local targets = { SetCustomData = true, UpdateInstance = true, UpdateWPO = true }
+    pcall(function()
+        mcls:ForEachFunction(function(fn)
+            local fname = "?"; pcall(function() fname = fn:GetFName():ToString() end)
+            if targets[fname] then
+                log(("[sig-probe] === mgr:%s ==="):format(fname))
+                pcall(function()
+                    fn:ForEachProperty(function(prop)
+                        local pn, cn = "?", "?"
+                        pcall(function() pn = prop:GetFName():ToString() end)
+                        pcall(function() cn = prop:GetClass():GetFName():ToString() end)
+                        log(("[sig-probe]   %s : %s"):format(pn, cn))
+                        return 0
+                    end)
+                end)
+            end
+            return 0
+        end)
+    end)
+end
+
+-- TEMP DIAGNOSTIC (runtime book-hiding, step 7): the decisive test. Call
+-- mgr:UpdateWPO(book.ItemInfo, {Z=-1e6}) on ~200 books — the manager maps Info
+-- ->instance, the material's WPO displaces the vertices to deep Z (invisible),
+-- no transform update, no material swap. If ~200 books vanish with no crash, this
+-- is the hide mechanism. NOT persisted; relaunch reverts.
+local _wpo_test_done = false
+local function test_wpo_hide()
+    if _wpo_test_done then return end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return end
+    local books = FindAllOf("BP_GrabbingBook_C")
+    if not books then return end
+    local bn = 0; pcall(function() bn = #books end)
+    if bn == 0 then return end
+    local ready = false
+    pcall(function() local info = books[1].ItemInfo; if info and info:IsValid() then ready = true end end)
+    if not ready then return end
+    _wpo_test_done = true
+    local offset = { X = 0.0, Y = 0.0, Z = -1000000.0 }
+    local target = math.min(bn, 2000)
+    local cursor, ok_count = 1, 0
+    local CHUNK = 250
+    local function do_chunk()
+        local last = math.min(cursor + CHUNK - 1, target)
+        for i = cursor, last do
+            local b = books[i]
+            if b and b:IsValid() then
+                local info = nil; pcall(function() info = b.ItemInfo end)
+                if info and info:IsValid() then
+                    if pcall(function() mgr:UpdateWPO(info, offset) end) then ok_count = ok_count + 1 end
+                end
+            end
+        end
+        cursor = last + 1
+        if cursor <= target then
+            LoopAsync(40, function() do_chunk() return true end)
+        else
+            log(("[wpo-test] UpdateWPO(Info, Z=-1e6) done: ok=%d of first %d books"):format(ok_count, target))
+        end
+    end
+    do_chunk()
+    log("[wpo-test] dispatching ~2000 UpdateWPO (chunks of 250); watch for a big hole in the pile")
+end
+
+-- TEMP DIAGNOSTIC (runtime book-hiding, step 8): does each book HISM hold ONE series
+-- (=> simple whole-HISM hide, no art rebuild) or a MIX (=> per-instance mask + art
+-- reproduction)? Spatial match: hash book-actor positions -> series, then classify
+-- each HISM instance by position. Pure reads (crash-safe). Heavy one-shot.
+local _homog_done = false
+local function probe_homogeneity()
+    if _homog_done then return end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return end
+    local arr = nil; pcall(function() arr = mgr.HISMArray end)
+    local hn = 0; if arr then pcall(function() hn = #arr end) end
+    if hn == 0 then return end
+    local books = FindAllOf("BP_GrabbingBook_C")
+    if not books then return end
+    local bn = 0; pcall(function() bn = #books end)
+    if bn == 0 then return end
+    local ready = false
+    pcall(function() local info = books[1].ItemInfo; if info and info:IsValid() then ready = true end end)
+    if not ready then return end
+    _homog_done = true
+    local IA = package.loaded["AP/ItemApply"]
+    local function bkey(x, y) return math.floor(x / 25 + 0.5) .. "_" .. math.floor(y / 25 + 0.5) end
+    local pos2series, hashed = {}, 0
+    for i = 1, bn do
+        local b = books[i]
+        if b and b:IsValid() then
+            local loc; pcall(function() loc = b:K2_GetActorLocation() end)
+            local info; pcall(function() info = b.ItemInfo end)
+            local ai; if info and info:IsValid() then pcall(function() ai = info.AssetIdx end) end
+            if loc and ai ~= nil then
+                local x, y; pcall(function() x = loc.X end); pcall(function() y = loc.Y end)
+                if x and y then
+                    local ser = (IA and IA._asset_to_series and IA._asset_to_series[ai]) or ("aidx" .. tostring(ai))
+                    pos2series[bkey(x, y)] = ser
+                    hashed = hashed + 1
+                end
+            end
+        end
+    end
+    log(("[homog] hashed %d/%d book positions"):format(hashed, bn))
+    local sample = math.min(hn, 60)
+    local single, multi, empty = 0, 0, 0
+    for hi = 1, sample do
+        local h; pcall(function() h = arr[hi] end)
+        if h and h:IsValid() then
+            local sm; pcall(function() sm = h.PerInstanceSMData end)
+            local sn = 0; if sm then pcall(function() sn = #sm end) end
+            local seen, matched = {}, 0
+            for j = 1, sn do
+                local t; pcall(function() t = sm[j].Transform end)
+                local wp; if t then pcall(function() wp = t.WPlane end) end
+                if wp then
+                    local x, y; pcall(function() x = wp.X end); pcall(function() y = wp.Y end)
+                    if x and y then
+                        local ser = pos2series[bkey(x, y)]
+                        if ser then seen[ser] = true; matched = matched + 1 end
+                    end
+                end
+            end
+            local distinct = 0; for _ in pairs(seen) do distinct = distinct + 1 end
+            if matched == 0 then empty = empty + 1
+            elseif distinct <= 1 then single = single + 1
+            else multi = multi + 1 end
+            if hi <= 10 then
+                local names = {}; for s in pairs(seen) do names[#names + 1] = s end
+                log(("[homog] HISM[%d] inst=%d matched=%d series=%d {%s}"):format(hi, sn, matched, distinct, table.concat(names, " | "):sub(1, 100)))
+            end
+        end
+    end
+    log(("[homog] sampled %d HISMs: single-series=%d multi-series=%d unmatched=%d"):format(sample, single, multi, empty))
+end
+
+-- TEMP (runtime book-hiding, step 9 = B2 pipeline validation): spatial-map every
+-- HISM instance -> series -> warded, swap every book HISM to M_APBookMask, and set
+-- PerInstanceCustomData[0] = 0 (hide warded) / 1 (show unwarded). All crash-safe ops
+-- (SetMaterial + SetCustomDataValue). Expected: warded books vanish, unwarded turn
+-- green. Validates targeting end-to-end before building the real art material.
+local _b2_done = false
+local _b2_load_requested = false
+local _b2_mat_ref = nil
+local _b2_load_ret = nil
+local function do_b2_hide()
+    if _b2_done then return end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._compute_unwarded_set and IA._asset_to_series) then return end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return end
+    local arr = nil; pcall(function() arr = mgr.HISMArray end)
+    local hn = 0; if arr then pcall(function() hn = #arr end) end
+    if hn == 0 then return end
+    local books = FindAllOf("BP_GrabbingBook_C")
+    if not books then return end
+    local bn = 0; pcall(function() bn = #books end)
+    if bn == 0 then return end
+    local ready = false
+    pcall(function() local info = books[1].ItemInfo; if info and info:IsValid() then ready = true end end)
+    if not ready then return end
+    local mat = nil
+    -- M_APBookMask is unreferenced, so LoadAsset can't pull it from the LogicMod pak.
+    -- It must be hard-referenced by ModActor (a Material var named BookMaskMat) so it
+    -- loads with the mod; read it from there. Fallback: StaticFindObject if already loaded.
+    local ma = FindFirstOf("ModActor_C")
+    if ma and ma:IsValid() then pcall(function() mat = ma.BookMaskMat end) end
+    if not (mat and mat:IsValid()) then
+        pcall(function() mat = StaticFindObject("/Game/Mods/LibrarianAPHUDFix/M_APBookMask.M_APBookMask") end)
+    end
+    if not (mat and mat:IsValid()) then
+        if not _b2_load_requested then
+            _b2_load_requested = true
+            log("[b2] M_APBookMask not available yet (add ModActor Material var 'BookMaskMat' = M_APBookMask, recook); will retry")
+        end
+        return
+    end
+    _b2_done = true
+    _b2_mat_ref = mat  -- pin against GC
+    log("[b2] M_APBookMask acquired via ModActor; applying hide")
+    local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
+    local unwarded = IA._compute_unwarded_set(only_shelfable) or {}
+    -- 2D nearest-match (X,Y only). HISM instance transforms are component-LOCAL, so
+    -- their Z doesn't line up with the actor's WORLD Z — including Z broke matching
+    -- (113 -> 10 correct). X,Y line up, so match on those. Stacked books share X,Y
+    -- (minor ambiguity, acceptable for now) but every instance gets classified.
+    local CELL = 25.0
+    local function gkey(ix, iy) return ix .. "_" .. iy end
+    local grid = {}
+    for i = 1, bn do
+        local b = books[i]
+        if b and b:IsValid() then
+            local loc; pcall(function() loc = b:K2_GetActorLocation() end)
+            local info; pcall(function() info = b.ItemInfo end)
+            local ai; if info and info:IsValid() then pcall(function() ai = info.AssetIdx end) end
+            local x, y
+            if loc then pcall(function() x = loc.X end); pcall(function() y = loc.Y end) end
+            if x and y and ai ~= nil then
+                local ser = IA._asset_to_series[ai]
+                local k = gkey(math.floor(x / CELL), math.floor(y / CELL))
+                local cell = grid[k]; if not cell then cell = {}; grid[k] = cell end
+                cell[#cell + 1] = { x = x, y = y, warded = not (ser and unwarded[ser]) }
+            end
+        end
+    end
+    local function nearest_warded(px, py)
+        local cx, cy = math.floor(px / CELL), math.floor(py / CELL)
+        local best, bd2 = nil, CELL * CELL
+        for dx = -1, 1 do for dy = -1, 1 do
+            local cell = grid[gkey(cx + dx, cy + dy)]
+            if cell then
+                for _, e in ipairs(cell) do
+                    local ex, ey = e.x - px, e.y - py
+                    local d2 = ex * ex + ey * ey
+                    if d2 <= bd2 then bd2 = d2; best = e end
+                end
+            end
+        end end
+        if best then return best.warded end
+        return nil
+    end
+    local cursor, CHUNK = 1, 40
+    local hid, shown = 0, 0
+    local function do_chunk()
+        local last = math.min(cursor + CHUNK - 1, hn)
+        for hi = cursor, last do
+            local h; pcall(function() h = arr[hi] end)
+            if h and h:IsValid() then
+                local ns = 1; pcall(function() ns = h:GetNumMaterials() end)
+                for s = 0, (ns or 1) - 1 do pcall(function() h:SetMaterial(s, mat) end) end
+                local sm; pcall(function() sm = h.PerInstanceSMData end)
+                local sn = 0; if sm then pcall(function() sn = #sm end) end
+                for j = 1, sn do
+                    local t; pcall(function() t = sm[j].Transform end)
+                    local wp; if t then pcall(function() wp = t.WPlane end) end
+                    local warded = true
+                    if wp then
+                        local x, y; pcall(function() x = wp.X end); pcall(function() y = wp.Y end)
+                        if x and y then
+                            local w = nearest_warded(x, y)
+                            if w ~= nil then warded = w end
+                        end
+                    end
+                    local maskval = warded and 0.0 or 1.0
+                    pcall(function() h:SetCustomDataValue(j - 1, 0, maskval, j == sn) end)
+                    if warded then hid = hid + 1 else shown = shown + 1 end
+                end
+            end
+        end
+        cursor = last + 1
+        if cursor <= hn then
+            LoopAsync(50, function() do_chunk() return true end)
+        else
+            log(("[b2] done: hid=%d shown=%d across %d HISMs"):format(hid, shown, hn))
+        end
+    end
+    do_chunk()
+    log("[b2] applying M_APBookMask + per-instance mask in chunks; warded -> hidden, unwarded -> green")
+end
+
+-- crash-watch (intermittent gameplay crash): passively hook the game's HISM movement
+-- ops so a recurrence leaves a trail — the last [crash-watch] line before a crash is
+-- the op the game ran on our material-swapped HISMs. One-shot, throttled.
+local _cw_done = false
+local _cw_ui, _cw_wpo = 0, 0
+local function setup_crash_watch()
+    if _cw_done then return end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return end
+    local full = nil
+    pcall(function() full = mgr:GetClass():GetFullName() end)
+    if not full then return end
+    local path = full:gsub("^%S+%s+", "")  -- "BlueprintGeneratedClass /Game/.../BP_HISM_Manager_C" -> path
+    _cw_done = true
+    local ok1 = pcall(function()
+        RegisterHook(path .. ":UpdateInstance", function()
+            _cw_ui = _cw_ui + 1
+            if _cw_ui % 20 == 1 then log(("[crash-watch] UpdateInstance #%d"):format(_cw_ui)) end
+        end)
+    end)
+    local ok2 = pcall(function()
+        RegisterHook(path .. ":UpdateWPO", function()
+            _cw_wpo = _cw_wpo + 1
+            log(("[crash-watch] UpdateWPO #%d"):format(_cw_wpo))
+        end)
+    end)
+    log(("[crash-watch] armed on '%s' (UpdateInstance=%s UpdateWPO=%s)"):format(path, tostring(ok1), tostring(ok2)))
+end
+
+-- TEMP (real material, step 1): probe a book HISM's ORIGINAL material (MI_G01_Book_NN)
+-- for its texture/scalar/vector parameters — tells us the cover-texture param name (to
+-- sample in M_APBookMask + read per-HISM for a MID) and what color params exist. Runs
+-- BEFORE do_b2_hide swaps the material. Read-only, one-shot.
+local _bmp_done = false
+local function probe_book_material_params()
+    if _bmp_done then return end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return end
+    local arr = nil; pcall(function() arr = mgr.HISMArray end)
+    local h = nil; if arr then pcall(function() h = arr[1] end) end
+    if not (h and h:IsValid()) then return end
+    local mic = nil; pcall(function() mic = h:GetMaterial(0) end)
+    if not (mic and mic:IsValid()) then return end
+    _bmp_done = true
+    local nm = "?"; pcall(function() nm = mic:GetFullName() end)
+    log(("[bmp] HISM[1] material: %s"):format(nm))
+    local function dump(prop, label)
+        local a = nil; pcall(function() a = mic[prop] end)
+        local n = 0; if a then pcall(function() n = #a end) end
+        log(("[bmp] %s (%d):"):format(label, n))
+        for i = 1, math.min(n, 16) do
+            local e = nil; pcall(function() e = a[i] end)
+            local pn, val = "?", "?"
+            if e then
+                local pi = nil; pcall(function() pi = e.ParameterInfo end)
+                if pi then pcall(function() pn = pi.Name:ToString() end) end
+                local pv = nil; pcall(function() pv = e.ParameterValue end)
+                if pv ~= nil then
+                    pcall(function()
+                        if type(pv) == "userdata" and pv.GetName then val = pv:GetName() else val = tostring(pv) end
+                    end)
+                end
+            end
+            log(("[bmp]   [%d] %s = %s"):format(i, pn, val))
+        end
+    end
+    dump("TextureParameterValues", "Textures")
+    dump("ScalarParameterValues", "Scalars")
+    dump("VectorParameterValues", "Vectors")
+end
+
+-- TEMP DIAGNOSTIC (step 10): figure out how to get M_APBookMask loaded + referenced.
+-- Captures LoadAsset's return + tries several find paths. One-shot.
+local _ld_done = false
+local function diag_loadasset()
+    if _ld_done then return end
+    _ld_done = true
+    local path = "/Game/Mods/LibrarianAPHUDFix/M_APBookMask"
+    local r, ok = nil, false
+    ok = pcall(function() r = LoadAsset(path) end)
+    log(("[ld] LoadAsset('%s') ok=%s ret=%s type=%s"):format(path, tostring(ok), tostring(r), type(r)))
+    if r and type(r) == "userdata" then
+        local cls, nm = "?", "?"
+        pcall(function() cls = r:GetClass():GetFName():ToString() end)
+        pcall(function() nm = r:GetFullName() end)
+        log(("[ld] ret class=%s full=%s"):format(cls, nm))
+    end
+    local v1, v2, v3, v4
+    pcall(function() v1 = StaticFindObject("/Game/Mods/LibrarianAPHUDFix/M_APBookMask.M_APBookMask") end)
+    pcall(function() v2 = StaticFindObject("/Game/Mods/LibrarianAPHUDFix/M_APBookMask") end)
+    pcall(function() v3 = FindObject("Material", "M_APBookMask") end)
+    pcall(function() v4 = FindObject("MaterialInterface", "M_APBookMask") end)
+    log(("[ld] find v1(obj.obj)=%s v2(pkg)=%s v3(Material)=%s v4(MatIface)=%s"):format(tostring(v1), tostring(v2), tostring(v3), tostring(v4)))
+    local all; pcall(function() all = FindAllOf("Material") end)
+    local found = "none"
+    if all then for _, m in ipairs(all) do local n; pcall(function() n = m:GetFullName() end); if n and n:find("M_APBookMask") then found = n; break end end end
+    log(("[ld] scan loaded Materials for M_APBookMask: %s"):format(found))
+end
+
 -- v1.1.0 (rewrite): emit a lifecycle state-machine event. No-op until the SM
 -- module is loaded (see the require below). The SM is OBSERVATIONAL for now —
 -- these events drive its state + [lifecycle] logging, but it gates nothing yet.
@@ -744,6 +1343,12 @@ local function start_gameplay_loops()
         pcall(function() IA.refresh_index_if_changed() end)
         -- Force re-apply (idempotent, cheap) for safety against any drift.
         pcall(function() IA._apply_bookcases_to_world() end)
+        pcall(probe_book_material_params) -- TEMP: real-material step 1 (read original book material params BEFORE the swap)
+        pcall(do_b2_hide)        -- TEMP: runtime book-hiding step 9b (B2 hide, same-pass LoadAsset)
+        -- crash-watch HISM hooks REMOVED: proved UpdateInstance barely fires (1x, not a burst),
+        -- so the crash is NOT a HISM-op burst; and the ~64s/Continue crashes match the prior
+        -- warding "0x1e3000010 freed-ptr after Continue" class (likely pre-existing, not B2).
+        -- BP struct-param hooks also carry their own risk. (setup_crash_watch left as dead code.)
         return false
     end)
 
@@ -982,6 +1587,17 @@ RegisterLoadMapPostHook(function(Engine, World)
         -- transforms refer to the old world.
         local IA = package.loaded["AP/ItemApply"]
         if IA and IA.reset_hism_state then IA.reset_hism_state() end
+
+        -- Re-arm the apply-gate for this fresh world. Menu→Continue reloads M01 but
+        -- never calls deactivate_gameplay, so _apply_safe stays true and the
+        -- loop-started guard stays set → the apply-gate LoopAsync never re-runs, the
+        -- "wait for the SL_M01_BG sublevel actors to stream" step is skipped, and
+        -- the warding indexes 0 bookcases → cases stay un-warded (signs still light,
+        -- since labels live in the persistent level). Reset both so the
+        -- start_gameplay_loops() call below actually re-runs the gate: re-wait for
+        -- the new world's actors, then re-index + re-ward. (Mirrors deactivate_gameplay.)
+        if IA and IA.set_apply_safe then pcall(function() IA.set_apply_safe(false) end) end
+        _gameplay_loops_started = false
 
         -- Tell the connection-menu LoopAsync that M01 is loaded — its
         -- initial show should now fire on the M01 ModActor.
