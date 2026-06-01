@@ -379,7 +379,7 @@ end
 -- isn't in TESTED_GAME_VERSIONS, append "(UNTESTED)" so the player knows
 -- compatibility isn't validated against their game build.
 
-local MOD_VERSION = "1.1.0"
+local MOD_VERSION = "1.1.0-beta1"
 local TESTED_GAME_VERSIONS = { "1.0.8" }
 
 local function get_game_version()
