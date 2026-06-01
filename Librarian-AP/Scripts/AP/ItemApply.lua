@@ -983,14 +983,21 @@ local function _ward_collision(case, case_key, locked)
                 -- left at Ignore(0) here; if the game later resets it to Block, we
                 -- know an event-less transition (Menu→Continue) un-warded us.
                 M._ward_canary = meshes[i]
-            elseif r.pf and r.pf ~= "?" and r.pf ~= "Custom" and r.pf ~= "" then
-                pcall(function() meshes[i]:SetCollisionProfileName(r.pf) end)
             else
+                -- UNLOCK = a faithful undo of the ward. The ward set every channel
+                -- to Ignore, then re-blocked only the object channels; the undo
+                -- restores the captured CollisionEnabled and sets EVERY channel back
+                -- to Block, so the placement line-trace (a trace channel the ward had
+                -- left at Ignore) hits the body again -> placeable. We intentionally
+                -- DROPPED the old SetCollisionProfileName(captured) shortcut: restoring
+                -- a named/"Custom" profile could leave a trace channel at Ignore, which
+                -- is exactly what left freshly-unlocked ("shown") cases un-placeable.
                 pcall(function() meshes[i]:SetCollisionEnabled(r.en or 3) end)
                 pcall(function() meshes[i]:SetCollisionResponseToAllChannels(2) end)
             end
         end
     end
+
 end
 
 --- Decompose UE FMatrix44f planes into a Lua FTransform table.
@@ -3599,6 +3606,7 @@ function M._apply_bookcases_to_world()
             tostring(M._gameplay_active), tostring(M._apply_safe)))
         M._last_apply_log_key = key
     end
+
 end
 
 --- Logs a per-section summary of which series each VISIBLE case accepts vs
