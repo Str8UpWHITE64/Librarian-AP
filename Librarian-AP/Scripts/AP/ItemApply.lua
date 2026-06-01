@@ -948,7 +948,18 @@ local function _ward_collision(case, case_key, locked)
             local en, pf = 3, "?"
             pcall(function() en = meshes[i]:GetCollisionEnabled() end)
             pcall(function() pf = meshes[i]:GetCollisionProfileName():ToString() end)
-            rec[i] = { en = tonumber(en) or 3, pf = pf }
+            -- Capture the per-channel responses too (cheap reads), so UNLOCK can
+            -- restore the EXACT original instead of a blanket block-all. Block-all
+            -- breaks multi-mesh cabinet cases: it makes the cabinet body/wall block
+            -- the placement trace, which originally passed THROUGH them to the inner
+            -- shelf -> the cabinet stays un-placeable even when "unwarded".
+            local resp = {}
+            for ch = 0, 31 do
+                local v = 0
+                pcall(function() v = meshes[i]:GetCollisionResponseToChannel(ch) end)
+                resp[ch] = tonumber(v) or 0
+            end
+            rec[i] = { en = tonumber(en) or 3, pf = pf, resp = resp }
         end
         M._case_orig_collision[case_key] = rec
     end
@@ -965,6 +976,8 @@ local function _ward_collision(case, case_key, locked)
     -- Object channels (player + thrown books) that must keep blocking:
     -- 0 WorldStatic, 1 WorldDynamic, 2 Pawn, 5 PhysicsBody, 6 Vehicle, 7 Destructible.
     local OBJ_CHANNELS = { 0, 1, 2, 5, 6, 7 }
+    local OBJ_SET = { [0] = true, [1] = true, [2] = true, [5] = true, [6] = true, [7] = true }
+
     for i = 1, #meshes do
         local r = rec[i] or { en = 3, pf = "?" }
         if (r.en or 3) ~= 0 then
@@ -984,16 +997,36 @@ local function _ward_collision(case, case_key, locked)
                 -- know an event-less transition (Menu→Continue) un-warded us.
                 M._ward_canary = meshes[i]
             else
-                -- UNLOCK = a faithful undo of the ward. The ward set every channel
-                -- to Ignore, then re-blocked only the object channels; the undo
-                -- restores the captured CollisionEnabled and sets EVERY channel back
-                -- to Block, so the placement line-trace (a trace channel the ward had
-                -- left at Ignore) hits the body again -> placeable. We intentionally
-                -- DROPPED the old SetCollisionProfileName(captured) shortcut: restoring
-                -- a named/"Custom" profile could leave a trace channel at Ignore, which
-                -- is exactly what left freshly-unlocked ("shown") cases un-placeable.
+                -- UNLOCK. The placement line-trace must hit the bookcase's
+                -- "StaticMesh" component -- the shelf surface you place books on,
+                -- present BOTH in single-mesh standard shelves AND as the inner shelf
+                -- of multi-mesh cabinets (alongside the SM_M01_BookCabinet/CabinetWall
+                -- structure). We force block-all on THAT mesh so placement always
+                -- works, INDEPENDENT of how good the captured collision was: a capture
+                -- read before the shelf finished initializing recorded the placement
+                -- channel as Ignore, and restoring that left the shelf un-placeable
+                -- forever (the 1F / 1N "unlocked shelf I can't place on" bug -- the
+                -- per-channel restore couldn't recover it because some OTHER trace
+                -- channel still looked blocked). The other meshes (cabinet body/wall)
+                -- get their captured original restored so the trace passes THROUGH
+                -- them to the inner shelf -- block-all-ing them was the original
+                -- cabinet bug. A non-StaticMesh mesh with no capture is left in its
+                -- warded pass-through state (it's structure, never the placement
+                -- target, so it must not block the trace).
+                local nm = "?"
+                pcall(function() nm = meshes[i]:GetFName():ToString() end)
                 pcall(function() meshes[i]:SetCollisionEnabled(r.en or 3) end)
-                pcall(function() meshes[i]:SetCollisionResponseToAllChannels(2) end)
+                if nm == "StaticMesh" then
+                    pcall(function() meshes[i]:SetCollisionResponseToAllChannels(2) end)
+                elseif r.resp then
+                    for ch = 0, 31 do
+                        local orig = r.resp[ch] or 0
+                        local warded_val = OBJ_SET[ch] and 2 or 0
+                        if orig ~= warded_val then
+                            pcall(function() meshes[i]:SetCollisionResponseToChannel(ch, orig) end)
+                        end
+                    end
+                end
             end
         end
     end
@@ -2860,11 +2893,20 @@ function M._index_bookcases(silent)
     -- A (re)index means the world (or our view of it) changed — e.g. after
     -- quit→Continue, which reloads the world but REUSES actor paths, so the
     -- apply-on-change tracker would otherwise match and skip re-warding. Drop the
-    -- warding tracker + sign-glow state so everything re-applies fresh.
+    -- warding tracker so every case re-wards fresh.
     M._case_ward_state = {}
-    M._section_to_label = nil
-    M._section_glow_state = {}
-    M._section_glow_orig = {}
+    -- Do NOT drop the sign-glow caches (_section_to_label / _section_glow_state /
+    -- _section_glow_orig) here. refresh_index_if_changed() re-indexes on EVERY
+    -- streaming change (running around streams bookcase sublevels in/out), but the
+    -- CabinetLabel actors + their SpotLights live in the PERSISTENT level — they
+    -- don't reload with the bookcases. Clearing the glow caches here forced
+    -- _apply_label_glow to re-map and re-touch all 31 SpotLights on every re-index;
+    -- touching a SpotLight whose render state is mid-stream is the recurring
+    -- BAE1A5E0 write-null crash (the glow re-map was the last thing logged before
+    -- it). The glow caches ARE reset on a genuine world reload by reset_hism_state()
+    -- (LoadMap), set_gameplay_active(false), and the ward-canary drift check — so the
+    -- glow stays correct across Continue while only touching a SpotLight when its
+    -- section's lock state actually changes.
     M._ward_canary = nil
 
     -- Step 1: build boi → BP_BookCase_C map. The wrappers (PillarCabinet,
@@ -3323,6 +3365,31 @@ function M._apply_bookcases_to_world()
             M._ward_canary = nil   -- stale (world reloaded); other paths re-ward
         end
     end
+
+    -- Periodic ward reconciliation. Apply-on-change keeps steady-state passes
+    -- cheap, but it also means that if a case is ever RECORDED as done in
+    -- _case_ward_state while its real collision is wrong -- an unlock whose
+    -- restore silently didn't take, or an event-less game-side reset the canary's
+    -- single sentinel mesh happened to miss -- nothing would re-correct it (the
+    -- shelf stays warded forever despite being unlocked). So every RECONCILE_EVERY
+    -- passes we drop the ward cache to force a clean full re-assert from
+    -- _shelves_open (the UNLOCK path's StaticMesh block-all then re-placeables any
+    -- stranded shelf). Gated on gameplay+apply_safe so it never runs during
+    -- streaming/teardown (can't race the world-teardown deref); the re-assert is
+    -- cheap (ward is ~1-8 pcall-guarded calls/mesh) and self-limits to once per
+    -- RECONCILE_EVERY passes. Captures (_case_orig_collision) are NOT cleared.
+    local RECONCILE_EVERY = 30
+    if M._gameplay_active and M._apply_safe then
+        M._reconcile_tick = (M._reconcile_tick or 0) + 1
+        if M._reconcile_tick >= RECONCILE_EVERY then
+            M._reconcile_tick = 0
+            if M._case_ward_state and next(M._case_ward_state) ~= nil then
+                log("[ward-reconcile] periodic re-assert of all bookcase ward state")
+                M._case_ward_state = {}
+            end
+        end
+    end
+
     local shown, hidden, dead = 0, 0, 0
     for section_id, cases in pairs(M._section_to_cases) do
         local shelves_open = M._shelves_open[section_id] or 0

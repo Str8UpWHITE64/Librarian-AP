@@ -25,6 +25,14 @@ local _b2_last_sig = nil
 local _b2_running = false
 local _b2_load_requested = false
 local _b2_mat_ref = nil
+-- Option A (warding is a startup-only operation): the warded set only ever
+-- SHRINKS during a session (unlocks add to the unwarded set; you can't re-lock),
+-- so once the initial warding converges, any later should_hide is a swap
+-- artifact. We freeze HIDING after convergence and only ever reveal afterward,
+-- which removes the "place a book and it flickers invisible" jank. Reset on
+-- world reload (LoadMap hook) re-opens the window for the fresh world.
+local _b2_hides_frozen = false
+local _b2_pass_count = 0     -- completed classification passes since last reload
 local function apply_book_visibility()
     if _b2_running then return end
     local IA = package.loaded["AP/ItemApply"]
@@ -58,14 +66,22 @@ local function apply_book_visibility()
         return
     end
     _b2_mat_ref = mat  -- pin against GC
-    -- re-run only when the set of unwarded series changes (apply / unlock / shelves opened)
+    -- Periodic re-classification: run on EVERY call (every ~5s from the gameplay
+    -- loop), NOT only when the unwarded set changes. The actor<->HISM swap fired
+    -- by looking at / moving past a series reshuffles which books are static
+    -- instances vs grabbable actors, so a pile-group classified correctly earlier
+    -- can drift wrong -- an unwarded book's instance lands in a hidden group and
+    -- vanishes. Re-running with fresh actor positions self-corrects that within
+    -- one pass instead of waiting for the next unlock. Steady state is cheap: when
+    -- nothing drifted, every group hits kept_hidden/kept_shown below (reads only,
+    -- no HISM mutations). sig is kept only to label the log (set change vs drift).
     local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
     local unwarded = IA._compute_unwarded_set(only_shelfable) or {}
     local skeys = {}
     for k in pairs(unwarded) do skeys[#skeys + 1] = k end
     table.sort(skeys)
     local sig = #skeys .. ":" .. table.concat(skeys, "|")
-    if sig == _b2_last_sig then return end
+    local sig_changed = (sig ~= _b2_last_sig)
     _b2_last_sig = sig
     _b2_running = true
     -- 2D nearest-match (X,Y only). HISM instance transforms are component-LOCAL, so
@@ -137,7 +153,10 @@ local function apply_book_visibility()
                 end
                 local should_hide = (sn > 0) and (nu == 0)
                 local st = _b2_state[hi]; if not st then st = { hidden = false }; _b2_state[hi] = st end
-                if should_hide and not st.hidden then
+                -- HIDE only while the initial-warding window is open (Option A).
+                -- Once frozen, a should_hide group we never hid just stays shown
+                -- (counts as kept_shown below) -- no gameplay-time re-warding.
+                if should_hide and not st.hidden and not _b2_hides_frozen then
                     -- record originals, then hide the whole component (renders in no pass)
                     local ns = 1; pcall(function() ns = h:GetNumMaterials() end)
                     st.ns = ns; st.mats = {}
@@ -171,11 +190,31 @@ local function apply_book_visibility()
             LoopAsync(50, function() do_chunk() return true end)
         else
             _b2_running = false
-            log(("[b2] applied: newly_hidden=%d revealed=%d kept_hidden=%d kept_shown=%d / %d HISMs"):format(newly_hidden, revealed, kept_hidden, kept_shown, hn))
+            -- Freeze HIDING once the initial warding has converged: a completed
+            -- pass that hid nothing new while groups ARE already hidden means
+            -- everything that should be warded now is. After that we only reveal.
+            -- Safety cap (MAX_WARD_PASSES) freezes regardless so we never hide
+            -- indefinitely. The LoadMap reset re-opens this for the next world.
+            _b2_pass_count = _b2_pass_count + 1
+            if not _b2_hides_frozen then
+                local MAX_WARD_PASSES = 6
+                if (newly_hidden == 0 and kept_hidden > 0) or _b2_pass_count >= MAX_WARD_PASSES then
+                    _b2_hides_frozen = true
+                    log(("[b2] initial warding converged (pass %d, %d groups hidden) -> hides frozen until reload; reveals stay active"):format(
+                        _b2_pass_count, kept_hidden + newly_hidden))
+                end
+            end
+            -- Only log when something actually changed (a real unlock, or drift we
+            -- corrected) so the every-5s periodic pass doesn't spam the log.
+            if sig_changed or (newly_hidden + revealed) > 0 then
+                log(("[b2] applied: newly_hidden=%d revealed=%d kept_hidden=%d kept_shown=%d / %d HISMs"):format(newly_hidden, revealed, kept_hidden, kept_shown, hn))
+            end
         end
     end
+    if sig_changed then
+        log("[b2] unwarded-set change -> re-classify book visibility (periodic drift checks run silently)")
+    end
     do_chunk()
-    log("[b2] book-visibility apply (hide warded / reveal unlocked); re-runs on unwarded-set change")
 end
 
 
@@ -379,7 +418,7 @@ end
 -- isn't in TESTED_GAME_VERSIONS, append "(UNTESTED)" so the player knows
 -- compatibility isn't validated against their game build.
 
-local MOD_VERSION = "1.1.0-beta1"
+local MOD_VERSION = "1.1.0-beta2"
 local TESTED_GAME_VERSIONS = { "1.0.8" }
 
 local function get_game_version()
@@ -751,10 +790,14 @@ local function start_gameplay_loops()
             return true
         end
         if not IA._apply_safe then return false end
-        pcall(function() IA.refresh_index_if_changed() end)
-        -- Force re-apply (idempotent, cheap) for safety against any drift.
-        pcall(function() IA._apply_bookcases_to_world() end)
-        pcall(apply_book_visibility) -- runtime book hide + reveal-on-unlock (re-runs on unwarded-set change)
+        -- [crumb] BAE1A5E0 crash-hunt (TEMP): the LAST "[crumb]" line in the log
+        -- before a crash names the periodic op that was mid-flight. "idle:*" means
+        -- none of ours was running -> the game's own tick (e.g. on an object the mod
+        -- left in a bad state). Remove once the culprit is found.
+        log("[crumb] idx");  pcall(function() IA.refresh_index_if_changed() end)
+        log("[crumb] ward"); pcall(function() IA._apply_bookcases_to_world() end)
+        log("[crumb] idle:5s")
+        pcall(apply_book_visibility) -- async; postdates BAE1A5E0, so left uncrumbed
         return false
     end)
 
@@ -783,6 +826,7 @@ local function start_gameplay_loops()
         if not IA._gameplay_active then return false end
         if not IA._apply_safe then return false end
         if not IA._slot_data then return false end
+        log("[crumb] sync")
         pcall(function() IA.sync_progress_state() end)
         -- Also re-run row-completion detection periodically. FinishRow
         -- only fires when the global row count INCREASES — so if the
@@ -792,7 +836,9 @@ local function start_gameplay_loops()
         -- those swap completions promptly. detect_completed_rows is
         -- idempotent (de-dup via _sent_row_locations), so re-running
         -- when nothing has changed is a no-op.
+        log("[crumb] detect")
         pcall(function() IA.detect_completed_rows() end)
+        log("[crumb] rowchecks")
         -- Row-completion threshold catch-up: read rows_finished from the
         -- save and re-fire any "Complete N Rows" threshold whose value
         -- the player has now reached. Belt-and-suspenders for cases
@@ -830,7 +876,9 @@ local function start_gameplay_loops()
         -- (e.g., a UpgradePlayer call dropped silently when the player
         -- was mid-transition), retry the missing applies. Idempotent
         -- and conservative — never over-grants past received counts.
+        log("[crumb] resync")
         pcall(function() IA.resync_skill_state() end)
+        log("[crumb] idle:3s")
         return false
     end)
 
@@ -994,6 +1042,17 @@ RegisterLoadMapPostHook(function(Engine, World)
         local IA = package.loaded["AP/ItemApply"]
         if IA and IA.reset_hism_state then IA.reset_hism_state() end
 
+        -- Book-visibility (cosmetic pile-hiding) is per-world: the fresh world's
+        -- HISM components start visible, so clear our hidden-state cache and
+        -- re-open the initial-warding window (Option A) so this world re-hides
+        -- from scratch, then re-freezes on convergence. Without this a
+        -- Menu->Continue would keep stale "already hidden" flags + a frozen
+        -- window and never re-ward the new world's pile.
+        _b2_state = {}
+        _b2_last_sig = nil
+        _b2_hides_frozen = false
+        _b2_pass_count = 0
+
         -- Re-arm the apply-gate for this fresh world. Menu→Continue reloads M01 but
         -- never calls deactivate_gameplay, so _apply_safe stays true and the
         -- loop-started guard stays set → the apply-gate LoopAsync never re-runs, the
@@ -1135,48 +1194,6 @@ RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:LoadGameDataBP", funct
         :format(tostring(read_save_slot())))
 end)
 
--- ============================================================
--- HOOK: Notification UFunctions (read-only, observation only).
--- ============================================================
--- Active calls to these have been observed to freeze the game; we hook
--- the natives instead and log when the GAME calls them organically.
-local function fext_to_str(p)
-    if not p then return "<nil>" end
-    local v
-    pcall(function() v = p:get() end)
-    if not v then return "<getfail>" end
-    local s
-    pcall(function() s = v:ToString() end)
-    if s then return tostring(s) end
-    return "<no-tostring>"
-end
-
-local function fnum_to_str(p)
-    if not p then return "<nil>" end
-    local v
-    pcall(function() v = p:get() end)
-    return tostring(v)
-end
-
-RegisterHook("/Script/Librarian.LibrarianGameMode:ShowNotification", function(self, text_param, duration_param)
-    log(("[notif-probe] GameMode.ShowNotification text='%s' duration=%s"):format(
-        fext_to_str(text_param), fnum_to_str(duration_param)))
-end)
-
-RegisterHook("/Script/Librarian.NotificationBoxWidget:AddNotification", function(self, text_param, duration_param)
-    log(("[notif-probe] NotificationBox.AddNotification text='%s' duration=%s"):format(
-        fext_to_str(text_param), fnum_to_str(duration_param)))
-end)
-
-RegisterHook("/Script/Librarian.NotificationBoxWidget:RemoveNotification", function(self, notify_param)
-    log("[notif-probe] NotificationBox.RemoveNotification fired")
-end)
-
-RegisterHook("/Script/Librarian.NotificationWidget:ShowNotification", function(self, text_param, duration_param)
-    log(("[notif-probe] NotificationWidget.ShowNotification text='%s' duration=%s"):format(
-        fext_to_str(text_param), fnum_to_str(duration_param)))
-end)
-
 -- OnLevelUp / ShowSkillLevelUp are redeclared on BP_LibrarianCharacter, so the
 -- runtime call dispatches to the BP version. Hook both paths and tag which one
 -- fires; we only need the BP-path hook to register after the BP class is loaded.
@@ -1187,12 +1204,6 @@ local function hook_safe(path, label, handler)
         return false
     end
     return true
-end
-
-local function on_level_up_native(self)
-    local n = "?"
-    pcall(function() n = tostring(self:get().EnableUpgradeNum) end)
-    log((">> [C++] OnLevelUp        EnableUpgradeNum=%s"):format(n))
 end
 
 local function on_level_up_bp(self)
@@ -1215,14 +1226,6 @@ local function on_level_up_bp(self)
         pcall(function() IA.on_level_up_event() end)
     end
 end
-
-local function on_show_skill_level_up_native(self) log(">> [C++] ShowSkillLevelUp") end
-local function on_show_skill_level_up_bp(self)     log(">> [BP]  ShowSkillLevelUp") end
-
-hook_safe("/Script/Librarian.LibrarianCharacter:OnLevelUp",
-    "OnLevelUp (C++)", on_level_up_native)
-hook_safe("/Script/Librarian.LibrarianCharacter:ShowSkillLevelUp",
-    "ShowSkillLevelUp (C++)", on_show_skill_level_up_native)
 
 -- Title-widget button handlers. The title screen's Continue button does NOT
 -- always fire LoadMap or LoadGameFromSlot — when the M01 level is already
@@ -1315,8 +1318,6 @@ register_bp_hooks_once = function()
     if bp_hooks_registered then return end
     local ok1 = hook_safe("/Game/Librarian/Blueprints/Character/BP_LibrarianCharacter.BP_LibrarianCharacter_C:OnLevelUp",
         "OnLevelUp (BP)", on_level_up_bp)
-    local ok2 = hook_safe("/Game/Librarian/Blueprints/Character/BP_LibrarianCharacter.BP_LibrarianCharacter_C:ShowSkillLevelUp",
-        "ShowSkillLevelUp (BP)", on_show_skill_level_up_bp)
     -- Title-widget hooks. Use hook_safe since the BP class may not be loaded
     -- yet on first attempt; we'll retry on subsequent LoadMaps.
     hook_safe(
@@ -1331,39 +1332,6 @@ register_bp_hooks_once = function()
     hook_safe(
         "/Game/Librarian/UI/Title/WBP_Title.WBP_Title_C:Construct",
         "WBP_Title.Construct", on_title_construct)
-
-    -- HUD-update probes (read-only). We want to see how the game itself
-    -- calls UpdateSkill / CheckLeftUpgradeNum / OnFinishNewRow_Event
-    -- naturally, so we can replicate the call context for the missing
-    -- ability icon after reconnect.
-    hook_safe(
-        "/Game/Librarian/UI/Game/WBP_PlayerInfo.WBP_PlayerInfo_C:UpdateSkill",
-        "WBP_PlayerInfo.UpdateSkill", function(self, skill_p, level_p, left_p)
-            local s, l, lf = "?", "?", "?"
-            pcall(function() s = tostring(skill_p:get()) end)
-            pcall(function() l = tostring(level_p:get()) end)
-            pcall(function() lf = tostring(left_p:get()) end)
-            log(("[hud-probe] WBP_PlayerInfo.UpdateSkill skill=%s level=%s left=%s"):format(s, l, lf))
-        end)
-    hook_safe(
-        "/Game/Librarian/UI/Game/WBP_PlayerInfo.WBP_PlayerInfo_C:CheckLeftUpgradeNum",
-        "WBP_PlayerInfo.CheckLeftUpgradeNum", function(self, row_p)
-            local r = "?"
-            pcall(function() r = tostring(row_p:get()) end)
-            log(("[hud-probe] WBP_PlayerInfo.CheckLeftUpgradeNum rowNum=%s"):format(r))
-        end)
-    hook_safe(
-        "/Game/Librarian/UI/Game/WBP_PlayerInfo.WBP_PlayerInfo_C:OnFinishNewRow_Event",
-        "WBP_PlayerInfo.OnFinishNewRow_Event", function(self, num_p)
-            local n = "?"
-            pcall(function() n = tostring(num_p:get()) end)
-            log(("[hud-probe] WBP_PlayerInfo.OnFinishNewRow_Event Num=%s"):format(n))
-        end)
-    hook_safe(
-        "/Game/Librarian/UI/Game/WBP_PlayerInfo.WBP_PlayerInfo_C:Construct",
-        "WBP_PlayerInfo.Construct", function(self)
-            log("[hud-probe] WBP_PlayerInfo.Construct")
-        end)
 
     -- Connection-menu signal: the Connect button calls
     -- ModActor.BroadcastConnectRequest with the three field strings. We
@@ -1402,19 +1370,11 @@ register_bp_hooks_once = function()
             c:connect()
         end)
 
-    if ok1 and ok2 then
+    if ok1 then
         bp_hooks_registered = true
-        log("BP hooks registered (OnLevelUp, ShowSkillLevelUp, WBP_Title buttons, HUD probes, ConnectMenu)")
+        log("BP hooks registered (OnLevelUp, WBP_Title buttons, ConnectMenu)")
     end
 end
-
-RegisterHook("/Script/Librarian.LibrarianCharacter:MajorSkillUsed", function(self)
-    log(">> MajorSkillUsed")
-end)
-
-RegisterHook("/Script/Librarian.LibrarianCharacter:FinalSkillUsed", function(self)
-    log(">> FinalSkillUsed")
-end)
 
 -- ============================================================
 -- HOOK: Row / level completion

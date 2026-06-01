@@ -1,0 +1,91 @@
+# Changelog
+
+Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
+
+## 1.1.0-beta2 — 2026-06-01 (released)
+
+Built on beta1. Bundles the fixes below, plus a temporary set of diagnostic breadcrumbs that
+log which periodic operation is active — to help pinpoint a rare, still-open crash (see the
+final note).
+
+- **Removed gameplay diagnostic hooks (crash investigation / stability).** beta1 still carried
+  several investigation-era hooks that fired during skill use, level-ups, and HUD updates —
+  `MajorSkillUsed` / `FinalSkillUsed`, the native + BP `OnLevelUp` / `ShowSkillLevelUp` probes,
+  four notification probes, and four HUD probes (99 lines total in `main.lua`). These ran during
+  the exact skill-burst moments that correlated with the in-game crashes, so they're removed to
+  test whether the mod's own hook footprint is the trigger. Only production hooks remain: BP
+  `OnLevelUp` (level/row tracking), `FinishRow` / `NewRowFinished` / `EndGame`, save/load, and the
+  title-menu + connect wiring. The book-hiding feature is unchanged.
+
+- **Shelves and cabinets un-placeable after unlock (1F, 1N, 1H).** The unlock restore
+  depended on the per-mesh collision *captured* at first-ward. If that capture was read before
+  the bookcase finished initializing, the placement channel was recorded as Ignore, and
+  restoring it left the shelf un-placeable forever (sign off, but no placement). A first attempt
+  added a "is any trace channel still blocked?" validity check with a block-all fallback, but it
+  missed multi-channel cases — when some *other* trace channel (e.g. Visibility) was blocked, the
+  check passed yet the placement channel stayed Ignore. Root fix in `_ward_collision`
+  (`AP/ItemApply.lua`): on unlock, the placement-target mesh — the component literally named
+  **`StaticMesh`**, which is the shelf surface in both single-mesh standard shelves AND the inner
+  shelf of multi-mesh cabinets — is forced to **block-all**, so placement always works regardless
+  of capture quality. The structural meshes (cabinet body `SM_M01_BookCabinet_03` + wall
+  `SM_M01_CabinetWall_02`) still restore their captured original so the placement trace passes
+  *through* them to the inner shelf (block-all-ing them was the original cabinet bug). This is
+  capture-independent for the placement target and supersedes the capture-validity attempt. A
+  periodic reconciliation (drop the ward cache every ~30 passes → clean re-assert from
+  `_shelves_open`, gameplay+apply_safe-gated) backs it up; books were already self-healing.
+
+- **Unwarded books occasionally going invisible until the next unlock.** The cosmetic
+  pile-hiding (`apply_book_visibility` in `main.lua`, which hides the static HISM pile-groups
+  for warded series) ran every ~5s but short-circuited unless the *unwarded set* changed. The
+  actor↔HISM swap triggered by looking at / moving past a series reshuffles which books are
+  static instances, so a group classified correctly earlier could drift and hide an unwarded
+  book — and, since that's not an unwarded-set change, it stayed hidden until the next series
+  unlock. Fix: the classifier now re-runs on every ~5s pass with fresh book positions, so a
+  wrongly-hidden group self-corrects within one pass. Cheap in steady state (when nothing has
+  drifted it only reads HISM data — no visibility/material mutations); logging is suppressed
+  unless a real change occurs.
+    - Follow-up (warding is a startup-only operation): the warded set only ever shrinks during
+      a session, so any mid-game *hide* is a swap artifact, not a real state change. The
+      classifier now **freezes hiding** once the initial warding converges (a pass that hides
+      nothing new while groups are already hidden; safety cap at 6 passes) and only ever
+      *reveals* afterward — eliminating the jarring "place a book and it flickers invisible"
+      effect. The freeze + the hidden-state cache reset on Menu→Continue / reload so each fresh
+      world re-wards from scratch.
+
+- **Label-glow efficiency cleanup (NOT a crash fix — see note).** `refresh_index_if_changed()`
+  re-indexes the bookcases every 5s *unconditionally*, and `_index_bookcases()` cleared the
+  sign-glow caches every time — so `_apply_label_glow()` re-mapped and re-touched all 31
+  CabinetLabel SpotLights on every pass, and spammed `[label-glow] mapped 31 sections` to the
+  log. The CabinetLabel actors + SpotLights live in the **persistent level**, so their glow
+  caches don't need clearing on a bookcase re-index — that coupling is removed from
+  `_index_bookcases`. The caches still reset on a genuine world reload (`reset_hism_state` /
+  leaving gameplay / ward-canary drift), so signs stay correct across Continue; the glow now
+  only touches a sign when its section's lock state actually changes. This eliminates wasted
+  per-cycle work and the log spam (which also makes future crash logs readable).
+
+  > Note: this was first (wrongly) blamed for the recurring `BAE1A5E0` write-AV crash because
+  > the glow log was the last line before a crash. That was a base-rate error — the most
+  > frequent logger is always the last logger. The `BAE1A5E0` call stack is **byte-identical**
+  > between a 2026-05-08 crash and a 2026-06-01 crash (every game + UE4SS frame matches), and
+  > the sign glow didn't ship until 2026-05-30 — so the glow is provably **not** in that crash
+  > path. `BAE1A5E0` remains an OPEN, long-standing use-after-free (faulting address varies
+  > between 0x0 and live heap addresses = writing through a freed pointer), unrelated to this
+  > change. Tracked separately; see investigation notes.
+
+- **Diagnostic breadcrumbs for the open `BAE1A5E0` crash (temporary).** A rare write-AV
+  (~once per long session, movement-correlated, and predating every v1.1.0 feature) is still
+  open and can't be symbolicated (the Shipping build ships no PDBs). To catch it, each periodic
+  operation now logs a `[crumb]` line as it runs; the last one before a crash names the
+  operation that was active (or `idle:*` = none of ours → the game's own tick). If you crash,
+  your `UE4SS.log` — read before relaunching, since it resets on launch — carries the
+  breadcrumb. These will be removed once the culprit is found.
+
+## 1.1.0-beta1 — 2026-05-31 (released)
+
+- Shelf unwarding fixed — unlocking a section faithfully reverses the ward so its bookcases
+  accept books again.
+- Invisible warded books in the central pile — spatial whole-group classifier with a
+  conservative rule (an unwarded series never vanishes when it shares a pile-group with
+  warded ones).
+- Removed temporary investigation diagnostics.
+- Version bumped to 1.1.0-beta1 (apworld + Lua + manifest).
