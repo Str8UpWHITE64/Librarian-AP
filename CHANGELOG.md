@@ -2,6 +2,39 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0-beta3 — 2026-06-02 (released)
+
+Built on beta2. Two new features plus a reworked warded-book classifier (a *potential* fix —
+see the note). The temporary `[crumb]` breadcrumbs from beta2 are still in for the open crash.
+
+- **Items you send to other players now show their real names (were "Unknown").** The
+  location-scout (`LocationInfo`) handler labelled every scouted item with the *local* game's name
+  table, so any item belonging to another game resolved to "Unknown". It now resolves each item's
+  name through the *receiving* player's game — `get_player_game(player)` → `get_item_name(id, that_game)`
+  in `APClient.lua`. Incoming-item naming was already correct; only the outgoing/scout display was wrong.
+
+- **Vanilla mode — play the base game without disconnecting or uninstalling.** The title-screen
+  Continue / New Game buttons stayed disabled unless you connected to a server, so having the mod
+  installed forced you into Archipelago. The connection window's close button is now labelled
+  **Vanilla**; clicking it enables the normal Continue / New Game buttons and the mod makes **no**
+  changes — no warding, no hiding, no tracking. The BP `Btn_Close` fires `BroadcastCloseRequest` →
+  `enter_vanilla_mode()` (`main.lua`) to un-gate the buttons, and `activate_gameplay` + the
+  level-up / row tracking are now no-ops unless a slot is actually connected. One-way for the
+  session — restart the game to return to Archipelago. (Requires the updated `LibrarianAPHUDFix.pak`.)
+
+- **Reworked warded-book hiding — a POTENTIAL fix for warded covers appearing in the pile (NOT
+  confirmed resolved).** The old classifier inferred each pile-group's series from the nearest book
+  *actor* by position. Once a series is shelved the game moves that series' book actors onto the
+  shelf, stranding its pile instances next to *other* series' books — so the position guess could
+  latch onto the wrong series and a warded cover could show (or the wrong group reveal as series
+  unlocked). The classifier now reads each group's series **directly from its fixed index**
+  (`series = _asset_to_series[hi-1]` in `apply_book_visibility`) rather than guessing from positions:
+  deterministic, unaffected by shelving or where you're standing, and correct immediately on a
+  resumed save. In our testing the warded-cover glitch did not reappear, but we can't yet call it
+  resolved — **please keep reporting any warded series whose cover shows in the pile.** The old
+  position-based classifier is retained but disabled behind a flag (`B2_SPATIAL_CROSSCHECK`) as a
+  fallback / ground-truth cross-check.
+
 ## 1.1.0-beta2 — 2026-06-01 (released)
 
 Built on beta1. Bundles the fixes below, plus a temporary set of diagnostic breadcrumbs that

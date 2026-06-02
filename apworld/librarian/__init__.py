@@ -1018,7 +1018,7 @@ class LibrarianWorld(World):
             goal_row_threshold = sum(s.shelf_count for s in data.SECTIONS)
 
         return {
-            "version": "1.1.0-beta2",
+            "version": "1.1.0-beta3",
             "goal": goal_value,
             # Row count at which the Lua client should send STATUS_GOAL.
             # Ignored for the "full" goal (the game's EndGame fires it).

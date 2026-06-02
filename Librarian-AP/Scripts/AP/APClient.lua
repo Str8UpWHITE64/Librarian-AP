@@ -229,7 +229,18 @@ function Client:_register_handlers()
             local player  = tonumber(info.player) or -1
             if loc_id and item_id then
                 local entry = { item_id = item_id, player = player }
-                pcall(function() entry.item_name = c:get_item_name(item_id, game_name) end)
+                -- The item at one of OUR locations belongs to the RECEIVING
+                -- player's game, not ours -- resolve its NAME against THAT game's
+                -- data package. Using our own game returned "Unknown" for every
+                -- cross-game item. (The LOCATION is ours, so location_name keeps
+                -- game_name; for items we send to ourselves, get_player_game
+                -- returns our game and this behaves exactly as before.)
+                local item_game = game_name
+                pcall(function()
+                    local g = c:get_player_game(player)
+                    if g and g ~= "" then item_game = g end
+                end)
+                pcall(function() entry.item_name = c:get_item_name(item_id, item_game) end)
                 pcall(function() entry.location_name = c:get_location_name(loc_id, game_name) end)
                 pcall(function() entry.player_name = c:get_player_alias(player) end)
                 self._scout_cache[loc_id] = entry

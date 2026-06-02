@@ -25,14 +25,21 @@ local _b2_last_sig = nil
 local _b2_running = false
 local _b2_load_requested = false
 local _b2_mat_ref = nil
--- Option A (warding is a startup-only operation): the warded set only ever
--- SHRINKS during a session (unlocks add to the unwarded set; you can't re-lock),
--- so once the initial warding converges, any later should_hide is a swap
--- artifact. We freeze HIDING after convergence and only ever reveal afterward,
--- which removes the "place a book and it flickers invisible" jank. Reset on
--- world reload (LoadMap hook) re-opens the window for the fresh world.
-local _b2_hides_frozen = false
-local _b2_pass_count = 0     -- completed classification passes since last reload
+-- v2 classifier (probe-confirmed: each pile-group / HISM is ONE series). Instead of
+-- re-reading actor positions every pass (which drifts as books swap actor<->HISM and
+-- can leak a warded cover), we ACCUMULATE each group's series votes across passes (its
+-- instances' nearest actors) until a dominant, well-sampled leader locks in -- so an
+-- occasional stacked-neighbor mis-vote averages out instead of deciding a small group
+-- from one noisy pass. Hide/reveal is driven off that leader + the warded set:
+-- deterministic, self-correcting, no flicker. The OLD spatial/conservative classifier
+-- still runs each pass for COMPARISON logging ([b2-cmp]) only. Resets on world reload.
+local _b2_group = {}   -- [hi] = { tally={series:count}, total, leader, leadn, locked }
+-- Spatial cross-check (vote accumulation + index-vs-spatial mismatch logging) is
+-- DISABLED. The index mapping (series = _asset_to_series[hi-1]) proved correct on both
+-- fresh and resumed saves, so it drives book visibility alone. Flip this to true to
+-- re-run the spatial classifier as a ground-truth comparison (e.g. to re-confirm the
+-- HISM<->data order after a game patch). All the spatial code is kept, just gated.
+local B2_SPATIAL_CROSSCHECK = false
 local function apply_book_visibility()
     if _b2_running then return end
     local IA = package.loaded["AP/ItemApply"]
@@ -91,6 +98,7 @@ local function apply_book_visibility()
     local CELL = 25.0
     local function gkey(ix, iy) return ix .. "_" .. iy end
     local grid = {}
+    if B2_SPATIAL_CROSSCHECK then   -- only the cross-check needs the actor-position grid
     for i = 1, bn do
         local b = books[i]
         if b and b:IsValid() then
@@ -103,11 +111,12 @@ local function apply_book_visibility()
                 local ser = IA._asset_to_series[ai]
                 local k = gkey(math.floor(x / CELL), math.floor(y / CELL))
                 local cell = grid[k]; if not cell then cell = {}; grid[k] = cell end
-                cell[#cell + 1] = { x = x, y = y, warded = not (ser and unwarded[ser]) }
+                cell[#cell + 1] = { x = x, y = y, warded = not (ser and unwarded[ser]), series = ser }
             end
         end
     end
-    local function nearest_warded(px, py)
+    end
+    local function nearest_entry(px, py)
         local cx, cy = math.floor(px / CELL), math.floor(py / CELL)
         local best, bd2 = nil, CELL * CELL
         for dx = -1, 1 do for dy = -1, 1 do
@@ -120,11 +129,11 @@ local function apply_book_visibility()
                 end
             end
         end end
-        if best then return best.warded end
-        return nil
+        return best
     end
     local cursor, CHUNK = 1, 40
     local newly_hidden, revealed, kept_hidden, kept_shown = 0, 0, 0, 0
+    local n_new_hide, mismatch, leader_changed, n_locked = 0, 0, 0, 0
     local function do_chunk()
         local last = math.min(cursor + CHUNK - 1, hn)
         for hi = cursor, last do
@@ -132,44 +141,80 @@ local function apply_book_visibility()
             if h and h:IsValid() then
                 local sm; pcall(function() sm = h.PerInstanceSMData end)
                 local sn = 0; if sm then pcall(function() sn = #sm end) end
-                -- Pile-groups mix 2-5 series (proven by the map-hunt probe), so a group can hold both
-                -- warded + unwarded books and whole-group visibility can't separate them. CONSERVATIVE
-                -- rule (below): hide a group ONLY if it has ZERO unwarded books (nu == 0) -> an unwarded
-                -- series NEVER vanishes; the cost is a few mostly-warded mixed groups showing their
-                -- (still un-grabbable) covers -- the "a series or two shows when it shouldn't" failure.
-                local nw, nu = 0, 0
-                for j = 1, sn do
-                    local t; pcall(function() t = sm[j].Transform end)
-                    local wp; if t then pcall(function() wp = t.WPlane end) end
-                    local warded = true
-                    if wp then
-                        local x, y; pcall(function() x = wp.X end); pcall(function() y = wp.Y end)
-                        if x and y then
-                            local w = nearest_warded(x, y)
-                            if w ~= nil then warded = w end
+                -- DRIVER: the index mapping. hi == the series' position in the data
+                -- order (hi==gi, confirmed on fresh + resumed saves), so the hi-th HISM's
+                -- series is just _asset_to_series[hi-1] (AssetIdx hi-1). Deterministic,
+                -- position- and shelving-independent, RESUME-SAFE, no warm-up: a row
+                -- classifies correctly on the first pass regardless of save state.
+                local idx_series = IA._asset_to_series[hi - 1]
+                local should_hide_new
+                if sn == 0 then should_hide_new = false
+                elseif idx_series == nil then should_hide_new = true   -- mapping not populated yet -> assume warded
+                else should_hide_new = (not unwarded[idx_series]) end
+                if should_hide_new then n_new_hide = n_new_hide + 1 end
+
+                -- SPATIAL CROSS-CHECK -- DISABLED (B2_SPATIAL_CROSSCHECK=false). Kept
+                -- verbatim for reference / re-validation: the per-instance nearest-actor
+                -- vote, the vote accumulation + size-aware lock, and the index-vs-spatial
+                -- mismatch log that proved the index mapping correct. The index lookup
+                -- above made all of this unnecessary; flip the flag on to re-run it as a
+                -- ground-truth comparison (e.g. to re-confirm the data order after a patch).
+                if B2_SPATIAL_CROSSCHECK then
+                    local nw, nu = 0, 0
+                    local votes = {}
+                    for j = 1, sn do
+                        local t; pcall(function() t = sm[j].Transform end)
+                        local wp; if t then pcall(function() wp = t.WPlane end) end
+                        local e
+                        if wp then
+                            local x, y; pcall(function() x = wp.X end); pcall(function() y = wp.Y end)
+                            if x and y then e = nearest_entry(x, y) end
+                        end
+                        if e then
+                            if e.warded then nw = nw + 1 else nu = nu + 1 end
+                            if e.series then votes[e.series] = (votes[e.series] or 0) + 1 end
+                        else
+                            nw = nw + 1   -- no nearby actor -> treat as warded
                         end
                     end
-                    if warded then nw = nw + 1 else nu = nu + 1 end
+                    local g = _b2_group[hi]
+                    if not g then g = { tally = {}, total = 0, leader = nil, leadn = 0, locked = false, sn = sn }; _b2_group[hi] = g end
+                    if not g.locked then
+                        g.sn = sn
+                        for s, c in pairs(votes) do g.tally[s] = (g.tally[s] or 0) + c; g.total = g.total + c end
+                        local leader, leadn = nil, 0
+                        for s, c in pairs(g.tally) do if c > leadn then leader = s; leadn = c end end
+                        if leader ~= g.leader and g.leader ~= nil then leader_changed = leader_changed + 1 end
+                        g.leader = leader; g.leadn = leadn
+                        -- size-aware lock: ~3 passes' worth of votes for ANY size.
+                        if leadn >= 3 * sn and leadn * 10 >= g.total * 7 then
+                            g.locked = true; n_locked = n_locked + 1
+                        end
+                    end
+                    local hser = g.leader
+                    if idx_series ~= nil and hser ~= nil and idx_series ~= hser then
+                        mismatch = mismatch + 1
+                        if mismatch <= 20 then
+                            log(("[b2-cmp] MISMATCH hi=%d index=%s spatial=%s (leader %d/%d)"):format(
+                                hi, tostring(idx_series), tostring(hser), g.leadn, g.total))
+                        end
+                    end
                 end
-                local should_hide = (sn > 0) and (nu == 0)
+
+                -- Apply the NEW verdict (no freeze -- the cache is stable, no flicker).
+                local should_hide = should_hide_new
                 local st = _b2_state[hi]; if not st then st = { hidden = false }; _b2_state[hi] = st end
-                -- HIDE only while the initial-warding window is open (Option A).
-                -- Once frozen, a should_hide group we never hid just stays shown
-                -- (counts as kept_shown below) -- no gameplay-time re-warding.
-                if should_hide and not st.hidden and not _b2_hides_frozen then
-                    -- record originals, then hide the whole component (renders in no pass)
+                if should_hide and not st.hidden then
                     local ns = 1; pcall(function() ns = h:GetNumMaterials() end)
                     st.ns = ns; st.mats = {}
                     for s = 0, (ns or 1) - 1 do local m; pcall(function() m = h:GetMaterial(s) end); st.mats[s] = m end
                     pcall(function() h:SetVisibility(false, false) end)
                     pcall(function() h:SetHiddenInGame(true, false) end)
                     for s = 0, (ns or 1) - 1 do pcall(function() h:SetMaterial(s, mat) end) end
-                    -- Do NOT touch PerInstanceCustomData: index 0 carries the game's per-book color
-                    -- (and actor<->HISM swap state). Overwriting it corrupts books on reveal (wrong
-                    -- color + z-fighting). SetVisibility(false) above already does the hiding.
+                    -- Do NOT touch PerInstanceCustomData: index 0 carries the game's per-book
+                    -- color; overwriting corrupts books on reveal. SetVisibility does the hiding.
                     st.hidden = true; newly_hidden = newly_hidden + 1
                 elseif (not should_hide) and st.hidden then
-                    -- reveal: make visible again + restore the ORIGINAL materials (real covers)
                     pcall(function() h:SetVisibility(true, false) end)
                     pcall(function() h:SetHiddenInGame(false, false) end)
                     if st.mats then
@@ -190,29 +235,41 @@ local function apply_book_visibility()
             LoopAsync(50, function() do_chunk() return true end)
         else
             _b2_running = false
-            -- Freeze HIDING once the initial warding has converged: a completed
-            -- pass that hid nothing new while groups ARE already hidden means
-            -- everything that should be warded now is. After that we only reveal.
-            -- Safety cap (MAX_WARD_PASSES) freezes regardless so we never hide
-            -- indefinitely. The LoadMap reset re-opens this for the next world.
-            _b2_pass_count = _b2_pass_count + 1
-            if not _b2_hides_frozen then
-                local MAX_WARD_PASSES = 6
-                if (newly_hidden == 0 and kept_hidden > 0) or _b2_pass_count >= MAX_WARD_PASSES then
-                    _b2_hides_frozen = true
-                    log(("[b2] initial warding converged (pass %d, %d groups hidden) -> hides frozen until reload; reveals stay active"):format(
-                        _b2_pass_count, kept_hidden + newly_hidden))
+            -- Index mapping drives; spatial vote is the cross-check. Log when anything
+            -- changed OR the two disagree, so we can watch the index correct conflated rows.
+            if sig_changed or (newly_hidden + revealed) > 0 or mismatch > 0 or leader_changed > 0 or n_locked > 0 then
+                log(("[b2] applied: newly_hidden=%d revealed=%d kept_hidden=%d kept_shown=%d / %d HISMs"):format(
+                    newly_hidden, revealed, kept_hidden, kept_shown, hn))
+                if B2_SPATIAL_CROSSCHECK then
+                    local cached, locked, clean_unlocked = 0, 0, 0
+                    local splits = {}
+                    for hi2, g in pairs(_b2_group) do
+                        if g.leader ~= nil then cached = cached + 1 end
+                        if g.locked then locked = locked + 1
+                        elseif g.total and g.total > 0 and g.leadn * 10 < g.total * 7 then splits[#splits + 1] = { hi = hi2, g = g }
+                        else clean_unlocked = clean_unlocked + 1 end
+                    end
+                    log(("[b2-cmp] index-driver hides=%d | index-vs-spatial mismatches=%d | spatial cached=%d locked=%d/%d (corrections=%d newly-locked=%d)"):format(
+                        n_new_hide, mismatch, cached, locked, hn, leader_changed, n_locked))
+                    -- diagnostic: split the still-unlocked groups into SPLIT (leader <70% ->
+                    -- conflated, the residual leak risk) vs clean (high-confidence, just not
+                    -- yet vote-saturated). List the split ones so we see exactly what they are.
+                    if #splits > 0 then
+                        log(("[b2-cmp] unlocked breakdown: split/conflated=%d clean=%d -- listing split (residual-risk groups):"):format(#splits, clean_unlocked))
+                        for i = 1, math.min(#splits, 12) do
+                            local e = splits[i]; local gg = e.g
+                            log(("[b2-cmp]   SPLIT hi=%d size=%s leader=%s %d%% (%d/%d votes)"):format(
+                                e.hi, tostring(gg.sn), tostring(gg.leader), math.floor(gg.leadn * 100 / gg.total), gg.leadn, gg.total))
+                        end
+                    else
+                        log(("[b2-cmp] unlocked breakdown: split/conflated=0 clean=%d (all benign, just under-sampled)"):format(clean_unlocked))
+                    end
                 end
-            end
-            -- Only log when something actually changed (a real unlock, or drift we
-            -- corrected) so the every-5s periodic pass doesn't spam the log.
-            if sig_changed or (newly_hidden + revealed) > 0 then
-                log(("[b2] applied: newly_hidden=%d revealed=%d kept_hidden=%d kept_shown=%d / %d HISMs"):format(newly_hidden, revealed, kept_hidden, kept_shown, hn))
             end
         end
     end
     if sig_changed then
-        log("[b2] unwarded-set change -> re-classify book visibility (periodic drift checks run silently)")
+        log("[b2] unwarded-set change -> re-evaluate (NEW drives off cached series, OLD logged for comparison)")
     end
     do_chunk()
 end
@@ -379,6 +436,13 @@ local function set_button_enabled(btn, enabled)
     pcall(function() btn:SetIsEnabled(enabled) end)
 end
 
+-- Vanilla latch: set true when the player clicks "Close" on the AP connection
+-- window (ModActor.BroadcastCloseRequest). It enables the real Continue/New Game
+-- buttons and makes EVERY gameplay modification gate off (warding, book-hiding,
+-- level-up suppression, tracking) -- the mod becomes fully passive. One-way for
+-- the session: only relaunching the game re-enables connecting.
+local _vanilla_mode = false
+
 local function update_title_buttons()
     local widget = find_title_widget()
     if not widget then return end  -- not at title screen
@@ -402,12 +466,32 @@ local function update_title_buttons()
                 tostring(current_slot), tostring(has_save),
                 tostring(enable_continue), tostring(enable_start)))
         end
+    elseif _vanilla_mode then
+        -- Vanilla (Close clicked): restore base-game button behavior -- Continue if
+        -- the player's (non-AP) save exists, New Game always. Mod stays passive.
+        local vanilla_slot = read_save_slot()
+        enable_continue = ap_save_exists(vanilla_slot)
+        enable_start = true
+        log(("[title-buttons] vanilla — continue=%s start=true (slot='%s')"):format(
+            tostring(enable_continue), tostring(vanilla_slot)))
     else
         log("[title-buttons] not connected; both gameplay buttons disabled")
     end
 
     pcall(function() set_button_enabled(widget.Button_LoadGame, enable_continue) end)
     pcall(function() set_button_enabled(widget.Button_StartGame, enable_start) end)
+end
+
+-- Latch Vanilla mode. Called from the BroadcastCloseRequest hook via the global
+-- _librarian_menu table (hook callbacks can't see this file's locals).
+local function enter_vanilla_mode()
+    if _vanilla_mode then return end
+    _vanilla_mode = true
+    log("[menu] Close clicked — VANILLA mode latched; mod passive until relaunch")
+    if _G._librarian_menu and _G._librarian_menu.hide then
+        pcall(function() _G._librarian_menu.hide() end)
+    end
+    pcall(function() update_title_buttons() end)
 end
 
 -- ============================================================
@@ -418,7 +502,7 @@ end
 -- isn't in TESTED_GAME_VERSIONS, append "(UNTESTED)" so the player knows
 -- compatibility isn't validated against their game build.
 
-local MOD_VERSION = "1.1.0-beta2"
+local MOD_VERSION = "1.1.0-beta3"
 local TESTED_GAME_VERSIONS = { "1.0.8" }
 
 local function get_game_version()
@@ -952,10 +1036,19 @@ local function start_gameplay_loops()
 end
 
 local function activate_gameplay(reason)
+    -- Only activate the mod's gameplay processing when connected to AP. In Vanilla
+    -- mode (or simply not connected) we stay fully passive: no warding, no
+    -- book-hiding, no apply loops, no tracking. This is the single gate that covers
+    -- every world mutation regardless of which path (button / SelectedLevel watcher
+    -- / LoadMap) tried to activate.
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient._slot_connected) then
+        log(("activate_gameplay skipped — not connected (reason: %s)"):format(reason or "?"))
+        return
+    end
     log(("Activating gameplay (reason: %s)"):format(reason or "?"))
     lc_event("on_continue")  -- PRE_APPLY→GAMEPLAY
-    local APClient = package.loaded["AP/APClient"]
-    if APClient and APClient.set_in_game then APClient:set_in_game(true) end
+    if APClient.set_in_game then APClient:set_in_game(true) end
     local IA = package.loaded["AP/ItemApply"]
     if IA and IA.set_gameplay_active then IA.set_gameplay_active(true) end
     start_gameplay_loops()
@@ -1042,16 +1135,14 @@ RegisterLoadMapPostHook(function(Engine, World)
         local IA = package.loaded["AP/ItemApply"]
         if IA and IA.reset_hism_state then IA.reset_hism_state() end
 
-        -- Book-visibility (cosmetic pile-hiding) is per-world: the fresh world's
-        -- HISM components start visible, so clear our hidden-state cache and
-        -- re-open the initial-warding window (Option A) so this world re-hides
-        -- from scratch, then re-freezes on convergence. Without this a
-        -- Menu->Continue would keep stale "already hidden" flags + a frozen
-        -- window and never re-ward the new world's pile.
+        -- Book-visibility (cosmetic pile-hiding) is per-world: the fresh world's HISM
+        -- components start visible AND the per-group series snapshot is tied to the old
+        -- world's actors, so clear both -- this world re-snapshots its series cache and
+        -- re-hides from scratch. Without this a Menu->Continue keeps stale "already
+        -- hidden" flags and a stale series cache.
         _b2_state = {}
         _b2_last_sig = nil
-        _b2_hides_frozen = false
-        _b2_pass_count = 0
+        _b2_group = {}
 
         -- Re-arm the apply-gate for this fresh world. Menu→Continue reloads M01 but
         -- never calls deactivate_gameplay, so _apply_safe stays true and the
@@ -1210,6 +1301,10 @@ local function on_level_up_bp(self)
     local n = "?"
     pcall(function() n = tostring(self:get().EnableUpgradeNum) end)
     log((">> [BP]  OnLevelUp        EnableUpgradeNum=%s"):format(n))
+    -- Vanilla / not connected: leave the base game's level-up alone (no skill-point
+    -- suppression, no AP level tracking).
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient._slot_connected) then return end
     if suppress_levelup then
         pcall(function()
             local p = self:get()
@@ -1368,6 +1463,20 @@ register_bp_hooks_once = function()
                 _G._librarian_menu.set_status("Connecting...", "warn")
             end
             c:connect()
+        end)
+
+    -- Close button on the AP window -> player declined to connect: latch Vanilla
+    -- mode (mirrors the Connect path; the pak's ModActor needs a BroadcastCloseRequest
+    -- custom event wired to Btn_Close.OnClicked). Until that pak event exists this
+    -- hook just defers harmlessly. enter_vanilla() is reached via the global menu
+    -- table because hook callbacks can't see this file's locals.
+    hook_safe(
+        "/Game/Mods/LibrarianAPHUDFix/ModActor.ModActor_C:BroadcastCloseRequest",
+        "ModActor.BroadcastCloseRequest",
+        function(self)
+            if _G._librarian_menu and _G._librarian_menu.enter_vanilla then
+                pcall(function() _G._librarian_menu.enter_vanilla() end)
+            end
         end)
 
     if ok1 then
@@ -1923,16 +2032,108 @@ end
 -- Expose to other modules (used by on_slot_connected / on_disconnected /
 -- on_slot_refused handlers above, which were defined before this section).
 _G._librarian_menu = {
-    set_status = menu_set_status,
-    set_fields = menu_set_fields,
-    show       = menu_show,
-    hide       = menu_hide,
-    toggle     = menu_toggle,
+    set_status    = menu_set_status,
+    set_fields    = menu_set_fields,
+    show          = menu_show,
+    hide          = menu_hide,
+    toggle        = menu_toggle,
+    enter_vanilla = enter_vanilla_mode,
 }
 
 RegisterKeyBind(Key.F4, function()
     log("[F4] toggle connection menu")
     menu_toggle()
+end)
+
+-- TEMP custom-data probe (F6). Question: does any HISM PerInstanceCustomData float
+-- encode the book's AssetIdx/series? If yes, we can hide warded books PER-INSTANCE
+-- (accurate even for stacked books) instead of the spatial whole-group guess that
+-- occasionally leaks a warded cover. Press F6 in-game while the pile is visible,
+-- then send the UE4SS.log. Remove this once answered.
+local function probe_customdata()
+    log("[cd-probe] === START ===")
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then log("[cd-probe] no BP_HISM_Manager_C (load a save first)"); return end
+    local arr; pcall(function() arr = mgr.HISMArray end)
+    local hn = 0; if arr then pcall(function() hn = #arr end) end
+    if hn == 0 then log("[cd-probe] HISMArray empty"); return end
+
+    -- Ground truth: distinct AssetIdx values from book actors.
+    local books = FindAllOf("BP_GrabbingBook_C")
+    local bn = 0; if books then pcall(function() bn = #books end) end
+    local aset, acount, amin, amax = {}, 0, math.huge, -math.huge
+    for i = 1, bn do
+        local b = books[i]
+        if b and b:IsValid() then
+            local ai
+            pcall(function() local info = b.ItemInfo; if info and info:IsValid() then ai = info.AssetIdx end end)
+            if ai and ai >= 0 then
+                if not aset[ai] then aset[ai] = true; acount = acount + 1 end
+                if ai < amin then amin = ai end
+                if ai > amax then amax = ai end
+            end
+        end
+    end
+    log(("[cd-probe] %d book actors, %d distinct AssetIdx (range %s..%s)"):format(
+        bn, acount, tostring(amin), tostring(amax)))
+
+    -- Custom floats per instance = len(PerInstanceSMCustomData) / numInstances.
+    local NUM = 0
+    for hi = 1, hn do
+        local h; pcall(function() h = arr[hi] end)
+        if h and h:IsValid() then
+            local sn = 0; pcall(function() sn = #h.PerInstanceSMData end)
+            local cl = 0; pcall(function() cl = #h.PerInstanceSMCustomData end)
+            if sn > 0 and cl > 0 then NUM = math.floor(cl / sn); break end
+        end
+    end
+    if NUM == 0 then log("[cd-probe] no PerInstanceSMCustomData found"); return end
+    log(("[cd-probe] %d custom floats per instance"):format(NUM))
+
+    local dist, mn, mx, intlike, inA = {}, {}, {}, {}, {}
+    for k = 0, NUM-1 do dist[k]={}; mn[k]=math.huge; mx[k]=-math.huge; intlike[k]=true; inA[k]=0 end
+    local sampled, raw = 0, 0
+    local step = math.max(1, math.floor(hn / 80))   -- ~80 HISMs spread across the pile
+    for hi = 1, hn, step do
+        local h; pcall(function() h = arr[hi] end)
+        if h and h:IsValid() then
+            local sn = 0; pcall(function() sn = #h.PerInstanceSMData end)
+            local cd; pcall(function() cd = h.PerInstanceSMCustomData end)
+            if cd and sn > 0 then
+                for j = 0, sn-1 do
+                    local row = {}
+                    for k = 0, NUM-1 do
+                        local v = 0; pcall(function() v = cd[j*NUM + k + 1] end)
+                        v = tonumber(v) or 0
+                        row[k] = v
+                        dist[k][math.floor(v*100+0.5)/100] = true
+                        if v < mn[k] then mn[k]=v end
+                        if v > mx[k] then mx[k]=v end
+                        if math.abs(v - math.floor(v+0.5)) > 0.01 then intlike[k]=false end
+                        if aset[math.floor(v+0.5)] then inA[k]=inA[k]+1 end
+                    end
+                    sampled = sampled + 1
+                    if raw < 6 then
+                        raw = raw + 1
+                        local p = {}; for k=0,NUM-1 do p[#p+1]=string.format("%.2f", row[k]) end
+                        log(("[cd-probe] raw hi=%d j=%d: [%s]"):format(hi, j, table.concat(p, ",")))
+                    end
+                end
+            end
+        end
+    end
+    log(("[cd-probe] sampled %d instances"):format(sampled))
+    for k = 0, NUM-1 do
+        local dc = 0; for _ in pairs(dist[k]) do dc = dc + 1 end
+        log(("[cd-probe] cd[%2d] distinct=%-4d min=%-9.2f max=%-9.2f int=%-5s in_assetidx=%d/%d"):format(
+            k, dc, mn[k], mx[k], tostring(intlike[k]), inA[k], sampled))
+    end
+    log(("[cd-probe] === END (winner = a float with int=true, distinct~%d, in_assetidx~%d) ==="):format(acount, sampled))
+end
+
+RegisterKeyBind(Key.F6, function()
+    log("[F6] running custom-data probe")
+    pcall(probe_customdata)
 end)
 
 -- Poll for ModActor on startup and show the menu once. Subsequent shows
