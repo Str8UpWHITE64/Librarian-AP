@@ -2,6 +2,40 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0-beta4 — 2026-06-02 (released)
+
+Built on beta3. A targeted **crash fix** and a **stuck-shelf fix**, plus a durable crash-logging
+system that replaces beta2's `[crumb]` breadcrumbs so any remaining crash is finally actionable.
+
+- **Crash fix — the recurring render-state-churn race (candidate fix).** Diagnosis: beta3 re-applied
+  the collision/visibility warding to *every* bookcase every ~5 seconds (~10,000 redundant mesh writes
+  per session), because the change-tracker was wiped on each periodic re-index. Those constant
+  main-thread render-state writes raced the game's parallel render/instance worker on the book pile —
+  the signature of the recurring `0x1e8a88f` access violation, which surfaced both inline on the game
+  thread (hash `BAE1A5E0`) and on a worker the game thread was blocked waiting on (hash `423B7BBD`) —
+  the *same* operation, not two bugs. The fix (`_apply_bookcases_to_world`, `AP/ItemApply.lua`) now
+  decides whether to re-ward a case by **reading the case's actual collision** instead of re-writing
+  blindly, so an already-correct shelf is a no-op. Per-session ward writes dropped from ~10,000 to a
+  few dozen, removing the race window; drift is still corrected within one pass. We believe this fixes
+  the crash but can't confirm without field time — please report any crash with the new log (below).
+  Toggleable via the `WARD_GROUND_TRUTH` flag.
+
+- **Fixed shelves stuck un-placeable until reload (e.g. 1M / 1N).** A bookcase that should be unlocked
+  could stay un-placeable — visible, but you couldn't place books on it — until you reloaded from the
+  menu. Cause: the unlock restore relied on the per-mesh collision *captured* at first-ward, and a
+  capture taken while the shelf was still streaming (e.g. during a burst of shelf unlocks from a
+  force-release) recorded a bad value the restore then skipped. The fix (`_ward_collision`) now forces
+  the placement shelf solid + placeable **unconditionally** on unlock, independent of the capture, and
+  identifies the placement mesh robustly (covers the 4x5 / 5-volume cases too). A new `[ward-unlock]`
+  log line records the decision so any future stuck shelf names the exact case.
+
+- **New durable crash logging (replaces the `[crumb]` breadcrumbs).** A flushed-to-disk ledger at
+  `Mods/Librarian-AP/crash_trace.log` records the mod's book/shelf operations as they happen, so the
+  lines right before a crash always survive to disk. **If the game crashes, please send
+  `crash_trace.log` alongside the crash dump** (and `UE4SS.log`). Also ships runtime diagnostic
+  switches (`Mods/Librarian-AP/Scripts/diag_flags.lua`, all default-on = normal behavior) we may ask
+  you to flip to isolate an issue.
+
 ## 1.1.0-beta3 — 2026-06-02 (released)
 
 Built on beta2. Two new features plus a reworked warded-book classifier (a *potential* fix —

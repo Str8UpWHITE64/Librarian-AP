@@ -10,6 +10,39 @@ local function log(msg)
     print(("[%s] %s\n"):format(MOD, tostring(msg)))
 end
 
+-- ============================================================
+-- Crash-hunt instrumentation (see AP/trace.lua, diag_flags.lua, CRASH_HANDOFF.md)
+-- ============================================================
+-- diag_flags: runtime bisection switches. Each flag DEFAULTS to ON (current behavior);
+-- a tester flips one to false, relaunches, and reports crash/no-crash to localize the
+-- subsystem. Loaded via pcall so a missing/broken file just means "all flags on".
+local DIAG = (function()
+    local ok, t = pcall(require, "diag_flags")
+    return (ok and type(t) == "table") and t or {}
+end)()
+local function diag_on(flag)
+    local v = DIAG[flag]
+    if v == nil then return true end   -- unknown/missing flag -> current behavior
+    return v and true or false
+end
+local function diag_flags_str()
+    local order = { "BOOK_VISIBILITY", "HISM_SETMATERIAL", "CASE_WARDING",
+                    "RENDER_STATE_DIRTY", "BOOK_ACTOR_WARDING", "NAMED_HOOKS" }
+    local parts = {}
+    for _, k in ipairs(order) do parts[#parts + 1] = k .. "=" .. tostring(diag_on(k)) end
+    return table.concat(parts, ",")
+end
+
+-- trace: durable, flushed-on-every-write crash breadcrumb ledger. Stubbed to no-ops if
+-- the module is somehow absent, so call sites can never error.
+local trace = (function()
+    local ok, t = pcall(require, "AP/trace")
+    if ok and type(t) == "table" and t.begin then return t end
+    return { init = function() end, begin = function() end, finish = function() end,
+             mark = function() end, recent = function() return {} end }
+end)()
+_G._librarian_trace = trace   -- reachable from hook callbacks if ever needed
+
 
 -- Runtime book visibility: hide warded shelves + REVEAL on unlock. Each book HISM is one cover
 -- design = one series; classify its instances by a 2D spatial match to the nearest BP_GrabbingBook
@@ -41,6 +74,7 @@ local _b2_group = {}   -- [hi] = { tally={series:count}, total, leader, leadn, l
 -- HISM<->data order after a game patch). All the spatial code is kept, just gated.
 local B2_SPATIAL_CROSSCHECK = false
 local function apply_book_visibility()
+    if not diag_on("BOOK_VISIBILITY") then return end
     if _b2_running then return end
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._compute_unwarded_set and IA._asset_to_series) then return end
@@ -205,23 +239,29 @@ local function apply_book_visibility()
                 local should_hide = should_hide_new
                 local st = _b2_state[hi]; if not st then st = { hidden = false }; _b2_state[hi] = st end
                 if should_hide and not st.hidden then
+                    trace.begin("b2-hide", h)
                     local ns = 1; pcall(function() ns = h:GetNumMaterials() end)
                     st.ns = ns; st.mats = {}
                     for s = 0, (ns or 1) - 1 do local m; pcall(function() m = h:GetMaterial(s) end); st.mats[s] = m end
                     pcall(function() h:SetVisibility(false, false) end)
                     pcall(function() h:SetHiddenInGame(true, false) end)
-                    for s = 0, (ns or 1) - 1 do pcall(function() h:SetMaterial(s, mat) end) end
+                    if diag_on("HISM_SETMATERIAL") then
+                        for s = 0, (ns or 1) - 1 do pcall(function() h:SetMaterial(s, mat) end) end
+                    end
                     -- Do NOT touch PerInstanceCustomData: index 0 carries the game's per-book
                     -- color; overwriting corrupts books on reveal. SetVisibility does the hiding.
+                    trace.finish("b2-hide", h)
                     st.hidden = true; newly_hidden = newly_hidden + 1
                 elseif (not should_hide) and st.hidden then
+                    trace.begin("b2-reveal", h)
                     pcall(function() h:SetVisibility(true, false) end)
                     pcall(function() h:SetHiddenInGame(false, false) end)
-                    if st.mats then
+                    if st.mats and diag_on("HISM_SETMATERIAL") then
                         for s = 0, (st.ns or 1) - 1 do
                             local m = st.mats[s]; if m then pcall(function() h:SetMaterial(s, m) end) end
                         end
                     end
+                    trace.finish("b2-reveal", h)
                     st.hidden = false; revealed = revealed + 1
                 elseif st.hidden then
                     kept_hidden = kept_hidden + 1
@@ -502,7 +542,7 @@ end
 -- isn't in TESTED_GAME_VERSIONS, append "(UNTESTED)" so the player knows
 -- compatibility isn't validated against their game build.
 
-local MOD_VERSION = "1.1.0-beta3"
+local MOD_VERSION = "1.1.0-beta4"
 local TESTED_GAME_VERSIONS = { "1.0.8" }
 
 local function get_game_version()
@@ -1187,6 +1227,7 @@ end)
 -- HOOK: Upgrade flow
 -- ============================================================
 RegisterHook("/Script/Librarian.LibrarianCharacter:UpgradePlayer", function(self, ability)
+    if not diag_on("NAMED_HOOKS") then return end
     local idx
     pcall(function() idx = ability:get() end)
     log((">> UpgradePlayer    ability=%s (%s)"):format(tostring(idx), ability_name(idx or -1)))
@@ -1298,6 +1339,7 @@ local function hook_safe(path, label, handler)
 end
 
 local function on_level_up_bp(self)
+    if not diag_on("NAMED_HOOKS") then return end
     local n = "?"
     pcall(function() n = tostring(self:get().EnableUpgradeNum) end)
     log((">> [BP]  OnLevelUp        EnableUpgradeNum=%s"):format(n))
@@ -1523,6 +1565,7 @@ local function announce_goal_progress(row)
 end
 
 RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, finishedRow)
+    if not diag_on("NAMED_HOOKS") then return end
     local row
     pcall(function() row = finishedRow:get() end)
     log((">> FinishRow        row=%s"):format(tostring(row)))
@@ -1610,12 +1653,14 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
 end)
 
 RegisterHook("/Script/Librarian.LibrarianGameMode:NewRowFinished", function(self, num)
+    if not diag_on("NAMED_HOOKS") then return end
     local n
     pcall(function() n = num:get() end)
     log((">> NewRowFinished   num=%s"):format(tostring(n)))
 end)
 
 RegisterHook("/Script/Librarian.LibrarianGameMode:EndGame", function(self)
+    if not diag_on("NAMED_HOOKS") then return end
     log(">> EndGame  (GAME COMPLETE)")
     if _goal_sent then
         log("[AP] STATUS_GOAL already sent (threshold reached earlier); skipping")
@@ -1642,6 +1687,18 @@ local APClient = require("AP/APClient")
 local ItemApply = require("AP/ItemApply")
 local APConfig = require("AP/APConfig")
 local HUD = require("AP/HUD")
+
+-- Open the crash breadcrumb ledger now, before any world mutation can fire. Re-opened
+-- with the seed on slot connect (header then carries it for triage). See AP/trace.lua.
+trace.init({ version = MOD_VERSION, flags = diag_flags_str() })
+trace.mark("boot")
+
+-- Crash-ledger heartbeat: a flushed 1 Hz marker so a post-crash read of crash_trace.log
+-- reveals how long after the mod's last mutation the crash landed — i.e. whether the
+-- fault was synchronous-in-op (tail = unmatched BEG) or decoupled/idle (tail = several
+-- "hb" lines after the last END). CR1 ("crash ~1 min after a series unlock") would show
+-- ~60 hb lines between the last b2-reveal and the crash.
+LoopAsync(1000, function() trace.mark("hb"); return false end)
 
 -- v1.1.0 (rewrite): the lifecycle state machine. Now driven by EVENTS at the
 -- real signal points (lc_event(...) calls below) rather than a polling derive
@@ -1776,6 +1833,8 @@ APClient.on_slot_connected = function(slot_data)
     -- Redirect save slot to a per-seed name so AP runs don't clobber the
     -- player's normal Sav.sav.
     local seed = sanitize_slot(slot_data and slot_data.seed or "unknown")
+    -- Re-open the crash ledger now that we know the seed (header carries it for triage).
+    pcall(function() trace.init({ version = MOD_VERSION, seed = seed, flags = diag_flags_str() }) end)
     local slot_num = tostring(APClient.slot_number or -1)
     local ap_slot_name = ("Sav_AP_%s_%s"):format(seed, sanitize_slot(slot_num))
     set_save_slot(ap_slot_name)

@@ -30,6 +30,24 @@ local M = {}
 local LOG_PREFIX = "[ItemApply]"
 local function log(msg) print(LOG_PREFIX .. " " .. tostring(msg)) end
 
+-- Crash-hunt instrumentation (see AP/trace.lua, diag_flags.lua, CRASH_HANDOFF.md).
+-- trace = durable flushed breadcrumb ledger; _diag_on = bisection switches (default on).
+-- Both pcall-guarded so a missing module never breaks ItemApply.
+local trace = (function()
+    local ok, t = pcall(require, "AP/trace")
+    if ok and type(t) == "table" and t.begin then return t end
+    return { init = function() end, begin = function() end, finish = function() end, mark = function() end }
+end)()
+local _DIAG = (function()
+    local ok, t = pcall(require, "diag_flags")
+    return (ok and type(t) == "table") and t or {}
+end)()
+local function _diag_on(flag)
+    local v = _DIAG[flag]
+    if v == nil then return true end
+    return v and true or false
+end
+
 -- ============================================================================
 -- Constants (mirrors apworld/librarian/data.py::UpgradeAbility)
 -- ============================================================================
@@ -518,6 +536,7 @@ function M.set_gameplay_active(state)
         -- which may not fully reload) re-wards every case and re-glows every sign
         -- from scratch instead of apply-on-change skipping them as "unchanged".
         M._case_ward_state = {}
+        M._case_placement_mesh = {}   -- stale (old world's components)
         M._section_to_label = nil
         M._section_glow_state = {}
         M._section_glow_orig = {}
@@ -851,7 +870,9 @@ local function _walk_set_visibility(comp, visible)
     if not comp or not comp:IsValid() then return end
     pcall(function() comp:SetVisibility(visible, false) end)
     pcall(function() comp:SetHiddenInGame(not visible, false) end)
-    pcall(function() comp:MarkRenderStateDirty() end)
+    if _diag_on("RENDER_STATE_DIRTY") then
+        pcall(function() comp:MarkRenderStateDirty() end)
+    end
     local children
     pcall(function() children = comp.AttachChildren end)
     if children then
@@ -978,47 +999,90 @@ local function _ward_collision(case, case_key, locked)
     local OBJ_CHANNELS = { 0, 1, 2, 5, 6, 7 }
     local OBJ_SET = { [0] = true, [1] = true, [2] = true, [5] = true, [6] = true, [7] = true }
 
+    -- Identify the PLACEMENT mesh: the shelf surface the placement line-trace must hit.
+    -- Normally the component named "StaticMesh" (the inner shelf, present in standard
+    -- shelves AND as the inner shelf of multi-mesh cabinets). For a SINGLE-mesh case the
+    -- sole mesh IS the placement target even when it is NOT named "StaticMesh" -- that name
+    -- assumption is exactly why 1M's 5-volume "second 5-book shelf" (a BP_BookCase_4x5_C
+    -- whose mesh isn't named "StaticMesh") stuck un-placeable until reload: it fell to the
+    -- per-channel restore of a stale capture instead of a block-all. We drive the placement
+    -- mesh to a DETERMINISTIC state in BOTH directions, OUTSIDE the captured-collision gate,
+    -- so a bad/partial capture can never strand it.
+    local placement_idx = nil
+    for i = 1, #meshes do
+        local nm = "?"; pcall(function() nm = meshes[i]:GetFName():ToString() end)
+        if nm == "StaticMesh" then placement_idx = i; break end
+    end
+    if not placement_idx and #meshes == 1 then placement_idx = 1 end
+
+    -- Stash the placement mesh so the periodic ward pass can read its ACTUAL collision
+    -- (Camera channel 4: Ignore=warded, Block=unwarded) as ground truth instead of
+    -- re-mutating blindly. Cleared on real world reload (reset_hism_state).
+    if case_key and placement_idx then
+        M._case_placement_mesh = M._case_placement_mesh or {}
+        M._case_placement_mesh[case_key] = meshes[placement_idx]
+    end
+
+    -- One-shot per case CLASS: log the unlock placement decision so any future stuck-shelf
+    -- report names exactly which mesh/structure was used (and loudly flags the one case we
+    -- cannot disambiguate: a multi-mesh case with no "StaticMesh").
+    if not locked and case then
+        local cls = "?"; pcall(function() cls = case:GetClass():GetFName():ToString() end)
+        M._ward_unlock_logged = M._ward_unlock_logged or {}
+        if not M._ward_unlock_logged[cls] then
+            M._ward_unlock_logged[cls] = true
+            if placement_idx then
+                local pnm = "?"; pcall(function() pnm = meshes[placement_idx]:GetFName():ToString() end)
+                local pen = rec[placement_idx] and rec[placement_idx].en
+                log(("[ward-unlock] %s: %d mesh(es), placement='%s' (%s), captured en=%s -> force block-all"):format(
+                    cls, #meshes, pnm, (pnm == "StaticMesh") and "by-name" or "sole-mesh", tostring(pen)))
+            else
+                log(("[ward-unlock] WARNING %s: %d meshes, no 'StaticMesh' + not single-mesh -> per-channel restore MAY stick; send this log"):format(
+                    cls, #meshes))
+            end
+        end
+    end
+
     for i = 1, #meshes do
         local r = rec[i] or { en = 3, pf = "?" }
-        if (r.en or 3) ~= 0 then
-            if locked then
-                -- Same end-state as setting all 32 channels, but ~8 calls instead
-                -- of 32 (the 32-call version was heavy enough to stall the load):
-                -- ignore EVERY channel (so the placement trace — whatever channel
-                -- it uses — misses → un-interactable), then re-block the object
-                -- channels (player Pawn + thrown books still bounce off).
+        local is_placement = (i == placement_idx)
+        -- Safe enabled value for the placement mesh: the captured one if real, else
+        -- QueryAndPhysics -- so a captured NoCollision (0) can't disable the shelf.
+        local pen = (r.en and r.en ~= 0) and r.en or 3
+        if locked then
+            if is_placement then
+                -- Always ward the placement mesh (deterministic Camera=Ignore), bypassing
+                -- the captured-en gate so the ground-truth read + the unlock stay reliable.
+                pcall(function() meshes[i]:SetCollisionEnabled(pen) end)
+                pcall(function() meshes[i]:SetCollisionResponseToAllChannels(0) end)
+                for _, ch in ipairs(OBJ_CHANNELS) do
+                    pcall(function() meshes[i]:SetCollisionResponseToChannel(ch, 2) end)
+                end
+                M._ward_canary = meshes[i]
+            elseif (r.en or 3) ~= 0 then
+                -- Other meshes: same ~8-call ward (ignore all channels so the placement
+                -- trace misses, then re-block the object channels so player + books bounce).
                 pcall(function() meshes[i]:SetCollisionEnabled(3) end)
                 pcall(function() meshes[i]:SetCollisionResponseToAllChannels(0) end)
                 for _, ch in ipairs(OBJ_CHANNELS) do
                     pcall(function() meshes[i]:SetCollisionResponseToChannel(ch, 2) end)
                 end
-                -- Remember one warded mesh as a drift canary: channel 4 (Camera) is
-                -- left at Ignore(0) here; if the game later resets it to Block, we
-                -- know an event-less transition (Menu→Continue) un-warded us.
                 M._ward_canary = meshes[i]
-            else
-                -- UNLOCK. The placement line-trace must hit the bookcase's
-                -- "StaticMesh" component -- the shelf surface you place books on,
-                -- present BOTH in single-mesh standard shelves AND as the inner shelf
-                -- of multi-mesh cabinets (alongside the SM_M01_BookCabinet/CabinetWall
-                -- structure). We force block-all on THAT mesh so placement always
-                -- works, INDEPENDENT of how good the captured collision was: a capture
-                -- read before the shelf finished initializing recorded the placement
-                -- channel as Ignore, and restoring that left the shelf un-placeable
-                -- forever (the 1F / 1N "unlocked shelf I can't place on" bug -- the
-                -- per-channel restore couldn't recover it because some OTHER trace
-                -- channel still looked blocked). The other meshes (cabinet body/wall)
-                -- get their captured original restored so the trace passes THROUGH
-                -- them to the inner shelf -- block-all-ing them was the original
-                -- cabinet bug. A non-StaticMesh mesh with no capture is left in its
-                -- warded pass-through state (it's structure, never the placement
-                -- target, so it must not block the trace).
-                local nm = "?"
-                pcall(function() nm = meshes[i]:GetFName():ToString() end)
+            end
+        else
+            if is_placement then
+                -- UNLOCK the placement mesh UNCONDITIONALLY: solid + block-all so the
+                -- placement trace always hits it, regardless of how good the capture was.
+                -- (The old code only did this for a mesh literally named "StaticMesh", and
+                -- only inside the captured-en gate -- the 1M stuck-shelf bug.)
+                pcall(function() meshes[i]:SetCollisionEnabled(pen) end)
+                pcall(function() meshes[i]:SetCollisionResponseToAllChannels(2) end)
+            elseif (r.en or 3) ~= 0 then
+                -- Structural meshes (cabinet body/wall): restore the captured original so
+                -- the placement trace passes THROUGH them to the inner shelf -- block-all-ing
+                -- them was the original cabinet bug.
                 pcall(function() meshes[i]:SetCollisionEnabled(r.en or 3) end)
-                if nm == "StaticMesh" then
-                    pcall(function() meshes[i]:SetCollisionResponseToAllChannels(2) end)
-                elseif r.resp then
+                if r.resp then
                     for ch = 0, 31 do
                         local orig = r.resp[ch] or 0
                         local warded_val = OBJ_SET[ch] and 2 or 0
@@ -1149,6 +1213,13 @@ M._case_orig_collision = {}
 -- (by GetFullName), so the warding only re-touches a case when its state
 -- changes — perf + avoids racing the world teardown on quit. Cleared on reload.
 M._case_ward_state = {}
+
+-- Per-case placement-mesh ref (the shelf surface whose Camera-channel collision encodes
+-- warded vs unwarded), stashed by _ward_collision. The periodic ward pass reads it as
+-- GROUND TRUTH so an already-correct case is a no-op — no render-state churn (the crash
+-- suspect) — while still catching drift within one pass. IsValid-guarded; dropped only on
+-- a real world reload (refs go stale), NOT on the 5s re-index.
+M._case_placement_mesh = {}
 
 -- Diagnostic flags for v1.1.0 pak functions. Set true the first time we
 -- successfully call into a new pak function so we don't spam the log.
@@ -1288,6 +1359,7 @@ function M.reset_hism_state()
     -- captures — the next apply pass recaptures and re-applies.
     M._case_orig_collision = {}
     M._case_ward_state = {}
+    M._case_placement_mesh = {}
     -- Section-sign glow: re-built by the indexer each session; drop stale state so
     -- the new (post-reload) spotlights get re-glowed.
     M._section_to_label = nil
@@ -2331,7 +2403,9 @@ function M._set_book_mesh_visible(book, visible)
             if c and c:IsValid() then
                 pcall(function() c:SetVisibility(visible, false) end)
                 pcall(function() c:SetHiddenInGame(not visible, false) end)
-                pcall(function() c:MarkRenderStateDirty() end)
+                if _diag_on("RENDER_STATE_DIRTY") then
+                    pcall(function() c:MarkRenderStateDirty() end)
+                end
             end
         end
     end
@@ -2502,6 +2576,10 @@ function M._apply_books_to_world()
     -- We're committed to a flush now. Take the in-progress lock and
     -- start the chunked Pass-1 driver.
     M._flush_in_progress = true
+    -- Pass-level marker: the book-actor warding walk (~3000 actors) is too high-volume to
+    -- BEG/END per book, so we timestamp the whole flush. BOOK_ACTOR_WARDING is the real
+    -- bisection lever for these; this just shows a flush was in flight near a crash.
+    trace.mark("books-flush", nil, "n=" .. tostring(n))
     local stats = { warded = 0, unwarded = 0, skipped = 0, gate_skipped_unwards = 0 }
     local cursor = 1
 
@@ -2613,13 +2691,17 @@ function M._apply_books_to_world()
                 if not is_warded then
                     stats.gate_skipped_unwards = stats.gate_skipped_unwards + 1
                 end
-                book:SetActorHiddenInGame(false)
-                book:SetActorEnableCollision(true)
+                if _diag_on("BOOK_ACTOR_WARDING") then
+                    book:SetActorHiddenInGame(false)
+                    book:SetActorEnableCollision(true)
+                end
                 M._books_warded[key] = nil
             else
                 if not is_warded then
-                    book:SetActorHiddenInGame(true)
-                    book:SetActorEnableCollision(false)
+                    if _diag_on("BOOK_ACTOR_WARDING") then
+                        book:SetActorHiddenInGame(true)
+                        book:SetActorEnableCollision(false)
+                    end
                     M._books_warded[key] = true
                     -- Per-book cover spawning was explored but visually
                     -- unsatisfactory (covers cluttered the scene,
@@ -3422,9 +3504,39 @@ function M._apply_bookcases_to_world()
                 -- deref a freeing mesh (the 0x0 quit crash). State resets on world
                 -- reload, so every case re-applies fresh next session.
                 M._case_ward_state = M._case_ward_state or {}
-                local changed = (not case_key) or (M._case_ward_state[case_key] ~= visible)
+                -- Decide whether to (re)ward by reading the case's ACTUAL collision rather
+                -- than trusting our cache. The placement mesh's Camera channel (4) reads
+                -- Ignore(0) when warded, Block(2) when unwarded (see _ward_collision). So a
+                -- correctly-warded case is a no-op every pass -> NO render-state churn (the
+                -- recurring crash is a main-thread mesh write racing the render/instance
+                -- worker), while game-side drift (Menu->Continue silently resetting collision)
+                -- is still caught within one pass. Falls back to the cache on a case's first
+                -- pass (placement mesh not stashed yet) or whenever the read is unavailable.
+                local desired_warded = not visible
+                local changed
+                if _diag_on("WARD_GROUND_TRUTH") then
+                    local actual_warded = nil
+                    local pm = case_key and M._case_placement_mesh and M._case_placement_mesh[case_key]
+                    if pm then
+                        local pm_valid = false
+                        pcall(function() pm_valid = pm:IsValid() end)
+                        if pm_valid then
+                            local ch4
+                            pcall(function() ch4 = pm:GetCollisionResponseToChannel(4) end)
+                            if ch4 ~= nil then actual_warded = (tonumber(ch4) == 0) end
+                        end
+                    end
+                    if actual_warded == nil then
+                        changed = (not case_key) or (M._case_ward_state[case_key] ~= visible)
+                    else
+                        changed = (actual_warded ~= desired_warded)
+                    end
+                else
+                    changed = (not case_key) or (M._case_ward_state[case_key] ~= visible)
+                end
 
-                if changed then
+                if changed and _diag_on("CASE_WARDING") then
+                    trace.begin(visible and "ward-show" or "ward-hide", case)
                     local ok = pcall(function()
                         -- Warding (Lua-only, crash-free) — 2e: LOCKED cases keep their
                         -- body meshes solid to OBJECT channels (block player + thrown
@@ -3450,11 +3562,14 @@ function M._apply_bookcases_to_world()
                                 if c and c:IsValid() then
                                     pcall(function() c:SetVisibility(true, false) end)
                                     pcall(function() c:SetHiddenInGame(false, false) end)
-                                    pcall(function() c:MarkRenderStateDirty() end)
+                                    if _diag_on("RENDER_STATE_DIRTY") then
+                                        pcall(function() c:MarkRenderStateDirty() end)
+                                    end
                                 end
                             end
                         end
                     end)
+                    trace.finish(visible and "ward-show" or "ward-hide", case)
                     if ok then
                         if case_key then M._case_ward_state[case_key] = visible end
                         if visible then shown = shown + 1 else hidden = hidden + 1 end
@@ -3631,7 +3746,7 @@ function M._apply_bookcases_to_world()
     -- section via CabinetLabel. Keep them permanently hidden + collision-
     -- off so the placement system can't drop books on them.
     local stray_disabled, stray_dead = 0, 0
-    for i = 1, #M._stray_cases do
+    for i = 1, (_diag_on("CASE_WARDING") and #M._stray_cases or 0) do
         local case = M._stray_cases[i]
         if case and case:IsValid() then
             local ok = pcall(function()
@@ -3650,7 +3765,9 @@ function M._apply_bookcases_to_world()
                         if c and c:IsValid() then
                             pcall(function() c:SetVisibility(false, false) end)
                             pcall(function() c:SetHiddenInGame(true, false) end)
-                            pcall(function() c:MarkRenderStateDirty() end)
+                            if _diag_on("RENDER_STATE_DIRTY") then
+                                pcall(function() c:MarkRenderStateDirty() end)
+                            end
                         end
                     end
                 end
