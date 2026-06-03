@@ -2,6 +2,34 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0-beta6 — 2026-06-03 (released)
+
+Built on beta5 (which fixed the recurring crash — confirmed by a full crash-free playthrough). This is a
+**book-visibility edge-case fix**: the rare (~3 of 3072 books over a long run) cases where a book's two
+representations — the cosmetic pile and the grabbable actor — briefly disagree about whether its series
+is warded, producing a book that is "visible but not grabbable" or that "vanishes when looked at /
+picked up."
+
+Root cause: the two warding systems re-evaluate on different triggers (the pile every ~5s; the actor
+only on item receipt), and the game toggles the book actor's visibility view-dependently — so an actor
+can lag the true locked-set after an unlock until the next item arrives.
+
+Fix: hook the game's own `BP_GrabbingBook_C` events **on the game thread** (validated: hookable, cheap
+— SetActorVisible fires <1/s in normal play — and the book's series is resolvable at hook time) and
+enforce the single, live locked-set at the moment the game shows a book:
+- **SetActorVisible pre-hook** (`BOOK_EVENT_ENFORCE`) — if the game tries to SHOW a book whose series is
+  warded, override the call so the game's own function keeps it hidden. Fixes the visible-but-not-
+  grabbable direction.
+- **SetActorVisible post-hook** (`BOOK_EVENT_REVEAL`) — if the game showed an unwarded book but it
+  stayed hidden, clear the stale hide so it actually shows. Fixes the vanishing-book direction.
+- Grab-blocking is unchanged (existing collision-off). New default-on diag flags `BOOK_EVENT_HOOKS` /
+  `BOOK_EVENT_ENFORCE` / `BOOK_EVENT_REVEAL`, each independently toggleable; every catch is logged
+  (`[book-hook]`) so the fix is observable in the field.
+
+The common case (warded books fully hidden, unlocked books shown + grabbable) was already correct and is
+unchanged. Because the targeted cases are rare, effectiveness is validated over a full playthrough via
+the `[book-hook]` counts + player reports. Crash fixes from beta5 are carried forward unchanged.
+
 ## 1.1.0-beta5 — 2026-06-02 (released)
 
 Built on beta4. Two more **crash fixes** for the warding system's interaction with the game's render
