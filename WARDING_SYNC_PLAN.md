@@ -1,6 +1,10 @@
 # Librarian-AP — Warding Sync Plan (beta6)
 
-Status: design, not yet implemented. Written 2026-06-02, after beta5 shipped crash-free.
+Status: **IMPLEMENTED in v1.1.0-beta6** (increments 1–3; see `BETA6_PROGRESS.md`). Written 2026-06-02
+after beta5; implemented 2026-06-03. What shipped uses the event-hook approach below: a
+`SetActorVisible` **pre-hook** (keep warded hidden) + **post-hook** (re-show stuck unwarded), driven off
+the live `_compute_unwarded_set`, on the game thread. Validated non-breaking; **effectiveness is
+field-validated** (rare ~3/3072 edge cases — watch the `[book-hook]` ENFORCE/REVEAL counts).
 Companion to `STAGE1_GAMETHREAD_NOTE.md` (the crash work) and `BOOK_WARDING_HANDOFF.md` (the system).
 
 ---

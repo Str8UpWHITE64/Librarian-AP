@@ -11,7 +11,14 @@ Feature Requests:
 
 - Remove posters.  They cause confusion when trying to look for books on the tables.
 
-Crashes (under investigation — see CRASH_HANDOFF.md / BOOK_WARDING_HANDOFF.md / STAGE1_GAMETHREAD_NOTE.md):
+Crashes (RESOLVED in v1.1.0-beta5 — see STAGE1_GAMETHREAD_NOTE.md / CRASH_HANDOFF.md):
+
+- [FIXED in 1.1.0-beta5] The recurring access-violation crash (the long-standing one). Root cause:
+  warding mutated live render/collision state from UE4SS LoopAsync callbacks (a SEPARATE async thread,
+  NOT the game thread), racing the engine's render/cluster-tree workers. Fix: layer-3 book-pile writes
+  moved to the game thread (ExecuteInGameThread, BOOK_VIS_GAMETHREAD) + a world-epoch teardown guard.
+  Confirmed by a full 1-4h crash-free playthrough. Layers 1 & 2 remain off-thread (rarer race; the
+  game-thread "pump" is the planned follow-up to bring them on without UE4SS #1180).
 
 - [FIXED in 1.1.0-beta5] 12AF29C8 / 7567C016 — EXCEPTION_ACCESS_VIOLATION reading 0x1e3010030 /
   0x300000037 (use-after-free read), going to the TITLE / MAIN MENU (title->M01 LoadMap / world
@@ -21,3 +28,13 @@ Crashes (under investigation — see CRASH_HANDOFF.md / BOOK_WARDING_HANDOFF.md 
   Fix: a world-epoch counter (reset_hism_state bumps it; the game-thread closure bails if it changed
   between scheduling and running). Confirmed catching the race live (b2-stale-world marker, no crash).
   Artifacts: "crash reports/title-reload 2026-06-02 2111..." and ".../mainmenu-AV 2026-06-02 2201...".
+
+Book visibility edge cases (rare ~3/3072 over a 1-4h run; ADDRESSED in v1.1.0-beta6, field-validation pending):
+
+- "Visible but not grabbable" — a warded book briefly shown by the game's view-dependent toggle. beta6:
+  a SetActorVisible PRE-hook keeps warded books hidden at show-time (BOOK_EVENT_ENFORCE).
+- "Vanishes when looked at / picked up, fine after dropping" — an unwarded book stuck hidden. beta6:
+  a SetActorVisible POST-hook re-shows it (BOOK_EVENT_REVEAL).
+  These are the two directions of the same actor-vs-pile desync. Confirm via the [book-hook]
+  ENFORCE/REVEAL log counts over a full playthrough + tester reports. If REVEAL stays 0 but vanishing
+  books persist, symptom 2 isn't the stale-hide we targeted — look elsewhere. See WARDING_SYNC_PLAN.md.
