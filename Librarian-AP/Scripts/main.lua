@@ -30,7 +30,7 @@ local function diag_flags_str()
                     "CASE_WARDING", "RENDER_STATE_DIRTY", "BOOK_ACTOR_WARDING",
                     "BOOK_ACTOR_GAMETHREAD", "WARD_GROUND_TRUTH", "CASE_WARD_GAMETHREAD",
                     "NAMED_HOOKS", "BOOK_EVENT_HOOKS", "BOOK_EVENT_ENFORCE",
-                    "BOOK_EVENT_REVEAL" }
+                    "BOOK_EVENT_REVEAL", "BOOK_EVENT_GRABFIX" }
     local parts = {}
     for _, k in ipairs(order) do parts[#parts + 1] = k .. "=" .. tostring(diag_on(k)) end
     return table.concat(parts, ",")
@@ -87,7 +87,7 @@ end
 local BOOK_BP = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingBook.BP_GrabbingBook_C"
 local _book_hooks_attempted = false
 local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0, enforced = 0, enf_samples = 0,
-              revealed = 0, rev_samples = 0 }
+              revealed = 0, rev_samples = 0, grabbed = 0, grab_samples = 0, grabfix = 0 }
 
 local function _bh_series(book_obj)
     local IA = package.loaded["AP/ItemApply"]
@@ -105,6 +105,51 @@ local function _bh_sample(tag, book_obj, extra)
         log(("[book-hook] %-15s aidx=%s series=%s%s"):format(
             tag, tostring(aidx), tostring(series), extra and (" " .. extra) or ""))
     end)
+end
+
+-- Shared grab-path check, called from BOTH GrabFromPlayer and CanBeGrab. (CanBeGrab is
+-- proven to fire on grab attempts -- Bug Report 5, ~10/run -- so routing through it hedges
+-- against GrabFromPlayer not firing.) Logs the book's full visibility state to pinpoint the
+-- "pickable book invisible" cause (symptom 2, which SetActorVisible/REVEAL never sees), then
+-- conservatively restores an UNWARDED book that's hidden. Logging gated by BOOK_EVENT_HOOKS
+-- (the caller), restore by BOOK_EVENT_GRABFIX. Game thread; the setters used aren't hooked
+-- (no re-entrancy) and align with "you grabbed it, it should be visible" (no fight).
+local function _bh_grab_check(b, tag)
+    if not b then return end
+    local _, series = _bh_series(b)
+    local bhidden, mesh_hidden, mat = nil, nil, "?"
+    pcall(function() bhidden = b.bHidden end)
+    local sm; pcall(function() sm = b.SM_Book_1 end)
+    if sm and sm:IsValid() then
+        pcall(function() mesh_hidden = sm.bHiddenInGame end)
+        pcall(function() local m = sm:GetMaterial(0); if m and m:IsValid() then mat = m:GetName() end end)
+    end
+    local IA = package.loaded["AP/ItemApply"]
+    local unwarded_here
+    if series and IA and IA._compute_unwarded_set then
+        local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
+        local uw = IA._compute_unwarded_set(only_shelfable)
+        unwarded_here = uw and uw[series] or false
+    end
+    if _bh.grab_samples < 30 then
+        _bh.grab_samples = _bh.grab_samples + 1
+        log(("[book-hook] %s series=%s unwarded=%s bHidden=%s meshHidden=%s mat=%s"):format(
+            tostring(tag), tostring(series), tostring(unwarded_here), tostring(bhidden),
+            tostring(mesh_hidden), tostring(mat)))
+    end
+    if diag_on("BOOK_EVENT_GRABFIX") and unwarded_here == true then
+        if bhidden == true then
+            pcall(function() b:SetActorHiddenInGame(false) end)
+            _bh.grabfix = _bh.grabfix + 1
+            log("[book-hook] GRAB-FIX cleared actor bHidden, series=" .. tostring(series))
+        end
+        if mesh_hidden == true and sm then
+            pcall(function() sm:SetHiddenInGame(false, false) end)
+            pcall(function() sm:SetVisibility(true, false) end)
+            _bh.grabfix = _bh.grabfix + 1
+            log("[book-hook] GRAB-FIX cleared mesh hidden, series=" .. tostring(series))
+        end
+    end
 end
 
 local function try_register_book_hooks()
@@ -196,9 +241,18 @@ local function try_register_book_hooks()
             if not diag_on("BOOK_EVENT_HOOKS") then return end
             _bh.canbegrab = _bh.canbegrab + 1
             local b; pcall(function() b = self:get() end)
-            _bh_sample("CanBeGrab", b)
+            _bh_grab_check(b, "CANGRAB")
         end)
-        log("[book-hook] OBSERVE-ONLY registered (logging only; no behaviour change)")
+        -- Increment 4: GRAB-path observe + conservative fix (symptom 2 = "pickable book
+        -- invisible", which SetActorVisible/REVEAL never sees). The shared _bh_grab_check
+        -- runs from BOTH CanBeGrab (above; proven to fire) and GrabFromPlayer.
+        reg("GrabFromPlayer", function(self)
+            if not diag_on("BOOK_EVENT_HOOKS") then return end
+            _bh.grabbed = _bh.grabbed + 1
+            local b; pcall(function() b = self:get() end)
+            _bh_grab_check(b, "GRAB")
+        end)
+        log("[book-hook] hooks registered (enforce/reveal/grabfix active per flags)")
     end)
 end
 
@@ -207,8 +261,8 @@ local function bh_report_periodic()
     if not diag_on("BOOK_EVENT_HOOKS") then return end
     _bh_report_tick = _bh_report_tick + 1
     if _bh_report_tick % 6 ~= 0 then return end   -- ~every 30s (6 ticks of the 5s loop)
-    log(("[book-hook] counts: SetActorVisible=%d (enforced-hidden=%d revealed=%d) SetBookInfo=%d CanBeGrab=%d"):format(
-        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab))
+    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d Grab=%d (grabfix=%d)"):format(
+        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab, _bh.grabbed, _bh.grabfix))
 end
 
 

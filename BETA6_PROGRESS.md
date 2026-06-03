@@ -129,3 +129,40 @@ vanish when looked at / picked up.
   a reload does ~3072 cheap set-builds — negligible here (~70 unlocked series each), but it's why the
   "cache the unwarded set" follow-up matters if a reload hitch ever shows.
 - **Decision: shipped in beta6** for full-playthrough field validation.
+
+### Field result (2026-06-03, Bug Report 5 — genuine beta6): REVEAL is INEFFECTIVE for symptom 2
+A beta6 player hit the "pickable book invisible" glitch, yet `revealed=0` across ~19 min / 4599
+SetActorVisible calls. (ENFORCE worked: `enforced-hidden=3`, `set_ok=true`.) So symptom 2 does NOT
+manifest as "unwarded book still bHidden after SetActorVisible" — it bypasses that path entirely and
+lives on the **grab/hold path** (`CanBeGrab` fired 10×). REVEAL stays in (harmless; the ENFORCE side is
+genuinely valuable) but does not fix symptom 2. The reporter also saw it in 1.0.4 → long-standing rare
+one-off, not a regression. → Increment 4.
+
+---
+
+## Increment 4 — GRAB-path observe + conservative fix  ·  status: AWAITING VALIDATION
+
+**Flag:** `BOOK_EVENT_GRABFIX` (default `true`; requires `BOOK_EVENT_HOOKS=true`).
+**Files:** `Scripts/main.lua` (GrabFromPlayer hook in `try_register_book_hooks`; Grab/grabfix counts;
+flag in the trace-header list), `Scripts/diag_flags.lua` (flag).
+**Behaviour:** hook `BP_GrabbingBook_C:GrabFromPlayer` AND `CanBeGrab` via a shared check (CanBeGrab is
+proven to fire on grab attempts — Bug Report 5 — so it captures data even if GrabFromPlayer doesn't). LOG the book's full visibility state —
+series, unwarded?, actor `bHidden`, `SM_Book_1` mesh hidden flag, and its material name (to catch the
+mask material wrongly on the actor). Then conservatively RESTORE: if the book is unwarded but hidden
+(actor or mesh), clear that flag. The next grab of the invisible book reveals the cause; common
+bHidden/mesh cases get fixed outright.
+
+**To validate (needs a beta6 run):**
+- Does GrabFromPlayer and/or CanBeGrab fire? Watch `Grab=N` + the `[book-hook] CANGRAB` lines (CanBeGrab
+  is proven to fire). If neither fires, try `Interact` (base `BP_GrabbingItem_C`) next.
+- When the glitch recurs, the `[book-hook] GRAB ...` line shows what's hidden (bHidden / meshHidden /
+  mat=<mask?>) — that pinpoints the real mechanism.
+- Does `grabfix` climb, and do players stop seeing invisible held books?
+
+**Rollback:** `BOOK_EVENT_GRABFIX = false` (keeps GRAB logging, drops the restore) → `BOOK_EVENT_HOOKS
+= false` (drops the hook) → `git revert <commit>` → `.pre-inc4.bak`.
+
+**Commit:** held until a test run confirms non-breaking.
+
+### Result (fill in after a beta6 run)
+- Grab fires? ____   invisible-book GRAB state (bHidden/mesh/mat)? ____   grabfix climbs? ____   still invisible? ____

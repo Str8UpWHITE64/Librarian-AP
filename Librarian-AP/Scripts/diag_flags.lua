@@ -114,4 +114,12 @@ return {
     -- disable just this direction (the warded-hide net BOOK_EVENT_ENFORCE stays). Rare glitch,
     -- so this is field-validated over a full playthrough.
     BOOK_EVENT_REVEAL  = true,
+
+    -- beta6 Increment 4: GRAB-path observe + fix (symptom 2 = "pickable book invisible").
+    -- REVEAL (on SetActorVisible) was confirmed NOT to catch this on a real beta6 repro
+    -- (revealed=0), so we hook GrabFromPlayer: log the grabbed book's full visibility state
+    -- (bHidden / mesh hidden / material) to pinpoint the cause, and conservatively restore an
+    -- unwarded book that's hidden when grabbed. Requires BOOK_EVENT_HOOKS. Flip false to keep
+    -- the GRAB logging but drop the restore.
+    BOOK_EVENT_GRABFIX = true,
 }
