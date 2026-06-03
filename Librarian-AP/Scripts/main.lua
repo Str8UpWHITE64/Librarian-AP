@@ -122,7 +122,7 @@ local function _bh_grab_check(b, tag)
     local sm; pcall(function() sm = b.SM_Book_1 end)
     if sm and sm:IsValid() then
         pcall(function() mesh_hidden = sm.bHiddenInGame end)
-        pcall(function() local m = sm:GetMaterial(0); if m and m:IsValid() then mat = m:GetName() end end)
+        pcall(function() local m = sm:GetMaterial(0); if m and m:IsValid() then mat = m:GetFullName() end end)
     end
     local IA = package.loaded["AP/ItemApply"]
     local unwarded_here
