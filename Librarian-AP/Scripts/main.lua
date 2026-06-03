@@ -29,7 +29,7 @@ local function diag_flags_str()
     local order = { "BOOK_VISIBILITY", "HISM_SETMATERIAL", "BOOK_VIS_GAMETHREAD",
                     "CASE_WARDING", "RENDER_STATE_DIRTY", "BOOK_ACTOR_WARDING",
                     "BOOK_ACTOR_GAMETHREAD", "WARD_GROUND_TRUTH", "CASE_WARD_GAMETHREAD",
-                    "NAMED_HOOKS" }
+                    "NAMED_HOOKS", "BOOK_EVENT_HOOKS" }
     local parts = {}
     for _, k in ipairs(order) do parts[#parts + 1] = k .. "=" .. tostring(diag_on(k)) end
     return table.concat(parts, ",")
@@ -66,6 +66,86 @@ local function on_game_thread(fn)
     else
         fn()
     end
+end
+
+
+-- ============================================================================
+-- beta6 (warding sync) — Increment 1: OBSERVE-ONLY book-event hooks.
+-- See WARDING_SYNC_PLAN.md + BETA6_PROGRESS.md. The plan: keep ONE locked-set and
+-- enforce it at the game's own book events. Before relying on those events, this
+-- increment only VALIDATES them — it hooks the book's SetActorVisible / SetBookInfo
+-- / CanBeGrab UFunctions and LOGS ([book-hook] lines), changing NO behaviour. Goal:
+-- confirm they're hookable, see how often SetActorVisible fires, and confirm we can
+-- resolve a book's series at hook time. Enforcement is increment 2 (separate flag).
+--
+-- Gated by diag_on("BOOK_EVENT_HOOKS"). Registers ONCE, on the game thread (a single
+-- one-shot ExecuteInGameThread — safe, not a #1180 storm), triggered from the 5s loop
+-- after books are loaded. Each callback re-checks the flag, so flipping it false makes
+-- them no-ops (rollback without a code revert).
+-- ============================================================================
+local BOOK_BP = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingBook.BP_GrabbingBook_C"
+local _book_hooks_attempted = false
+local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0 }
+
+local function _bh_series(book_obj)
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._book_valid_asset_idx and IA._asset_to_series) then return nil, nil end
+    local aidx = IA._book_valid_asset_idx(book_obj)
+    if aidx == nil then return nil, nil end
+    return aidx, IA._asset_to_series[aidx]
+end
+
+local function _bh_sample(tag, book_obj, extra)
+    if _bh.samples >= 15 then return end
+    _bh.samples = _bh.samples + 1
+    pcall(function()
+        local aidx, series = _bh_series(book_obj)
+        log(("[book-hook] %-15s aidx=%s series=%s%s"):format(
+            tag, tostring(aidx), tostring(series), extra and (" " .. extra) or ""))
+    end)
+end
+
+local function try_register_book_hooks()
+    if _book_hooks_attempted then return end
+    if not diag_on("BOOK_EVENT_HOOKS") then return end
+    _book_hooks_attempted = true
+    ExecuteInGameThread(function()
+        local function reg(fn, cb)
+            local ok, err = pcall(function() RegisterHook(BOOK_BP .. ":" .. fn, cb) end)
+            log(("[book-hook] register %-16s %s"):format(
+                fn, ok and "OK" or ("FAILED: " .. tostring(err))))
+        end
+        reg("SetActorVisible", function(self, is_visible)
+            if not diag_on("BOOK_EVENT_HOOKS") then return end
+            _bh.setvis = _bh.setvis + 1
+            local b, v
+            pcall(function() b = self:get() end)
+            pcall(function() v = is_visible:get() end)
+            _bh_sample("SetActorVisible", b, "vis=" .. tostring(v))
+        end)
+        reg("SetBookInfo", function(self)
+            if not diag_on("BOOK_EVENT_HOOKS") then return end
+            _bh.setinfo = _bh.setinfo + 1
+            local b; pcall(function() b = self:get() end)
+            _bh_sample("SetBookInfo", b)
+        end)
+        reg("CanBeGrab", function(self)
+            if not diag_on("BOOK_EVENT_HOOKS") then return end
+            _bh.canbegrab = _bh.canbegrab + 1
+            local b; pcall(function() b = self:get() end)
+            _bh_sample("CanBeGrab", b)
+        end)
+        log("[book-hook] OBSERVE-ONLY registered (logging only; no behaviour change)")
+    end)
+end
+
+local _bh_report_tick = 0
+local function bh_report_periodic()
+    if not diag_on("BOOK_EVENT_HOOKS") then return end
+    _bh_report_tick = _bh_report_tick + 1
+    if _bh_report_tick % 6 ~= 0 then return end   -- ~every 30s (6 ticks of the 5s loop)
+    log(("[book-hook] counts so far: SetActorVisible=%d SetBookInfo=%d CanBeGrab=%d"):format(
+        _bh.setvis, _bh.setinfo, _bh.canbegrab))
 end
 
 
@@ -989,6 +1069,8 @@ local function start_gameplay_loops()
             return true
         end
         if not IA._apply_safe then return false end
+        pcall(try_register_book_hooks)   -- beta6 inc1: one-shot observe-hook register (game thread)
+        pcall(bh_report_periodic)        -- beta6 inc1: ~30s [book-hook] count report
         -- [crumb] BAE1A5E0 crash-hunt (TEMP): the LAST "[crumb]" line in the log
         -- before a crash names the periodic op that was mid-flight. "idle:*" means
         -- none of ours was running -> the game's own tick (e.g. on an object the mod

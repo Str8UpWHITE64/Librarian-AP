@@ -91,4 +91,12 @@ return {
     -- ModActor). Disabling stops the mod observing those events; use only to test the
     -- hook surface (note: AP progress tracking degrades while off).
     NAMED_HOOKS        = true,
+
+    -- beta6 (warding sync) Increment 1: register OBSERVE-ONLY hooks on the book's
+    -- SetActorVisible / SetBookInfo / CanBeGrab functions to validate them (do they
+    -- fire? how often? can we resolve the series?) BEFORE building enforcement on top.
+    -- Logs only ([book-hook] lines); changes NO gameplay. Flip false to make the
+    -- callbacks no-ops (the hooks stay registered but do nothing). Default true for the
+    -- beta6 dev validation run; the actual enforcement will use a separate flag.
+    BOOK_EVENT_HOOKS   = true,
 }
