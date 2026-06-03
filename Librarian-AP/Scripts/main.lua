@@ -29,7 +29,8 @@ local function diag_flags_str()
     local order = { "BOOK_VISIBILITY", "HISM_SETMATERIAL", "BOOK_VIS_GAMETHREAD",
                     "CASE_WARDING", "RENDER_STATE_DIRTY", "BOOK_ACTOR_WARDING",
                     "BOOK_ACTOR_GAMETHREAD", "WARD_GROUND_TRUTH", "CASE_WARD_GAMETHREAD",
-                    "NAMED_HOOKS", "BOOK_EVENT_HOOKS", "BOOK_EVENT_ENFORCE" }
+                    "NAMED_HOOKS", "BOOK_EVENT_HOOKS", "BOOK_EVENT_ENFORCE",
+                    "BOOK_EVENT_REVEAL" }
     local parts = {}
     for _, k in ipairs(order) do parts[#parts + 1] = k .. "=" .. tostring(diag_on(k)) end
     return table.concat(parts, ",")
@@ -85,7 +86,8 @@ end
 -- ============================================================================
 local BOOK_BP = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingBook.BP_GrabbingBook_C"
 local _book_hooks_attempted = false
-local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0, enforced = 0, enf_samples = 0 }
+local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0, enforced = 0, enf_samples = 0,
+              revealed = 0, rev_samples = 0 }
 
 local function _bh_series(book_obj)
     local IA = package.loaded["AP/ItemApply"]
@@ -110,10 +112,15 @@ local function try_register_book_hooks()
     if not diag_on("BOOK_EVENT_HOOKS") then return end
     _book_hooks_attempted = true
     ExecuteInGameThread(function()
-        local function reg(fn, cb)
-            local ok, err = pcall(function() RegisterHook(BOOK_BP .. ":" .. fn, cb) end)
+        local function reg(fn, cb, cb_post)
+            local ok, err
+            if cb_post then
+                ok, err = pcall(function() RegisterHook(BOOK_BP .. ":" .. fn, cb, cb_post) end)
+            else
+                ok, err = pcall(function() RegisterHook(BOOK_BP .. ":" .. fn, cb) end)
+            end
             log(("[book-hook] register %-16s %s"):format(
-                fn, ok and "OK" or ("FAILED: " .. tostring(err))))
+                fn, ok and (cb_post and "OK (pre+post)" or "OK") or ("FAILED: " .. tostring(err))))
         end
         reg("SetActorVisible", function(self, is_visible)
             if not diag_on("BOOK_EVENT_HOOKS") then return end
@@ -146,6 +153,38 @@ local function try_register_book_hooks()
                     end
                 end
             end
+        end,
+        -- Increment 3: REVEAL net (POST-hook; symptom 2 = the "vanishing" unlocked book).
+        -- Runs AFTER the game's SetActorVisible. If the game tried to SHOW (v==true) an
+        -- UNWARDED book but it is STILL hidden (bHidden==true) afterward -- the "fine after
+        -- dropping, invisible when looked at / picked up" glitch -- clear the stale hide so
+        -- it actually shows. Only fires on the real edge case, so the log's revealed=N is
+        -- how often it was caught. SetActorHiddenInGame isn't hooked (no re-entrancy), and
+        -- it's aligned with the game's own show intent (no fight). Gated BOOK_EVENT_REVEAL.
+        function(self, is_visible)
+            if not diag_on("BOOK_EVENT_HOOKS") then return end
+            if not diag_on("BOOK_EVENT_REVEAL") then return end
+            local b, v
+            pcall(function() b = self:get() end)
+            pcall(function() v = is_visible:get() end)
+            if v ~= true or not b then return end
+            local _, series = _bh_series(b)
+            local IA = package.loaded["AP/ItemApply"]
+            if not (series and IA and IA._compute_unwarded_set) then return end
+            local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
+            local unwarded = IA._compute_unwarded_set(only_shelfable)
+            if not (unwarded and unwarded[series]) then return end   -- warded -> the pre-hook's job
+            local still_hidden
+            pcall(function() still_hidden = b.bHidden end)
+            if still_hidden == true then
+                pcall(function() b:SetActorHiddenInGame(false) end)
+                _bh.revealed = _bh.revealed + 1
+                if _bh.rev_samples < 10 then
+                    _bh.rev_samples = _bh.rev_samples + 1
+                    log(("[book-hook] REVEAL unwarded-but-hidden series=%s (cleared stale hide)"):format(
+                        tostring(series)))
+                end
+            end
         end)
         reg("SetBookInfo", function(self)
             if not diag_on("BOOK_EVENT_HOOKS") then return end
@@ -168,8 +207,8 @@ local function bh_report_periodic()
     if not diag_on("BOOK_EVENT_HOOKS") then return end
     _bh_report_tick = _bh_report_tick + 1
     if _bh_report_tick % 6 ~= 0 then return end   -- ~every 30s (6 ticks of the 5s loop)
-    log(("[book-hook] counts: SetActorVisible=%d (enforced-hidden=%d) SetBookInfo=%d CanBeGrab=%d"):format(
-        _bh.setvis, _bh.enforced, _bh.setinfo, _bh.canbegrab))
+    log(("[book-hook] counts: SetActorVisible=%d (enforced-hidden=%d revealed=%d) SetBookInfo=%d CanBeGrab=%d"):format(
+        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab))
 end
 
 

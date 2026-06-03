@@ -94,3 +94,38 @@ restore `.pre-inc2.bak`.
 - Cache the unwarded set (recompute on state change) instead of per-call, if call frequency ever rises.
 - Consolidate: drive layer 1 (actor) + layer 3 (pile) + this hook off one shared snapshot, and retire
   the redundant per-flush actor walk once the hook proves sufficient.
+
+---
+
+## Increment 3 — REVEAL net (second direction)  ·  status: VALIDATED non-breaking ✓ (2026-06-03), shipped in beta6
+
+**Flag:** `BOOK_EVENT_REVEAL` (default `true`; requires `BOOK_EVENT_HOOKS=true`).
+**Files:** `Scripts/main.lua` (POST-hook on SetActorVisible; `reg()` now takes an optional post
+callback; revealed-count in the report; flag in the trace-header list), `Scripts/diag_flags.lua` (flag).
+**Behaviour:** a POST-hook on SetActorVisible (runs AFTER the game's call). If the game tried to SHOW
+(`v==true`) an UNWARDED book but it is STILL hidden (`bHidden==true`) afterward, clear the stale hide
+(`SetActorHiddenInGame(false)`). Targets the "vanishing unlocked book" glitch (symptom 2). Fires only on
+the actual edge case, so `revealed=N` in the count report = how often it was caught.
+
+**To validate:** (a) that the POST-hook fires at all in this UE4SS version (new mechanism — watch for
+`register SetActorVisible OK (pre+post)`), and (b) whether `revealed` ever climbs over a full
+playthrough. If `revealed` stays 0, symptom 2 isn't a stale `bHidden` and we look elsewhere; if it
+climbs and the tester reports no more vanishing books, it's fixed. In-game: unlocked books should not
+vanish when looked at / picked up.
+
+**Rollback:** `BOOK_EVENT_REVEAL = false` (disables just this direction; the warded-hide net stays) →
+`git revert <commit>` → `.pre-inc3.bak`.
+
+**Commit:** held until a test run confirms it's non-breaking.
+
+### Result (2026-06-03 — VALIDATED non-breaking ✓)
+- **Post-hook registered** — `register SetActorVisible OK (pre+post)`; the post-hook mechanism works in
+  this UE4SS version. No RegisterHook errors, no crash.
+- **enforced-hidden=0, revealed=0** in the short test — EXPECTED for a ~3/3072-over-hours glitch, not a
+  failure. Effectiveness is field-validated by a full playthrough (watch the counts + tester report).
+- **Reload burst observed:** on a world (re)load the game calls SetBookInfo on all 3072 books and
+  SetActorVisible on ~all of them (SetActorVisible 9 → 3100, SetBookInfo 0 → 3072 across one reload).
+  Hooks handled it with no crash. Each enforce/reveal call computes `_compute_unwarded_set` per call, so
+  a reload does ~3072 cheap set-builds — negligible here (~70 unlocked series each), but it's why the
+  "cache the unwarded set" follow-up matters if a reload hitch ever shows.
+- **Decision: shipped in beta6** for full-playthrough field validation.

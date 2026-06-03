@@ -107,4 +107,11 @@ return {
     -- hooks still log but enforce nothing) without reverting code. Grab-blocking is
     -- unaffected (stays on the existing collision-off path).
     BOOK_EVENT_ENFORCE = true,
+
+    -- beta6 Increment 3: REVEAL net (symptom 2 = the "vanishing" unlocked book). A POST-hook
+    -- on SetActorVisible: if the game tried to SHOW an UNWARDED book but it stayed hidden,
+    -- clear the stale hide so it actually shows. Requires BOOK_EVENT_HOOKS. Flip false to
+    -- disable just this direction (the warded-hide net BOOK_EVENT_ENFORCE stays). Rare glitch,
+    -- so this is field-validated over a full playthrough.
+    BOOK_EVENT_REVEAL  = true,
 }
