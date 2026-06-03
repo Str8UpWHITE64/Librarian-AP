@@ -2,6 +2,26 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0-beta6.1 — 2026-06-03 (released)
+
+A small follow-up to beta6 targeting the **"pickable book turns invisible"** glitch (symptom 2). beta6's
+REVEAL net (a post-hook on `SetActorVisible`) was confirmed in the field NOT to catch it — a genuine
+beta6 repro logged `revealed=0` while the player hit the glitch — because it bypasses the show path
+entirely and lives on the **grab/hold path**. This build adds a grab-path hook to (a) capture exactly
+what's hiding the book and (b) conservatively fix the common cases.
+
+- **Grab-path instrumentation + conservative fix.** A shared check runs from both
+  `BP_GrabbingBook_C:GrabFromPlayer` and `CanBeGrab` (the latter is proven to fire on grab attempts, so
+  data is captured regardless of which path the game uses). It logs the grabbed book's full visibility
+  state — actor `bHidden`, the `SM_Book_1` mesh hidden flag, and its material name (to catch the mask
+  material wrongly on the actor) — and, if an UNWARDED book is found hidden, clears that flag. Gated
+  `BOOK_EVENT_GRABFIX`. The `[book-hook] GRAB` / `CANGRAB` log lines pinpoint the mechanism for the next
+  occurrence, so a precise fix can follow if the conservative one doesn't fully cover it.
+- **Version strings tidied.** The `slot_data` "version" (stale at beta3 since beta3 — harmless, since
+  the client parses only the numeric `1.1.0`) and a README example now read the current version.
+- Crash fixes and the warding base are unchanged; beta6's ENFORCE net (warded-hide) is unchanged and
+  confirmed working in the field.
+
 ## 1.1.0-beta6 — 2026-06-03 (released)
 
 Built on beta5 (which fixed the recurring crash — confirmed by a full crash-free playthrough). This is a
