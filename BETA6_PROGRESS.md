@@ -61,11 +61,36 @@ enforcement is built.
 
 ---
 
-## Increment 2 — (planned) enforce warding in the SetActorVisible hook
-Now that the hook is validated: in the `SetActorVisible` callback, resolve the book's series → check
-the one locked-set → if the series is **warded and the game is trying to show it** (`vis=true`), force
-it hidden (re-apply invisible, or pre-hook `:set(false)` if param modification is supported — to test).
-Grab-blocking stays on the existing collision-off (CanBeGrab didn't fire, so we don't use it). Drive the
-locked-set from a single snapshot shared with the pile (layer 3). Separate flag (e.g.
-`BOOK_EVENT_ENFORCE`, default off until validated), separate commit. Watch for flicker (game shows →
-we hide) and decide between post-hook re-hide vs pre-hook param set. Not started.
+## Increment 2 — enforce warding in the SetActorVisible hook  ·  status: AWAITING VALIDATION
+
+**Flag:** `BOOK_EVENT_ENFORCE` (default `true`; requires `BOOK_EVENT_HOOKS=true`).
+**Files:** `Scripts/main.lua` (enforcement branch in the SetActorVisible callback; enforced-count in the
+report; flag in the trace-header list), `Scripts/diag_flags.lua` (flag).
+**Behaviour:** in the SetActorVisible pre-hook, when the game tries to SHOW (`v==true`) a book whose
+series is WARDED (not in the live `_compute_unwarded_set`), override the argument via
+`is_visible:set(false)` so the game's own call keeps it hidden. Unwarded books are untouched.
+Grab-blocking is unchanged (existing collision-off).
+
+**The thing to validate:** that a PRE-hook `is_visible:set(false)` actually takes effect in this UE4SS
+version. If `:set()` is a no-op, warded books still leak (NO regression) and `set_ok` logs the failure —
+then we fall back to a post-hook re-hide.
+
+**What to look for:**
+- `[book-hook] ENFORCE keep-hidden warded series=… set_ok=true` lines (enforcement firing).
+- `enforced-hidden=N` rising in the count report.
+- In-game: warded books **no longer flash visible** when you look at them (fixes symptom 1); unwarded
+  books **show normally** when looked at / picked up (fixes symptom 2). No crash, stutter, or flicker.
+
+**Rollback:** `BOOK_EVENT_ENFORCE = false` (back to observe-only) → or `git revert <commit>` → or
+restore `.pre-inc2.bak`.
+
+**Commit:** held until validated.
+
+### Result (fill in after the test run)
+- set_ok=true? ____   warded stop leaking? ____   unwarded show OK? ____   flicker/crash? ____
+- Decision: ____
+
+### Possible follow-ups
+- Cache the unwarded set (recompute on state change) instead of per-call, if call frequency ever rises.
+- Consolidate: drive layer 1 (actor) + layer 3 (pile) + this hook off one shared snapshot, and retire
+  the redundant per-flush actor walk once the hook proves sufficient.

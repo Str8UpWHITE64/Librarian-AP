@@ -99,4 +99,12 @@ return {
     -- callbacks no-ops (the hooks stay registered but do nothing). Default true for the
     -- beta6 dev validation run; the actual enforcement will use a separate flag.
     BOOK_EVENT_HOOKS   = true,
+
+    -- beta6 Increment 2: ENFORCE warding in the SetActorVisible hook. When the game
+    -- tries to SHOW a book whose series is warded, override the call to keep it hidden
+    -- (reads the live unwarded set, same one the pile uses). Requires BOOK_EVENT_HOOKS.
+    -- This is the actual book-sync fix. Flip false to fall back to observe-only (the
+    -- hooks still log but enforce nothing) without reverting code. Grab-blocking is
+    -- unaffected (stays on the existing collision-off path).
+    BOOK_EVENT_ENFORCE = true,
 }

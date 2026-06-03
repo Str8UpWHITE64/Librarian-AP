@@ -29,7 +29,7 @@ local function diag_flags_str()
     local order = { "BOOK_VISIBILITY", "HISM_SETMATERIAL", "BOOK_VIS_GAMETHREAD",
                     "CASE_WARDING", "RENDER_STATE_DIRTY", "BOOK_ACTOR_WARDING",
                     "BOOK_ACTOR_GAMETHREAD", "WARD_GROUND_TRUTH", "CASE_WARD_GAMETHREAD",
-                    "NAMED_HOOKS", "BOOK_EVENT_HOOKS" }
+                    "NAMED_HOOKS", "BOOK_EVENT_HOOKS", "BOOK_EVENT_ENFORCE" }
     local parts = {}
     for _, k in ipairs(order) do parts[#parts + 1] = k .. "=" .. tostring(diag_on(k)) end
     return table.concat(parts, ",")
@@ -85,7 +85,7 @@ end
 -- ============================================================================
 local BOOK_BP = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingBook.BP_GrabbingBook_C"
 local _book_hooks_attempted = false
-local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0 }
+local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0, enforced = 0, enf_samples = 0 }
 
 local function _bh_series(book_obj)
     local IA = package.loaded["AP/ItemApply"]
@@ -122,6 +122,30 @@ local function try_register_book_hooks()
             pcall(function() b = self:get() end)
             pcall(function() v = is_visible:get() end)
             _bh_sample("SetActorVisible", b, "vis=" .. tostring(v))
+            -- Increment 2: ENFORCE. When the game tries to SHOW (v==true) a book whose
+            -- series is WARDED, override the argument to false so the game's own
+            -- SetActorVisible keeps it hidden -- no flicker, no re-entrancy (we change
+            -- the argument, we don't re-call the function), no material-swap risk.
+            -- Unwarded books are never touched (allowed to show), so an unlock takes
+            -- effect the next time the game shows the book. Reads the LIVE unwarded set
+            -- (same _compute_unwarded_set the pile uses), so it cannot lag behind it.
+            if diag_on("BOOK_EVENT_ENFORCE") and v == true and b then
+                local _, series = _bh_series(b)
+                local IA = package.loaded["AP/ItemApply"]
+                if series and IA and IA._compute_unwarded_set then
+                    local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
+                    local unwarded = IA._compute_unwarded_set(only_shelfable)
+                    if not (unwarded and unwarded[series]) then
+                        local set_ok = pcall(function() is_visible:set(false) end)
+                        _bh.enforced = _bh.enforced + 1
+                        if _bh.enf_samples < 10 then
+                            _bh.enf_samples = _bh.enf_samples + 1
+                            log(("[book-hook] ENFORCE keep-hidden warded series=%s set_ok=%s"):format(
+                                tostring(series), tostring(set_ok)))
+                        end
+                    end
+                end
+            end
         end)
         reg("SetBookInfo", function(self)
             if not diag_on("BOOK_EVENT_HOOKS") then return end
@@ -144,8 +168,8 @@ local function bh_report_periodic()
     if not diag_on("BOOK_EVENT_HOOKS") then return end
     _bh_report_tick = _bh_report_tick + 1
     if _bh_report_tick % 6 ~= 0 then return end   -- ~every 30s (6 ticks of the 5s loop)
-    log(("[book-hook] counts so far: SetActorVisible=%d SetBookInfo=%d CanBeGrab=%d"):format(
-        _bh.setvis, _bh.setinfo, _bh.canbegrab))
+    log(("[book-hook] counts: SetActorVisible=%d (enforced-hidden=%d) SetBookInfo=%d CanBeGrab=%d"):format(
+        _bh.setvis, _bh.enforced, _bh.setinfo, _bh.canbegrab))
 end
 
 
