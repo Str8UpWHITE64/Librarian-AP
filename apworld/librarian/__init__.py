@@ -1018,7 +1018,10 @@ class LibrarianWorld(World):
             goal_row_threshold = sum(s.shelf_count for s in data.SECTIONS)
 
         return {
-            "version": "1.1.0-beta3",
+            # Keep in sync with archipelago.json:world_version + main.lua MOD_VERSION.
+            # (The Lua client parses only the numeric 1.1.0 from this for its warding-rule
+            # gate; the -betaN suffix is informational, used in logs/telemetry.)
+            "version": "1.1.0-beta6",
             "goal": goal_value,
             # Row count at which the Lua client should send STATUS_GOAL.
             # Ignored for the "full" goal (the game's EndGame fires it).
