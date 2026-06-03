@@ -3912,15 +3912,19 @@ end
 -- Row completion detection (FinishRow → AP location check)
 -- ============================================================================
 
--- Walks every indexed bookcase and detects newly-complete series.
--- Authoritative trigger: the game's per-case RowStatus list, which only
--- grows when the game considers a row complete (correct series, all
--- volumes, in order). Wrong order, wrong section, or split rows = no
--- growth, no fire.
---
--- When RowStatus grows, walk PlacingBookInfo to find AssetIdx(s) with
--- count >= expected_volumes and not already fired. Slot position on
--- the case doesn't matter — RowStatus already validated.
+-- Walks every indexed bookcase and fires the AP row-completion location for each
+-- GENUINELY-completed shelf. AUTHORITATIVE signal: the game's per-case RowStatus
+-- (BP_BookCase: TArray<bool>, ONE ENTRY PER SHELF) -- rs[i]==true ONLY when shelf i's
+-- designated series is fully placed IN ORDER on that single shelf (the game validates
+-- order + section before flipping the bit). Wrong order, wrong section, or a series
+-- split across shelves never flips a bit -> never fires.
+--   • Uniform case  -> completed shelf i maps to series CorrectBookDataIndex[i] (exact).
+--   • Mixed cabinet -> fall back to "fully present in home section", capped by the count
+--     of completed shelves.
+-- BUG THIS FIXED: the old code read #case.RowStatus as a completion COUNT, but that is
+-- the SHELF COUNT (TArray length), so the gate was always true and any series merely
+-- PRESENT in its section fired regardless of order/single-row. Read the bool VALUES,
+-- never the length (#RowStatus is still the right SHELF count for _case_accepted_assets).
 function M.detect_completed_rows()
     if not M._cases_indexed then return 0 end
     if not M._slot_data then return 0 end
@@ -3928,114 +3932,123 @@ function M.detect_completed_rows()
     if type(row_loc_map) ~= "table" then return 0 end
 
     local sent_count = 0
+
+    -- Send the row-completion location for one (section, series), de-duped via
+    -- _sent_row_locations. Returns true if a NEW check was actually sent.
+    local function fire_row(sid, series_name, dbg)
+        if not series_name then return false end
+        local loc_id = row_loc_map[sid .. "|" .. series_name]
+        if not loc_id then
+            log(("[row-detect] %s / %s -- no loc_id in row_location_map"):format(sid, series_name))
+            return false
+        end
+        if M._sent_row_locations[loc_id] then return false end
+        M._sent_row_locations[loc_id] = true
+        log(("[row-detect] %s / %s -> loc %d %s"):format(sid, series_name, loc_id, dbg or ""))
+        local APClient = package.loaded["AP/APClient"]
+        if APClient and APClient.send_check then APClient:send_check(loc_id); return true end
+        return false
+    end
+
     for sid, cases in pairs(M._section_to_cases) do
         for _, case in ipairs(cases) do
             if case and case:IsValid() then
-                -- Game's authoritative completion count for this case.
-                local current_rows = 0
-                pcall(function() current_rows = #case.RowStatus end)
+                -- AUTHORITATIVE per-shelf completion. RowStatus is a TArray<bool> (game class
+                -- BP_BookCase) with ONE ENTRY PER SHELF; rs[i]==true ONLY when shelf i holds its
+                -- designated series fully placed IN ORDER -- the game validates order + section
+                -- before flipping it. The old code read #case.RowStatus, but that is the SHELF
+                -- COUNT, not the completed count: the gate was always true and ANY series merely
+                -- PRESENT in its home section (count >= volumes) fired, regardless of order or
+                -- whether it sat on one row. We now read the bool VALUES.
+                local rs = nil; pcall(function() rs = case.RowStatus end)
+                local rs_n = 0; if rs then pcall(function() rs_n = #rs end) end
+                local completed = {}   -- 1-based shelf indices with rs[i] == true
+                for i = 1, rs_n do
+                    local done = false
+                    pcall(function() local v = rs[i]; done = (v == true or v == 1) end)
+                    if done then completed[#completed + 1] = i end
+                end
 
-                if current_rows > 0 then
-                    -- At least one row is complete on this case. Walk
-                    -- PlacingBookInfo to find which AssetIdx(s) have a
-                    -- full volume count placed. We always re-sweep (not
-                    -- gated on count diff) so a "complete -> remove ->
-                    -- recomplete in same case" cycle fires the new
-                    -- series's check correctly.
-                    local current = {}
-                    pcall(function()
-                        local pbi = case.PlacingBookInfo
-                        if pbi then
-                            local n = 0; pcall(function() n = #pbi end)
-                            for i = 1, n do
-                                local book = pbi[i]
-                                if book and book:IsValid() then
-                                    -- Split the property walk into
-                                    -- validated steps. Crash reports
-                                    -- (Failure.Hash e40fc030-fde3-5dbb-
-                                    -- d6fb-06aad7d0ab97) faulted inside
-                                    -- UE4SS!UObjectBase::IsA /
-                                    -- resolve_function_address_from_potential_jmp
-                                    -- during FinishRow → detect_completed_rows.
-                                    -- book:IsValid() passes but
-                                    -- book.ItemInfo can be transiently
-                                    -- freed mid-row-completion while the
-                                    -- game animates the final book. pcall
-                                    -- doesn't catch native AVs — only
-                                    -- defense is to never hand UE4SS a
-                                    -- stale sub-object ref.
-                                    local item_info
-                                    pcall(function() item_info = book.ItemInfo end)
-                                    if item_info and item_info:IsValid() then
-                                        local aidx
-                                        pcall(function()
-                                            aidx = tonumber(item_info.AssetIdx)
-                                        end)
-                                        if aidx and aidx >= 0 then
-                                            current[aidx] = (current[aidx] or 0) + 1
+                if #completed > 0 then
+                    -- Uniform case (BP_BookCase_C / 4x5): CorrectBookDataIndex is per-shelf and
+                    -- aligned with RowStatus (CDI[i] = the designated series AssetIdx for shelf i
+                    -- -- the same indexing _case_accepted_assets relies on). So a completed shelf
+                    -- maps DIRECTLY + EXACTLY to its series, with NO PlacingBookInfo deref (which
+                    -- also dodges the freed-sub-object crash class entirely). Mixed cabinets
+                    -- (4x16/6x16) use a "decorator" CDI not aligned 1:1 to shelves -> fallback.
+                    local cdi = nil; pcall(function() cdi = case.CorrectBookDataIndex end)
+                    local cdi_first = nil
+                    if cdi then pcall(function() cdi_first = tonumber(cdi[1]) end) end
+                    local uniform = cdi_first ~= nil and M._asset_to_section[cdi_first] == sid
+
+                    if uniform and cdi then
+                        for _, i in ipairs(completed) do
+                            local aidx = nil; pcall(function() aidx = tonumber(cdi[i]) end)
+                            if aidx and aidx >= 0 and M._asset_to_section[aidx] == sid then
+                                if fire_row(sid, M._asset_to_series[aidx],
+                                        ("(shelf %d, AssetIdx %d) [uniform]"):format(i, aidx)) then
+                                    sent_count = sent_count + 1
+                                end
+                            end
+                        end
+                    else
+                        -- MIXED cabinet: which series sits on a completed shelf is not a straight
+                        -- CDI[i] lookup, so fall back to the "series fully present in its home
+                        -- section" scan -- but CAP by the number of GENUINELY-completed shelves
+                        -- (#completed), not the shelf count. This can no longer fire a series with
+                        -- ZERO completed rows; the only residual imprecision is WHICH of several
+                        -- present+complete series in the same cabinet fires when fewer rows are
+                        -- complete -- it never fires a not-present series and never misses a real
+                        -- completion. PBI walk keeps the crash-safe split access (book.ItemInfo
+                        -- can be a transiently-freed sub-object mid-completion; pcall can't catch
+                        -- the native AV -- never hand UE4SS a stale sub-object ref).
+                        local current = {}
+                        pcall(function()
+                            local pbi = case.PlacingBookInfo
+                            if pbi then
+                                local n = 0; pcall(function() n = #pbi end)
+                                for i = 1, n do
+                                    local book = pbi[i]
+                                    if book and book:IsValid() then
+                                        local item_info
+                                        pcall(function() item_info = book.ItemInfo end)
+                                        if item_info and item_info:IsValid() then
+                                            local aidx
+                                            pcall(function() aidx = tonumber(item_info.AssetIdx) end)
+                                            if aidx and aidx >= 0 then
+                                                current[aidx] = (current[aidx] or 0) + 1
+                                            end
                                         end
                                     end
                                 end
                             end
-                        end
-                    end)
-
-                    -- Sweep full-count, home-section series in the case
-                    -- and split them into:
-                    --   • candidates  = unfired, eligible to fire this pass
-                    --   • already_fired = previously-sent series still
-                    --                     occupying RowStatus slots
-                    --
-                    -- already_fired comes from the CURRENT PBI state (NOT
-                    -- a sticky per-case flag), so a series we fired earlier
-                    -- and the player has since removed no longer counts
-                    -- against the cap. That's what unblocks the
-                    -- "complete A → remove A → complete B in same case"
-                    -- case the old count-diff guard missed.
-                    --
-                    -- Home-section filter rejects misplaced cross-section
-                    -- books. Sort by AssetIdx so deterministic order when
-                    -- multiple series happen to be complete at once.
-                    local candidates = {}
-                    local already_fired = 0
-                    for aidx, count in pairs(current) do
-                        local expected = M._asset_to_volumes[aidx] or 0
-                        if expected > 0 and count >= expected
-                                and M._asset_to_section[aidx] == sid then
-                            local series_name = M._asset_to_series[aidx]
-                            local map_key = sid .. "|" .. (series_name or "")
-                            local loc_id = row_loc_map[map_key]
-                            if loc_id then
-                                if M._sent_row_locations[loc_id] then
-                                    already_fired = already_fired + 1
-                                else
-                                    candidates[#candidates + 1] = {
-                                        aidx = aidx,
-                                        loc_id = loc_id,
-                                        name = series_name,
-                                    }
+                        end)
+                        local candidates = {}
+                        local already_fired = 0
+                        for aidx, count in pairs(current) do
+                            local expected = M._asset_to_volumes[aidx] or 0
+                            if expected > 0 and count >= expected
+                                    and M._asset_to_section[aidx] == sid then
+                                local series_name = M._asset_to_series[aidx]
+                                local loc_id = series_name and row_loc_map[sid .. "|" .. series_name]
+                                if loc_id then
+                                    if M._sent_row_locations[loc_id] then
+                                        already_fired = already_fired + 1
+                                    else
+                                        candidates[#candidates + 1] = { aidx = aidx, name = series_name }
+                                    end
                                 end
-                            elseif series_name then
-                                log(("[row-detect] %s / %s -- no loc_id in row_location_map"):format(
-                                    sid, series_name))
                             end
                         end
-                    end
-                    table.sort(candidates, function(a, b) return a.aidx < b.aidx end)
-
-                    -- Cap fires by remaining RowStatus capacity.
-                    local cap = current_rows - already_fired
-                    if cap > 0 and #candidates > 0 then
-                        local to_fire = math.min(cap, #candidates)
-                        for k = 1, to_fire do
-                            local c = candidates[k]
-                            M._sent_row_locations[c.loc_id] = true
-                            log(("[row-detect] %s / %s (AssetIdx %d) -> loc %d"):format(
-                                sid, c.name, c.aidx, c.loc_id))
-                            local APClient = package.loaded["AP/APClient"]
-                            if APClient and APClient.send_check then
-                                APClient:send_check(c.loc_id)
-                                sent_count = sent_count + 1
+                        table.sort(candidates, function(a, b) return a.aidx < b.aidx end)
+                        local cap = #completed - already_fired
+                        if cap > 0 then
+                            for k = 1, math.min(cap, #candidates) do
+                                local c = candidates[k]
+                                if fire_row(sid, c.name,
+                                        ("(AssetIdx %d) [mixed %d/%d rows]"):format(c.aidx, #completed, rs_n)) then
+                                    sent_count = sent_count + 1
+                                end
                             end
                         end
                     end
