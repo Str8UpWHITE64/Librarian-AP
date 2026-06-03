@@ -10,3 +10,14 @@ Current fill step (Progression) at 1000/942 items placed."
 Feature Requests:
 
 - Remove posters.  They cause confusion when trying to look for books on the tables.
+
+Crashes (under investigation — see CRASH_HANDOFF.md / BOOK_WARDING_HANDOFF.md / STAGE1_GAMETHREAD_NOTE.md):
+
+- [FIXED in 1.1.0-beta5] 12AF29C8 / 7567C016 — EXCEPTION_ACCESS_VIOLATION reading 0x1e3010030 /
+  0x300000037 (use-after-free read), going to the TITLE / MAIN MENU (title->M01 LoadMap / world
+  reload). First seen 2026-06-02 21:11 (beta4+Stage1), then REPRODUCED going to the main menu at 22:01.
+  Cause: a deferred book-pile-hiding pass (apply_book_visibility, marshaled to the game thread) ran on
+  the FREED old-world HISM array during the reload — a native AV that Lua pcall can't catch.
+  Fix: a world-epoch counter (reset_hism_state bumps it; the game-thread closure bails if it changed
+  between scheduling and running). Confirmed catching the race live (b2-stale-world marker, no crash).
+  Artifacts: "crash reports/title-reload 2026-06-02 2111..." and ".../mainmenu-AV 2026-06-02 2201...".

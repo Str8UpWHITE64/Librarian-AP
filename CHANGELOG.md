@@ -2,6 +2,35 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0-beta5 — 2026-06-02 (released)
+
+Built on beta4. Two more **crash fixes** for the warding system's interaction with the game's render
+thread and with world reloads, plus diagnostic groundwork (default-off) for finishing the job.
+
+- **Crash fix — book-pile hiding moved onto the game thread.** beta4 cut the *shelf*-warding churn;
+  this addresses the remaining confirmed trigger on the **book pile** (the 400
+  HierarchicalInstancedStaticMesh components). The mod hid/revealed warded series by writing their
+  visibility + material (`SetVisibility` / `SetMaterial`) from a UE4SS `LoopAsync` callback — which,
+  contrary to a long-standing assumption in our notes, runs on a **separate thread, not the game
+  thread** (only `RegisterHook` / `NotifyOnNewObject` callbacks are on the game thread). Those
+  off-thread writes raced the engine's parallel render / cluster-tree workers reading the same data —
+  the `READ 0xFFFFFFFF…` (INDEX_NONE) member of the recurring `0x1e8a88f` access-violation family. Fix
+  (`apply_book_visibility`, `main.lua`): marshal the whole pile-hiding pass onto the game thread via
+  `ExecuteInGameThread` (one call per pass). Behind the `BOOK_VIS_GAMETHREAD` flag.
+
+- **Crash fix — returning to the main menu (world-reload use-after-free).** Going to the main menu
+  forces a world reload; a pile-hiding pass already scheduled for the game thread could then run
+  against the **freed** old-world HISM array — a *native* access violation that Lua `pcall` cannot
+  catch. Fix: a **world-epoch counter** bumped on every reload (`reset_hism_state`); the deferred pass
+  snapshots it and **bails without touching any captured reference** if the world changed underneath
+  it. Confirmed catching the race in the field (a `b2-stale-world` ledger marker) with no crash.
+
+- **Stability — shelf + book-actor warding kept off the game-thread marshal (for now).** Marshaling
+  those layers too overloaded UE4SS's game-thread action queue and hit a separate abort (UE4SS issue
+  \#1180), so they stay on the proven off-thread path (with beta4's churn reduction). New default-off
+  flags `BOOK_ACTOR_GAMETHREAD` / `CASE_WARD_GAMETHREAD` stage them for a follow-up that moves them via
+  a single per-frame game-thread "pump" instead of per-pass marshaling.
+
 ## 1.1.0-beta4 — 2026-06-02 (released)
 
 Built on beta3. A targeted **crash fix** and a **stuck-shelf fix**, plus a durable crash-logging

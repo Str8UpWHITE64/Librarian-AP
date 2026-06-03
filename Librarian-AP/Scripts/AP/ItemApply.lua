@@ -48,6 +48,22 @@ local function _diag_on(flag)
     return v and true or false
 end
 
+-- _on_game_thread(fn, flag): run fn on the GAME THREAD via ExecuteInGameThread.
+-- UE4SS LoopAsync callbacks run on a SEPARATE async thread (only RegisterHook /
+-- NotifyOnNewObject run on the game thread), so warding writes fired from there
+-- race the engine's collision / render / cluster-tree workers that read the same
+-- components -- the lead crash suspect (see CRASH_HANDOFF.md, main.lua on_game_thread).
+-- `flag` gates the marshal for A/B bisection; falls back to inline (the OLD off-thread
+-- behavior) when the flag is false or ExecuteInGameThread is unavailable, so a missing
+-- global can never break mod loading.
+local function _on_game_thread(fn, flag)
+    if _diag_on(flag) and type(ExecuteInGameThread) == "function" then
+        ExecuteInGameThread(fn)
+    else
+        fn()
+    end
+end
+
 -- ============================================================================
 -- Constants (mirrors apworld/librarian/data.py::UpgradeAbility)
 -- ============================================================================
@@ -1341,6 +1357,12 @@ end
 --- a previous world load are stale. The next apply-safe will re-run
 --- _initialize_hism_book_mapping against the new world.
 function M.reset_hism_state()
+    -- World epoch: bumped on every world reset (this fires from the LoadMap hook on
+    -- the game thread). Any DEFERRED game-thread closure that captured the OLD world's
+    -- refs (notably layer 3's HISM array in apply_book_visibility) re-checks this and
+    -- bails instead of dereferencing freed memory -- the main-menu / LoadMap teardown
+    -- use-after-free (a NATIVE access violation, uncatchable by Lua pcall).
+    M._world_epoch = (M._world_epoch or 0) + 1
     M._hism_initialized = false
     M._book_captured_transforms = {}
     M._books_we_have_hidden = {}
@@ -2761,7 +2783,13 @@ function M._apply_books_to_world()
         -- clears _flush_pending first, so this won't loop forever.
         if M._flush_pending then
             M._flush_pending = false
-            M.flush_apply()
+            -- Bounce to the ASYNC thread instead of calling inline. This finalizer
+            -- can run inside a game-thread closure (BOOK_ACTOR_GAMETHREAD), and
+            -- flush_apply -> _on_game_thread -> ExecuteInGameThread would then NEST
+            -- ExecuteInGameThread calls (UE4SS #1180: scheduling a tick-action while
+            -- the tick-action list is being iterated). LoopAsync re-issues the flush
+            -- from the async thread. Harmless (~10ms) when already on the async thread.
+            LoopAsync(10, function() M.flush_apply() return true end)
         end
     end
 
@@ -2797,26 +2825,40 @@ function M._apply_books_to_world()
         _finalize_after_pass2()
     end
 
-    --- One chunk of Pass 1. Schedules itself for the next tick via
-    --- LoopAsync(one-shot) until the cursor runs past `n`, at which
-    --- point it calls the finalizer instead of rescheduling.
-    local function _process_chunk()
+    --- Pass 1, chunked, on the GAME THREAD. _book_process_one_chunk does one
+    --- chunk's per-book reads+writes (_apply_one_book); _book_run_chunk runs it via
+    --- _on_game_thread (gated BOOK_ACTOR_GAMETHREAD), then reschedules through
+    --- LoopAsync -> _book_run_chunk so the next ExecuteInGameThread is issued from
+    --- the async thread, never nested inside a game-thread callback (UE4SS #1180).
+    --- pcall-guarded: a throwing chunk releases _flush_in_progress so it can't wedge
+    --- the flush lock (which would block every future flush_apply). Moving the walk
+    --- off the async thread also stops it starving the AP poll loop on big bursts.
+    local _book_run_chunk
+    local function _book_process_one_chunk()
         local chunk_end = math.min(cursor + BOOK_APPLY_CHUNK_SIZE - 1, n)
         for i = cursor, chunk_end do
             _apply_one_book(books[i])
         end
         cursor = chunk_end + 1
-        if cursor <= n then
-            LoopAsync(BOOK_APPLY_CHUNK_DELAY_MS, function()
-                _process_chunk()
-                return true  -- one-shot
-            end)
-        else
-            _finalize()
-        end
+    end
+    _book_run_chunk = function()
+        _on_game_thread(function()
+            local ok, err = pcall(_book_process_one_chunk)
+            if not ok then
+                M._flush_in_progress = false
+                trace.mark("books-chunk-error", nil, tostring(err))
+                log("[apply] book chunk error -> released flush lock: " .. tostring(err))
+                return
+            end
+            if cursor <= n then
+                LoopAsync(BOOK_APPLY_CHUNK_DELAY_MS, function() _book_run_chunk() return true end)
+            else
+                _finalize()
+            end
+        end, "BOOK_ACTOR_GAMETHREAD")
     end
 
-    _process_chunk()
+    _book_run_chunk()
 end
 
 -- Material-opacity worker. Drains M._material_update_queue at a slow
@@ -3419,7 +3461,16 @@ function M._apply_label_glow()
     end
 end
 
+-- Stage 2: layer-2 ward marshaled onto the GAME THREAD (gated CASE_WARD_GAMETHREAD).
+-- Covers BOTH callers (the 5s loop + flush_apply). The impl below is byte-for-byte
+-- unchanged -- all its _ward_collision writes (SetCollisionEnabled / SetCollisionResponseTo*
+-- / SetVisibility / MarkRenderStateDirty) plus the ground-truth + canary collision reads
+-- now run on the game thread, where they can't race the engine's collision/render workers.
 function M._apply_bookcases_to_world()
+    _on_game_thread(M._apply_bookcases_impl, "CASE_WARD_GAMETHREAD")
+end
+
+function M._apply_bookcases_impl()
     if not M._cases_indexed then return end
     -- Section sign glow: drive each fully-locked section's sign SpotLight red.
     -- Gameplay-only (never during streaming), apply-on-change.

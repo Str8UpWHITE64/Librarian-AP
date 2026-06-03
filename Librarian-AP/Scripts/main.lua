@@ -26,8 +26,10 @@ local function diag_on(flag)
     return v and true or false
 end
 local function diag_flags_str()
-    local order = { "BOOK_VISIBILITY", "HISM_SETMATERIAL", "CASE_WARDING",
-                    "RENDER_STATE_DIRTY", "BOOK_ACTOR_WARDING", "NAMED_HOOKS" }
+    local order = { "BOOK_VISIBILITY", "HISM_SETMATERIAL", "BOOK_VIS_GAMETHREAD",
+                    "CASE_WARDING", "RENDER_STATE_DIRTY", "BOOK_ACTOR_WARDING",
+                    "BOOK_ACTOR_GAMETHREAD", "WARD_GROUND_TRUTH", "CASE_WARD_GAMETHREAD",
+                    "NAMED_HOOKS" }
     local parts = {}
     for _, k in ipairs(order) do parts[#parts + 1] = k .. "=" .. tostring(diag_on(k)) end
     return table.concat(parts, ",")
@@ -42,6 +44,29 @@ local trace = (function()
              mark = function() end, recent = function() return {} end }
 end)()
 _G._librarian_trace = trace   -- reachable from hook callbacks if ever needed
+
+-- on_game_thread(fn): run `fn` on the GAME THREAD. CRITICAL: UE4SS LoopAsync /
+-- ExecuteWithDelay callbacks run on a SEPARATE async thread -- only RegisterHook
+-- and NotifyOnNewObject callbacks run on the game thread. So any UObject mutation
+-- fired from inside a LoopAsync callback (e.g. the book-pile HISM SetVisibility /
+-- SetMaterial / SetHiddenInGame writes in apply_book_visibility below) races the
+-- engine's own game/render/cluster-tree workers that read those same components.
+-- That cross-thread race -- NOT merely a "mid-frame" write on the game thread, as
+-- the handoffs assumed -- is the lead suspect for the recurring native crash (see
+-- CRASH_HANDOFF.md). ExecuteInGameThread marshals the work onto the game thread
+-- (drained on the engine tick), where it can no longer race them.
+--
+-- Gated by diag_on("BOOK_VIS_GAMETHREAD") for A/B bisection: flip that false to
+-- restore the OLD off-thread behavior (fn runs inline here on the async thread) and
+-- confirm the crash returns. Also falls back to inline if ExecuteInGameThread is
+-- somehow unavailable, so a missing global can never break mod loading.
+local function on_game_thread(fn)
+    if diag_on("BOOK_VIS_GAMETHREAD") and type(ExecuteInGameThread) == "function" then
+        ExecuteInGameThread(fn)
+    else
+        fn()
+    end
+end
 
 
 -- Runtime book visibility: hide warded shelves + REVEAL on unlock. Each book HISM is one cover
@@ -78,6 +103,12 @@ local function apply_book_visibility()
     if _b2_running then return end
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._compute_unwarded_set and IA._asset_to_series) then return end
+    -- Snapshot the world epoch (bumped by reset_hism_state on every LoadMap). The
+    -- game-thread chunk closure re-checks it before touching the captured HISM array;
+    -- if the world reloaded between scheduling and running, it bails -- the captured
+    -- arr/HISMs are freed, so arr[hi] would be a native AV that pcall can't catch
+    -- (the main-menu teardown crash).
+    local epoch0 = IA._world_epoch
     local mgr = FindFirstOf("BP_HISM_Manager_C")
     if not (mgr and mgr:IsValid()) then return end
     local arr = nil; pcall(function() arr = mgr.HISMArray end)
@@ -165,10 +196,35 @@ local function apply_book_visibility()
         end end
         return best
     end
-    local cursor, CHUNK = 1, 40
+    -- ONE ExecuteInGameThread per pass: CHUNK = hn processes ALL HISMs in a single
+    -- game-thread call, so process_chunk never reschedules. The old per-chunk
+    -- reschedule issued ~10 ExecuteInGameThread calls/pass; that churn (amplified by
+    -- Stage 2's layer-1 burst) tripped UE4SS #1180 -- overlapping engine-tick actions
+    -- -> abort() ("Abort signal received"). Chunking only ever existed to keep the
+    -- ASYNC poll loop pumping, which is moot now the work runs on the game thread.
+    -- One marshal/pass = minimal queue churn. (Cost: one ~400-HISM tick; a brief
+    -- hitch on connect / unwarded-set change, acceptable vs an abort.)
+    local cursor, CHUNK = 1, hn
     local newly_hidden, revealed, kept_hidden, kept_shown = 0, 0, 0, 0
     local n_new_hide, mismatch, leader_changed, n_locked = 0, 0, 0, 0
-    local function do_chunk()
+    -- run_chunk is forward-declared so process_chunk can reschedule through it
+    -- (Lua binds the upvalue at process_chunk's definition, so the local must
+    -- exist first). process_chunk = one chunk of HISM work (runs on the game
+    -- thread); run_chunk = the game-thread driver that invokes it. See
+    -- on_game_thread above.
+    local run_chunk
+    local function process_chunk()
+        -- Teardown guard (runs on the game thread). If the world reloaded since this
+        -- pass was scheduled (epoch changed), the captured `arr` + HISM components are
+        -- from the freed old world; arr[hi] would be a native access violation that
+        -- pcall CANNOT catch (the main-menu / LoadMap use-after-free). Bail without
+        -- touching any captured ref -- the next pass re-resolves the new world fresh.
+        if (IA._world_epoch or 0) ~= (epoch0 or 0) then
+            _b2_running = false
+            trace.mark("b2-stale-world", nil,
+                "epoch " .. tostring(epoch0) .. " -> " .. tostring(IA._world_epoch))
+            return
+        end
         local last = math.min(cursor + CHUNK - 1, hn)
         for hi = cursor, last do
             local h; pcall(function() h = arr[hi] end)
@@ -272,7 +328,7 @@ local function apply_book_visibility()
         end
         cursor = last + 1
         if cursor <= hn then
-            LoopAsync(50, function() do_chunk() return true end)
+            LoopAsync(50, function() run_chunk() return true end)
         else
             _b2_running = false
             -- Index mapping drives; spatial vote is the cross-check. Log when anything
@@ -308,10 +364,29 @@ local function apply_book_visibility()
             end
         end
     end
+    -- Driver: run ONE chunk's HISM work on the GAME THREAD (on_game_thread).
+    -- process_chunk does all the UObject reads/writes and, while chunks remain,
+    -- reschedules via LoopAsync -> run_chunk -- which bounces back onto the async
+    -- thread before the next ExecuteInGameThread, so we never nest
+    -- ExecuteInGameThread calls (UE4SS issue #1180). The body is pcall-guarded and
+    -- ALWAYS clears _b2_running on error: a throw that left the flag set would wedge
+    -- layer 3 permanently (every later pass early-returns on _b2_running, so the
+    -- pile would never hide or reveal again -- a likely cause of the field report
+    -- where the pile stopped re-revealing after the unwarded set grew).
+    run_chunk = function()
+        on_game_thread(function()
+            local ok, err = pcall(process_chunk)
+            if not ok then
+                _b2_running = false
+                trace.mark("b2-chunk-error", nil, tostring(err))
+                log("[b2] chunk error -> cleared _b2_running: " .. tostring(err))
+            end
+        end)
+    end
     if sig_changed then
         log("[b2] unwarded-set change -> re-evaluate (NEW drives off cached series, OLD logged for comparison)")
     end
-    do_chunk()
+    run_chunk()
 end
 
 
@@ -542,7 +617,7 @@ end
 -- isn't in TESTED_GAME_VERSIONS, append "(UNTESTED)" so the player knows
 -- compatibility isn't validated against their game build.
 
-local MOD_VERSION = "1.1.0-beta4"
+local MOD_VERSION = "1.1.0-beta5"
 local TESTED_GAME_VERSIONS = { "1.0.8" }
 
 local function get_game_version()
