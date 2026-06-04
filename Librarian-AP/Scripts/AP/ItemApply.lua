@@ -1186,8 +1186,6 @@ M._hism_initialized = false
 M._book_captured_transforms = {}         -- key → HISM original transform
 M._books_we_have_hidden = {}             -- key → true if our hide moved this book
 M._books_warded = {}                     -- key → true if actor.bHidden + collision-off applied
-M._material_update_queue = {}            -- list of {book, opacity} for deferred MID updates
-M._material_worker_running = false
 
 -- Diagnostic probe for B10 / B9. For each bookcase we touched on the
 -- previous _apply_bookcases_to_world call, remember what we set
@@ -2378,56 +2376,8 @@ function M._apply_books_to_world()
     _book_run_chunk()
 end
 
--- Material-opacity worker. Drains M._material_update_queue at a slow
--- rate to avoid render-thread overload when many books need per-MID
--- updates.
---
--- Currently no producer pushes to this queue — kept as scaffolding
--- for a future "pak-author-time hiding" approach: ship a pak where
--- BookMatInst.Opacity defaults to 0 (books born invisible), then this
--- worker reveals books for unwarded series by setting Opacity = 1.
--- That flips the work direction and dodges the render-thread overload,
--- init race, and false-positive validation issues we hit trying to
--- runtime-hide already-visible books. See ROADMAP.md.
-function M._start_material_worker()
-    if M._material_worker_running then return end
-    if #M._material_update_queue == 0 then return end
-    M._material_worker_running = true
-    local CHUNK = 5
-    M._material_worker_processed = 0
-    LoopAsync(200, function()
-        for _ = 1, CHUNK do
-            local item = table.remove(M._material_update_queue, 1)
-            if not item then
-                M._material_worker_running = false
-                log(("[material-worker] complete: processed %d items"):format(
-                    M._material_worker_processed))
-                return true  -- queue drained, stop loop
-            end
-            local b = item.book
-            if b and b:IsValid() then
-                pcall(function()
-                    local mat = b.BookMatInst
-                    if mat and mat:IsValid() then
-                        mat:SetScalarParameterValue("Opacity", item.opacity)
-                    end
-                end)
-                M._material_worker_processed = M._material_worker_processed + 1
-            end
-        end
-        -- Periodic progress log every ~5 seconds
-        if M._material_worker_processed % 125 == 0 then
-            log(("[material-worker] progress: %d processed, %d remaining"):format(
-                M._material_worker_processed, #M._material_update_queue))
-        end
-        return false  -- continue
-    end)
-end
-
 --- Pass-1 finalizer: diff log, state summary.
 function M._finalize_apply_books(books, n, stats)
-    M._start_material_worker()
-
     -- Diff: which series were newly unwarded this apply? Diff
     -- _series_unlocked against the last applied snapshot. Logs per-series
     -- book counts, flagging any books that are in the unmapped set (may
