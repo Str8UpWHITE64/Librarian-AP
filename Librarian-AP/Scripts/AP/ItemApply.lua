@@ -3374,8 +3374,9 @@ end
 --- (pillars, walls) stay visible. Idempotent.
 -- ── Section sign (CabinetLabel) glow ───────────────────────────────────────
 -- Each section's BP_M01_CabinetLabel_01_C sign carries a SpotLight (the
--- completion glow). We drive that spotlight RED on fully-locked sections as a
--- "blocked" cue. The label→section map is built by the indexer (M._section_to_label,
+-- completion glow). We drive it as an UNLOCK-PROGRESS cue: RED = none of the section's
+-- cases unlocked, YELLOW = some but not all, OFF = all unlocked (the game's own
+-- completion glow takes back over). The label→section map is built by the indexer (M._section_to_label,
 -- via the label's `Label Number`), so we just read it here — no FindAllOf / position
 -- matching. SAFE: gameplay-only (never the streaming window that AV'd),
 -- apply-on-change, and we DO NOT persistently hold the SpotLight component (a
@@ -3419,8 +3420,20 @@ function M._apply_label_glow()
     M._section_glow_state = M._section_glow_state or {}
     M._section_glow_orig = M._section_glow_orig or {}
     for sid, lbl in pairs(M._section_to_label) do
-        local locked = (M._shelves_open[sid] or 0) == 0
-        if M._section_glow_state[sid] ~= locked then
+        -- Three-state sign: RED = none of the section's cases unlocked, YELLOW = some but
+        -- not all, OFF (hand the light back to the game) = all unlocked. Driven by
+        -- shelves-open vs the section's total case count.
+        local open = M._shelves_open[sid] or 0
+        local total = (M._section_to_cases[sid] and #M._section_to_cases[sid]) or 0
+        if total == 0 and M._section_bookcase_count then
+            total = M._section_bookcase_count[sid] or 0
+        end
+        local state
+        if total <= 0 then            state = "off"      -- unknown total -> leave it to the game
+        elseif open <= 0 then         state = "red"
+        elseif open >= total then     state = "off"
+        else                          state = "yellow" end
+        if M._section_glow_state[sid] ~= state then
             if lbl and lbl:IsValid() then
                 -- Look the SpotLight up on-demand; never store the component.
                 local spot
@@ -3442,21 +3455,24 @@ function M._apply_label_glow()
                         M._section_glow_orig[sid] = { int = oi, vis = ov, units = ou }
                     end
                     local o = M._section_glow_orig[sid] or {}
-                    if locked then
-                        pcall(function() spot:SetLightColor({ R = 1.0, G = 0.0, B = 0.0, A = 1.0 }, true) end)
+                    if state == "red" or state == "yellow" then
+                        local col = (state == "red")
+                            and { R = 1.0, G = 0.0, B = 0.0, A = 1.0 }   -- none unlocked
+                            or  { R = 1.0, G = 1.0, B = 0.0, A = 1.0 }   -- some but not all
+                        pcall(function() spot:SetLightColor(col, true) end)
                         local inten = GLOW_INTENSITY[o.units or 0] or 15.0
                         pcall(function() spot:SetIntensity(inten) end)
                         pcall(function() spot:SetVisibility(true, false) end)
                     else
-                        -- Restore original light state; the game owns the real
-                        -- completion glow once the section is unlocked.
+                        -- All unlocked: restore original light state; the game owns the
+                        -- real completion glow from here.
                         pcall(function() spot:SetIntensity(o.int or 0.0) end)
                         pcall(function() spot:SetVisibility(o.vis == true, false) end)
                         pcall(function() spot:SetLightColor({ R = 1.0, G = 1.0, B = 1.0, A = 1.0 }, true) end)
                     end
                 end
             end
-            M._section_glow_state[sid] = locked
+            M._section_glow_state[sid] = state
         end
     end
 end
@@ -3472,7 +3488,7 @@ end
 
 function M._apply_bookcases_impl()
     if not M._cases_indexed then return end
-    -- Section sign glow: drive each fully-locked section's sign SpotLight red.
+    -- Section sign glow: RED = none unlocked, YELLOW = some but not all, OFF = all unlocked.
     -- Gameplay-only (never during streaming), apply-on-change.
     if M._gameplay_active and M._apply_safe then
         pcall(M._apply_label_glow)
