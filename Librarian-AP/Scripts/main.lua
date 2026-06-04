@@ -221,52 +221,6 @@ local function _inspect_pile(b)
         bd2 and tostring(math.floor(math.sqrt(bd2))) or "?", tostring(bz))
 end
 
--- One-time sweep of EVERY unwarded book's "1. Desaturation B" value -- so we find the rare
--- anomaly ourselves instead of asking the player to hunt intermittent broken books. If only a
--- few books read < 0.5, that rarity matches the bug (and we log their series to spot-check);
--- if hundreds do, DesatB=0 is just a normal cover value and the cause is elsewhere. Read-only.
-local _desat_scanned = false
-local function _scan_desat()
-    if _desat_scanned then return end
-    local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA._apply_safe and IA._book_valid_asset_idx and IA._asset_to_series
-            and IA._compute_unwarded_set) then return end
-    local books = FindAllOf("BP_GrabbingBook_C")
-    local n = 0; if books then pcall(function() n = #books end) end
-    if n == 0 then return end
-    _desat_scanned = true
-    local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
-    local uw = IA._compute_unwarded_set(only_shelfable) or {}
-    local nlow, nhigh, nbad, nchk = 0, 0, 0, 0
-    local lows = {}
-    for i = 1, n do
-        local b = books[i]
-        if b and b:IsValid() then
-            local aidx = IA._book_valid_asset_idx(b)
-            local series = aidx and IA._asset_to_series[aidx]
-            if series and uw[series] then
-                local sm; pcall(function() sm = b.SM_Book_1 end)
-                local mid; if sm and sm:IsValid() then pcall(function() mid = sm:GetMaterial(0) end) end
-                if mid and mid:IsValid() then
-                    local dv = _mid_scalar(mid, "1. Desaturation B")
-                    nchk = nchk + 1
-                    if type(dv) == "number" then
-                        if dv < 0.5 then
-                            nlow = nlow + 1
-                            if #lows < 30 then lows[#lows + 1] = series end
-                        else nhigh = nhigh + 1 end
-                    else nbad = nbad + 1 end
-                end
-            end
-        end
-    end
-    log(("[desat-scan] unwarded books: checked=%d  DesatB<0.5=%d  DesatB>=0.5=%d  unreadable=%d"):format(
-        nchk, nlow, nhigh, nbad))
-    if nlow > 0 then
-        log("[desat-scan] DesatB<0.5 series (candidates for the invisible bug): " .. table.concat(lows, " | "))
-    end
-end
-
 -- PROACTIVE RefreshInfo sweep (inc5e): redraw every unwarded book in small chunks so a corrupt
 -- one (invisible, but with correct identity) self-heals WITHOUT the player grabbing it. We can't
 -- DETECT broken books by value -- they don't share one (one had out-of-range Tints, another
@@ -629,38 +583,6 @@ local function try_register_book_hooks()
                             end
                         end
                     end
-                end
-            end
-        end,
-        -- Increment 3: REVEAL net (POST-hook; symptom 2 = the "vanishing" unlocked book).
-        -- Runs AFTER the game's SetActorVisible. If the game tried to SHOW (v==true) an
-        -- UNWARDED book but it is STILL hidden (bHidden==true) afterward -- the "fine after
-        -- dropping, invisible when looked at / picked up" glitch -- clear the stale hide so
-        -- it actually shows. Only fires on the real edge case, so the log's revealed=N is
-        -- how often it was caught. SetActorHiddenInGame isn't hooked (no re-entrancy), and
-        -- it's aligned with the game's own show intent (no fight). Gated BOOK_EVENT_REVEAL.
-        function(self, is_visible)
-            if not diag_on("BOOK_EVENT_HOOKS") then return end
-            if not diag_on("BOOK_EVENT_REVEAL") then return end
-            local b, v
-            pcall(function() b = self:get() end)
-            pcall(function() v = is_visible:get() end)
-            if v ~= true or not b then return end
-            local _, series = _bh_series(b)
-            local IA = package.loaded["AP/ItemApply"]
-            if not (series and IA and IA._compute_unwarded_set) then return end
-            local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
-            local unwarded = IA._compute_unwarded_set(only_shelfable)
-            if not (unwarded and unwarded[series]) then return end   -- warded -> the pre-hook's job
-            local still_hidden
-            pcall(function() still_hidden = b.bHidden end)
-            if still_hidden == true then
-                pcall(function() b:SetActorHiddenInGame(false) end)
-                _bh.revealed = _bh.revealed + 1
-                if _bh.rev_samples < 10 then
-                    _bh.rev_samples = _bh.rev_samples + 1
-                    log(("[book-hook] REVEAL unwarded-but-hidden series=%s (cleared stale hide)"):format(
-                        tostring(series)))
                 end
             end
         end)
