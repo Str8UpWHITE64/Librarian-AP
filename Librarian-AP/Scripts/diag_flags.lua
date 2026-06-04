@@ -151,18 +151,4 @@ return {
     -- visible flicker on healthy books or any hitch, flip THIS false (BOOK_REFRESH_FIX grab-path
     -- still works) and report. Requires BOOK_EVENT_HOOKS.
     BOOK_REFRESH_SWEEP = true,
-
-    -- beta6.2 Increment 5: PROACTIVE TIMER-SWEEP. SHELVED (default false). It walked all book
-    -- actors clearing bHidden, but that CHURNS: the game's per-frame visibility Tick re-sets the
-    -- flag next frame, so the clear has no lasting effect (test: 33 "fixes", all repeats of the
-    -- same few series, zero visible change), and "actor hidden" is also the NORMAL state of any
-    -- distant pile-mode book (false positives everywhere). An external timer can't beat the Tick.
-    -- Visibility is corrected instead by RIDING the game's own SetActorVisible call
-    -- (BOOK_EVENT_ENFORCE keep-hidden + BOOK_EVENT_REVEAL complete-the-show) and the grab path
-    -- (BOOK_EVENT_GRABFIX). Sweep code kept in main.lua for reference / a possible
-    -- proximity-gated revival. Flip true only to A/B the churn.
-    BOOK_SWEEP     = false,
-
-    -- Moot while BOOK_SWEEP=false (it gated the sweep's repair writes vs observe-only).
-    BOOK_SWEEP_FIX = false,
 }
