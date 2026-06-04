@@ -337,6 +337,12 @@ end
 --- items on (re)connect, so we reset _received_counts to avoid double-counts.
 function M.set_slot_data(slot_data)
     M._slot_data = slot_data
+    -- book_visibility mode (BookVisibility option). true = HIDE warded books ("hidden", the
+    -- default); false = "stacks" = keep them VISIBLE but non-grabbable. The three live hide
+    -- paths gate on this -- layer-1 actor ward (below), the SetActorVisible ENFORCE hook, and
+    -- the HISM-pile apply_book_visibility -- so in stacks they skip hiding and only collision-off
+    -- remains. "~= stacks" so any missing/unknown value defaults to the safe legacy hide.
+    M._book_hide_mode = (slot_data and slot_data.book_visibility ~= "stacks")
     M._received_counts    = {}
     M._series_unlocked    = {}
     M._shelves_open       = {}
@@ -2721,7 +2727,9 @@ function M._apply_books_to_world()
             else
                 if not is_warded then
                     if _diag_on("BOOK_ACTOR_WARDING") then
-                        book:SetActorHiddenInGame(true)
+                        -- stacks mode (M._book_hide_mode == false): keep the book VISIBLE,
+                        -- only disable collision so it can't be grabbed (walk-through).
+                        if M._book_hide_mode then book:SetActorHiddenInGame(true) end
                         book:SetActorEnableCollision(false)
                     end
                     M._books_warded[key] = true

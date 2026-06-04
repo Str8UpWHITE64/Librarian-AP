@@ -94,6 +94,22 @@ class OnlyUnwardShelfableBooks(Toggle):
     default = 0
 
 
+class BookVisibility(Choice):
+    """How books from locked series appear before you've unlocked them.
+
+    hidden -- locked books are invisible AND non-grabbable; the library
+              visibly fills in as you unlock series. Default. (The mod hides
+              the book actors + their cosmetic pile instances.)
+    stacks -- locked books stay VISIBLE (preserving shelf density) but are
+              non-grabbable -- you walk through them. Nothing is hidden, so
+              none of the hide-path edge cases can occur. Pick this if you
+              prefer a full-looking library or want to avoid hide glitches."""
+    display_name = "Book Visibility"
+    option_hidden = 0
+    option_stacks = 1
+    default = 0
+
+
 @dataclass
 class LibrarianOptions(PerGameCommonOptions):
     goal: Goal
@@ -101,3 +117,4 @@ class LibrarianOptions(PerGameCommonOptions):
     starting_series_count: StartingSeriesCount
     series_per_unlock: SeriesPerUnlock
     only_unward_shelfable_books: OnlyUnwardShelfableBooks
+    book_visibility: BookVisibility

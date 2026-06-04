@@ -578,7 +578,9 @@ local function try_register_book_hooks()
                 if series and IA and IA._compute_unwarded_set then
                     local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
                     local unwarded = IA._compute_unwarded_set(only_shelfable)
-                    if not (unwarded and unwarded[series]) then
+                    -- stacks mode (IA._book_hide_mode == false): never force-hide a warded book
+                    -- actor -- it stays visible, just non-grabbable (collision is layer 1's job).
+                    if IA._book_hide_mode ~= false and not (unwarded and unwarded[series]) then
                         local set_ok = pcall(function() is_visible:set(false) end)
                         _bh.enforced = _bh.enforced + 1
                         if _bh.enf_samples < 10 then
@@ -731,6 +733,10 @@ local function apply_book_visibility()
     if _b2_running then return end
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._compute_unwarded_set and IA._asset_to_series) then return end
+    -- stacks mode (book_visibility="stacks"): leave the cosmetic HISM pile fully visible -- the
+    -- only warding is layer-1 collision-off. Skip all pile hiding. (== false so a nil mode before
+    -- slot_data arrives still runs the legacy hide path.)
+    if IA._book_hide_mode == false then return end
     -- Snapshot the world epoch (bumped by reset_hism_state on every LoadMap). The
     -- game-thread chunk closure re-checks it before touching the captured HISM array;
     -- if the world reloaded between scheduling and running, it bails -- the captured

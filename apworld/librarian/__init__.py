@@ -1070,11 +1070,10 @@ class LibrarianWorld(World):
             "milestone_thresholds": [],
             # Lua tracks correctly-completed rows and fires each threshold.
             "row_completion_thresholds": list(ROW_COMPLETION_THRESHOLDS),
-            # Locked-series book appearance. "stacks" = visible-but-
-            # disabled (preserves visual density; collision off so player
-            # walks through). Hidden-mode code path still present in Lua
-            # for possible re-introduction, but the YAML option was
-            # removed for v1.0 because HISM per-instance limitations
-            # left ~5-10 books visible in walls/floors.
-            "book_visibility": "stacks",
+            # Locked-series book appearance, from the BookVisibility option.
+            # "hidden" (default) = invisible + non-grabbable; "stacks" =
+            # visible-but-non-grabbable (collision off, walk through). The Lua
+            # client gates ALL hiding on this == "hidden"; in "stacks" it only
+            # disables collision, so none of the hide-path edge cases apply.
+            "book_visibility": self.options.book_visibility.current_key,
         }
