@@ -1178,10 +1178,11 @@ end
 --- the natural HISM transform for every warded book. We use that for
 --- showing previously-warded books (warded → unwarded transitions).
 ---
---- Only runs when slot_data.book_visibility == "hidden". The shipped v1
---- config emits "stacks" unconditionally, so this code path is dormant
---- by default — kept for possible re-introduction once a cleaner approach
---- (per-instance opacity via custom material) is available.
+--- Only runs when slot_data.book_visibility == "hidden", the DEFAULT since beta7.
+--- NOTE: this HISM-mapping pipeline is currently vestigial FOR HIDING -- Layer 3
+--- (apply_book_visibility) + Pass 1 actor warding do the actual hiding, and its
+--- refs now feed only init bookkeeping + the diagnostic dump. Kept pending a
+--- gate-off verification before any wholesale removal (do NOT delete as "dormant").
 M._hism_initialized = false
 M._book_captured_transforms = {}         -- key → HISM original transform
 M._books_we_have_hidden = {}             -- key → true if our hide moved this book
