@@ -2349,61 +2349,14 @@ function M._start_phase7_scan()
     end)
 end
 
---- Hide a book's HISM instance. Uses per-instance UpdateHISMInstance
---- via ModActor — moves only this book's specific HISM instance, not
---- the canonical (which other dupe-partner books may share). Books
---- without a recorded (HISM, idx) ref (e.g. failed Phase 5 AddInstance)
---- silently no-op — they remain visible (the documented edge case).
---- Tracked in M._books_we_have_hidden so we know whether to restore.
-function M._hide_book_in_hism(book)
-    if not book or not book:IsValid() then return end
-    local key = book:GetFullName()
-    if M._books_we_have_hidden[key] then return end
-
-    local ref = M._book_hism_refs[key]
-    if not ref then return end
-    local orig = M._book_captured_transforms[key]
-    local rot = (orig and orig.Rotation) or {X=0, Y=0, Z=0, W=1}
-    local far_t = {
-        Rotation    = rot,
-        Translation = {X=0, Y=0, Z=-1000000.0},
-        Scale3D     = {X=1, Y=1, Z=1},
-    }
-    local mod_actor = FindFirstOf("ModActor_C")
-    if mod_actor and mod_actor:IsValid() then
-        pcall(function() mod_actor:UpdateHISMInstance(ref.hism, ref.idx, far_t) end)
-    end
-
-    M._books_we_have_hidden[key] = true
-end
-
---- Restore a book's HISM instance to natural transform via per-instance
---- UpdateHISMInstance. No-op for books we never hid.
-function M._show_book_in_hism(book)
-    if not book or not book:IsValid() then return end
-    local key = book:GetFullName()
-    if not M._books_we_have_hidden[key] then return end
-
-    local ref = M._book_hism_refs[key]
-    local orig = M._book_captured_transforms[key]
-    if ref and orig then
-        local mod_actor = FindFirstOf("ModActor_C")
-        if mod_actor and mod_actor:IsValid() then
-            pcall(function() mod_actor:UpdateHISMInstance(ref.hism, ref.idx, orig) end)
-        end
-    end
-
-    M._books_we_have_hidden[key] = nil
-end
-
 --- Toggle a book actor's mesh visibility. Tree-walk AttachChildren +
 --- BlueprintCreatedComponents.
 ---
 --- NOTE: We do NOT call SetActorVisible(visible) here. That's the game's
 --- own BP-graph visibility function, and the BP Tick reverts it to the
 --- "expected" state every frame — leading to a brief disappear-then-
---- reappear flicker. We instead rely on the actor displacement done
---- by _hide_book_in_hism to keep warded books out of view.
+--- reappear flicker, so we set the component flags directly instead. (Warded
+--- books are kept hidden by Layer 3 pile hiding + Pass 1 actor warding.)
 function M._set_book_mesh_visible(book, visible)
     if not book or not book:IsValid() then return end
     local root = book:K2_GetRootComponent()
@@ -2719,42 +2672,11 @@ function M._apply_books_to_world()
         end
     end
 
-    --- Finalizer: runs after the last Pass-1 chunk. Handles Pass 2
-    --- (hidden mode only) inline (it's a much cheaper walk — just
-    --- HISM teleport calls that queue to the existing deferred
-    --- worker), then diff logging, state summary, and the
-    --- in-progress/pending bookkeeping.
-    --- Pass 2 single-book worker: HISM teleport + deferred tree-walk
-    --- queue. Same logic as the legacy synchronous Pass 2 loop, just
-    --- factored out so the chunker can call it one book at a time.
-    local function _apply_pass2_one_book(book)
-        if not (book and book:IsValid()) then return end
-        local asset_idx = _book_valid_asset_idx(book)
-        if asset_idx == nil then return end
-        local series_name = M._asset_to_series[asset_idx]
-        -- Same precomputed unwarded set as Pass 1.
-        local should_unward = series_name and unwarded_set[series_name]
-        local key = book:GetFullName()
-        local is_hidden_by_us = M._books_we_have_hidden[key] or false
-        pcall(function()
-            if should_unward then
-                if is_hidden_by_us then
-                    M._show_book_in_hism(book)
-                    M._queue_book_visibility(book, true)
-                end
-            else
-                if not is_hidden_by_us then
-                    M._hide_book_in_hism(book)
-                    M._queue_book_visibility(book, false)
-                end
-            end
-        end)
-    end
-
-    --- After all Pass 2 chunks have run (or immediately, if Pass 2 was
-    --- skipped because hide_mesh=false), this finalises diff logging
-    --- and clears the in-flight flag.
-    local function _finalize_after_pass2()
+    -- Finalizer: runs after the last Pass-1 chunk -- diff logging, state summary,
+    -- and the in-progress/pending bookkeeping. (The old Pass 2 -- a per-book HISM
+    -- teleport pass -- was removed: it was disabled, and pile hiding is handled by
+    -- Layer 3 (apply_book_visibility) + Pass 1 actor warding, not per-book moves.)
+    local function _finalize_apply()
         M._finalize_apply_books(books, n, stats)
         M._flush_in_progress = false
 
@@ -2770,38 +2692,6 @@ function M._apply_books_to_world()
             -- from the async thread. Harmless (~10ms) when already on the async thread.
             LoopAsync(10, function() M.flush_apply() return true end)
         end
-    end
-
-    --- Pass 2 chunker. Same chunk size + delay as Pass 1 so the
-    --- LoopAsync poll thread can pump c:poll() between chunks and so
-    --- mass UpdateHISMInstance calls don't burst the render thread —
-    --- a single-tick Pass 2 with 1866 UpdateHISMInstance calls plus
-    --- newly-added HISM slots crashed the game (offset-8 null-deref
-    --- in shipping binary, likely a not-yet-registered HISM slot).
-    local pass2_cursor = 1
-    local function _process_pass2_chunk()
-        local chunk_end = math.min(pass2_cursor + BOOK_APPLY_CHUNK_SIZE - 1, n)
-        for i = pass2_cursor, chunk_end do
-            _apply_pass2_one_book(books[i])
-        end
-        pass2_cursor = chunk_end + 1
-        if pass2_cursor <= n then
-            LoopAsync(BOOK_APPLY_CHUNK_DELAY_MS, function()
-                _process_pass2_chunk()
-                return true  -- one-shot
-            end)
-        else
-            _finalize_after_pass2()
-        end
-    end
-
-    local function _finalize()
-        -- Pass 2 (HISM teleport via _hide_book_in_hism) DISABLED. Its
-        -- mass UpdateHISMInstance calls cause 0x8 null-deref crashes
-        -- on the render thread seconds after the burst. HISM init's
-        -- Phase 3 markers already moved 1158 canonicals to -1M and
-        -- Pass 1's BookMatInst opacity hides the rest; Pass 2 redundant.
-        _finalize_after_pass2()
     end
 
     --- Pass 1, chunked, on the GAME THREAD. _book_process_one_chunk does one
@@ -2832,7 +2722,7 @@ function M._apply_books_to_world()
             if cursor <= n then
                 LoopAsync(BOOK_APPLY_CHUNK_DELAY_MS, function() _book_run_chunk() return true end)
             else
-                _finalize()
+                _finalize_apply()
             end
         end, "BOOK_ACTOR_GAMETHREAD")
     end
