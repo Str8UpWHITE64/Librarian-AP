@@ -367,23 +367,11 @@ function M.set_slot_data(slot_data)
         return
     end
 
-    -- v1.0.3 warding rule gate. The shelf-req-based warding behavior
-    -- changed in v1.0.3: with only_unward_shelfable_books OFF, we
-    -- restrict pickable books to series whose shelf_req <= max(1,
-    -- cases_open). v1.0.2 and earlier seeds keep their original lenient
-    -- behavior so mid-game saves don't suddenly re-ward placed books.
-    do
-        local v = slot_data.version or "0.0.0"
-        local maj, min, pat = v:match("^(%d+)%.(%d+)%.(%d+)")
-        maj = tonumber(maj) or 0
-        min = tonumber(min) or 0
-        pat = tonumber(pat) or 0
-        M._use_v103_warding = (maj > 1)
-            or (maj == 1 and min > 0)
-            or (maj == 1 and min == 0 and pat >= 3)
-        log(("Apworld version=%s → warding rule: %s"):format(
-            v, M._use_v103_warding and "v1.0.3 (shelf-req gated)" or "v1.0.2 (lenient)"))
-    end
+    -- (beta7: the v1.0.2/v1.0.3 warding-rule version gate was removed. Off now
+    -- uniformly unwards every received series regardless of bookcase -- see
+    -- M._compute_unwarded_set -- so the old shelf-req floor and the
+    -- _use_v103_warding split no longer exist. On mode is unchanged across versions.)
+    log("slot_data version=" .. tostring(slot_data.version or "?"))
 
     -- Derived lookups built from asset_idx_to_series.json + slot_data so
     -- the per-book warding decision is cheap. Built once on slot_connect
@@ -2439,61 +2427,44 @@ function M._set_book_mesh_visible(book, visible)
     end
 end
 
---- Compute the set of series that should be unwarded right now, given the
---- player's current item state and the warding mode in effect.
+--- Compute the set of series that should be unwarded (pickable) right now, given
+--- the player's item state and the only_unward_shelfable_books mode. Returns
+--- {[series_name] = true}. Recomputed on each apply (cheap).
 ---
---- Returns {[series_name] = true}. Recomputed each call to
---- _apply_books_to_world (cheap: walks unlocked series once).
+--- Off (only_shelfable = false, DEFAULT): every RECEIVED series is unwarded,
+---   regardless of which bookcase it lives on or whether that case is open. You can
+---   pick a book up the moment its series arrives and stash it on any open shelf --
+---   mis-shelving + moving it later is part of the loop. (Completing a row still
+---   needs the home bookcase OPEN to place correctly -- that's the separate bookcase
+---   warding. Generation gates row-completion on the bookcase being open, so this
+---   pickup leniency never makes a check unreachable.)
 ---
---- Rules:
----   v1.0.3+ seeds (M._use_v103_warding == true):
----     - default mode (only_unward_shelfable_books = false):
----         unward iff shelf_req <= max(1, cases_open)
----         (the "first 4" of every section — the shelf_req=1 series —
----          unward as soon as their series item arrives, regardless of
----          whether any bookcase has been opened yet. Higher shelf_req
----          requires the corresponding shelves to actually be open.)
----     - strict mode (only_unward_shelfable_books = true):
----         unward iff shelf_req <= cases_open
----         (no visibility floor; series in a section with 0 cases open
----          stay warded.)
----     Note: single-bookcase sections have shelf_req=1 for every series,
----     so the formula naturally unwards all unlocked series in them
----     (default and strict alike, once any case is open in strict).
+--- On (only_shelfable = true, STRICT): a received series stays warded until its
+---   home bookcase is open -- cases_open >= shelf_req for its section. A section with
+---   0 cases open has none of its series pickable.
 ---
----   v1.0.2 and earlier seeds (legacy):
----     - default mode: unward all unlocked (no shelf gating at all)
----     - strict mode:  unward iff shelf_req <= cases_open
----     Preserves existing mid-game saves; no in-place behavior change.
+--- beta7: Off was previously shelf-req-gated (floor-of-1) on v1.0.3+ seeds; that
+--- gate -- and the v1.0.2/v1.0.3 `_use_v103_warding` split -- was removed so Off
+--- matches its documented "pickable as soon as received" behavior. On is unchanged.
 function M._compute_unwarded_set(only_shelfable)
     local unwarded = {}
-    local shelf_req_map = (M._slot_data and M._slot_data.shelf_req_map) or {}
-
-    if not M._use_v103_warding then
-        -- Legacy: replicate v1.0.2 behavior bit-for-bit.
-        for series_name, _ in pairs(M._series_unlocked) do
-            if only_shelfable then
-                local section_id = M._series_to_section[series_name]
-                local cases_open = M._shelves_open[section_id] or 0
-                local needed = shelf_req_map[series_name] or 1
-                if cases_open >= needed then unwarded[series_name] = true end
-            else
-                unwarded[series_name] = true
-            end
+    if not only_shelfable then
+        -- Off (default): every RECEIVED series is pickable, no shelf gating --
+        -- regardless of which bookcase it lives on or whether that case is open.
+        for series_name in pairs(M._series_unlocked) do
+            unwarded[series_name] = true
         end
         return unwarded
     end
-
-    -- v1.0.3+ unified rule: cases_open with a default-mode floor of 1.
-    for series_name, _ in pairs(M._series_unlocked) do
+    -- On (strict): gate each received series on its home bookcase being open
+    -- (cases_open >= shelf_req for its section).
+    local shelf_req_map = (M._slot_data and M._slot_data.shelf_req_map) or {}
+    for series_name in pairs(M._series_unlocked) do
         local section_id = M._series_to_section[series_name]
         if section_id then
             local cases_open = M._shelves_open[section_id] or 0
             local needed = shelf_req_map[series_name] or 1
-            local effective = only_shelfable
-                and cases_open
-                or math.max(1, cases_open)
-            if effective >= needed then unwarded[series_name] = true end
+            if cases_open >= needed then unwarded[series_name] = true end
         end
     end
     return unwarded

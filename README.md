@@ -277,22 +277,21 @@ be picked up or collided with — you walk through them, and the
 Toggle (default `false`). Controls how strictly books are gated by
 shelf unlocks.
 
-**Off (default)** — A series's books are pickable as soon as either
-(a) the section's first bookcase is open, or (b) the series has
-`shelf_req == 1` (lives on bookcase 1 of its section). So the
-"first 4" series of every section become pickable as soon as you
-receive their series unlock, even if no shelf in that section is
-open yet. Higher-`shelf_req` series stay warded until their target
-bookcase is open.
+**Off (default)** — A series's books are pickable as soon as you receive its
+series unlock, **regardless of whether its bookcase is open yet**. You can pick
+books up early and stash them on any open shelf — mis-shelving and moving them
+later is part of the loop. (Correctly *completing* a row still needs that row's
+home bookcase open so you can shelve its books in the right place.)
 
 **On** — Stricter. A series's books stay warded until you have **both**
 the series unlock **and** enough Progressive Shelf Unlocks for that
 section to reach the series's home bookcase. No visibility floor — if
 a section has zero bookcases open, none of its series are pickable.
 
-The difference only matters for sections that haven't been opened at
-all yet — once you have any shelf unlock in a section, both modes
-behave identically.
+The difference: **Off** lets you hold any received series' books immediately
+(placing them once that shelf opens); **On** withholds the books themselves
+until the shelf is open. Either way, *finishing* a row requires its bookcase
+open.
 
 > **v1.0.3 note**: cumulative-book-placement milestones
 > (`Milestone: N Books Placed`) were removed from the seed entirely in
