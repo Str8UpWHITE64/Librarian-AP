@@ -2,6 +2,29 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0-beta6.2 — 2026-06-04 (released)
+
+Candidate fix for the rare **"unlocked book renders invisible (but still grabbable)"** glitch (symptom 2).
+A 3-adjacent-books diagnosis (middle one broken) pinned the shape: the invisible book has the CORRECT
+identity but a CORRUPT display (out-of-range material Tint colors), while every visibility flag, scale,
+mesh position, and pile state read normal — and broken books share no single wrong value, so they can't be
+detected by inspection. The cause is a scrambled appearance over intact data, so the fix is to **redraw**.
+
+- **Proactive RefreshInfo sweep.** A chunked, game-thread sweep (`BOOK_REFRESH_SWEEP`) walks every unlocked
+  book and calls the game's own `RefreshInfo()` (which rebuilds a book's appearance from its BookInfo), so
+  a corrupt/invisible book **self-heals as you move past it — no grab required**. Redrawing a healthy book
+  is a no-op. Confirmed executing (the `SetBookInfo` count tracks `refresh-sweep` 1:1) + safe (no
+  flicker/stutter/crash); chunked so there's no hitch and **zero `ExecuteInGameThread`** (can't hit #1180).
+  Also applied on grab (`BOOK_REFRESH_FIX`).
+- **Honest status:** the bug is intermittent and invisible to every readable value, so effectiveness is
+  validated in the field, not locally — report if you still see an invisible-but-grabbable book. Rich grab
+  diagnostics are retained so any remaining case is captured in the log.
+- Earlier dead-end approaches (a `bHidden` timer-sweep that churned, a never-firing post-hook,
+  opacity/desaturation guesses) are gated off; see `BETA6_PROGRESS.md`.
+- **Also:** section signs now glow RED (no cases open) / YELLOW (some) / OFF (all open) for clearer unlock
+  progress, replacing the old RED/locked-only cue.
+- Crash fixes + beta5/beta6 warding are unchanged.
+
 ## 1.1.0-beta6.1 — 2026-06-03 (released)
 
 A small follow-up to beta6 targeting the **"pickable book turns invisible"** glitch (symptom 2). beta6's
