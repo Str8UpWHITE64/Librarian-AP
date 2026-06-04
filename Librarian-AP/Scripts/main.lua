@@ -30,7 +30,8 @@ local function diag_flags_str()
                     "CASE_WARDING", "RENDER_STATE_DIRTY", "BOOK_ACTOR_WARDING",
                     "BOOK_ACTOR_GAMETHREAD", "WARD_GROUND_TRUTH", "CASE_WARD_GAMETHREAD",
                     "NAMED_HOOKS", "BOOK_EVENT_HOOKS", "BOOK_EVENT_ENFORCE",
-                    "BOOK_EVENT_REVEAL", "BOOK_EVENT_GRABFIX" }
+                    "BOOK_EVENT_REVEAL", "BOOK_EVENT_GRABFIX", "BOOK_OPACITY_FIX",
+                    "BOOK_REFRESH_FIX", "BOOK_REFRESH_SWEEP", "BOOK_SWEEP", "BOOK_SWEEP_FIX" }
     local parts = {}
     for _, k in ipairs(order) do parts[#parts + 1] = k .. "=" .. tostring(diag_on(k)) end
     return table.concat(parts, ",")
@@ -87,7 +88,8 @@ end
 local BOOK_BP = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingBook.BP_GrabbingBook_C"
 local _book_hooks_attempted = false
 local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0, enforced = 0, enf_samples = 0,
-              revealed = 0, rev_samples = 0, grabbed = 0, grab_samples = 0, grabfix = 0 }
+              revealed = 0, rev_samples = 0, grabbed = 0, grab_samples = 0, grabfix = 0,
+              swept = 0, swept_samples = 0, opacity_samples = 0 }
 
 local function _bh_series(book_obj)
     local IA = package.loaded["AP/ItemApply"]
@@ -107,6 +109,206 @@ local function _bh_sample(tag, book_obj, extra)
     end)
 end
 
+-- Read a named scalar param from a MID's OVERRIDDEN list (ScalarParameterValues). This is the
+-- reliable path: plain GetScalarParameterValue read nil, and b.BookMatInst is nil. Returns a
+-- number or nil (nil = that param isn't overridden on this MID).
+local function _mid_scalar(mid, name)
+    local out
+    pcall(function()
+        local arr = mid.ScalarParameterValues
+        local n = 0; if arr then pcall(function() n = #arr end) end
+        for i = 1, n do
+            local e = arr[i]
+            if e then
+                local nm
+                pcall(function() nm = e.ParameterInfo.Name:ToString() end)
+                if not nm then pcall(function() nm = e.ParameterName:ToString() end) end
+                if nm == name then pcall(function() out = e.ParameterValue end) break end
+            end
+        end
+    end)
+    return out
+end
+
+-- Dump all overridden scalar params as "name=value,..." -- DEFINITIVE diagnosis of which
+-- parameter the game animates (we've guessed the name twice; this shows what's actually set).
+local function _mid_dump(mid)
+    local s = "?"
+    pcall(function()
+        local arr = mid.ScalarParameterValues
+        local n = 0; if arr then pcall(function() n = #arr end) end
+        local parts = {}
+        for i = 1, math.min(n, 12) do
+            local e = arr[i]
+            if e then
+                local nm, val = "?", "?"
+                pcall(function() nm = e.ParameterInfo.Name:ToString() end)
+                if nm == "?" or not nm then pcall(function() nm = e.ParameterName:ToString() end) end
+                pcall(function() val = e.ParameterValue end)
+                parts[#parts + 1] = tostring(nm) .. "=" .. tostring(val)
+            end
+        end
+        s = "[" .. table.concat(parts, ",") .. "](" .. tostring(n) .. ")"
+    end)
+    return s
+end
+
+-- Same, for VECTOR params (colors) -- opacity could be a color's alpha, which the scalar dump
+-- can't see. Logs name=(R,G,B,a=A).
+local function _mid_dump_vec(mid)
+    local s = "?"
+    pcall(function()
+        local arr = mid.VectorParameterValues
+        local n = 0; if arr then pcall(function() n = #arr end) end
+        local parts = {}
+        for i = 1, math.min(n, 10) do
+            local e = arr[i]
+            if e then
+                local nm = "?"
+                pcall(function() nm = e.ParameterInfo.Name:ToString() end)
+                if nm == "?" or not nm then pcall(function() nm = e.ParameterName:ToString() end) end
+                local r, g, bl, a = "?", "?", "?", "?"
+                pcall(function() local v = e.ParameterValue; r = v.R; g = v.G; bl = v.B; a = v.A end)
+                parts[#parts + 1] = ("%s=(%s,%s,%s,a=%s)"):format(tostring(nm), tostring(r), tostring(g), tostring(bl), tostring(a))
+            end
+        end
+        s = "[" .. table.concat(parts, ",") .. "](" .. tostring(n) .. ")"
+    end)
+    return s
+end
+
+-- Inspect the grabbed book's COSMETIC pile instance (the HISM that layer 3 wards) -- the one
+-- thing we write that the GRAB hook (which reads the ACTOR) can't see. Reports whether WE left
+-- this book's HISM component hidden / swapped to M_APBookMask, or its instance moved off-screen,
+-- while the series is unwarded -- i.e. our warding not reversed. hi = AssetIdx+1 (the layer-3
+-- index mapping). Read-only; pcall-guarded; game thread (same as layer 3).
+local function _inspect_pile(b)
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._book_valid_asset_idx) then return "no-IA" end
+    local aidx = IA._book_valid_asset_idx(b)
+    if aidx == nil then return "no-aidx" end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return "no-mgr" end
+    local arr; pcall(function() arr = mgr.HISMArray end)
+    local hn = 0; if arr then pcall(function() hn = #arr end) end
+    local hi = aidx + 1
+    if hi < 1 or hi > hn then return ("hi=%d out-of-range(%d)"):format(hi, hn) end
+    local h; pcall(function() h = arr[hi] end)
+    if not (h and h:IsValid()) then return "no-hism@" .. tostring(hi) end
+    local cvis, chid, cmat = "?", "?", "?"
+    pcall(function() cvis = h.bVisible end)
+    pcall(function() chid = h.bHiddenInGame end)
+    pcall(function() local m = h:GetMaterial(0); if m and m:IsValid() then cmat = m:GetFullName() end end)
+    -- nearest instance to the book actor's X,Y, and its Z (hugely negative => moved off-screen)
+    local bx, by
+    pcall(function() local loc = b:K2_GetActorLocation(); if loc then bx = loc.X; by = loc.Y end end)
+    local sm; pcall(function() sm = h.PerInstanceSMData end)
+    local sn = 0; if sm then pcall(function() sn = #sm end) end
+    local bd2, bz
+    if bx and by then
+        for j = 1, sn do
+            local x, y, z
+            pcall(function() local wp = sm[j].Transform.WPlane; x = wp.X; y = wp.Y; z = wp.Z end)
+            if x and y then
+                local dx, dy = x - bx, y - by
+                local d2 = dx * dx + dy * dy
+                if not bd2 or d2 < bd2 then bd2 = d2; bz = z end
+            end
+        end
+    end
+    return ("hi=%d compVis=%s compHidden=%s compMat=%s instN=%d nearDist=%s nearZ=%s"):format(
+        hi, tostring(cvis), tostring(chid), tostring(cmat), sn,
+        bd2 and tostring(math.floor(math.sqrt(bd2))) or "?", tostring(bz))
+end
+
+-- One-time sweep of EVERY unwarded book's "1. Desaturation B" value -- so we find the rare
+-- anomaly ourselves instead of asking the player to hunt intermittent broken books. If only a
+-- few books read < 0.5, that rarity matches the bug (and we log their series to spot-check);
+-- if hundreds do, DesatB=0 is just a normal cover value and the cause is elsewhere. Read-only.
+local _desat_scanned = false
+local function _scan_desat()
+    if _desat_scanned then return end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._apply_safe and IA._book_valid_asset_idx and IA._asset_to_series
+            and IA._compute_unwarded_set) then return end
+    local books = FindAllOf("BP_GrabbingBook_C")
+    local n = 0; if books then pcall(function() n = #books end) end
+    if n == 0 then return end
+    _desat_scanned = true
+    local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
+    local uw = IA._compute_unwarded_set(only_shelfable) or {}
+    local nlow, nhigh, nbad, nchk = 0, 0, 0, 0
+    local lows = {}
+    for i = 1, n do
+        local b = books[i]
+        if b and b:IsValid() then
+            local aidx = IA._book_valid_asset_idx(b)
+            local series = aidx and IA._asset_to_series[aidx]
+            if series and uw[series] then
+                local sm; pcall(function() sm = b.SM_Book_1 end)
+                local mid; if sm and sm:IsValid() then pcall(function() mid = sm:GetMaterial(0) end) end
+                if mid and mid:IsValid() then
+                    local dv = _mid_scalar(mid, "1. Desaturation B")
+                    nchk = nchk + 1
+                    if type(dv) == "number" then
+                        if dv < 0.5 then
+                            nlow = nlow + 1
+                            if #lows < 30 then lows[#lows + 1] = series end
+                        else nhigh = nhigh + 1 end
+                    else nbad = nbad + 1 end
+                end
+            end
+        end
+    end
+    log(("[desat-scan] unwarded books: checked=%d  DesatB<0.5=%d  DesatB>=0.5=%d  unreadable=%d"):format(
+        nchk, nlow, nhigh, nbad))
+    if nlow > 0 then
+        log("[desat-scan] DesatB<0.5 series (candidates for the invisible bug): " .. table.concat(lows, " | "))
+    end
+end
+
+-- PROACTIVE RefreshInfo sweep (inc5e): redraw every unwarded book in small chunks so a corrupt
+-- one (invisible, but with correct identity) self-heals WITHOUT the player grabbing it. We can't
+-- DETECT broken books by value -- they don't share one (one had out-of-range Tints, another
+-- normal) -- so we redraw ALL of them; RefreshInfo re-derives a book's look from its BookInfo, so
+-- for a healthy book it just re-applies the SAME look (a no-op redraw), and for a corrupt one it
+-- rebuilds it. Chunked across the (game-thread) SetActorVisible pre-hook -> no mass-update burst,
+-- no new ExecuteInGameThread. RefreshInfo is a redraw (not a flag the game's Tick reverts), so it
+-- does NOT churn like the shelved bHidden sweep. World-epoch guarded. Gated BOOK_REFRESH_SWEEP.
+local _rsw_books, _rsw_n, _rsw_cursor, _rsw_epoch, _rsw_uw = nil, 0, 1, nil, nil
+local RSWEEP_BUDGET = 12
+local function _refresh_sweep_step()
+    if not diag_on("BOOK_REFRESH_SWEEP") then return end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._apply_safe and IA._book_valid_asset_idx and IA._asset_to_series
+            and IA._compute_unwarded_set) then return end
+    if _rsw_books and (IA._world_epoch or 0) ~= (_rsw_epoch or 0) then _rsw_books = nil end
+    if not _rsw_books or _rsw_cursor > _rsw_n then
+        _rsw_books = FindAllOf("BP_GrabbingBook_C")
+        _rsw_n = 0; if _rsw_books then pcall(function() _rsw_n = #_rsw_books end) end
+        _rsw_cursor = 1
+        _rsw_epoch = IA._world_epoch
+        local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
+        _rsw_uw = IA._compute_unwarded_set(only_shelfable)
+        if _rsw_n == 0 then return end
+    end
+    local uw = _rsw_uw
+    if not uw then return end
+    local last = math.min(_rsw_cursor + RSWEEP_BUDGET - 1, _rsw_n)
+    for i = _rsw_cursor, last do
+        local b = _rsw_books[i]
+        if b and b:IsValid() then
+            local aidx = IA._book_valid_asset_idx(b)
+            local series = aidx and IA._asset_to_series[aidx]
+            if series and uw[series] then
+                pcall(function() b:RefreshInfo() end)
+                _bh.rsweep = (_bh.rsweep or 0) + 1
+            end
+        end
+    end
+    _rsw_cursor = last + 1
+end
+
 -- Shared grab-path check, called from BOTH GrabFromPlayer and CanBeGrab. (CanBeGrab is
 -- proven to fire on grab attempts -- Bug Report 5, ~10/run -- so routing through it hedges
 -- against GrabFromPlayer not firing.) Logs the book's full visibility state to pinpoint the
@@ -118,11 +320,36 @@ local function _bh_grab_check(b, tag)
     if not b then return end
     local _, series = _bh_series(b)
     local bhidden, mesh_hidden, mat = nil, nil, "?"
+    local mesh_vis, opacity, scalex, midref, scalars_dump, vectors_dump = nil, nil, nil, nil, "?", "?"
+    local actorz, meshz, meshname, cpd = "?", "?", "?", "?"
     pcall(function() bhidden = b.bHidden end)
+    pcall(function() local s = b:GetActorScale3D(); if s then scalex = s.X end end)
+    pcall(function() local al = b:K2_GetActorLocation(); if al then actorz = al.Z end end)
     local sm; pcall(function() sm = b.SM_Book_1 end)
     if sm and sm:IsValid() then
         pcall(function() mesh_hidden = sm.bHiddenInGame end)
-        pcall(function() local m = sm:GetMaterial(0); if m and m:IsValid() then mat = m:GetFullName() end end)
+        pcall(function() mesh_vis = sm.bVisible end)
+        pcall(function()
+            local m = sm:GetMaterial(0)
+            if m and m:IsValid() then mat = m:GetFullName(); midref = m end
+        end)
+        if midref then
+            opacity = _mid_scalar(midref, "Opacity")   -- value if "Opacity" is overridden, else nil
+            scalars_dump = _mid_dump(midref)            -- DEFINITIVE: every overridden scalar param
+            vectors_dump = _mid_dump_vec(midref)        -- and every overridden vector/color param
+        end
+        -- GEOMETRY check: is the MESH shoved to deep Z (our -1,000,000 hide pattern) while the
+        -- ACTOR root sits at the hand? That = grab-able-but-invisible. Plus the mesh asset
+        -- (null/wrong?) and CustomPrimitiveData (per-book floats a WPO/material may read).
+        pcall(function() local ml = sm:K2_GetComponentLocation(); if ml then meshz = ml.Z end end)
+        pcall(function() local msh = sm.StaticMesh; if msh and msh:IsValid() then meshname = msh:GetFullName() end end)
+        pcall(function()
+            local arr = sm.CustomPrimitiveData and sm.CustomPrimitiveData.Data
+            local nn = 0; if arr then pcall(function() nn = #arr end) end
+            local parts = {}
+            for k = 1, math.min(nn, 12) do local v; pcall(function() v = arr[k] end); parts[#parts + 1] = tostring(v) end
+            cpd = "[" .. table.concat(parts, ",") .. "](" .. tostring(nn) .. ")"
+        end)
     end
     local IA = package.loaded["AP/ItemApply"]
     local unwarded_here
@@ -133,23 +360,182 @@ local function _bh_grab_check(b, tag)
     end
     if _bh.grab_samples < 30 then
         _bh.grab_samples = _bh.grab_samples + 1
-        log(("[book-hook] %s series=%s unwarded=%s bHidden=%s meshHidden=%s mat=%s"):format(
+        log(("[book-hook] %s series=%s unwarded=%s bHidden=%s meshHidden=%s meshVis=%s opacity=%s scaleX=%s mat=%s"):format(
             tostring(tag), tostring(series), tostring(unwarded_here), tostring(bhidden),
-            tostring(mesh_hidden), tostring(mat)))
+            tostring(mesh_hidden), tostring(mesh_vis), tostring(opacity), tostring(scalex), tostring(mat)))
+        log(("[book-hook] %s-PARAMS series=%s scalars=%s"):format(tostring(tag), tostring(series), scalars_dump))
+        log(("[book-hook] %s-VPARAMS series=%s vectors=%s"):format(tostring(tag), tostring(series), vectors_dump))
+        log(("[book-hook] %s-PILE series=%s %s"):format(tostring(tag), tostring(series), _inspect_pile(b)))
+        log(("[book-hook] %s-MESH series=%s actorZ=%s meshZ=%s cpd=%s mesh=%s"):format(
+            tostring(tag), tostring(series), tostring(actorz), tostring(meshz), tostring(cpd), tostring(meshname)))
     end
     if diag_on("BOOK_EVENT_GRABFIX") and unwarded_here == true then
+        local did = {}
         if bhidden == true then
             pcall(function() b:SetActorHiddenInGame(false) end)
-            _bh.grabfix = _bh.grabfix + 1
-            log("[book-hook] GRAB-FIX cleared actor bHidden, series=" .. tostring(series))
+            did[#did + 1] = "actorHidden"
         end
-        if mesh_hidden == true and sm then
-            pcall(function() sm:SetHiddenInGame(false, false) end)
-            pcall(function() sm:SetVisibility(true, false) end)
+        if sm then
+            if mesh_hidden == true then
+                pcall(function() sm:SetHiddenInGame(false, false) end)
+                did[#did + 1] = "meshHidden"
+            end
+            if mesh_vis == false then
+                pcall(function() sm:SetVisibility(true, false) end)
+                did[#did + 1] = "meshVisible"
+            end
+        end
+        -- The cause for "all flags say visible but it's invisible" (the reproducible book):
+        -- the per-book MID's "Opacity" is stuck < 1. Restore it via the mesh material -- the
+        -- same GetMaterial(0) MID we logged at grab time (b.BookMatInst returned nil). Gated
+        -- BOOK_OPACITY_FIX. Setting a scalar on the EXISTING actor MID is what the dormant
+        -- material worker does -- NOT creating a MID on the HISM (the documented crash).
+        if diag_on("BOOK_OPACITY_FIX") and midref and type(opacity) == "number" and opacity < 1.0 then
+            pcall(function() midref:SetScalarParameterValue("Opacity", 1.0) end)
+            did[#did + 1] = "opacity(" .. tostring(opacity) .. ")"
+        end
+        pcall(function() b:SetActorEnableCollision(true) end)
+        if #did > 0 then
             _bh.grabfix = _bh.grabfix + 1
-            log("[book-hook] GRAB-FIX cleared mesh hidden, series=" .. tostring(series))
+            log("[book-hook] GRAB-FIX series=" .. tostring(series) .. " fixed=" .. table.concat(did, "+"))
         end
     end
+    -- inc5d: the broken book's IDENTITY (series) is correct but its DISPLAY is corrupt (out-of-
+    -- range Tint colors like 2.0/3.0 + invisible, while every flag, scale, mesh position and pile
+    -- read normal). The game's own RefreshInfo() re-derives a book's appearance from its BookInfo
+    -- -- so on grab of an unwarded book, redraw it. Gated BOOK_REFRESH_FIX.
+    if diag_on("BOOK_REFRESH_FIX") and unwarded_here == true then
+        local ok = pcall(function() b:RefreshInfo() end)
+        _bh.refreshed = (_bh.refreshed or 0) + 1
+        if (_bh.refresh_samples or 0) < 20 then
+            _bh.refresh_samples = (_bh.refresh_samples or 0) + 1
+            log(("[book-hook] REFRESH series=%s ok=%s"):format(tostring(series), tostring(ok)))
+        end
+    end
+end
+
+-- ======================= PROACTIVE BOOK SWEEP (beta6.2, inc5) =======================
+-- The grab-time fix (inc4) is reactive: a book that is BOTH invisible AND un-grabbable can
+-- never be grabbed, so a grab-time repair never fires -> the player is stuck reloading. This
+-- sweep instead walks ALL book actors on its own and repairs any UNWARDED book it finds in a
+-- hidden state, with NO player action required.
+--
+-- Driver: the existing game-thread SetActorVisible POST-hook (fires constantly during play).
+-- So the sweep needs ZERO ExecuteInGameThread of its own -> it CANNOT trip UE4SS #1180 (the
+-- concurrent-tick-queue abort that bit layers 1/2), and its writes land on the game thread (no
+-- render race). Work is chunked (SWEEP_BUDGET books per hook call) so there's no hitch; the
+-- cursor wraps the full ~3072-book list every ~38s of normal play. If the player stands
+-- perfectly still the sweep pauses -- benign, since no NEW desync forms while idle and it
+-- resumes the moment they move.
+--
+-- Repairs the CERTAIN, safe signals: actor bHidden, the SM_Book_1 mesh hidden flag, and the
+-- mesh VISIBILITY flag (bVisible -- distinct from bHiddenInGame; layer 1 only ever cleared the
+-- actor flag, so a stuck mesh bVisible=false survives clearing bHidden, matching Bug 6). Also
+-- re-enables collision so an unwarded book can't be left un-grabbable (covers symptom 1 too).
+--
+-- The book's BookMatInst "Opacity" is OBSERVED (logged) but NOT auto-written yet: GetScalar on a
+-- material lacking the param returns 0, which would look like "every book invisible". We log the
+-- normal value first; if stuck-at-0 proves to be a cause, the writer already exists
+-- (M._start_material_worker uses SetScalarParameterValue("Opacity", v)) -- a one-line follow-up.
+local SWEEP_BUDGET = 16
+local _sweep_books, _sweep_n, _sweep_cursor, _sweep_epoch = nil, 0, 1, nil
+local _sweep_unwarded = nil
+
+local function _sweep_refresh()
+    local IA = package.loaded["AP/ItemApply"]
+    if not IA then return false end
+    _sweep_books = FindAllOf("BP_GrabbingBook_C")
+    _sweep_n = 0
+    if _sweep_books then pcall(function() _sweep_n = #_sweep_books end) end
+    _sweep_cursor = 1
+    _sweep_epoch = IA._world_epoch
+    if IA._compute_unwarded_set then
+        local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
+        _sweep_unwarded = IA._compute_unwarded_set(only_shelfable)
+    else
+        _sweep_unwarded = nil
+    end
+    return _sweep_n > 0
+end
+
+-- Inspect (and, if do_fix, repair) one unwarded book that should be fully visible.
+local function _sweep_check_book(b, series, do_fix)
+    local signals = {}
+    local bhidden; pcall(function() bhidden = b.bHidden end)
+    if bhidden == true then
+        if do_fix then
+            pcall(function() b:SetActorHiddenInGame(false) end)
+            pcall(function() b:SetActorEnableCollision(true) end)
+        end
+        signals[#signals + 1] = "actorHidden"
+    end
+    local sm; pcall(function() sm = b.SM_Book_1 end)
+    if sm and sm:IsValid() then
+        local mh; pcall(function() mh = sm.bHiddenInGame end)
+        if mh == true then
+            if do_fix then pcall(function() sm:SetHiddenInGame(false, false) end) end
+            signals[#signals + 1] = "meshHidden"
+        end
+        local vis; pcall(function() vis = sm.bVisible end)
+        if vis == false then
+            if do_fix then pcall(function() sm:SetVisibility(true, false) end) end
+            signals[#signals + 1] = "meshVisible"
+        end
+    end
+    local abnormal = #signals > 0
+    -- read opacity when something's wrong (to diagnose) or to sample the normal value
+    local want_op = abnormal or ((_bh.opacity_samples or 0) < 20)
+    local opacity
+    if want_op then
+        pcall(function()
+            local m = b.BookMatInst
+            if m and m:IsValid() then opacity = m:GetScalarParameterValue("Opacity") end
+        end)
+    end
+    if abnormal then
+        _bh.swept = (_bh.swept or 0) + 1
+        if (_bh.swept_samples or 0) < 40 then
+            _bh.swept_samples = (_bh.swept_samples or 0) + 1
+            log(("[book-sweep] %s series=%s signals=%s opacity=%s"):format(
+                do_fix and "FIX" or "FOUND", tostring(series),
+                table.concat(signals, "+"), tostring(opacity)))
+        end
+    elseif want_op then
+        _bh.opacity_samples = (_bh.opacity_samples or 0) + 1
+        log(("[book-sweep] sample series=%s opacity=%s (normal visible book)"):format(
+            tostring(series), tostring(opacity)))
+    end
+end
+
+-- One chunk of the proactive sweep. Called from the SetActorVisible post-hook (game thread).
+local function _sweep_step()
+    if not diag_on("BOOK_SWEEP") then return end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._apply_safe and IA._book_valid_asset_idx and IA._asset_to_series) then return end
+    -- world reloaded since we cached the list? drop it -- stale actor wrappers can native-AV.
+    if _sweep_books and (IA._world_epoch or 0) ~= (_sweep_epoch or 0) then
+        _sweep_books = nil
+    end
+    if not _sweep_books or _sweep_cursor > _sweep_n then
+        if not _sweep_refresh() then return end
+    end
+    local uw = _sweep_unwarded
+    if not uw then return end
+    local do_fix = diag_on("BOOK_SWEEP_FIX")
+    local last = math.min(_sweep_cursor + SWEEP_BUDGET - 1, _sweep_n)
+    for i = _sweep_cursor, last do
+        local b = _sweep_books[i]
+        if b and b:IsValid() then
+            local aidx = IA._book_valid_asset_idx(b)
+            if aidx ~= nil then
+                local series = IA._asset_to_series[aidx]
+                if series and uw[series] then
+                    pcall(_sweep_check_book, b, series, do_fix)
+                end
+            end
+        end
+    end
+    _sweep_cursor = last + 1
 end
 
 local function try_register_book_hooks()
@@ -170,6 +556,11 @@ local function try_register_book_hooks()
         reg("SetActorVisible", function(self, is_visible)
             if not diag_on("BOOK_EVENT_HOOKS") then return end
             _bh.setvis = _bh.setvis + 1
+            pcall(_refresh_sweep_step)    -- proactive: redraw unwarded books in chunks (heal corrupt ones)
+            -- (inc5 timer-sweep SHELVED: it churned against the game's per-frame visibility
+            -- Tick -- see the sweep block above + BOOK_SWEEP in diag_flags. Visibility is now
+            -- corrected by riding the game's OWN SetActorVisible call: ENFORCE + REVEAL-complete
+            -- below. The POST-hook -- 2nd RegisterHook cb -- never fires in this UE4SS build.)
             local b, v
             pcall(function() b = self:get() end)
             pcall(function() v = is_visible:get() end)
@@ -194,6 +585,46 @@ local function try_register_book_hooks()
                             _bh.enf_samples = _bh.enf_samples + 1
                             log(("[book-hook] ENFORCE keep-hidden warded series=%s set_ok=%s"):format(
                                 tostring(series), tostring(set_ok)))
+                        end
+                    end
+                end
+            end
+            -- REVEAL-complete (supersedes the dead post-hook REVEAL): when the game SHOWS an
+            -- UNWARDED book (you looked at / approached it) it sets the actor visible but does
+            -- NOT always restore the MESH -- a stuck SM_Book_1 bHiddenInGame / bVisible leaves
+            -- the book "shown" yet invisible (Bug 6). Complete the show: clear the mesh hide
+            -- flags + ensure collision (grabbable). Rides the game's own show call so the
+            -- per-frame Tick keeps it -- no churn (unlike the shelved inc5 timer-sweep).
+            if diag_on("BOOK_EVENT_REVEAL") and v == true and b then
+                local _, rseries = _bh_series(b)
+                local IA = package.loaded["AP/ItemApply"]
+                if rseries and IA and IA._compute_unwarded_set then
+                    local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
+                    local unwarded = IA._compute_unwarded_set(only_shelfable)
+                    if unwarded and unwarded[rseries] then
+                        local sm; pcall(function() sm = b.SM_Book_1 end)
+                        if sm and sm:IsValid() then
+                            local mh, vis, op, mid
+                            pcall(function() mh = sm.bHiddenInGame end)
+                            pcall(function() vis = sm.bVisible end)
+                            pcall(function() mid = sm:GetMaterial(0) end)
+                            if mid and mid:IsValid() then op = _mid_scalar(mid, "Opacity") end
+                            -- op < 1 = the stuck-transparent book (all flags say visible). Fix it
+                            -- by restoring the MID's Opacity here too, so just LOOKING at the book
+                            -- (the show that triggers the glitch) repairs it. Gated BOOK_OPACITY_FIX.
+                            local op_bad = diag_on("BOOK_OPACITY_FIX") and type(op) == "number" and op < 1.0
+                            if mh == true or vis == false or op_bad then
+                                if mh == true then pcall(function() sm:SetHiddenInGame(false, false) end) end
+                                if vis == false then pcall(function() sm:SetVisibility(true, false) end) end
+                                if op_bad then pcall(function() mid:SetScalarParameterValue("Opacity", 1.0) end) end
+                                pcall(function() b:SetActorEnableCollision(true) end)
+                                _bh.revealed = _bh.revealed + 1
+                                if _bh.rev_samples < 15 then
+                                    _bh.rev_samples = _bh.rev_samples + 1
+                                    log(("[book-hook] REVEAL-complete series=%s mh=%s vis=%s op=%s"):format(
+                                        tostring(rseries), tostring(mh), tostring(vis), tostring(op)))
+                                end
+                            end
                         end
                     end
                 end
@@ -261,8 +692,8 @@ local function bh_report_periodic()
     if not diag_on("BOOK_EVENT_HOOKS") then return end
     _bh_report_tick = _bh_report_tick + 1
     if _bh_report_tick % 6 ~= 0 then return end   -- ~every 30s (6 ticks of the 5s loop)
-    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d Grab=%d (grabfix=%d)"):format(
-        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab, _bh.grabbed, _bh.grabfix))
+    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d Grab=%d (grabfix=%d) refresh-sweep=%d"):format(
+        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab, _bh.grabbed, _bh.grabfix, _bh.rsweep or 0))
 end
 
 

@@ -108,11 +108,13 @@ return {
     -- unaffected (stays on the existing collision-off path).
     BOOK_EVENT_ENFORCE = true,
 
-    -- beta6 Increment 3: REVEAL net (symptom 2 = the "vanishing" unlocked book). A POST-hook
-    -- on SetActorVisible: if the game tried to SHOW an UNWARDED book but it stayed hidden,
-    -- clear the stale hide so it actually shows. Requires BOOK_EVENT_HOOKS. Flip false to
-    -- disable just this direction (the warded-hide net BOOK_EVENT_ENFORCE stays). Rare glitch,
-    -- so this is field-validated over a full playthrough.
+    -- beta6 Increment 3 / 5b: REVEAL-complete. Now a PRE-hook branch (the post-hook never fires
+    -- in this UE4SS build, so the original post-hook version was dead code -> rev=0). When the
+    -- game SHOWS an unwarded book, ensure the show is COMPLETE: restore the mesh visibility flags
+    -- (SM_Book_1 bHiddenInGame / bVisible) that the game's show doesn't always restore, + enable
+    -- collision -- so a "shown but invisible / un-grabbable" book (Bug 6) is corrected. Rides the
+    -- game's own show call so it sticks (no churn). Requires BOOK_EVENT_HOOKS. Flip false to
+    -- disable this direction (the warded-hide net BOOK_EVENT_ENFORCE stays).
     BOOK_EVENT_REVEAL  = true,
 
     -- beta6 Increment 4: GRAB-path observe + fix (symptom 2 = "pickable book invisible").
@@ -122,4 +124,45 @@ return {
     -- unwarded book that's hidden when grabbed. Requires BOOK_EVENT_HOOKS. Flip false to keep
     -- the GRAB logging but drop the restore.
     BOOK_EVENT_GRABFIX = true,
+
+    -- beta6.2 Increment 5c: OPACITY restore. The reproducible book proved the "invisible when
+    -- looked at, visible after dropping" glitch is NOT any visibility flag (bHidden/mesh all say
+    -- visible) -- it's the per-book dynamic material's "Opacity" scalar stuck < 1. When the grab
+    -- or look-at (show) paths see an unwarded book with Opacity < 1, set it back to 1 via the
+    -- mesh material's MID (sm:GetMaterial(0) -- the reliable path; b.BookMatInst read as nil).
+    -- This sets a scalar on the EXISTING actor MID (what the dormant material worker does), NOT
+    -- creating a MID on the HISM (the documented crash). Requires BOOK_EVENT_GRABFIX / REVEAL to
+    -- carry it. Flip false if forcing Opacity=1 interferes with a legit fade (then the read still
+    -- logs the value for diagnosis).
+    BOOK_OPACITY_FIX   = true,
+
+    -- beta6.2 Increment 5d: REFRESH fix. The reproducible broken books have CORRECT identity
+    -- (series name) but CORRUPT display -- out-of-range Tint colors (2.0 / 3.0 vs the normal 0-1)
+    -- and invisible, while every visibility flag, scale, mesh position and pile read normal. The
+    -- game's own BP_GrabbingBook RefreshInfo() re-derives a book's appearance from its BookInfo,
+    -- so on grab of an unwarded book we call it to redraw a corrupted one. Flip false to disable.
+    BOOK_REFRESH_FIX   = true,
+
+    -- beta6.2 Increment 5e: PROACTIVE RefreshInfo sweep. Same fix as BOOK_REFRESH_FIX but applied
+    -- on its own (no grab needed): chunks through every unwarded book (a few per SetActorVisible
+    -- pre-hook call, game thread, no mass burst) calling RefreshInfo so a corrupt/invisible book
+    -- self-heals as you walk past. Redraws healthy books too (a no-op redraw) since broken books
+    -- can't be detected by value. This is the FIRST broad use of RefreshInfo -- if it causes a
+    -- visible flicker on healthy books or any hitch, flip THIS false (BOOK_REFRESH_FIX grab-path
+    -- still works) and report. Requires BOOK_EVENT_HOOKS.
+    BOOK_REFRESH_SWEEP = true,
+
+    -- beta6.2 Increment 5: PROACTIVE TIMER-SWEEP. SHELVED (default false). It walked all book
+    -- actors clearing bHidden, but that CHURNS: the game's per-frame visibility Tick re-sets the
+    -- flag next frame, so the clear has no lasting effect (test: 33 "fixes", all repeats of the
+    -- same few series, zero visible change), and "actor hidden" is also the NORMAL state of any
+    -- distant pile-mode book (false positives everywhere). An external timer can't beat the Tick.
+    -- Visibility is corrected instead by RIDING the game's own SetActorVisible call
+    -- (BOOK_EVENT_ENFORCE keep-hidden + BOOK_EVENT_REVEAL complete-the-show) and the grab path
+    -- (BOOK_EVENT_GRABFIX). Sweep code kept in main.lua for reference / a possible
+    -- proximity-gated revival. Flip true only to A/B the churn.
+    BOOK_SWEEP     = false,
+
+    -- Moot while BOOK_SWEEP=false (it gated the sweep's repair writes vs observe-only).
+    BOOK_SWEEP_FIX = false,
 }

@@ -138,6 +138,11 @@ lives on the **grab/hold path** (`CanBeGrab` fired 10×). REVEAL stays in (harml
 genuinely valuable) but does not fix symptom 2. The reporter also saw it in 1.0.4 → long-standing rare
 one-off, not a regression. → Increment 4.
 
+**ROOT CAUSE (found 2026-06-03 during inc5 bring-up):** the SetActorVisible **POST-hook never fires**
+in this UE4SS version (the 2nd RegisterHook callback registers "OK (pre+post)" but its code never
+executes). So REVEAL was **dead code**, not merely ineffective — `rev=0` always. The PRE-hook (ENFORCE)
+fires fine. Any future post-hook logic must move to the pre-hook (as inc5's sweep driver did).
+
 ---
 
 ## Increment 4 — GRAB-path observe + conservative fix  ·  status: AWAITING VALIDATION
@@ -164,5 +169,161 @@ bHidden/mesh cases get fixed outright.
 
 **Commit:** held until a test run confirms non-breaking.
 
-### Result (fill in after a beta6 run)
-- Grab fires? ____   invisible-book GRAB state (bHidden/mesh/mat)? ____   grabfix climbs? ____   still invisible? ____
+### Result (2026-06-03, beta6.1 + Bug Report 6): GrabFromPlayer fires; bHidden is NOT the full cause
+- **GrabFromPlayer fires** (registered + `Grab=276` in one session) and **GRAB-FIX works**: it cleared
+  `bHidden` on 8 unwarded books ("Prolegomena to Holy Magic Theory", grabbed via a skill).
+- **But the book stayed invisible.** Clearing `bHidden` didn't reveal it; no "cleared mesh hidden" logs
+  (so mesh `bHiddenInGame`=false); `mat=...MID_MI_G01_Book...` = the normal material (not the mask). So
+  the residual invisibility is something grab-fix didn't read: mesh `bVisible` or `BookMatInst` Opacity.
+  (The inc4 material-read fix `GetFullName` worked — material confirmed normal.)
+- **Conclusion:** grab-time repair is also the wrong *place* — a book that's invisible AND un-grabbable
+  can't be grabbed, so the repair can never reach it. Superseded by the proactive sweep (inc5). The grab
+  hooks stay as a cheap secondary net + logging.
+
+---
+
+## Increment 5 — PROACTIVE SWEEP (self-healing)  ·  status: LIVE, AWAITING VALIDATION
+
+> **Bring-up fix (2026-06-03):** first wiring drove the sweep from the SetActorVisible POST-hook, which
+> produced ZERO output — that post-hook never fires in this UE4SS version (see inc3 root-cause above).
+> Moved the `pcall(_sweep_step)` driver to the PRE-hook (provably fires, `setvis=751`). Re-test pending.
+
+**Flags:** `BOOK_SWEEP` (master, default `true`) + `BOOK_SWEEP_FIX` (repair gate, default `true`). Both
+require `BOOK_EVENT_HOOKS` (the sweep rides the SetActorVisible hook).
+**Files:** `Scripts/main.lua` (sweep block before `try_register_book_hooks`; `pcall(_sweep_step)` in the
+SetActorVisible post-hook; `swept`/`swept_samples`/`opacity_samples` in `_bh` + the count report; flags
+in the trace-header list), `Scripts/diag_flags.lua` (flags).
+
+**Behaviour:** walk ALL ~3072 BP_GrabbingBook actors, `SWEEP_BUDGET=16` per SetActorVisible call (full
+cycle ~38s of play). For each UNWARDED book, ensure it's fully visible: clear actor `bHidden` (+ enable
+collision), clear mesh `bHiddenInGame`, set mesh `bVisible=true`. Logs every repair (`[book-sweep] FIX
+series=... signals=... opacity=...`). OBSERVES `BookMatInst` Opacity (logs ~20 normal-book samples + the
+value on every fix) but does NOT write it yet (GetScalar on a param-less material returns 0 = a false
+"invisible"; confirm the normal value first).
+
+**Why this design:** proactive (no player action — fixes books the player can't reach or grab); driven by
+the existing game-thread hook so ZERO new `ExecuteInGameThread` (can't hit #1180); chunked (no hitch);
+world-epoch guarded (drops the cached actor list on reload to avoid a native AV on stale wrappers). Only
+touches UNWARDED books (disjoint from ENFORCE's warded-hide → no fight). Re-enabling collision also
+covers symptom 1 (an unwarded book left un-grabbable).
+
+**To validate (field):**
+- `[book-sweep] sample ... opacity=N (normal visible book)` — what is N for a healthy book? (1.0 = the
+  Opacity param is real and stuck-at-0 is a candidate cause; 0.0 = param absent/unused → ignore opacity.)
+- `[book-sweep] FIX series=... signals=...` — which signal(s) it repairs in the wild. If `meshVisible`
+  appears, that was Bug 6's residual. `sweep-fixes=N` climbs in the periodic count report.
+- Do players stop reporting stuck invisible / un-grabbable books? No hitch/stutter, no crash.
+
+**Rollback:** `BOOK_SWEEP_FIX = false` (observe-only) → `BOOK_SWEEP = false` (off) → `git revert
+<commit>` → `.pre-inc5.bak`.
+
+**Commit:** held until a quick local test confirms non-breaking (no hitch/crash + `[book-sweep]` lines).
+
+### Result (2026-06-03 test): RUNS but CHURNS → timer-sweep SHELVED
+- Once moved to the pre-hook, the sweep ran: 20 opacity samples + 33 `[book-sweep] FIX` lines, no crash.
+- `opacity=nil` on every read → the `BookMatInst:GetScalarParameterValue("Opacity")` path doesn't resolve
+  (opacity unreadable as written; secondary hypothesis anyway).
+- All 33 fixes were `signals=actorHidden`, REPEATED on the same few series across cycles (~30-60s apart)
+  with NO visible change. Diagnosis: clearing `bHidden` from an external timer **churns** — the game's
+  per-frame visibility Tick (documented in `ItemApply._set_book_mesh_visible`: "the BP Tick reverts it to
+  the expected state every frame") re-sets it next frame, so the clear has no lasting effect. And "actor
+  hidden" is the NORMAL state of any distant pile-mode book → mass false positives.
+- **Conclusion:** an external timer-sweep cannot fix book visibility — at any instant a book is either one
+  the game wants visible (already visible, nothing to do) or one it wants hidden (our write is reverted).
+  The fix MUST ride the game's own visibility call (exactly why ENFORCE works). Timer-sweep SHELVED
+  (`BOOK_SWEEP=false`; code kept for reference / possible proximity-gated revival). → Increment 5b.
+
+---
+
+## Increment 5b — RIDE-THE-GAME visibility repair  ·  status: LIVE, AWAITING VALIDATION
+
+**Flags:** `BOOK_EVENT_REVEAL` (repurposed → pre-hook complete-the-show) + `BOOK_EVENT_GRABFIX` (enhanced).
+Both require `BOOK_EVENT_HOOKS`.
+**Files:** `Scripts/main.lua` (REVEAL-complete branch in the SetActorVisible PRE-hook; `_bh_grab_check`
+fix enhanced with `bVisible` + collision; timer-sweep call removed), `Scripts/diag_flags.lua`
+(`BOOK_SWEEP=false`; comments).
+
+**Behaviour:** two non-churning repairs, both riding hooks PROVEN to fire (pre-hook `setvis=751`;
+CanBeGrab/GrabFromPlayer fired):
+1. **REVEAL-complete** — SetActorVisible PRE-hook, on `v=true` for an UNWARDED book (you looked at /
+   approached it): ensure the show is COMPLETE. If `SM_Book_1.bHiddenInGame==true` or `bVisible==false`,
+   restore them + enable collision. Logs `[book-hook] REVEAL-complete series=.. mh=.. vis=..`. Fires only
+   on a genuinely-incomplete show (the Bug-6 "shown but invisible" case).
+2. **GRAB-FIX enhanced** — added `bVisible` (the Bug-6 residual the bHidden-only fix missed) +
+   `SetActorEnableCollision(true)`. Logs `[book-hook] GRAB-FIX series=.. fixed=..`.
+
+**Why this works where the sweep didn't:** it augments the game's OWN show → the Tick keeps the result (no
+churn); it fires exactly when the player interacts with the book (looked-at / aimed-at / grabbed) → no
+distant-book false positives; the dead post-hook is avoided.
+
+**To validate (normal play, no need to repro the full stuck-bug):** grab books + look along shelves, then
+check the log — `GRAB-FIX ... fixed=...meshVisible...` or `REVEAL-complete ... vis=false` would CONFIRM the
+mesh-visibility residual is real and now repaired. `revealed=N` / `grabfix=N` climb. No hitch/crash. If a
+book stays invisible with NO mh/vis signal, the cause is the (currently unreadable) material Opacity →
+next step is fixing that read.
+
+**Rollback:** `BOOK_EVENT_REVEAL=false` / `BOOK_EVENT_GRABFIX=false` → `git revert` → `.pre-inc5.bak`.
+
+### Result (2026-06-03, reproducible book): residual is OPACITY, not the mesh flags → inc5c
+- A reproducible book ("Forbidden Alchemy: The Guide to Toxin Brewing and Disposal", BP_GrabbingBook_C_9179):
+  grabbable, but invisible when looked at, visible again after dropping. GRAB log:
+  `unwarded=true bHidden=false meshHidden=false mat=...MID_MI_G01_Book...` — EVERY visibility flag says
+  visible. So inc5b's mesh-flag fixes can't apply to it; the invisibility is the per-book MID's
+  transparency. (inc5b's bVisible/mesh fixes stay — valid for the flag-based cases — but this book needs
+  opacity.) → Increment 5c.
+
+---
+
+## Increment 5c — OPACITY restore  ·  status: LIVE, AWAITING VALIDATION
+
+**Flag:** `BOOK_OPACITY_FIX` (default `true`; carried by `BOOK_EVENT_GRABFIX` / `BOOK_EVENT_REVEAL`).
+**Files:** `Scripts/main.lua` (`_bh_grab_check` + REVEAL-complete: read the MID Opacity via
+`sm:GetMaterial(0)` — the reliable path; `b.BookMatInst` read `nil` — log it + actor `scaleX`; if an
+unwarded book's Opacity < 1, set it to 1), `Scripts/diag_flags.lua` (flag).
+
+**Behaviour:** on grab and on look-at (show), for an unwarded book, read
+`sm:GetMaterial(0):GetScalarParameterValue("Opacity")`. If < 1 (stuck transparent),
+`SetScalarParameterValue("Opacity", 1)`. Sets a scalar on the EXISTING actor MID (what the dormant
+material worker does) — NOT a MID on the HISM (the documented crash). The GRAB log now also prints
+`opacity=` + `scaleX=` for diagnosis.
+
+**To validate:** reproduce the book — GRAB log should show `opacity=0` (or <1), confirming the cause;
+`GRAB-FIX ... fixed=opacity(..)` / `REVEAL-complete ... op=0` should fire and the book should stay visible.
+If `opacity=1` but still invisible, the logged `scaleX` is the next suspect. No crash.
+
+**Rollback:** `BOOK_OPACITY_FIX=false` (keeps the opacity LOGGING for diagnosis, drops the write) →
+`git revert` → `.pre-inc5.bak`.
+
+### inc5c result + the real finding (2026-06-04): it's CORRUPT DISPLAY → fix = RefreshInfo (inc5d/5e)
+The opacity reads (inc5c) returned nil/0 — wrong accessor AND not the cause. Widened the grab diagnostic
+to dump the MID's full scalar + vector params, the pile (HISM) state, and the mesh world-Z. A controlled
+3-adjacent-books test (middle broken) was decisive:
+- NOT geometry (mesh Z == actor Z), NOT custom data (empty), NOT the pile mask (`compMat` normal,
+  `compVis=true`), NOT scale (1.0), NOT any visibility flag (all read "visible").
+- The broken book's IDENTITY is correct (right series) but its DISPLAY is corrupt — out-of-range Tint
+  colors (`2.0` / `3.0` vs the normal `0–1`). And broken books DON'T share one wrong value (one had
+  out-of-range tints, another normal; `DesatB<0.5` is 292/362 = common) → there is NO reliable
+  value-marker to detect them by.
+- **Conclusion:** scrambled DISPLAY over intact data. The game's own `RefreshInfo()` rebuilds a book's
+  appearance from its BookInfo, so a REDRAW is the correction — no detection needed.
+
+## Increment 5d — RefreshInfo on grab  ·  status: in beta6.2
+**Flag:** `BOOK_REFRESH_FIX`. On grab of an unwarded book, call `b:RefreshInfo()` to redraw it.
+
+## Increment 5e — PROACTIVE RefreshInfo sweep (SHIPPED in beta6.2)  ·  status: LIVE, FIELD-VALIDATING
+**Flag:** `BOOK_REFRESH_SWEEP` (default `true`). Chunks through every unwarded book (`RSWEEP_BUDGET=12`
+per SetActorVisible pre-hook call — game thread, no mass burst, no ExecuteInGameThread) calling
+`RefreshInfo` so a corrupt/invisible book self-heals as the player moves — no grab needed. Redraws
+healthy books too (a no-op redraw) since broken books can't be detected by value. World-epoch guarded.
+**Confirmed:** RefreshInfo executes + redraws (the `SetBookInfo` count tracks `refresh-sweep` 1:1) and is
+SAFE (~144 healthy redraws — no flicker / stutter / crash). EFFECTIVENESS (heals broken books) is
+unconfirmable locally (the invisibility isn't in any readable value + the bug is intermittent), so it
+ships as a **candidate fix for FIELD validation**. Grab-path fix + full grab diagnostics (`GRAB` /
+`-PARAMS` / `-VPARAMS` / `-PILE` / `-MESH`) left in to capture any still-broken book.
+**Rollback:** `BOOK_REFRESH_SWEEP=false` (keeps grab-path RefreshInfo) → `BOOK_REFRESH_FIX=false` (drops
+both) → `git revert` → `.pre-inc5.bak`.
+
+**Dead ends (kept in code, gated off / unused, for reference):** inc5a timer-sweep clearing `bHidden`
+(`BOOK_SWEEP=false` — churned vs the game's per-frame Tick); the SetActorVisible POST-hook (never fires
+in this UE4SS build → inc3 REVEAL was dead code; REVEAL-complete moved to the PRE-hook); the DesatB scan
+(`_scan_desat`, call removed — DesatB isn't the marker); the opacity read/fix (inc5c — not the cause).
