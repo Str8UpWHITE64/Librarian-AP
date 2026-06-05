@@ -1721,6 +1721,147 @@ function M._finalize_apply_books(books, n, stats)
 end
 
 -- ============================================================================
+-- Periodic actor-state reconciliation  (Bug 1 / Bug 2 fix)
+-- ============================================================================
+--
+-- A floor book's warded/unwarded state lives across THREE objects that the game
+-- and the mod toggle on DIFFERENT schedules:
+--   * HISM pile-instance visibility -- Layer 3 (apply_book_visibility), re-run every 5s.
+--   * Actor bHidden                 -- the GAME's distance swap (HISM <-> actor form) + Pass 1.
+--   * Actor collision + SM_Book_1 mesh flags -- Pass 1 ward (only on an item flush) + beta6 hooks.
+--
+-- Only Layer 3 runs continuously. Pass 1 (the ACTOR ward) is event-driven (it runs
+-- inside flush_apply, i.e. on item receipt / connect settle), and the beta6 hooks are
+-- reactive (they fire on the game's own SetActorVisible / grab calls, which were proven
+-- to miss cases -- diag_flags BOOK_EVENT_REVEAL, "revealed=0"). So when an unwarded book's
+-- actor lazy-streams in, or the game's swap leaves a flag stale, nothing re-asserts the
+-- ACTOR state. Two symptoms, one gap:
+--   Bug 1: visible (pile shown) but NOT grabbable -- collision left OFF.
+--   Bug 2: grabbable but invisible when looked at  -- SM_Book_1 left hidden, so the actor
+--          form (shown on look/grab) renders nothing.
+--
+-- This pass is the missing continuous counterpart to Layer 3, for the ACTOR. For each
+-- UNWARDED book it asserts the two flags the bugs leave stale, writing ONLY when the live
+-- value disagrees -- read-before-write "ground truth", the same churn-free pattern as
+-- WARD_GROUND_TRUTH for bookcases. Steady state = all reads, zero writes, zero render-state
+-- churn, so it cannot reintroduce the layer-3 crash.
+--
+-- Deliberately swap-safe:
+--   * It NEVER touches actor bHidden for an unwarded book -- that flag is the game's
+--     distance swap; pinning it visible would double-render a far book.
+--   * It corrects SM_Book_1 ONLY when the actor is already in its SHOWN form (bHidden=false)
+--     -- exactly the Bug-2 condition -- so far books (HISM form) are never churned.
+--   * Collision-on is harmless on a far book (you can't reach it) and correct the instant
+--     the swap shows the actor, so it's asserted unconditionally for unwarded books.
+--
+-- Rolling cursor + budget: a pass touches at most RECONCILE_BUDGET actors so the async poll
+-- loop keeps pumping (same shape as main.lua's RefreshInfo sweep). Full coverage every
+-- ceil(n / budget) passes (~a few 5s ticks). Warded books are skipped this iteration -- the
+-- reported bugs are unwarded-half-shown, and ENFORCE + Layer 3 already keep warded hidden.
+local RECONCILE_BUDGET = 1000
+function M.reconcile_book_actors()
+    if not _diag_on("BOOK_ACTOR_RECONCILE") then return end
+    if not M._apply_safe then return end
+    if M._flush_in_progress then return end          -- don't race an active Pass-1 flush
+    if not M._recon_started then
+        M._recon_started = true
+        log(("[reconcile] active (budget=%d) -- periodic actor-state reconcile for Bug 1/Bug 2"):format(RECONCILE_BUDGET))
+    end
+    -- (Re)snapshot the book list + unwarded set when the cursor wraps or the world reloaded.
+    if M._recon_books and (M._world_epoch or 0) ~= (M._recon_epoch or 0) then
+        M._recon_books = nil
+    end
+    if not M._recon_books or (M._recon_cursor or 1) > (M._recon_n or 0) then
+        -- Sweep boundary: emit a heartbeat for the sweep that just finished -- proves the
+        -- reconcile is alive and shows how many unwarded books it examined, so a run with
+        -- corrected=0 is distinguishable from one where the scan never ran -- then reset.
+        if M._recon_sweep_actors then
+            log(("[reconcile] sweep done: %d actors, examined %d unwarded, corrected=%d"):format(
+                M._recon_sweep_actors, M._recon_sweep_checked or 0, M._recon_sweep_corrected or 0))
+        end
+        M._recon_books = FindAllOf("BP_GrabbingBook_C")
+        M._recon_n = 0
+        if M._recon_books then pcall(function() M._recon_n = #M._recon_books end) end
+        M._recon_cursor = 1
+        M._recon_epoch = M._world_epoch
+        M._recon_sweep_actors = M._recon_n
+        M._recon_sweep_checked = 0
+        M._recon_sweep_corrected = 0
+        local only_shelfable = M._slot_data and M._slot_data.only_unward_shelfable_books == 1
+        M._recon_uw = M._compute_unwarded_set(only_shelfable)
+        if M._recon_n == 0 then return end
+    end
+    local books = M._recon_books
+    local unwarded = M._recon_uw
+    if not (books and unwarded) then return end
+    local epoch0 = M._world_epoch
+    local lo = M._recon_cursor
+    local hi = math.min(lo + RECONCILE_BUDGET - 1, M._recon_n)
+    -- READ pass (async thread): collect only the unwarded books whose live flags are wrong.
+    local fixes = {}
+    local checked_unwarded = 0
+    for i = lo, hi do
+        local b = books[i]
+        if b and b:IsValid() then
+            local aidx = _book_valid_asset_idx(b)
+            local series = aidx ~= nil and M._asset_to_series[aidx] or nil
+            if series and unwarded[series] then
+                checked_unwarded = checked_unwarded + 1
+                -- Bug 1: collision must be ON for an unwarded (received) book.
+                local coll
+                pcall(function() coll = b:GetActorEnableCollision() end)
+                local fix_coll = (coll == false)
+                -- Bug 2: only when the actor is in its SHOWN form (bHidden=false) -- the
+                -- far HISM form (bHidden=true) renders via the pile, so leave it alone.
+                local bhid
+                pcall(function() bhid = b.bHidden end)
+                local fix_mesh, sm = false, nil
+                if bhid == false then
+                    pcall(function() sm = b.SM_Book_1 end)
+                    if sm and sm:IsValid() then
+                        local mh, mv
+                        pcall(function() mh = sm.bHiddenInGame end)
+                        pcall(function() mv = sm.bVisible end)
+                        if mh == true or mv == false then fix_mesh = true end
+                    end
+                end
+                if fix_coll or fix_mesh then
+                    fixes[#fixes + 1] = { book = b, coll = fix_coll, mesh = fix_mesh, sm = sm, series = series }
+                end
+            end
+        end
+    end
+    M._recon_cursor = hi + 1
+    M._recon_sweep_checked = (M._recon_sweep_checked or 0) + checked_unwarded
+    if #fixes == 0 then return end
+    -- WRITE pass: only the mismatched books. Same thread gate as Pass 1
+    -- (BOOK_ACTOR_GAMETHREAD): marshals to the game thread when that flag is on, inline
+    -- otherwise. Re-check the world epoch first -- a reload between read and a MARSHALED
+    -- write would leave `fixes` pointing at freed actors (a native AV pcall can't catch).
+    _on_game_thread(function()
+        if (M._world_epoch or 0) ~= (epoch0 or 0) then return end
+        local c_coll, c_mesh = 0, 0
+        for _, f in ipairs(fixes) do
+            local b = f.book
+            if b and b:IsValid() then
+                if f.coll then
+                    pcall(function() b:SetActorEnableCollision(true) end)
+                    c_coll = c_coll + 1
+                end
+                if f.mesh and f.sm and f.sm:IsValid() then
+                    pcall(function() f.sm:SetHiddenInGame(false, false) end)
+                    pcall(function() f.sm:SetVisibility(true, false) end)
+                    c_mesh = c_mesh + 1
+                end
+            end
+        end
+        M._recon_sweep_corrected = (M._recon_sweep_corrected or 0) + #fixes
+        log(("[reconcile] window[%d-%d/%d] unwarded=%d corrected=%d (coll=%d mesh=%d)"):format(
+            lo, hi, M._recon_n, checked_unwarded, #fixes, c_coll, c_mesh))
+    end, "BOOK_ACTOR_GAMETHREAD")
+end
+
+-- ============================================================================
 -- Apply: Bookcases (Phase 2a — section-gated visibility)
 -- ============================================================================
 

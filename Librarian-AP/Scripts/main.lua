@@ -1428,6 +1428,11 @@ local function start_gameplay_loops()
         log("[crumb] ward"); pcall(function() IA._apply_bookcases_to_world() end)
         log("[crumb] idle:5s")
         pcall(apply_book_visibility) -- async; postdates BAE1A5E0, so left uncrumbed
+        -- Periodic actor-state reconcile: the continuous counterpart to Layer 3, for the
+        -- BP_GrabbingBook ACTOR. Heals Bug 1 (visible-not-grabbable) + Bug 2 (grabbable-
+        -- invisible) by re-asserting collision + SM_Book_1 mesh on unwarded books whose
+        -- flags drifted. Read-before-write, budgeted, gated BOOK_ACTOR_RECONCILE.
+        pcall(function() IA.reconcile_book_actors() end)
         return false
     end)
 

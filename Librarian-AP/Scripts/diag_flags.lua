@@ -151,4 +151,15 @@ return {
     -- visible flicker on healthy books or any hitch, flip THIS false (BOOK_REFRESH_FIX grab-path
     -- still works) and report. Requires BOOK_EVENT_HOOKS.
     BOOK_REFRESH_SWEEP = true,
+
+    -- v1.1.0 periodic ACTOR-STATE RECONCILE (the Bug 1 / Bug 2 fix). Every 5s, walk a budget
+    -- of BP_GrabbingBook actors and, for each UNWARDED (received) book, assert the two flags the
+    -- bugs leave stale -- collision ON (Bug 1: "visible but not grabbable") and, when the actor is
+    -- in its shown form, SM_Book_1 mesh visible (Bug 2: "grabbable but invisible when looked at").
+    -- Read-before-write: writes ONLY the books whose live value disagrees, so steady state is
+    -- reads-only (no churn, no render-state crash risk). It never pins actor bHidden for unwarded
+    -- books (that's the game's distance HISM<->actor swap), so it can't double-render a far book.
+    -- Logs [reconcile] lines only when it corrects something. Flip false to A/B back to the old
+    -- reactive-only behavior (Pass 1 on flush + the beta6 hooks) and confirm the bugs return.
+    BOOK_ACTOR_RECONCILE = true,
 }
