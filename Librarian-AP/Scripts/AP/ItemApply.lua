@@ -1,38 +1,25 @@
 -- AP/ItemApply.lua
 -- Translates received AP items into game-state mutations.
 --
--- SCOPE:
---   • Books warded by SERIES. A book is unwarded iff its series is in
---     `_series_unlocked`. "Warding" = SetActorHiddenInGame(true) +
---     SetActorEnableCollision(false): title text disappears and pickup is
---     blocked, while the mesh remains as a visible "stack" on the shelf.
---   • Bookcase visibility per section: bookcases sorted by BookOrderIdx;
---     visible_count = _shelves_open[section]. Each Progressive Shelf
---     Unlock (X) reveals one more bookcase in section X.
---   • Major Magic level items are granted by calling UpgradePlayer(idx)
---     on the player. _ap_grant guards against the UpgradePlayer hook in
---     main.lua echoing the call back as a location check.
---   • Minor Magic abilities (Crimson/Emerald/Azure/Golden) are NOT items —
---     the player gets each ability natively from the in-world chest the
---     matching key opens. The chest opening is tracked as a location check.
+-- Two warding axes:
+--   • Per-book by SERIES: a book is unwarded iff its series is in _series_unlocked.
+--     Ward = SetActorHiddenInGame(true) + collision-off (hide title, block pickup).
+--   • Per-bookcase by SECTION: cases sorted, visible_count = _shelves_open[section].
+--     Each Progressive Shelf Unlock (X) reveals one more case in section X.
+-- Major Magic = UpgradePlayer(idx) (guarded by _ap_grant vs the main.lua hook echo).
+-- Minor Magic abilities aren't items — earned from the in-world chest each key opens.
 --
--- DERIVED STATE shape:
---   _series_unlocked   = { [series_name] = true } from N Progressive Series
---                        Unlock items × series_per_unlock; indexes
---                        slot_data.series_order.
---   _shelves_open      = { [section_id] = open_count } from per-section
---                        Progressive Shelf Unlock items. A section is
---                        "active" iff _shelves_open[X] >= 1; visible bookcase
---                        count for X = _shelves_open[X].
+-- Derived state:
+--   _series_unlocked = { [series] = true } from N unlocks × series_per_unlock into series_order.
+--   _shelves_open    = { [section] = open_count }; section active iff >= 1, visible cases = count.
 
 local M = {}
 
 local LOG_PREFIX = "[ItemApply]"
 local function log(msg) print(LOG_PREFIX .. " " .. tostring(msg)) end
 
--- Crash-hunt instrumentation (see AP/trace.lua, diag_flags.lua, CRASH_HANDOFF.md).
--- trace = durable flushed breadcrumb ledger; _diag_on = bisection switches (default on).
--- Both pcall-guarded so a missing module never breaks ItemApply.
+-- Crash-hunt instrumentation (see CRASH_HANDOFF.md). trace = durable breadcrumb ledger;
+-- _diag_on = bisection switches (default on). Both pcall-guarded so a missing module is safe.
 local trace = (function()
     local ok, t = pcall(require, "AP/trace")
     if ok and type(t) == "table" and t.begin then return t end
@@ -48,14 +35,10 @@ local function _diag_on(flag)
     return v and true or false
 end
 
--- _on_game_thread(fn, flag): run fn on the GAME THREAD via ExecuteInGameThread.
--- UE4SS LoopAsync callbacks run on a SEPARATE async thread (only RegisterHook /
--- NotifyOnNewObject run on the game thread), so warding writes fired from there
--- race the engine's collision / render / cluster-tree workers that read the same
--- components -- the lead crash suspect (see CRASH_HANDOFF.md, main.lua on_game_thread).
--- `flag` gates the marshal for A/B bisection; falls back to inline (the OLD off-thread
--- behavior) when the flag is false or ExecuteInGameThread is unavailable, so a missing
--- global can never break mod loading.
+-- Run fn on the GAME THREAD via ExecuteInGameThread. LoopAsync callbacks run on a
+-- separate async thread, so warding writes from there race the engine's collision/render/
+-- cluster-tree workers -> crash (CRASH_HANDOFF.md). `flag` gates the marshal for bisection;
+-- falls back to inline when off or ExecuteInGameThread is missing, so loading never breaks.
 local function _on_game_thread(fn, flag)
     if _diag_on(flag) and type(ExecuteInGameThread) == "function" then
         ExecuteInGameThread(fn)
@@ -65,7 +48,7 @@ local function _on_game_thread(fn, flag)
 end
 
 -- ============================================================================
--- Constants (mirrors apworld/librarian/data.py::UpgradeAbility)
+-- Constants (mirror apworld/librarian/data.py + Locations.py)
 -- ============================================================================
 
 -- AP location ID layout (mirrors apworld/librarian/Locations.py)
@@ -77,11 +60,9 @@ local AP_LOC_MILESTONE_FIRST = AP_BASE + 640 -- 22 entries: aligned to MILESTONE
 local AP_LOC_ROW_COMPLETION_FIRST = AP_BASE + 1000 -- 50 entries: aligned to ROW_COMPLETION_THRESHOLDS order
 local AP_MAX_PLAYER_LEVEL  = 45
 
--- section_id → ordinal position in data.SECTIONS (apworld/librarian/data.py).
--- Used as a fallback when slot_data doesn't ship section_location_map
--- (legacy 1.0.x seeds generated before the section-completion fix). The
--- AP location id for "Section Complete: <id>" is AP_LOC_SECTION_FIRST +
--- SECTION_IDX[id]. Keep in lockstep with the SECTIONS tuple ordering.
+-- section_id → ordinal in data.SECTIONS. Fallback when slot_data lacks
+-- section_location_map; "Section Complete: <id>" loc = AP_LOC_SECTION_FIRST + SECTION_IDX[id].
+-- Keep in lockstep with the SECTIONS tuple ordering.
 local SECTION_IDX = {
     ["1A"] =  0, ["1B"] =  1, ["1C"] =  2, ["1D"] =  3, ["1E"] =  4,
     ["1F"] =  5, ["1G"] =  6, ["1H"] =  7, ["1I"] =  8, ["1J"] =  9,
@@ -92,20 +73,16 @@ local SECTION_IDX = {
     ["2P"] = 29, ["2Q"] = 30,
 }
 
--- floor number → ordinal offset within AP_LOC_FLOOR_FIRST. Used as a
--- fallback when slot_data doesn't ship floor_location_map (pre-1.0.4
--- seeds). Floor 1 → loc 1910550, Floor 2 → loc 1910551.
+-- floor number → ordinal offset within AP_LOC_FLOOR_FIRST. Fallback when
+-- slot_data lacks floor_location_map. Floor 1 → loc 1910550, Floor 2 → 1910551.
 local FLOOR_IDX = {
     [1] = 0,
     [2] = 1,
 }
 
--- Cumulative XP curve, mirrored from apworld/librarian/data.py:XP_CURVE.
--- Used as a fallback for run_baseline_sync's level-up catch-up when
--- player.SkillLevelUpRowNum isn't accessible at baseline time. The live
--- BP read remains the primary source — this is just so the baseline
--- doesn't silently compute xp_level=0 for a player who has 14 rows
--- finished offline. Keep in lockstep with data.py XP_CURVE.
+-- Cumulative XP curve (mirrors data.py:XP_CURVE). Fallback for run_baseline_sync's
+-- level catch-up when player.SkillLevelUpRowNum isn't readable; live BP read is primary.
+-- Keep in lockstep with data.py XP_CURVE.
 local XP_CURVE = {
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 19, 22, 25, 29, 33, 37, 41,
     46, 50, 55, 61, 66, 72, 78, 84, 91, 98, 105, 112, 120, 127, 135,
@@ -124,8 +101,7 @@ local UPGRADE = {
     GRAB_SAME_TYPE_BOOK = 8,
 }
 
--- AP item name → UpgradeAbility index. Major Magic items are progressive
--- (each instance bumps level by 1 via UpgradePlayer).
+-- AP item name → UpgradeAbility index. Progressive: each instance bumps level by 1.
 local SKILL_ITEM_TO_ABILITY = {
     ["Progressive Sort"]          = UPGRADE.SORT_BOOKS,
     ["Progressive Shelf Guide"]   = UPGRADE.SHOW_MATCHING_SHELF,
@@ -151,140 +127,96 @@ M._received_counts   = {}  -- { [item_name] = count }
 M._series_unlocked   = {}  -- { [series_name] = true }
 M._shelves_open      = {}  -- { [section_id] = open_count }
 
--- True around AP-driven UpgradePlayer calls so the UpgradePlayer hook in
--- main.lua doesn't echo the call back as a location check.
+-- True around AP-driven UpgradePlayer calls so the main.lua hook doesn't echo a check.
 M._ap_grant = false
 
--- True once we have BOTH slot_data + asset_data and can apply items to world.
--- Until set, items still increment _received_counts but no game-state
--- mutation runs.
+-- True once both slot_data + asset_data are loaded. Until then items only count.
 M._initialized = false
 
--- True only while the player is in actual gameplay (not title screen).
--- Set by main.lua's LoadMap hook via set_gameplay_active(). Mutations to
--- world (book ward / skill grant) are GATED on this — touching actors at
--- the title screen has been observed to crash the game.
+-- True only during real gameplay (not title). Set by main.lua's LoadMap hook.
+-- World mutations gate on this — touching actors at the title screen crashes.
 M._gameplay_active = false
 
--- Pre-apply: when true, flush_apply is allowed at the post-connect title
--- screen so warding completes BEFORE the player clicks Continue. The
--- Continue/Start buttons in main.lua are kept disabled until
--- _pre_apply_complete flips true, which the settle loop sets after the
--- deferred tree-walk queue has drained and stayed empty.
+-- Pre-apply: warding runs behind the post-connect title screen so it completes
+-- BEFORE Continue. main.lua keeps Continue disabled until _pre_apply_complete,
+-- which the settle loop sets once the deferred tree-walk queue drains and stays empty.
 M._allow_pre_apply = false
 M._pre_apply_complete = false
 
--- Counter bumped every apply_item call. The pre-apply settle loop
--- watches this for "items have quieted down": once N ticks pass without
--- the counter advancing, the starting-item dump is considered complete
--- and the settle loop fires the single world-mutating flush_apply with
--- the FINAL state (instead of N wasteful per-item flushes).
+-- Bumped every apply_item. The pre-apply settle loop watches it for "items quieted":
+-- N idle ticks => fire one world-mutating flush_apply with the FINAL state, not N.
 M._last_item_apply_tick = 0
 
--- Mid-gameplay reconnect window. When the player disconnects then
--- reconnects WHILE PLAYING, the AP server re-sends every received item
--- one at a time. Without this flag, each apply_item would call
--- flush_apply on partial state (most shelves not yet re-unlocked),
--- causing every bookcase to flash to hidden and the placed books to
--- look stranded until the next 5-second re-apply rebuilds the world.
---
--- Set true by set_slot_data() when it fires mid-gameplay; cleared by
--- main.lua's reconnect-settle watcher once items quiet down. While
--- true, apply_item only recomputes state and skips flush_apply — the
--- watcher fires ONE flush_apply at the end with the fully rebuilt state.
+-- Mid-gameplay reconnect: AP re-sends every received item one at a time. Without this,
+-- each apply_item would flush_apply on partial state and flash every bookcase to hidden.
+-- Set by set_slot_data() when it fires mid-gameplay; cleared by main.lua's reconnect-settle
+-- watcher, which then fires ONE flush_apply with the fully rebuilt state.
 M._reconnect_settle_active = false
 
--- Skill grants requested while not in gameplay queue here and replay on
--- the gameplay-active transition.
+-- Skill grants requested while not in gameplay; replayed on the gameplay-active transition.
 M._pending_skill_grants = {}
 
--- Tracks how many times we've successfully bumped each skill via
--- UpgradePlayer. Initialised from the save's PlayerExtraData.SkillData
--- when apply-safe fires (so already-applied levels don't re-trigger on
--- reconnect). Increments on each successful bump.
+-- Successful UpgradePlayer bumps per skill. Seeded from save's PlayerExtraData.SkillData
+-- at apply-safe so already-applied levels don't re-trigger on reconnect.
 M._applied_skill_counts = {}
 
--- Even with _gameplay_active=true and books spawned, mutating book actors
--- immediately after LoadMap has crashed the game (book sub-levels still
--- streaming or actor init not finished). Independent flag set true ONLY
--- after a generous post-LoadMap delay + initialization sanity check.
+-- Mutating book actors right after LoadMap crashes (sub-levels still streaming / actors
+-- un-init), even with _gameplay_active. Set true only after a post-LoadMap delay + probe.
 M._apply_safe = false
 
--- Bookcase index built at apply-time. Maps section_id → array of unique
--- bookcase actors derived from BP_BookCase_C's CorrectBookDataIndex[1] →
--- AssetIdx → section. Reset whenever we leave gameplay (cases get torn
--- down on level reload).
+-- Bookcase index (section_id → array of unique case actors), built at apply-time.
+-- Reset on leaving gameplay (cases torn down on level reload).
 M._section_to_cases = {}
 M._cases_indexed    = false
 
--- Reverse lookup: bookcase actor key → section_id. Built alongside index.
+-- Reverse lookup: case actor key → section_id.
 M._case_to_section  = {}
 
--- Last-logged "Bookcases: shown=X hidden=Y dead=Z" string. We compare current
--- state against this and only log when it changes — the periodic re-apply
--- runs every 5s and was spamming the log with identical lines.
+-- Last-logged bookcase summary; only re-log on change (the 5s re-apply spammed it).
 M._last_apply_log_key = nil
 
--- Already-sent row location IDs in this session (de-dupe defense).
+-- Already-sent row location IDs this session (de-dupe defense).
 M._sent_row_locations = {}
 
--- Already-fired row-completion thresholds in this session (de-dupe defense).
--- Keyed by threshold value (matches slot_data.row_completion_thresholds entries).
+-- Already-fired row-completion thresholds this session (de-dupe), keyed by threshold value.
 M._sent_row_completions = {}
 
--- Already-fired "Section Complete: <id>" sections this session (de-dupe
--- defense, keyed by section_id). Section completion fires when every
--- row location in that section is in _sent_row_locations.
+-- Already-fired section completions this session (de-dupe, keyed by section_id).
+-- Fires when every row location in the section is in _sent_row_locations.
 M._sent_section_completions = {}
 
--- section_id → list of row location IDs in that section. Built once from
--- slot_data.row_location_map at slot-data setup so check_section_completions
--- can iterate cheaply.
+-- section_id → list of its row location IDs. Built once from slot_data.row_location_map.
 M._section_to_row_locs = {}
 
--- Already-fired "Floor N Complete" floors this session (de-dupe defense,
--- keyed by integer floor number 1 or 2). Floor completion fires when
--- every row location across the floor's active sections is in
--- _sent_row_locations.
+-- Already-fired floor completions this session (de-dupe, keyed by floor int 1/2).
+-- Fires when every row location across the floor's active sections is sent.
 M._sent_floor_completions = {}
 
--- floor number (int) → list of row location IDs in that floor's active
--- sections. Built from _section_to_row_locs at slot-data setup. For
--- floor-goal seeds, only the active floor has an entry (the inactive
--- floor has no rows in row_location_map and so contributes nothing).
+-- floor number → flat list of row location IDs in its active sections. Built from
+-- _section_to_row_locs. Floor-goal seeds only have the active floor's entry.
 M._floor_to_row_locs = {}
 
--- Highest player level we've sent a "Reached Level N" check for. Synced
--- from max of: (a) XP curve vs GameSaveData.CurrentFinishedRowNum,
--- (b) APClient._sent_checks (server's view of prior sessions). Max
--- guards against stale GameSaveData at baseline time. Subsequent
--- level-ups arrive via the OnLevelUp BP hook → on_level_up_event(),
--- which catches up from _sent_checks before incrementing — self-heals
--- if baseline missed. (Reading CurrentFinishedRowNum at OnLevelUp time
--- is unreliable — the field hasn't updated yet when the event fires.)
+-- Highest level we've sent a "Reached Level N" check for. Synced to max of the XP curve
+-- vs CurrentFinishedRowNum and APClient._sent_checks (max guards stale GameSaveData).
+-- Subsequent level-ups arrive via on_level_up_event(), which catches up from _sent_checks
+-- first (CurrentFinishedRowNum hasn't updated yet when OnLevelUp fires).
 M._levels_reached = 0
 M._level_baseline_done = false
 
--- Milestone thresholds we've already sent checks for (set { [threshold] = true }).
+-- Milestone thresholds already checked ({ [threshold] = true }).
 M._milestones_sent = {}
 
 
 
--- "Stray" BookCase actors found in the level that aren't referenced by any
--- CabinetLabel's CountBookCase array. These appear to be level-design
--- artifacts — bookcases tucked into walls / corners that don't belong to
--- any section but are still real BookCase actors. They were never indexed
--- (and so never hidden/collision-disabled), and the game's placement system
--- can still find them by aim angle, causing a softlock when the player
--- places a book they can't retrieve. Collected once during _index_bookcases
--- and permanently kept hidden + collision-off by _apply_bookcases_to_world.
+-- BookCase actors not referenced by any CabinetLabel's CountBookCase — level-design
+-- artifacts (cases tucked in walls). The placement system can still find them by aim
+-- angle and accept an unreachable book = softlock, so they're kept permanently
+-- hidden + collision-off by _apply_bookcases_to_world.
 M._stray_cases = {}
 
--- One-shot guard: baseline sync (rows/levels/milestones) runs only on the
--- first detected player movement after entering gameplay. The title screen
--- has the previous save loaded behind the scenes; reading GameSaveData at
--- apply-safe time can return stale values. Movement is a reliable signal
--- that the new save state has fully taken over in-memory.
+-- One-shot: baseline sync runs only on first player movement after entering gameplay.
+-- The title screen has the previous save loaded, so a GameSaveData read at apply-safe
+-- can be stale; movement is a reliable "new save is live" signal.
 M._baseline_sync_done = false
 
 -- ============================================================================
@@ -332,16 +264,13 @@ function M.load_asset_data(path)
     return true
 end
 
---- Called by main.lua's APClient.on_slot_connected. Stores the seed-specific
---- orderings and resets per-connection state. AP will re-send all received
---- items on (re)connect, so we reset _received_counts to avoid double-counts.
+--- Called by main.lua on slot-connect. Stores seed orderings and resets per-connection
+--- state. AP re-sends all items on (re)connect, so reset _received_counts to avoid double-counts.
 function M.set_slot_data(slot_data)
     M._slot_data = slot_data
-    -- book_visibility mode (BookVisibility option). true = HIDE warded books ("hidden", the
-    -- default); false = "stacks" = keep them VISIBLE but non-grabbable. The three live hide
-    -- paths gate on this -- layer-1 actor ward (below), the SetActorVisible ENFORCE hook, and
-    -- the HISM-pile apply_book_visibility -- so in stacks they skip hiding and only collision-off
-    -- remains. "~= stacks" so any missing/unknown value defaults to the safe legacy hide.
+    -- BookVisibility option. true = HIDE warded books (default); false = "stacks" = visible
+    -- but non-grabbable. The three hide paths gate on this so stacks keeps only collision-off.
+    -- "~= stacks" defaults any missing/unknown value to the safe hide.
     M._book_hide_mode = (slot_data and slot_data.book_visibility ~= "stacks")
     M._received_counts    = {}
     M._series_unlocked    = {}
@@ -367,19 +296,12 @@ function M.set_slot_data(slot_data)
         return
     end
 
-    -- (beta7: the v1.0.2/v1.0.3 warding-rule version gate was removed. Off now
-    -- uniformly unwards every received series regardless of bookcase -- see
-    -- M._compute_unwarded_set -- so the old shelf-req floor and the
-    -- _use_v103_warding split no longer exist. On mode is unchanged across versions.)
     log("slot_data version=" .. tostring(slot_data.version or "?"))
 
-    -- Derived lookups built from asset_idx_to_series.json + slot_data so
-    -- the per-book warding decision is cheap. Built once on slot_connect
-    -- since the underlying data is per-seed.
-    --   _series_to_section[name] = section_id
-    --   _series_to_asset_idx[name] = numeric AssetIdx (for any future
-    --                                  asset-ordered tiebreaks)
-    --   _section_bookcase_count[sid] = how many bookcases that section has
+    -- Derived lookups (per-seed, built once) so the per-book warding decision is cheap:
+    --   _series_to_section[name]     = section_id
+    --   _series_to_asset_idx[name]   = numeric AssetIdx
+    --   _section_bookcase_count[sid] = case count for that section
     M._series_to_section = {}
     M._series_to_asset_idx = {}
     for aidx, sname in pairs(M._asset_to_series) do
@@ -393,9 +315,8 @@ function M.set_slot_data(slot_data)
         end
     end
 
-    -- Build section_id → list of row location IDs from row_location_map keys.
-    -- Used by fire_section_completions() to determine when all rows of a
-    -- section are complete. Skipped for seeds without row_location_map.
+    -- Build section_id → list of row location IDs from row_location_map keys
+    -- (for fire_section_completions). Skipped for seeds without row_location_map.
     M._section_to_row_locs = {}
     if type(slot_data.row_location_map) == "table" then
         for key, loc_id in pairs(slot_data.row_location_map) do
@@ -413,12 +334,8 @@ function M.set_slot_data(slot_data)
     end
 
     -- Build floor_number → flat list of row location IDs by re-bucketing
-    -- _section_to_row_locs. Section IDs are encoded as "<floor><letter>"
-    -- (e.g. "1A", "2Q"), so the first character is the floor number.
-    -- Floor-goal seeds only have one floor's worth of sections in
-    -- _section_to_row_locs, so the other floor naturally drops out (its
-    -- "Floor N Complete" location isn't in the pool either, per
-    -- create_regions's active_floor_locs filter).
+    -- _section_to_row_locs. Section IDs are "<floor><letter>" so sid[1] is the floor.
+    -- Floor-goal seeds only have the active floor's sections, so the other drops out.
     M._floor_to_row_locs = {}
     for sid, row_locs in pairs(M._section_to_row_locs) do
         local floor_n = tonumber(sid:sub(1, 1))
@@ -433,19 +350,14 @@ function M.set_slot_data(slot_data)
             end
         end
     end
-    -- Allow pre-apply: the OpenLevel-on-connect that main.lua fires right
-    -- after this will trigger a fresh M01 LoadMap → apply-gate retry loop.
-    -- main.lua's title-button logic keeps Continue disabled until
-    -- _pre_apply_complete flips true (after the deferred tree-walk drains).
+    -- Allow pre-apply: main.lua's OpenLevel-on-connect triggers a fresh M01 LoadMap →
+    -- apply-gate retry loop. Continue stays disabled until _pre_apply_complete.
     M._allow_pre_apply = true
     M._pre_apply_complete = false
 
-    -- Mid-gameplay reconnect: AP server is about to re-send every item the
-    -- player already received. Without this flag, each apply_item would
-    -- call flush_apply with partial state (zero shelves open at first,
-    -- then 1, then 2, ...), causing every bookcase to flicker to hidden.
-    -- main.lua's reconnect-settle watcher fires ONE flush_apply once items
-    -- quiet down and clears this flag.
+    -- Mid-gameplay reconnect: AP is about to re-send every received item. Without this
+    -- flag each apply_item would flush_apply on partial state and flicker cases to hidden.
+    -- main.lua's reconnect-settle watcher fires ONE flush_apply once items quiet, then clears.
     if M._gameplay_active then
         M._reconnect_settle_active = true
         log("Slot data set; per-connection state reset; reconnect-settle window opened (mid-gameplay)")
@@ -454,11 +366,9 @@ function M.set_slot_data(slot_data)
         log("Slot data set; per-connection state reset; pre-apply enabled")
     end
 
-    -- Goal-scope verification: log series_order's section coverage so the
-    -- player can confirm at-a-glance that no off-floor series can be
-    -- unlocked. The Python apworld filters series_order to active sections,
-    -- and _recompute_state() only ever sets _series_unlocked[s] for s in
-    -- series_order — so this log is the authoritative truth.
+    -- Goal-scope verification: log series_order's section/floor coverage. The apworld
+    -- filters series_order to active sections, and _recompute_state only unlocks series
+    -- in series_order, so this log is authoritative for "no off-floor series unlockable".
     do
         local goal = slot_data.goal
         local goal_name = ({ [0]="full", [1]="custom", [2]="floor_1", [3]="floor_2" })[goal] or ("?"..tostring(goal))
@@ -498,19 +408,14 @@ function M.set_slot_data(slot_data)
     end
 end
 
---- Called by main.lua's APClient.on_disconnected. Clears pre-apply state
---- so a subsequent reconnect starts fresh.
+--- Called by main.lua on disconnect. Clears pre-apply state so reconnect starts fresh.
 function M.clear_pre_apply()
     M._allow_pre_apply = false
     M._pre_apply_complete = false
 end
 
---- Called by main.lua's LoadMap hook. Toggles whether world mutations are
---- safe to perform. On the title→gameplay transition we replay any queued
---- skill grants. World apply does NOT happen here — main.lua's LoadMap
---- retry loop calls set_apply_safe(true) + flush_apply() only after the
---- book sub-levels have streamed in and ItemInfo is populated for many
---- distinct AssetIdx values. See _apply_safe comment.
+--- Called by main.lua's LoadMap hook. Toggles whether we're in gameplay. World apply does
+--- NOT happen here — the LoadMap retry loop drives set_apply_safe + flush_apply later.
 function M.set_gameplay_active(state)
     state = state and true or false
     if M._gameplay_active == state then return end
@@ -518,16 +423,12 @@ function M.set_gameplay_active(state)
     log(("Gameplay-active: %s"):format(tostring(state)))
 
     if not state then
-        -- Leaving gameplay (title screen / level transition): book actors
-        -- are about to be torn down or already gone. Force the next entry
-        -- to re-prove safety before mutating again. Same goes for the
-        -- bookcase index — actor pointers won't survive the level reload.
+        -- Leaving gameplay: book + case actors are about to be torn down. Force the next
+        -- entry to re-prove safety and re-index — actor pointers don't survive the reload.
         if M._apply_safe then
             log("Resetting _apply_safe (left gameplay)")
             M._apply_safe = false
         end
-        -- Reset baseline sync so the next gameplay entry waits for a fresh
-        -- first-movement signal again.
         M._baseline_sync_done = false
         if M._cases_indexed then
             log("Clearing bookcase index (left gameplay)")
@@ -536,50 +437,39 @@ function M.set_gameplay_active(state)
             M._stray_cases = {}
             M._last_apply_log_key = nil
             M._cases_indexed = false
-            -- WardCover actors (v1.1.0) are tied to the old world's case
-            -- actors; both are destroyed when the world unloads. Just
-            -- drop our refs so the next apply re-spawns fresh covers.
+            -- WardCover actors die with the old world; drop refs so the next apply re-spawns.
             M._case_covers = {}
         end
-        -- Warding + sign-glow trackers are keyed to the old world's actors and to
-        -- our last-applied state. Drop them so the next gameplay entry (Continue,
-        -- which may not fully reload) re-wards every case and re-glows every sign
-        -- from scratch instead of apply-on-change skipping them as "unchanged".
+        -- Warding + sign-glow trackers are keyed to the old world's actors. Drop them so the
+        -- next entry (Continue, which may not fully reload) re-wards/re-glows from scratch
+        -- instead of apply-on-change skipping as "unchanged".
         M._case_ward_state = {}
         M._case_placement_mesh = {}   -- stale (old world's components)
         M._section_to_label = nil
         M._section_glow_state = {}
         M._section_glow_orig = {}
-        -- Drop pending skill grants — they'll be re-queued on the next
-        -- slot_connect via set_slot_data's reset + AP item re-dump.
+        -- Pending skill grants get re-queued on the next slot_connect's item re-dump.
         if #M._pending_skill_grants > 0 then
             log(("Clearing %d pending skill grants (left gameplay)"):format(#M._pending_skill_grants))
             M._pending_skill_grants = {}
         end
     end
-    -- Entering gameplay: glow the locked signs promptly instead of waiting for the
-    -- periodic loop (no-op if not yet apply-safe; the loop is the backstop).
+    -- Entering gameplay: glow locked signs now instead of waiting for the periodic loop
+    -- (no-op if not yet apply-safe; the loop is the backstop).
     M._maybe_glow_now()
 end
 
---- Called by main.lua's LoadMap retry loop after the book sub-levels have
---- streamed in and ItemInfo is populated for many distinct AssetIdx values.
---- Until this is true, flush_apply() recomputes derived state but doesn't
---- touch any actors.
----
---- Also drains any queued skill grants — UpgradePlayer silently no-ops
---- when called before the player+world are fully wired, so grants made
---- pre-apply-safe stay at level 0 even after retries.
+--- Called by main.lua's LoadMap retry loop once book sub-levels have streamed in and
+--- ItemInfo is populated. Until true, flush_apply recomputes state but touches no actors.
+--- Also drains queued skill grants (UpgradePlayer no-ops before the world is fully wired).
 function M.set_apply_safe(state)
     state = state and true or false
     if M._apply_safe == state then return end
     M._apply_safe = state
     log(("Apply-safe: %s"):format(tostring(state)))
     if state then
-        -- Save is loaded and stable here — read its skill levels into the
-        -- applied counter BEFORE draining queued grants, so already-applied
-        -- skills (from a prior session) get a correct baseline and aren't
-        -- re-bumped by AP's reconnect item dump.
+        -- Save is stable here — seed the applied counter from its skill levels BEFORE
+        -- draining queued grants, so prior-session skills aren't re-bumped by the re-dump.
         M._init_applied_skill_counts_from_save()
         if #M._pending_skill_grants > 0 then
             local q = M._pending_skill_grants
@@ -601,8 +491,7 @@ function M.apply_item(name)
     M._received_counts[name] = (M._received_counts[name] or 0) + 1
     M._last_item_apply_tick = M._last_item_apply_tick + 1
 
-    -- Skill items: grant via UpgradePlayer immediately. Doesn't depend on
-    -- slot_data / asset_data being loaded.
+    -- Skill items: grant immediately (no slot_data / asset_data dependency).
     if SKILL_ITEM_TO_ABILITY[name] then
         M._apply_skill(name)
     end
@@ -612,16 +501,9 @@ function M.apply_item(name)
         log(("queued (not initialized): %s × %d"):format(name, M._received_counts[name]))
         return
     end
-    -- Defer the world-apply during two settle windows:
-    --   • Pre-apply (post-connect title): 14+ starting items; per-item
-    --     flush is wasteful (each iterates all 3072 books) and visually
-    --     flickers. main.lua's pre-apply settle loop fires ONE
-    --     flush_apply once items quiet, with the FINAL state.
-    --   • Reconnect settle (mid-gameplay): AP re-sends all received
-    --     items on reconnect; per-item flush would hide every bookcase
-    --     mid-rebuild. main.lua's reconnect-settle watcher fires ONE
-    --     flush_apply once items quiet, clearing the flag.
-    -- recompute_state() still runs so counters track during the defer.
+    -- Defer the world-apply during the two settle windows (pre-apply title burst,
+    -- mid-gameplay reconnect re-dump): per-item flush is wasteful + flickers, so main.lua's
+    -- settle watchers fire ONE flush with the FINAL state. recompute still runs to track counts.
     if (M._allow_pre_apply and not M._gameplay_active)
             or M._reconnect_settle_active then
         M._recompute_state()
@@ -630,12 +512,9 @@ function M.apply_item(name)
     M.flush_apply()
 end
 
---- Recompute derived state and apply to world. Idempotent.
---- World mutations are gated on _gameplay_active AND _apply_safe. The
---- former filters out the title screen; the latter is a stronger signal
---- that book sub-levels have actually finished streaming, set by main.lua
---- only after a delay + initialization probe. State recomputation always
---- runs so the in-memory state is correct when apply does fire.
+--- Recompute derived state and apply to world. Idempotent. World mutations gate on
+--- _gameplay_active (not title) AND _apply_safe (sub-levels streamed). State recompute
+--- always runs so in-memory state is correct when apply does fire.
 function M.flush_apply()
     if not M._initialized then return end
     M._recompute_state()
@@ -654,23 +533,15 @@ function M.flush_apply()
     if first_index then
         M._index_bookcases()
     end
-    -- Bookcases first: SetActorHiddenInGame on ~71 actors is fast and gives
-    -- the player immediate visual feedback that warding is happening. Books
-    -- afterward — the per-book tree-walk hide queue drains in the background
-    -- over several seconds, but locked sections are already out of sight.
+    -- Bookcases first (fast, immediate visual feedback); books drain in the background.
     M._apply_bookcases_to_world()
     M._apply_books_to_world()
-    -- NOTE: baseline syncs (rows, levels, milestones) are NOT done here.
-    -- The title menu loads the previous save behind the scenes, so reading
-    -- GameSaveData at apply-safe time can return stale values. Baseline
-    -- syncs run via M.run_baseline_sync() which main.lua triggers on first
-    -- detected player movement (a reliable "we're truly in gameplay" signal).
+    -- Baseline syncs run from run_baseline_sync (first-movement), not here: GameSaveData
+    -- can be stale at apply-safe time since the title menu loads the prior save behind it.
 end
 
--- Called by main.lua's movement-detection loop after the player physically
--- moves for the first time post-load. By that point GameSaveData reflects
--- the actually-loaded save (Continue path) or the fresh state (New Game),
--- so the baseline read is safe.
+-- Called by main.lua's movement-detection loop on first post-load movement, by which
+-- point GameSaveData reflects the actually-loaded save, so the baseline read is safe.
 function M.run_baseline_sync()
     if M._baseline_sync_done then return end
     M._baseline_sync_done = true
@@ -681,14 +552,10 @@ function M.run_baseline_sync()
         log(("Row baseline sync: sent %d check(s) for already-completed rows"):format(row_synced))
     end
 
-    -- Hydrate _sent_row_locations from the server's view of checked
-    -- locations so fire_section_completions() can recognize sections that
-    -- were fully completed in a prior session. Without this, a player
-    -- who finished a section in session A and reconnects in session B
-    -- would never get the Section Complete check — detect_completed_rows
-    -- correctly skips already-checked row locs (so they aren't resent),
-    -- but they also never get added to _sent_row_locations in session B
-    -- without a separate sync.
+    -- Hydrate _sent_row_locations from the server's checked locations so
+    -- fire_section_completions can see prior-session-completed sections. Without this,
+    -- detect_completed_rows skips already-checked rows (correct) but never marks them
+    -- in _sent_row_locations this session, so the Section Complete check never fires.
     local prior_row_synced = 0
     pcall(function() prior_row_synced = M._sync_sent_row_locations_from_server() end)
     if prior_row_synced and prior_row_synced > 0 then
@@ -710,10 +577,8 @@ function M.run_baseline_sync()
             floor_synced))
     end
 
-    -- Read the game's CurrentFinishedRowNum and fire any
-    -- "Complete N Rows" thresholds the saved game has already passed.
-    -- Without this, a save loaded mid-run would silently skip those
-    -- milestones (FinishRow only fires for NEW row completions).
+    -- Fire any "Complete N Rows" thresholds the save already passed. Without this a
+    -- mid-run save skips them (FinishRow only fires for NEW completions).
     local rows_finished = 0
     pcall(function()
         local gi = FindFirstOf("BP_LibrarianGameInstance_C")
@@ -732,20 +597,11 @@ function M.run_baseline_sync()
             rc_synced, rows_finished))
     end
 
-    -- Level-up baseline. Compute current level as max of:
-    --   • xp_level   — walk player.SkillLevelUpRowNum vs rows_finished
-    --     (correct when GameSaveData + player BP are loaded).
-    --   • sent_level — highest level location already in
-    --     APClient._sent_checks (server-populated at slot_connect,
-    --     works even when GameSaveData isn't ready).
-    --
-    -- Without _sent_checks as a floor, _levels_reached resets to 0 on
-    -- reconnect; the first OnLevelUp queues "Reached Level 1" which
-    -- the server dedupes, and the actual new level never gets sent
-    -- because every earlier attempt was deduped.
-    --
-    -- We also re-send checks for every level <= current_level (server
-    -- dedupes; belt-and-suspenders for prior-session disconnects).
+    -- Level-up baseline. current_level = max(xp_level, sent_level):
+    --   xp_level   — walk player.SkillLevelUpRowNum vs rows_finished (needs BP loaded).
+    --   sent_level — highest level loc in APClient._sent_checks (works without GameSaveData).
+    -- The _sent_checks floor stops _levels_reached resetting to 0 on reconnect (else every
+    -- OnLevelUp re-queues an already-deduped level and the real one never sends).
     local xp_level = 0
     do
         local player = FindFirstOf("BP_LibrarianCharacter_C")
@@ -764,12 +620,8 @@ function M.run_baseline_sync()
             end)
         end
     end
-    -- Static-curve fallback: if the BP read returned 0 (player BP not
-    -- fully resolved despite first-movement having fired, or the array
-    -- read errored), recompute from the hardcoded XP_CURVE so we still
-    -- credit every level the player has earned offline. Mirrors the
-    -- runtime values verified against the in-game SkillLevelUpRowNum
-    -- dump.
+    -- Static-curve fallback: if the BP read returned 0 (player BP not resolved / array
+    -- read errored), recompute from XP_CURVE so offline-earned levels still get credited.
     if xp_level == 0 and rows_finished > 0 then
         local static_level = 0
         for i = 1, #XP_CURVE do
@@ -824,7 +676,7 @@ function M._recompute_state()
         M._series_unlocked[series_order[i]] = true
     end
 
-    -- Shelf unlocks (per-section open_count). One per bookcase received.
+    -- Shelf unlocks: per-section open_count = received count of that section's item.
     M._shelves_open = {}
     for item_name, count in pairs(M._received_counts) do
         local section_id = item_name:match("^Progressive Shelf Unlock %((.+)%)$")
@@ -838,24 +690,14 @@ end
 -- Apply: Books
 -- ============================================================================
 
---- Return the BP_GrabbingBook_C actor's AssetIdx if initialized, or
---- nil if it's an orphan with default ItemInfo.
----
---- AssetIdx=0 is a VALID asset ("Monsterology: An Introduction to
---- Forbidden Beast", section 1A's first series). Gating on `AssetIdx > 0`
---- would leave its 10 books permanently un-warded. We disambiguate via
---- ItemInfo.Mesh: real books have a populated UStaticMesh*; orphans
---- from the OpenLevel-on-connect reload leave it nil. AssetIdx > 0 is
---- trusted directly — a default-constructed ItemInfo can't produce a
---- non-zero index.
+--- BP_GrabbingBook_C's AssetIdx if initialized, else nil (orphan with default ItemInfo).
+--- AssetIdx=0 is VALID (section 1A's first series), so we can't gate on >0; instead
+--- disambiguate via ItemInfo.Mesh (real books have a mesh, OpenLevel-reload orphans leave nil).
 local function _book_valid_asset_idx(book)
     if not book or not book:IsValid() then return nil end
     local info; pcall(function() info = book.ItemInfo end)
-    -- Also IsValid the ItemInfo sub-UObject. Crash reports (Failure.Hash
-    -- e40fc030...) faulted inside UE4SS reflection reading sub-UObject
-    -- properties — book:IsValid() alone is not enough; ItemInfo can be
-    -- a stale ref and the next .AssetIdx read crashes in IsA on garbage
-    -- (pcall doesn't catch native AVs). Guards nine downstream call sites.
+    -- IsValid the ItemInfo sub-UObject too: book:IsValid() alone isn't enough — a stale
+    -- ItemInfo ref makes the next .AssetIdx read AV in IsA (a native crash pcall can't catch).
     if not info or not info:IsValid() then return nil end
     local aidx; pcall(function() aidx = info.AssetIdx end)
     if aidx == nil then return nil end
@@ -872,10 +714,8 @@ local function _book_valid_asset_idx(book)
 end
 M._book_valid_asset_idx = _book_valid_asset_idx  -- expose for diagnostics
 
---- Recursively walk a SceneComponent tree and apply visibility to each
---- node. Setting bHiddenInGame alone doesn't always trigger a render-
---- proxy refresh in UE 5.5 — the property flips but the cached scene
---- proxy keeps drawing. MarkRenderStateDirty forces invalidation.
+--- Recursively set visibility on a SceneComponent tree. bHiddenInGame alone doesn't
+--- always refresh the render proxy in UE 5.5; MarkRenderStateDirty forces invalidation.
 local function _walk_set_visibility(comp, visible)
     if not comp or not comp:IsValid() then return end
     pcall(function() comp:SetVisibility(visible, false) end)
@@ -897,47 +737,19 @@ local function _walk_set_visibility(comp, visible)
     end
 end
 
--- v1.1.0 Option 2c: ward via the bookcase's OWN StaticMesh collision — no runtime
--- spawn, so no `(async)` world-leak crash. Refinement history (2026-05-30):
---   2a  mesh OFF + `Box` set to block → FAILED: books + player passed through
---       (the `Box` doesn't cover the footprint).
---   2b  mesh PhysicsOnly → books bounce + un-interactable, BUT the player still
---       walks through: character movement is a QUERY sweep (Pawn channel), and
---       PhysicsOnly turns queries off. Placement is also a query, so we can't
---       just turn queries back on (that re-enables placement).
---   2c  InvisibleWall profile → FAILED: locked cases became placeable. Placement
---       does NOT trace on Visibility (InvisibleWall blocks every channel except
---       Visibility, yet placement came back). But the log resolved the real
---       structure: TWO StaticMeshComponents — "StaticMesh" (solid body) and
---       "PreviewBookLocation" (the named placement target).
---   2d  Toggle ONLY "PreviewBookLocation" off, body left solid → FAILED: still
---       placeable (preview_orig_enabled=1, so it WAS a collider, yet off didn't
---       gate placement). So the placement trace hits the BODY, not the preview
---       (2b body-query-off blocked placement; 2d body-query-on allowed it).
---   2e  Per-channel responses (probe-confirmed, camera-resp 2→0): each LOCKED
---       solid StaticMesh → QueryAndPhysics, BLOCK object channels (Pawn player +
---       PhysicsBody/WorldDynamic books), IGNORE trace channels (Visibility/Camera/
---       Game) so the placement line-trace misses → solid AND un-interactable.
---       UNLOCKED → restore the captured profile. WORKS on regular/small cases.
---       Large cases have MULTIPLE placement meshes, so treat ALL StaticMeshComponents
---       (single-mesh left large cases placeable at angles hitting an unhandled
---       mesh); `[ward-collision] N static meshes` logs each distinct structure.
---       RISK: if placement uses TraceByObjectType (an object channel) rather than
---       a trace channel, cases stay placeable → fall back to 2b PhysicsOnly.
+-- Ward a bookcase via its OWN StaticMesh collision (no runtime spawn = no world-leak crash).
+-- LOCKED: each solid StaticMeshComponent → BLOCK object channels (Pawn=player,
+-- PhysicsBody/WorldDynamic=thrown books), IGNORE trace channels (Visibility/Camera/Game) so
+-- the placement line-trace misses → solid AND un-interactable. UNLOCKED: restore the captured
+-- profile. Treats ALL meshes, not just one — large cases have multiple placement meshes and a
+-- single-mesh approach left them placeable at angles hitting an unhandled mesh.
+-- Risk: if placement ever traces an object channel instead of a trace channel, cases stay
+-- placeable. See WARDING_SYNC_PLAN.md for the full refinement history.
 local function _ward_collision(case, case_key, locked)
     if not (case and case:IsValid()) then return end
     -- Actor-level collision MUST be on or per-component settings are ignored.
     pcall(function() case:SetActorEnableCollision(true) end)
 
-    -- 2e (multi-mesh): the placement trace + the player sweep hit the bookcase
-    -- BODY, and the probe confirmed UE4SS can set per-channel responses. Large
-    -- bookcases have MORE than one placement-relevant StaticMeshComponent, so we
-    -- treat them ALL (the single-mesh version left large cases placeable at angles
-    -- hitting an unhandled mesh). LOCKED: each solid mesh → QueryAndPhysics, BLOCK
-    -- object channels (Pawn = player, PhysicsBody/WorldDynamic = thrown books),
-    -- IGNORE trace channels (Visibility/Camera/Game) so the placement line-trace
-    -- misses → solid yet un-interactable. UNLOCKED: restore each mesh's captured
-    -- profile (placement works at every angle again). NoCollision meshes untouched.
     local meshes = {}
     local seen, inventory = {}, {}
     local function consider(c)
@@ -948,8 +760,7 @@ local function _ward_collision(case, case_key, locked)
         pcall(function() nm = c:GetFName():ToString() end)
         pcall(function() cls = c:GetClass():GetFName():ToString() end)
         inventory[#inventory + 1] = nm .. ":" .. cls
-        -- Skip the small PreviewBookLocation marker: it isn't the placement target
-        -- and doesn't block, so warding it just wastes calls.
+        -- PreviewBookLocation is a non-blocking marker, not the placement target — skip it.
         if cls == "StaticMeshComponent" and nm ~= "PreviewBookLocation" then
             meshes[#meshes + 1] = c
         end
@@ -979,11 +790,9 @@ local function _ward_collision(case, case_key, locked)
             local en, pf = 3, "?"
             pcall(function() en = meshes[i]:GetCollisionEnabled() end)
             pcall(function() pf = meshes[i]:GetCollisionProfileName():ToString() end)
-            -- Capture the per-channel responses too (cheap reads), so UNLOCK can
-            -- restore the EXACT original instead of a blanket block-all. Block-all
-            -- breaks multi-mesh cabinet cases: it makes the cabinet body/wall block
-            -- the placement trace, which originally passed THROUGH them to the inner
-            -- shelf -> the cabinet stays un-placeable even when "unwarded".
+            -- Capture per-channel responses so UNLOCK restores the EXACT original, not a
+            -- block-all (block-all makes a cabinet body/wall block the placement trace that
+            -- originally passed THROUGH to the inner shelf → stays un-placeable when unwarded).
             local resp = {}
             for ch = 0, 31 do
                 local v = 0
@@ -1009,15 +818,10 @@ local function _ward_collision(case, case_key, locked)
     local OBJ_CHANNELS = { 0, 1, 2, 5, 6, 7 }
     local OBJ_SET = { [0] = true, [1] = true, [2] = true, [5] = true, [6] = true, [7] = true }
 
-    -- Identify the PLACEMENT mesh: the shelf surface the placement line-trace must hit.
-    -- Normally the component named "StaticMesh" (the inner shelf, present in standard
-    -- shelves AND as the inner shelf of multi-mesh cabinets). For a SINGLE-mesh case the
-    -- sole mesh IS the placement target even when it is NOT named "StaticMesh" -- that name
-    -- assumption is exactly why 1M's 5-volume "second 5-book shelf" (a BP_BookCase_4x5_C
-    -- whose mesh isn't named "StaticMesh") stuck un-placeable until reload: it fell to the
-    -- per-channel restore of a stale capture instead of a block-all. We drive the placement
-    -- mesh to a DETERMINISTIC state in BOTH directions, OUTSIDE the captured-collision gate,
-    -- so a bad/partial capture can never strand it.
+    -- Identify the PLACEMENT mesh (shelf surface the placement line-trace must hit): the
+    -- component named "StaticMesh", or the sole mesh of a single-mesh case (whose name may
+    -- differ). Driven to a DETERMINISTIC state in BOTH directions OUTSIDE the captured-
+    -- collision gate so a bad/partial capture can never strand it un-placeable.
     local placement_idx = nil
     for i = 1, #meshes do
         local nm = "?"; pcall(function() nm = meshes[i]:GetFName():ToString() end)
@@ -1025,17 +829,15 @@ local function _ward_collision(case, case_key, locked)
     end
     if not placement_idx and #meshes == 1 then placement_idx = 1 end
 
-    -- Stash the placement mesh so the periodic ward pass can read its ACTUAL collision
-    -- (Camera channel 4: Ignore=warded, Block=unwarded) as ground truth instead of
-    -- re-mutating blindly. Cleared on real world reload (reset_hism_state).
+    -- Stash the placement mesh so the periodic ward pass reads its ACTUAL collision as
+    -- ground truth (Camera channel 4: Ignore=warded, Block=unwarded) instead of re-mutating.
     if case_key and placement_idx then
         M._case_placement_mesh = M._case_placement_mesh or {}
         M._case_placement_mesh[case_key] = meshes[placement_idx]
     end
 
-    -- One-shot per case CLASS: log the unlock placement decision so any future stuck-shelf
-    -- report names exactly which mesh/structure was used (and loudly flags the one case we
-    -- cannot disambiguate: a multi-mesh case with no "StaticMesh").
+    -- One-shot per case CLASS: log the unlock placement decision so a future stuck-shelf
+    -- report names which mesh was used (and flags the un-disambiguatable multi-mesh/no-StaticMesh case).
     if not locked and case then
         local cls = "?"; pcall(function() cls = case:GetClass():GetFName():ToString() end)
         M._ward_unlock_logged = M._ward_unlock_logged or {}
@@ -1056,13 +858,13 @@ local function _ward_collision(case, case_key, locked)
     for i = 1, #meshes do
         local r = rec[i] or { en = 3, pf = "?" }
         local is_placement = (i == placement_idx)
-        -- Safe enabled value for the placement mesh: the captured one if real, else
-        -- QueryAndPhysics -- so a captured NoCollision (0) can't disable the shelf.
+        -- Safe enabled value for the placement mesh: captured if real, else QueryAndPhysics
+        -- (a captured NoCollision must not disable the shelf).
         local pen = (r.en and r.en ~= 0) and r.en or 3
         if locked then
             if is_placement then
-                -- Always ward the placement mesh (deterministic Camera=Ignore), bypassing
-                -- the captured-en gate so the ground-truth read + the unlock stay reliable.
+                -- Ward the placement mesh deterministically (bypass the captured-en gate) so
+                -- the ground-truth read + unlock stay reliable: ignore all, re-block objects.
                 pcall(function() meshes[i]:SetCollisionEnabled(pen) end)
                 pcall(function() meshes[i]:SetCollisionResponseToAllChannels(0) end)
                 for _, ch in ipairs(OBJ_CHANNELS) do
@@ -1070,8 +872,8 @@ local function _ward_collision(case, case_key, locked)
                 end
                 M._ward_canary = meshes[i]
             elseif (r.en or 3) ~= 0 then
-                -- Other meshes: same ~8-call ward (ignore all channels so the placement
-                -- trace misses, then re-block the object channels so player + books bounce).
+                -- Other meshes: same ward (ignore all so the placement trace misses, re-block
+                -- object channels so player + books bounce).
                 pcall(function() meshes[i]:SetCollisionEnabled(3) end)
                 pcall(function() meshes[i]:SetCollisionResponseToAllChannels(0) end)
                 for _, ch in ipairs(OBJ_CHANNELS) do
@@ -1081,16 +883,13 @@ local function _ward_collision(case, case_key, locked)
             end
         else
             if is_placement then
-                -- UNLOCK the placement mesh UNCONDITIONALLY: solid + block-all so the
-                -- placement trace always hits it, regardless of how good the capture was.
-                -- (The old code only did this for a mesh literally named "StaticMesh", and
-                -- only inside the captured-en gate -- the 1M stuck-shelf bug.)
+                -- UNLOCK the placement mesh UNCONDITIONALLY (solid + block-all) so the trace
+                -- always hits it regardless of capture quality.
                 pcall(function() meshes[i]:SetCollisionEnabled(pen) end)
                 pcall(function() meshes[i]:SetCollisionResponseToAllChannels(2) end)
             elseif (r.en or 3) ~= 0 then
-                -- Structural meshes (cabinet body/wall): restore the captured original so
-                -- the placement trace passes THROUGH them to the inner shelf -- block-all-ing
-                -- them was the original cabinet bug.
+                -- Structural meshes (cabinet body/wall): restore the capture so the placement
+                -- trace passes THROUGH to the inner shelf (block-all-ing them was the cabinet bug).
                 pcall(function() meshes[i]:SetCollisionEnabled(r.en or 3) end)
                 if r.resp then
                     for ch = 0, 31 do
@@ -1107,11 +906,9 @@ local function _ward_collision(case, case_key, locked)
 
 end
 
---- Decompose UE FMatrix44f planes into a Lua FTransform table.
---- UE FMatrix is row-major; rows 0-2 are basis vectors (X/Y/Z axes
---- after rotation, scaled), row 3 is translation. We extract scale as
---- the magnitude of each basis vector, normalize, then convert the
---- 3x3 rotation matrix to a quaternion via Shoemake's algorithm.
+--- Decompose UE FMatrix44f planes into a Lua FTransform table. UE FMatrix is row-major:
+--- rows 0-2 are scaled basis vectors, row 3 is translation. Scale = basis magnitudes;
+--- rotation via Shoemake matrix→quaternion.
 local function _decompose_matrix(xp, yp, zp, wp)
     local sx = math.sqrt(xp.X*xp.X + xp.Y*xp.Y + xp.Z*xp.Z)
     local sy = math.sqrt(yp.X*yp.X + yp.Y*yp.Y + yp.Z*yp.Z)
@@ -1123,9 +920,7 @@ local function _decompose_matrix(xp, yp, zp, wp)
     local m10, m11, m12 = yp.X/sy, yp.Y/sy, yp.Z/sy
     local m20, m21, m22 = zp.X/sz, zp.Y/sz, zp.Z/sz
 
-    -- Shoemake quaternion-from-matrix. Sign conventions chosen to
-    -- produce a quat that, when passed back via FTransform, reproduces
-    -- the original UE matrix. (Inverse of UE's FQuat→FMatrix path.)
+    -- Shoemake quaternion-from-matrix; sign conventions chosen to invert UE's FQuat→FMatrix.
     local trace = m00 + m11 + m22
     local qx, qy, qz, qw
     if trace > 0 then
@@ -1161,59 +956,33 @@ local function _decompose_matrix(xp, yp, zp, wp)
     }
 end
 
--- Pass 1 actor-warding tracker: key → true once actor.bHidden + collision-off
--- has been applied to a book. Live — read by the warding / unward passes and the
--- unlocked-state dump. (The former brute-force per-book HISM mapping pipeline that
--- also populated _book_hism_refs / _book_captured_transforms / _books_we_have_hidden
--- was removed in I3; Layer 3 pile-hiding + this Pass 1 warding do all book hiding now.)
+-- Pass 1 actor-warding tracker: key → true once a book has bHidden + collision-off applied.
+-- Read by the warding/unward passes and the unlocked-state dump.
 M._books_warded = {}
 
--- Diagnostic probe for B10 / B9. For each bookcase we touched on the
--- previous _apply_bookcases_to_world call, remember what we set
--- `bHidden` to. On the next apply, before writing, we compare the
--- case's current `bHidden` against this map and log `[bookcase-drift]`
--- if they disagree — gives us hard data on whether the game's BP tick
--- reverts our visibility flag.
---
--- Keyed by `case:GetFullName()`. Value is BOOLEAN bHidden (true =
--- hidden, false = visible).
+-- Drift probe: per case (keyed by GetFullName), the bHidden we last wrote. Compared before
+-- the next write to log [bookcase-drift] if the game's BP tick reverted our flag.
 M._case_last_applied_hidden = {}
 
--- v1.1.0 B10 fix: per-case WardCover actor reference. For each warded
--- bookcase, we spawn a BP_WardCover (chain-link fence overlay) via
--- ModActor:SpawnWardCover. Keyed by case:GetFullName(); value is the
--- spawned cover actor.
---
--- We KEEP the legacy SetActorHiddenInGame on the case itself (it can
--- stop working when the BP tick reverts, but doesn't hurt). The cover
--- is the durable visual ward — its tick is disabled at the
--- BP_WardCover class level so the game's BP can't revert it.
---
--- If the new pak isn't installed (no SpawnWardCover function), the
--- pcall fails silently and the case is managed by the legacy bHidden
--- path alone — degraded but functional.
+-- Per-case WardCover actor (BP_WardCover chain-link overlay), keyed by GetFullName. The
+-- cover is the durable visual ward — its tick is disabled at the class level so the game
+-- can't revert it; the legacy SetActorHiddenInGame on the case is kept as a harmless backup.
+-- If the pak lacks SpawnWardCover the pcall fails silently → legacy bHidden path alone.
 M._case_covers = {}
 
--- Option 2 warding: per-case captured original component collision (keyed by
--- GetFullName). Cleared on world reload.
+-- Per-case captured original component collision (keyed by GetFullName). Cleared on reload.
 M._case_orig_collision = {}
 
--- Apply-on-change tracker: the last visible (lock) state we applied per case
--- (by GetFullName), so the warding only re-touches a case when its state
--- changes — perf + avoids racing the world teardown on quit. Cleared on reload.
+-- Apply-on-change tracker: last visible (lock) state applied per case (by GetFullName), so
+-- warding only re-touches on change — perf + avoids racing world teardown on quit.
 M._case_ward_state = {}
 
--- Per-case placement-mesh ref (the shelf surface whose Camera-channel collision encodes
--- warded vs unwarded), stashed by _ward_collision. The periodic ward pass reads it as
--- GROUND TRUTH so an already-correct case is a no-op — no render-state churn (the crash
--- suspect) — while still catching drift within one pass. IsValid-guarded; dropped only on
--- a real world reload (refs go stale), NOT on the 5s re-index.
+-- Per-case placement-mesh ref stashed by _ward_collision. The periodic ward pass reads its
+-- Camera-channel collision as GROUND TRUTH so an already-correct case is a no-op (no render-
+-- state churn = the crash suspect), still catching drift within one pass. Dropped only on reload.
 M._case_placement_mesh = {}
 
--- Diagnostic flags for v1.1.0 pak functions. Set true the first time we
--- successfully call into a new pak function so we don't spam the log.
--- The "_error" variants log the FIRST failure so we can diagnose
--- missing-function or argument-type-mismatch issues on the new pak.
+-- One-shot diagnostic flags for v1.1.0 pak functions (first-success / first-failure logging).
 M._diag_spawnwardcover_ok    = false
 M._diag_spawnwardcover_err   = false
 M._diag_pak_probed           = false
@@ -1221,79 +990,44 @@ M._diag_no_modactor_logged   = false
 M._diag_spawnwardcover_table_dumped = false
 M._diag_geometry_dumped             = false
 
--- Books we couldn't HISM-map (no canonical and AddInstance failed). These
--- can't be hidden via HISM teleport — their mesh renders via the actor's
--- own mesh component at the actor's RootComponent world position. When
--- unwarded via SetActorHiddenInGame(false) + tree-walk visibility, they
--- become visible at that position, which can be inside walls/floors if
--- the level designer placed the actor at a trigger location (the visible
--- HISM instance is elsewhere on the shelf, but we lost the link to it).
--- Captured here so the user can verify which specific books are stuck
--- and confirm it's the same set across runs (deterministic level layout
--- → same stuck books every time).
+-- Books with no HISM canonical (AddInstance failed). Their mesh renders via the actor's own
+-- component at its RootComponent position — which can be inside a wall if the level placed
+-- the actor at a trigger, so they appear "stuck" when unwarded. Captured for diagnostics.
 M._unmapped_warded_books = {}  -- key → { asset_idx, series, section, x, y, z }
 
--- Snapshot of _series_unlocked from the last completed _apply_books_to_world.
--- Used to diff against the current state and log newly-unlocked series
--- when a Progressive Series Unlock is received.
+-- Snapshot of _series_unlocked from the last apply, to diff + log newly-unlocked series.
 M._last_applied_series_unlocked = {}
 
--- B7: chunked Pass-1 flush state.
---
--- _apply_books_to_world walks ~3000 book actors and toggles bHidden +
--- collision on each. Doing this in one tick blocks LoopAsync long
--- enough that AP times out on big item bursts (initial connect /
--- reconnect re-dump). We chunk the walk via LoopAsync so the poll
--- thread can pump c:poll() between chunks.
---
--- _flush_in_progress is set at chunk-1 start, cleared in the
--- post-Pass-1 finalizer. _flush_pending records "another flush was
--- requested while one was running" — the finalizer self-re-fires
--- if set so the newer state gets a fresh apply.
---
--- Pattern lifted from Crab Champions AP's _apply_pending_items /
--- FLUSH_BATCH chunking. See HANDOFF for design notes.
+-- Chunked Pass-1 flush state. _apply_books_to_world walks ~3000 actors; doing it in one tick
+-- blocks LoopAsync long enough that AP times out on big bursts, so it's chunked via LoopAsync.
+-- _flush_in_progress held start→finalizer; _flush_pending makes the finalizer self-re-fire if
+-- a flush was requested mid-run.
 M._flush_in_progress = false
 M._flush_pending     = false
 
---- Reset per-world state on every LoadMap into M01 — a fresh world has fresh
---- BP_GrabbingBook actors, HISM instances, bookcase actors and sign-glow, so any
---- captured refs from a previous world load are stale and must be dropped. (Also bumps
---- the world-epoch so deferred game-thread closures that captured the old world bail.)
+--- Reset per-world state on every LoadMap into M01 — a fresh world means all captured
+--- actor/HISM/glow refs are stale. Bumps the world-epoch so deferred game-thread closures
+--- that captured the old world bail (see below).
 function M.reset_hism_state()
-    -- World epoch: bumped on every world reset (this fires from the LoadMap hook on
-    -- the game thread). Any DEFERRED game-thread closure that captured the OLD world's
-    -- refs (notably layer 3's HISM array in apply_book_visibility) re-checks this and
-    -- bails instead of dereferencing freed memory -- the main-menu / LoadMap teardown
-    -- use-after-free (a NATIVE access violation, uncatchable by Lua pcall).
+    -- World epoch, bumped on every reset. Any DEFERRED game-thread closure that captured
+    -- the OLD world's refs (notably layer 3's HISM array) re-checks this and bails instead
+    -- of dereferencing freed memory — the LoadMap-teardown use-after-free (a native AV).
     M._world_epoch = (M._world_epoch or 0) + 1
     M._books_warded = {}
     M._unmapped_warded_books = {}
     M._last_applied_series_unlocked = {}
-    -- Bookcase drift tracking: also stale across world reloads since
-    -- actor identities (UE GetFullName paths) change.
     M._case_last_applied_hidden = {}
-    -- WardCover actors get destroyed by UE when the world reloads, so
-    -- our references are dangling. Drop them. Next _apply_bookcases_to_world
-    -- pass will re-spawn covers for warded sections.
+    -- WardCover actors are destroyed on reload; drop dangling refs (next apply re-spawns).
     M._case_covers = {}
-    -- Per-case captured component collision (Option 2 warding). Cases reload at
-    -- their level-default collision and actor identities change, so drop the
-    -- captures — the next apply pass recaptures and re-applies.
     M._case_orig_collision = {}
     M._case_ward_state = {}
     M._case_placement_mesh = {}
-    -- Section-sign glow: re-built by the indexer each session; drop stale state so
-    -- the new (post-reload) spotlights get re-glowed.
     M._section_to_label = nil
     M._section_glow_state = {}
     M._section_glow_orig = {}
-    -- Bookcase index: the case refs point at the OLD world's actors. Keeping them
-    -- both pins the old world (preventing GC) and makes the next warding pass
-    -- operate on stale/invisible cases — so after Menu→Continue the visible new
-    -- cases stay UN-warded. set_gameplay_active(false) clears these on a normal
-    -- exit, but that path doesn't fire on the Menu→Continue LoadMap. Clear here too
-    -- and force a fresh re-index against the new world.
+    -- Bookcase index points at the OLD world's actors. Keeping it pins the old world (no GC)
+    -- and makes the next pass ward stale cases, leaving the new ones un-warded after
+    -- Menu→Continue (which doesn't fire set_gameplay_active(false)). Clear + force re-index.
     M._section_to_cases = {}
     M._case_to_section = {}
     M._stray_cases = {}
@@ -1302,30 +1036,16 @@ function M.reset_hism_state()
     log("[hism-reset] cleared HISM mapping state (will re-init on next apply-safe)")
 end
 
---- Compute the set of series that should be unwarded (pickable) right now, given
---- the player's item state and the only_unward_shelfable_books mode. Returns
---- {[series_name] = true}. Recomputed on each apply (cheap).
----
---- Off (only_shelfable = false, DEFAULT): every RECEIVED series is unwarded,
----   regardless of which bookcase it lives on or whether that case is open. You can
----   pick a book up the moment its series arrives and stash it on any open shelf --
----   mis-shelving + moving it later is part of the loop. (Completing a row still
----   needs the home bookcase OPEN to place correctly -- that's the separate bookcase
----   warding. Generation gates row-completion on the bookcase being open, so this
----   pickup leniency never makes a check unreachable.)
----
---- On (only_shelfable = true, STRICT): a received series stays warded until its
----   home bookcase is open -- cases_open >= shelf_req for its section. A section with
----   0 cases open has none of its series pickable.
----
---- beta7: Off was previously shelf-req-gated (floor-of-1) on v1.0.3+ seeds; that
---- gate -- and the v1.0.2/v1.0.3 `_use_v103_warding` split -- was removed so Off
---- matches its documented "pickable as soon as received" behavior. On is unchanged.
+--- Set of series that are unwarded (pickable) now, given item state + the
+--- only_unward_shelfable_books mode. Returns {[series] = true}; recomputed each apply.
+---   Off (default): every RECEIVED series is pickable, no shelf gating. (Row completion
+---     still needs the home case open — separate bookcase warding — so this never makes
+---     a check unreachable.)
+---   On (strict): a series stays warded until its home case is open (cases_open >= shelf_req).
 function M._compute_unwarded_set(only_shelfable)
     local unwarded = {}
     if not only_shelfable then
-        -- Off (default): every RECEIVED series is pickable, no shelf gating --
-        -- regardless of which bookcase it lives on or whether that case is open.
+        -- Off (default): every RECEIVED series is pickable, no shelf gating.
         for series_name in pairs(M._series_unlocked) do
             unwarded[series_name] = true
         end
@@ -1345,40 +1065,18 @@ function M._compute_unwarded_set(only_shelfable)
     return unwarded
 end
 
--- B7 chunked-flush tuning.
--- Pass 1 walks ~3000 BP_GrabbingBook actors toggling SetActorHiddenInGame
--- + SetActorEnableCollision. All-in-one tick blocks the AP poll loop
--- long enough to drop the server connection on big item bursts.
---
--- BOOK_APPLY_CHUNK_SIZE       — books per tick (300 ≈ 10 chunks for a
---                                typical full flush).
--- BOOK_APPLY_CHUNK_DELAY_MS   — yield between chunks so the LoopAsync
---                                poll thread can pump c:poll() once.
---                                50ms < the 100-150ms AP heartbeat.
--- Total wall-clock ~10 chunks * 50ms = ~500ms, comparable to the
--- previous synchronous walk but split across 10 non-blocking ticks.
+-- Chunked-flush tuning: books per tick, and the yield between chunks so the LoopAsync poll
+-- thread can pump c:poll(). 50ms < the 100-150ms AP heartbeat, keeping the socket alive.
 local BOOK_APPLY_CHUNK_SIZE     = 300
 local BOOK_APPLY_CHUNK_DELAY_MS = 50
 
---- Walk every BP_GrabbingBook_C in the level and ward/unward based on
---- whether its series is in the current unwarded set. Section is NOT part
---- of the per-book gate — section unlocks affect bookcase/shelf visibility
---- (phase 2).
----
---- Pass 1 is chunked (see BOOK_APPLY_CHUNK_SIZE) so the LoopAsync poll
---- thread can pump c:poll() between chunks, keeping the AP socket alive
---- during big item-application bursts. The post-pass finalizer (Pass 2
---- in hidden mode, diff logging, state summary) runs after the last
---- chunk completes.
----
---- Re-entry: if a second flush is requested while one is in progress,
---- M._flush_pending is set; the finalizer self-re-fires once done so
---- the latest state is captured. Concurrent flushes are NOT supported
---- (no benefit + harder reasoning about state consistency).
+--- Ward/unward every BP_GrabbingBook_C by whether its series is in the unwarded set.
+--- Section is NOT part of the per-book gate (that's bookcase visibility). Chunked so the
+--- LoopAsync poll thread keeps the AP socket alive during big bursts; finalizer runs last.
+--- Re-entry: a flush requested mid-run sets _flush_pending and the finalizer self-re-fires;
+--- concurrent flushes aren't supported.
 function M._apply_books_to_world()
-    -- Re-entry guard. If a flush is already running, just mark a
-    -- follow-up and return — the in-flight flush's finalizer will
-    -- pick it up.
+    -- Re-entry guard: if a flush is running, mark a follow-up; the finalizer picks it up.
     if M._flush_in_progress then
         M._flush_pending = true
         return
@@ -1396,29 +1094,23 @@ function M._apply_books_to_world()
         return
     end
 
-    -- Compute the unwarded set once per apply call. The rules (v1.0.2
-    -- legacy vs v1.0.3 unified) are encapsulated in _compute_unwarded_set;
-    -- per-book code just does a table lookup. Snapshot stays consistent
-    -- across all chunks of THIS flush; if state changes mid-flight, the
-    -- _flush_pending re-fire path captures it next.
+    -- Unwarded set computed once per apply (per-book code just does a table lookup). The
+    -- snapshot stays consistent across this flush's chunks; mid-flight changes are caught
+    -- by the _flush_pending re-fire.
     local only_shelfable = M._slot_data
         and M._slot_data.only_unward_shelfable_books == 1
     local unwarded_set = M._compute_unwarded_set(only_shelfable)
 
-    -- Sanity check: are book actors INITIALIZED yet? When M01 first loads,
-    -- BP_GrabbingBook actors are spawned but their ItemInfo.AssetIdx is the
-    -- default 0 until the game runs its placement / population logic.
-    -- Calling SetActorHiddenInGame on un-init actors has crashed the game.
-    -- Sample the first 20 books; require ≥2 distinct non-zero AssetIdx
-    -- values before treating the world as safe to mutate.
+    -- Are book actors INITIALIZED yet? On first M01 load ItemInfo.AssetIdx is default 0
+    -- until the game's population logic runs, and warding un-init actors crashes. Require
+    -- >=2 distinct non-zero AssetIdx in the first 20 books before treating it as safe.
     do
         local sample = {}
         local distinct = 0
         for i = 1, math.min(20, n) do
             local b = books[i]
             if b and b:IsValid() then
-                -- Split ItemInfo access (see detect_completed_rows for
-                -- the full rationale). Same UE4SS reflection AV class.
+                -- Split ItemInfo access — UE4SS reflection AV (see detect_completed_rows).
                 local item_info
                 pcall(function() item_info = b.ItemInfo end)
                 if item_info and item_info:IsValid() then
@@ -1439,35 +1131,26 @@ function M._apply_books_to_world()
         end
     end
 
-    -- We're committed to a flush now. Take the in-progress lock and
-    -- start the chunked Pass-1 driver.
+    -- Committed to a flush: take the lock and start the chunked Pass-1 driver.
     M._flush_in_progress = true
-    -- Pass-level marker: the book-actor warding walk (~3000 actors) is too high-volume to
-    -- BEG/END per book, so we timestamp the whole flush. BOOK_ACTOR_WARDING is the real
-    -- bisection lever for these; this just shows a flush was in flight near a crash.
+    -- The ~3000-actor walk is too high-volume to mark per book; timestamp the whole flush
+    -- so a crash trace shows a flush was in flight. BOOK_ACTOR_WARDING is the bisection lever.
     trace.mark("books-flush", nil, "n=" .. tostring(n))
     local stats = { warded = 0, unwarded = 0, skipped = 0, gate_skipped_unwards = 0 }
     local cursor = 1
 
-    -- v1.1.0 (B10 book material swap): cache ModActor once per flush so
-    -- we don't FindFirstOf for every one of ~3000 books. Captured by the
-    -- _apply_one_book closure below. May be nil if the pre-v1.1.0 pak is
-    -- installed (no ModActor exposed) or if pak failed to load — in that
-    -- case the legacy SetActorHiddenInGame approach is the only ward.
+    -- Cache ModActor once per flush (vs FindFirstOf per book). nil if the pre-v1.1.0 pak is
+    -- installed or load failed → legacy SetActorHiddenInGame is the only ward.
     local mod_actor = FindFirstOf("ModActor_C")
     if not (mod_actor and mod_actor:IsValid()) then mod_actor = nil end
 
-    -- v1.1.0: cache the BP_HISM_Manager for the new UpdateWPO call. WPO
-    -- displaces book vertices via material parameter — invisible at deep
-    -- Z without touching bHidden (which the game toggles view-dependently).
+    -- Cache BP_HISM_Manager for UpdateWPO: WPO displaces book vertices via material param,
+    -- hiding at deep Z without touching bHidden (which the game toggles view-dependently).
     local mgr_for_wpo = FindFirstOf("BP_HISM_Manager_C")
     if not (mgr_for_wpo and mgr_for_wpo:IsValid()) then mgr_for_wpo = nil end
 
-    -- v1.1.0: cache any valid BP_BookCase_C so we can call
-    -- book:MoveToBookCase(deep_transform, any_case) — the function needs
-    -- a non-null AttchedActor and any valid bookcase serves as the
-    -- attachment target. Books animate to the deep-Z target and attach
-    -- to the bookcase actor, hopefully keeping them out of view.
+    -- Cache any valid BP_BookCase_C as a MoveToBookCase attachment target (it needs a
+    -- non-null AttchedActor; any case works).
     local any_case
     do
         local cases = FindAllOf("BP_BookCase_C")
@@ -1483,11 +1166,8 @@ function M._apply_books_to_world()
         end
     end
 
-    -- One-shot diagnostic: introspect the ModActor for the new pak's
-    -- ModActor BP function probe. Logs which expected functions are
-    -- present so we can distinguish "pak loaded but functions missing"
-    -- (cook issue) from "pak not loaded" (install issue) from "functions
-    -- present but spawn fails at call time" (BP graph issue).
+    -- One-shot ModActor function probe: logs which expected BP functions exist, to tell
+    -- "pak loaded but functions missing" from "pak not loaded" from "spawn fails at call time".
     if mod_actor and not M._diag_pak_probed then
         M._diag_pak_probed = true
         local found = {
@@ -1517,43 +1197,29 @@ function M._apply_books_to_world()
         log("[ward-diag] No ModActor_C found in world — cover features disabled. Pak missing or not yet loaded?")
     end
 
-    --- Process a single book at index i. Extracted so the chunk loop
-    --- body stays readable.
+    --- Ward/unward one book. Extracted to keep the chunk loop readable.
     local function _apply_one_book(book)
         if not (book and book:IsValid()) then
             stats.skipped = stats.skipped + 1
             return
         end
-        -- Skip uninitialized books (orphan actors from the
-        -- OpenLevel-on-connect reload have default BookInfo and
-        -- trying to ward them via mgr.UpdateInstance corrupts HISM
-        -- state). _book_valid_asset_idx returns nil for orphans
-        -- but 0 for the real Monsterology series (section 1A).
+        -- Skip uninitialized orphans (default BookInfo; warding them corrupts HISM state).
+        -- _book_valid_asset_idx returns nil for orphans but 0 for the real 1A series.
         local asset_idx = _book_valid_asset_idx(book)
         if asset_idx == nil then
             stats.skipped = stats.skipped + 1
             return
         end
         local series_name = M._asset_to_series[asset_idx]
-        -- Single-table lookup encapsulates v1.0.2-legacy and
-        -- v1.0.3-unified rules. See _compute_unwarded_set above.
         local should_unward = series_name and unwarded_set[series_name]
         local key = book:GetFullName()
         local is_warded = M._books_warded[key] or false
         local ok = pcall(function()
             if should_unward then
-                -- Unconditional unward (no `if is_warded` gate). UE
-                -- SetActorHiddenInGame / SetActorEnableCollision are
-                -- idempotent. The previous gate left books un-pickable
-                -- ("last 1-2 of a series stayed stuck") in two cases:
-                --   1. Book had AssetIdx=0 at first apply → skipped,
-                --      no tracker entry; later when AssetIdx populated,
-                --      gate kept us from unwarding (is_warded=false).
-                --   2. Actor destroyed + respawned by lazy streaming;
-                --      new GetFullName key → no tracker entry.
-                -- gate_skipped_unwards counts cases the previous gate
-                -- would have skipped (high on first flush, near-zero
-                -- in steady state = real drift catches).
+                -- Unconditional unward (SetActorHiddenInGame/Collision are idempotent). An
+                -- `if is_warded` gate stranded the last 1-2 of a series: a book first seen at
+                -- AssetIdx=0, or respawned by streaming with a new key, had no tracker entry.
+                -- gate_skipped_unwards counts those (high first flush, ~0 = real drift catches).
                 if not is_warded then
                     stats.gate_skipped_unwards = stats.gate_skipped_unwards + 1
                 end
@@ -1565,16 +1231,11 @@ function M._apply_books_to_world()
             else
                 if not is_warded then
                     if _diag_on("BOOK_ACTOR_WARDING") then
-                        -- stacks mode (M._book_hide_mode == false): keep the book VISIBLE,
-                        -- only disable collision so it can't be grabbed (walk-through).
+                        -- stacks mode (_book_hide_mode false): keep VISIBLE, only collision-off.
                         if M._book_hide_mode then book:SetActorHiddenInGame(true) end
                         book:SetActorEnableCollision(false)
                     end
                     M._books_warded[key] = true
-                    -- Per-book cover spawning was explored but visually
-                    -- unsatisfactory (covers cluttered the scene,
-                    -- didn't hide books in stacks). Books remain
-                    -- visible-but-non-interactable.
                 end
             end
         end)
@@ -1586,36 +1247,24 @@ function M._apply_books_to_world()
         end
     end
 
-    -- Finalizer: runs after the last Pass-1 chunk -- diff logging, state summary,
-    -- and the in-progress/pending bookkeeping. (The old Pass 2 -- a per-book HISM
-    -- teleport pass -- was removed: it was disabled, and pile hiding is handled by
-    -- Layer 3 (apply_book_visibility) + Pass 1 actor warding, not per-book moves.)
+    -- Finalizer after the last chunk: diff log, state summary, in-progress/pending bookkeeping.
     local function _finalize_apply()
         M._finalize_apply_books(books, n, stats)
         M._flush_in_progress = false
 
-        -- Re-flush if a request landed mid-flight. Each re-flush
-        -- clears _flush_pending first, so this won't loop forever.
         if M._flush_pending then
             M._flush_pending = false
-            -- Bounce to the ASYNC thread instead of calling inline. This finalizer
-            -- can run inside a game-thread closure (BOOK_ACTOR_GAMETHREAD), and
-            -- flush_apply -> _on_game_thread -> ExecuteInGameThread would then NEST
-            -- ExecuteInGameThread calls (UE4SS #1180: scheduling a tick-action while
-            -- the tick-action list is being iterated). LoopAsync re-issues the flush
-            -- from the async thread. Harmless (~10ms) when already on the async thread.
+            -- Bounce to the ASYNC thread, not inline: this finalizer can run inside a
+            -- game-thread closure, and flush_apply → ExecuteInGameThread would then NEST
+            -- those calls (UE4SS #1180: scheduling a tick-action mid-iteration of the list).
             LoopAsync(10, function() M.flush_apply() return true end)
         end
     end
 
-    --- Pass 1, chunked, on the GAME THREAD. _book_process_one_chunk does one
-    --- chunk's per-book reads+writes (_apply_one_book); _book_run_chunk runs it via
-    --- _on_game_thread (gated BOOK_ACTOR_GAMETHREAD), then reschedules through
-    --- LoopAsync -> _book_run_chunk so the next ExecuteInGameThread is issued from
-    --- the async thread, never nested inside a game-thread callback (UE4SS #1180).
-    --- pcall-guarded: a throwing chunk releases _flush_in_progress so it can't wedge
-    --- the flush lock (which would block every future flush_apply). Moving the walk
-    --- off the async thread also stops it starving the AP poll loop on big bursts.
+    --- Chunked Pass 1 on the game thread. Each chunk's writes run via _on_game_thread, then
+    --- reschedule through LoopAsync so the next ExecuteInGameThread is issued from the async
+    --- thread, never nested in a game-thread callback (UE4SS #1180). pcall-guarded so a
+    --- throwing chunk releases the flush lock instead of wedging every future flush.
     local _book_run_chunk
     local function _book_process_one_chunk()
         local chunk_end = math.min(cursor + BOOK_APPLY_CHUNK_SIZE - 1, n)
@@ -1646,11 +1295,8 @@ end
 
 --- Pass-1 finalizer: diff log, state summary.
 function M._finalize_apply_books(books, n, stats)
-    -- Diff: which series were newly unwarded this apply? Diff
-    -- _series_unlocked against the last applied snapshot. Logs per-series
-    -- book counts, flagging any books that are in the unmapped set (may
-    -- appear stuck when their actor mesh becomes visible at an internal
-    -- trigger location).
+    -- Diff _series_unlocked vs the last snapshot for newly-unwarded series; logs per-series
+    -- counts and flags any unmapped books (may appear stuck at an internal trigger location).
     local newly_unlocked = {}
     for s in pairs(M._series_unlocked) do
         if not M._last_applied_series_unlocked[s] then
@@ -1721,49 +1367,25 @@ function M._finalize_apply_books(books, n, stats)
 end
 
 -- ============================================================================
--- Periodic actor-state reconciliation  (Bug 1 / Bug 2 fix)
+-- Periodic actor-state reconciliation
 -- ============================================================================
---
--- A floor book's warded/unwarded state lives across THREE objects that the game
--- and the mod toggle on DIFFERENT schedules:
---   * HISM pile-instance visibility -- Layer 3 (apply_book_visibility), re-run every 5s.
---   * Actor bHidden                 -- the GAME's distance swap (HISM <-> actor form) + Pass 1.
---   * Actor collision + SM_Book_1 mesh flags -- Pass 1 ward (only on an item flush) + beta6 hooks.
---
--- Only Layer 3 runs continuously. Pass 1 (the ACTOR ward) is event-driven (it runs
--- inside flush_apply, i.e. on item receipt / connect settle), and the beta6 hooks are
--- reactive (they fire on the game's own SetActorVisible / grab calls, which were proven
--- to miss cases -- diag_flags BOOK_EVENT_REVEAL, "revealed=0"). So when an unwarded book's
--- actor lazy-streams in, or the game's swap leaves a flag stale, nothing re-asserts the
--- ACTOR state. Two symptoms, one gap:
---   Bug 1: visible (pile shown) but NOT grabbable -- collision left OFF.
---   Bug 2: grabbable but invisible when looked at  -- SM_Book_1 left hidden, so the actor
---          form (shown on look/grab) renders nothing.
---
--- This pass is the missing continuous counterpart to Layer 3, for the ACTOR. For each
--- UNWARDED book it asserts the two flags the bugs leave stale, writing ONLY when the live
--- value disagrees -- read-before-write "ground truth", the same churn-free pattern as
--- WARD_GROUND_TRUTH for bookcases. Steady state = all reads, zero writes, zero render-state
--- churn, so it cannot reintroduce the layer-3 crash.
---
--- Deliberately swap-safe:
---   * It NEVER touches actor bHidden for an unwarded book -- that flag is the game's
---     distance swap; pinning it visible would double-render a far book.
---   * It corrects SM_Book_1 ONLY when the actor is already in its SHOWN form (bHidden=false)
---     -- exactly the Bug-2 condition -- so far books (HISM form) are never churned.
---   * Collision-on is harmless on a far book (you can't reach it) and correct the instant
---     the swap shows the actor, so it's asserted unconditionally for unwarded books.
---
--- Rolling cursor + budget: a pass touches at most RECONCILE_BUDGET actors so the async poll
--- loop keeps pumping (same shape as main.lua's RefreshInfo sweep). Full coverage every
--- ceil(n / budget) passes (~a few 5s ticks). Warded books are skipped this iteration -- the
--- reported bugs are unwarded-half-shown, and ENFORCE + Layer 3 already keep warded hidden.
+-- Continuous counterpart to Layer 3 for the ACTOR (not the HISM pile). Pass 1's actor ward
+-- is event-driven and the SetActorVisible/grab hooks miss cases, so when an unwarded book's
+-- actor lazy-streams in or the game's distance swap leaves a flag stale, two bugs appear:
+--   * collision left OFF -> visible but not grabbable.
+--   * SM_Book_1 left hidden -> grabbable but invisible (the shown actor form renders nothing).
+-- For each UNWARDED book, assert those two flags, writing ONLY when the live value disagrees
+-- (read-before-write ground truth, like WARD_GROUND_TRUTH) so steady state = zero render-
+-- state churn and can't reintroduce the layer-3 crash. Swap-safe: never touches actor bHidden
+-- (the game's distance swap — pinning it would double-render a far book), and corrects
+-- SM_Book_1 only when bHidden=false (the shown form). Rolling cursor + budget keeps the async
+-- poll loop pumping; warded books are skipped (ENFORCE + Layer 3 keep them hidden).
 local RECONCILE_BUDGET = 1000
 function M.reconcile_book_actors()
     if not _diag_on("BOOK_ACTOR_RECONCILE") then return end
     if not M._apply_safe then return end
     if M._flush_in_progress then return end          -- don't race an active Pass-1 flush
-    -- (Re)snapshot the book list + unwarded set when the cursor wraps or the world reloaded.
+    -- Drop the snapshot when the world reloaded (stale epoch).
     if M._recon_books and (M._world_epoch or 0) ~= (M._recon_epoch or 0) then
         M._recon_books = nil
     end
@@ -1794,12 +1416,12 @@ function M.reconcile_book_actors()
             local series = aidx ~= nil and M._asset_to_series[aidx] or nil
             if series and unwarded[series] then
                 checked_unwarded = checked_unwarded + 1
-                -- Bug 1: collision must be ON for an unwarded (received) book.
+                -- Collision must be ON for an unwarded book.
                 local coll
                 pcall(function() coll = b:GetActorEnableCollision() end)
                 local fix_coll = (coll == false)
-                -- Bug 2: only when the actor is in its SHOWN form (bHidden=false) -- the
-                -- far HISM form (bHidden=true) renders via the pile, so leave it alone.
+                -- SM_Book_1: only fix in the SHOWN form (bHidden=false); the far HISM form
+                -- renders via the pile, leave it alone.
                 local bhid
                 pcall(function() bhid = b.bHidden end)
                 local fix_mesh, sm = false, nil
@@ -1820,10 +1442,9 @@ function M.reconcile_book_actors()
     end
     M._recon_cursor = hi + 1
     if #fixes == 0 then return end
-    -- WRITE pass: only the mismatched books. Same thread gate as Pass 1
-    -- (BOOK_ACTOR_GAMETHREAD): marshals to the game thread when that flag is on, inline
-    -- otherwise. Re-check the world epoch first -- a reload between read and a MARSHALED
-    -- write would leave `fixes` pointing at freed actors (a native AV pcall can't catch).
+    -- WRITE pass (mismatched books only), game-thread-gated like Pass 1. Re-check the world
+    -- epoch first — a reload between read and a marshaled write leaves `fixes` pointing at
+    -- freed actors (a native AV pcall can't catch).
     _on_game_thread(function()
         if (M._world_epoch or 0) ~= (epoch0 or 0) then return end
         local c_coll, c_mesh = 0, 0
@@ -1847,19 +1468,12 @@ function M.reconcile_book_actors()
 end
 
 -- ============================================================================
--- Apply: Bookcases (Phase 2a — section-gated visibility)
+-- Apply: Bookcases (section-gated visibility)
 -- ============================================================================
 
--- Each section has exactly one BP_M01_CabinetLabel_01_C. Its `Label Number`
--- (int32) maps ordinally to a section: 1..14 → 1A..1N, 21..37 → 2A..2Q
--- (gap 15-20 = unused). `CountBookCase` (TArray<AActor>) holds either
--- direct BookCases or wrapper actors (BP_M01_PillarCabinet_01_01_C,
--- BP_M01_Cabinet_01_C).
---
--- This is the authoritative mapping. CDI[1]-based derivation was
--- unreliable — data.py's series→section assignments are wrong for ~10
--- sections (series grouped under 2E/1B actually live in 1C/1D/1G/1H/
--- 2C/2D/2G/2H/2K/2L per the in-game labels).
+-- Each section has one BP_M01_CabinetLabel_01_C whose `Label Number` (int32) maps
+-- ordinally: 1..14 → 1A..1N, 21..37 → 2A..2Q (gap 15-20 unused). This is the authoritative
+-- section mapping — CDI[1]-based derivation is wrong for ~10 sections vs the in-game labels.
 local function _label_num_to_section(n)
     if n == nil then return nil end
     n = tonumber(n)
@@ -1875,29 +1489,20 @@ end
 function M._index_bookcases(silent)
     M._section_to_cases = {}
     M._case_to_section  = {}
-    -- A (re)index means the world (or our view of it) changed — e.g. after
-    -- quit→Continue, which reloads the world but REUSES actor paths, so the
-    -- apply-on-change tracker would otherwise match and skip re-warding. Drop the
-    -- warding tracker so every case re-wards fresh.
+    -- A (re)index means our view of the world changed (e.g. quit→Continue reuses actor
+    -- paths). Drop the warding tracker so every case re-wards fresh.
     M._case_ward_state = {}
-    -- Do NOT drop the sign-glow caches (_section_to_label / _section_glow_state /
-    -- _section_glow_orig) here. refresh_index_if_changed() re-indexes on EVERY
-    -- streaming change (running around streams bookcase sublevels in/out), but the
-    -- CabinetLabel actors + their SpotLights live in the PERSISTENT level — they
-    -- don't reload with the bookcases. Clearing the glow caches here forced
-    -- _apply_label_glow to re-map and re-touch all 31 SpotLights on every re-index;
-    -- touching a SpotLight whose render state is mid-stream is the recurring
-    -- BAE1A5E0 write-null crash (the glow re-map was the last thing logged before
-    -- it). The glow caches ARE reset on a genuine world reload by reset_hism_state()
-    -- (LoadMap), set_gameplay_active(false), and the ward-canary drift check — so the
-    -- glow stays correct across Continue while only touching a SpotLight when its
-    -- section's lock state actually changes.
+    -- Do NOT drop the sign-glow caches here. refresh_index_if_changed re-indexes on every
+    -- streaming change, but CabinetLabels + their SpotLights live in the PERSISTENT level.
+    -- Clearing the caches forced _apply_label_glow to re-touch all 31 SpotLights every
+    -- re-index, and touching a SpotLight whose render state is mid-stream is a write-null
+    -- crash. The caches ARE reset on a genuine reload (reset_hism_state / gameplay exit /
+    -- canary drift), so glow stays correct across Continue while only touching on change.
     M._ward_canary = nil
 
-    -- Step 1: build boi → BP_BookCase_C map. The wrappers (PillarCabinet,
-    -- Cabinet_01) reference their child bookcases via BookOrderIndex (matches
-    -- ABookCaseBase.BookOrderIdx on the child). This is more reliable than
-    -- ChildActorComponent:GetChildActor() which has been returning nil for us.
+    -- Step 1: build boi → BP_BookCase_C map. Wrappers (PillarCabinet, Cabinet_01) reference
+    -- children via BookOrderIndex (== child's BookOrderIdx) — more reliable than
+    -- ChildActorComponent:GetChildActor(), which returns nil for us.
     local boi_to_case = {}
     local cases = FindAllOf("BookCaseBase")
     if not cases or (function() local n = 0; pcall(function() n = #cases end); return n end)() == 0 then
@@ -1916,10 +1521,8 @@ function M._index_bookcases(silent)
         end
     end
 
-    -- Step 2: walk CabinetLabels. LabelNumber → section ordinal. CountBookCase
-    -- entries are either direct BookCases (add as-is) or wrapper actors
-    -- (PillarCabinet / Cabinet_01) whose BookOrderIndex tells us which
-    -- BookCases to pull out of boi_to_case.
+    -- Step 2: walk CabinetLabels. LabelNumber → section. CountBookCase entries are direct
+    -- BookCases (add as-is) or wrappers whose BookOrderIndex resolves children via boi_to_case.
     local labels = FindAllOf("BP_M01_CabinetLabel_01_C")
     if not labels then
         log("(no CabinetLabels found; cannot index)")
@@ -1938,10 +1541,8 @@ function M._index_bookcases(silent)
     local labels_ok, labels_skipped = 0, 0
     local resolved, unresolved = 0, 0
 
-    -- De-dup by GetFullName, not tostring(case): UE4SS doesn't always return
-    -- the same Lua wrapper across different fetch paths (FindAllOf vs reading
-    -- CabinetLabel.CountBookCase[j]) even when both point to the same UObject.
-    -- GetFullName returns the actor's stable UE path so it matches across calls.
+    -- De-dup by GetFullName, not tostring(case): UE4SS returns different Lua wrappers for the
+    -- same UObject across fetch paths, but GetFullName is the stable UE path.
     local function _case_key(case)
         local name
         pcall(function() name = case:GetFullName() end)
@@ -1977,7 +1578,7 @@ function M._index_bookcases(silent)
                                 local cls
                                 pcall(function() cls = actor:GetClass():GetFName():ToString() end)
                                 if cls == "BP_M01_PillarCabinet_01_01_C" then
-                                    -- Walk BookOrderIndex array → look up child BookCases
+                                    -- BookOrderIndex array → child BookCases
                                     pcall(function()
                                         local arr = actor.BookOrderIndex
                                         if arr then
@@ -2018,13 +1619,9 @@ function M._index_bookcases(silent)
         end
     end
 
-    -- Stray-case sweep: any BookCase actor not added via a CabinetLabel
-    -- walk is a "stray" — a level-design artifact (case tucked into a
-    -- wall corner) not part of any AP section. The placement system
-    -- can still find these by aim angle and accept books there, but
-    -- the player can't reach them — softlock. Kept permanently hidden
-    -- + collision-off by _apply_bookcases_to_world. _case_key matches
-    -- add_case's key so indexed cases aren't reclassified.
+    -- Stray-case sweep: any BookCase not added via a CabinetLabel walk is a level-design
+    -- artifact not in any section. Kept permanently hidden + collision-off (else placement
+    -- can drop an unreachable book = softlock). Same _case_key so indexed cases aren't reclassified.
     M._stray_cases = {}
     local all_cases = FindAllOf("BookCaseBase")
     if not all_cases or (function() local nn = 0; pcall(function() nn = #all_cases end); return nn end)() == 0 then
@@ -2068,10 +1665,8 @@ function M._index_bookcases(silent)
     end
 end
 
---- Re-run _index_bookcases and return true iff the index actually grew
---- (new sections found, or new cases in an existing section). Used by
---- main.lua's periodic refresh loop to catch lazily-streamed bookcases
---- without spamming the world-apply when nothing has changed.
+--- Re-index and return true iff the index grew (new sections/cases). main.lua's refresh
+--- loop uses this to catch lazily-streamed bookcases without re-applying when unchanged.
 function M.refresh_index_if_changed()
     if not M._gameplay_active or not M._apply_safe then return false end
 
@@ -2111,11 +1706,8 @@ function M.refresh_index_if_changed()
     return false
 end
 
--- Class-name → "vol capacity tier" priority for sorting cases within a
--- section. Smaller tier = unlocks earlier (matches AP world's shelf_req
--- assignment, which puts smaller-vol series in earlier cases).
---   tier 1: BP_BookCase_4x5_C (holds 5-vol series)
---   tier 2: everything else (BP_BookCase_C / 4x16 / 6x16 — holds 10-vol series)
+-- Class-name → vol-capacity tier for ordering cases within a section (smaller unlocks
+-- first, matching the apworld's shelf_req). tier 1 = 4x5 (5-vol), tier 2 = rest (10-vol).
 local CASE_VOL_TIER = {
     BP_BookCase_4x5_C  = 1,
     BP_BookCase_C      = 2,
@@ -2129,11 +1721,9 @@ local function _case_tier(case)
     return CASE_VOL_TIER[cls] or 2
 end
 
--- Returns a flat list of AssetIdx that the given BookCase accepts.
---   Uniform cases  (CDI[1] AssetIdx is in the case's section): take CDI[1..N]
---                  where N = RowStatus length.
---   Mixed cases    (4x16, 6x16): CDI is a "decorator" set; use BAI groups
---                  (FColumnCorrectIdx.CorrectIdx), deduplicated.
+-- Flat list of AssetIdx a BookCase accepts.
+--   Uniform (CDI[1] in the case's section): CDI[1..RowStatus length].
+--   Mixed (4x16, 6x16): CDI is a decorator set; use BookArrayInfo.CorrectIdx groups, deduped.
 local function _case_accepted_assets(case, sid)
     local out = {}
     if not case or not case:IsValid() then return out end
@@ -2179,23 +1769,15 @@ local function _case_accepted_assets(case, sid)
     return out
 end
 
--- Fence cover variants. Each warded case gets a chain-link fence in front,
--- but case sizes differ — bookcases come in standard, small (5-vol case
--- of a mixed-volume section), smallest (the even-narrower outer cases
--- of 2O), and cabinet (tall alcove-wrapped single-case sections that
--- need wider collision so books can't be physics-thrown through the
--- chain-link sides). Four Blueprint variants:
---   standard — BP_WardCover (existing): 10-vol case or uniform section
---   cabinet  — BP_WardCover_Cabinet: 1C/1D/1G/1H and 2C/2D/2G/2H/2K/2L
+-- Fence-cover variants (chain-link in front of each warded case), sized per case:
+--   standard — BP_WardCover: 10-vol case / uniform section
+--   cabinet  — BP_WardCover_Cabinet: tall alcove sections (wider collision so books
+--              can't be thrown through the sides)
 --   small    — BP_WardCover_Small: 5-vol case of a mixed section
 --   smallest — BP_WardCover_Smallest: 2O outer cases (narrower than small)
---
--- FENCE_PER_CASE maps section → { [case_idx] = variant_name }. Cases not
--- listed (or any case in a section not in the table) default to standard
--- unless the section is in FENCE_CABINET_SECTIONS. Note the case_idx
--- order is the game's CabinetLabel.CountBookCase order, which doesn't
--- always match left-to-right physical layout — verify visually after
--- changes.
+-- FENCE_PER_CASE maps section → { [case_idx] = variant }; unlisted cases default to standard
+-- unless the section is in FENCE_CABINET_SECTIONS. case_idx is CountBookCase order, which may
+-- not match physical left-to-right layout — verify visually after changes.
 local FENCE_CABINET_SECTIONS = {
     ["1C"] = true, ["1D"] = true, ["1G"] = true, ["1H"] = true,
     ["2C"] = true, ["2D"] = true, ["2G"] = true,
@@ -2224,33 +1806,18 @@ local function _fence_variant_for_case(section_id, case_idx)
     return "standard"
 end
 
---- Per-section visibility: cases sorted by (vol_tier asc, BookOrderIdx asc),
---- with visible_count = min(shelves_open[section], n_cases).
---- The first `visible_count` cases of each section are shown, the rest hidden.
---- Each Progressive Shelf Unlock (section) item received increments shelves_open
---- and reveals the next bookcase. Smaller-vol cases (4x5) unlock first, which
---- mirrors the AP world's per-section shelf_req ordering — so series in 5-vol
---- cases become reachable before series in 10-vol cases.
---- Operates only on BP_BookCase_C actors so structural wrapper meshes
---- (pillars, walls) stay visible. Idempotent.
--- ── Section sign (CabinetLabel) glow ───────────────────────────────────────
--- Each section's BP_M01_CabinetLabel_01_C sign carries a SpotLight (the
--- completion glow). We drive it as an UNLOCK-PROGRESS cue: RED = none of the section's
--- cases unlocked, YELLOW = some but not all, OFF = all unlocked (the game's own
--- completion glow takes back over). The label→section map is built by the indexer (M._section_to_label,
--- via the label's `Label Number`), so we just read it here — no FindAllOf / position
--- matching. SAFE: gameplay-only (never the streaming window that AV'd),
--- apply-on-change, and we DO NOT persistently hold the SpotLight component (a
--- render-scene-tied reference held across teardown hung the game) — we look it up
--- on the rare state-change and keep only primitives (original intensity/vis/units).
+-- Section-sign (CabinetLabel) glow. Each sign's SpotLight is driven as an unlock-progress
+-- cue: RED = none of the section's cases unlocked, YELLOW = some, OFF = all (game's own
+-- completion glow takes over). label→section map comes from the indexer. SAFE: gameplay-only
+-- (never the streaming window that AV'd), apply-on-change, and we never persistently hold the
+-- SpotLight (a render-tied ref held across teardown hung the game) — look it up on the rare
+-- state-change and keep only primitives.
 
--- Bright value by ELightUnits (0 Unitless, 1 Candelas, 2 Lumens, 3 EV). This
--- game's signs use Candelas (1); tune that entry for brightness.
+-- Bright value by ELightUnits (0 Unitless, 1 Candelas, 2 Lumens, 3 EV). Signs use Candelas.
 local GLOW_INTENSITY = { [0] = 0.5, [1] = 0.5, [2] = 180.0, [3] = 1.0 }
 
--- Glow the locked signs immediately when we're in gameplay AND apply-safe, instead
--- of waiting up to 5s for the periodic loop. Forces a fresh map first (drops any
--- stale label refs from the prior world) so it's safe right after Continue.
+-- Glow locked signs now (gameplay + apply-safe) instead of waiting for the 5s loop. Forces a
+-- fresh map first (drops stale label refs from the prior world) so it's safe right after Continue.
 function M._maybe_glow_now()
     if not (M._gameplay_active and M._apply_safe) then return end
     M._section_to_label = nil
@@ -2260,9 +1827,8 @@ function M._maybe_glow_now()
 end
 
 function M._apply_label_glow()
-    -- One-time per session, IN GAMEPLAY: map sections → their CabinetLabel actor
-    -- via the label's `Label Number`. Done here (not at index/load time) so nothing
-    -- touches these label actors during the fragile streaming window.
+    -- Map sections → CabinetLabel via `Label Number`, once per session in gameplay. Done here
+    -- (not at index/load) so nothing touches these actors during the fragile streaming window.
     if not M._section_to_label then
         M._section_to_label = {}
         local labels = FindAllOf("BP_M01_CabinetLabel_01_C")
@@ -2281,8 +1847,7 @@ function M._apply_label_glow()
     M._section_glow_state = M._section_glow_state or {}
     M._section_glow_orig = M._section_glow_orig or {}
     for sid, lbl in pairs(M._section_to_label) do
-        -- Three-state sign: RED = none of the section's cases unlocked, YELLOW = some but
-        -- not all, OFF (hand the light back to the game) = all unlocked. Driven by
+        -- RED = none unlocked, YELLOW = some, OFF (game owns the light) = all, by
         -- shelves-open vs the section's total case count.
         local open = M._shelves_open[sid] or 0
         local total = (M._section_to_cases[sid] and #M._section_to_cases[sid]) or 0
@@ -2338,27 +1903,21 @@ function M._apply_label_glow()
     end
 end
 
--- Stage 2: layer-2 ward marshaled onto the GAME THREAD (gated CASE_WARD_GAMETHREAD).
--- Covers BOTH callers (the 5s loop + flush_apply). The impl below is byte-for-byte
--- unchanged -- all its _ward_collision writes (SetCollisionEnabled / SetCollisionResponseTo*
--- / SetVisibility / MarkRenderStateDirty) plus the ground-truth + canary collision reads
--- now run on the game thread, where they can't race the engine's collision/render workers.
+-- Layer-2 ward marshaled onto the GAME THREAD (gated CASE_WARD_GAMETHREAD) for both callers,
+-- so its collision/visibility writes + reads can't race the engine's collision/render workers.
 function M._apply_bookcases_to_world()
     _on_game_thread(M._apply_bookcases_impl, "CASE_WARD_GAMETHREAD")
 end
 
 function M._apply_bookcases_impl()
     if not M._cases_indexed then return end
-    -- Section sign glow: RED = none unlocked, YELLOW = some but not all, OFF = all unlocked.
-    -- Gameplay-only (never during streaming), apply-on-change.
+    -- Section sign glow (gameplay-only, apply-on-change).
     if M._gameplay_active and M._apply_safe then
         pcall(M._apply_label_glow)
     end
-    -- Drift canary: the game silently resets bookcase collision on some transitions
-    -- (e.g. Menu→Continue) that fire NO mod event, so apply-on-change would keep
-    -- skipping the now-unwarded cases forever. If our sample warded mesh's Camera
-    -- response is no longer Ignore, it's been reset — drop the warding + glow
-    -- trackers so this pass re-applies everything.
+    -- Drift canary: the game silently resets case collision on some transitions (Menu→Continue)
+    -- with NO mod event, so apply-on-change would skip the now-unwarded cases forever. If our
+    -- sample warded mesh's Camera response is no longer Ignore, drop the trackers to re-apply all.
     if M._ward_canary then
         if M._ward_canary:IsValid() then
             local resp
@@ -2376,18 +1935,11 @@ function M._apply_bookcases_impl()
         end
     end
 
-    -- Periodic ward reconciliation. Apply-on-change keeps steady-state passes
-    -- cheap, but it also means that if a case is ever RECORDED as done in
-    -- _case_ward_state while its real collision is wrong -- an unlock whose
-    -- restore silently didn't take, or an event-less game-side reset the canary's
-    -- single sentinel mesh happened to miss -- nothing would re-correct it (the
-    -- shelf stays warded forever despite being unlocked). So every RECONCILE_EVERY
-    -- passes we drop the ward cache to force a clean full re-assert from
-    -- _shelves_open (the UNLOCK path's StaticMesh block-all then re-placeables any
-    -- stranded shelf). Gated on gameplay+apply_safe so it never runs during
-    -- streaming/teardown (can't race the world-teardown deref); the re-assert is
-    -- cheap (ward is ~1-8 pcall-guarded calls/mesh) and self-limits to once per
-    -- RECONCILE_EVERY passes. Captures (_case_orig_collision) are NOT cleared.
+    -- Periodic ward reconciliation. Apply-on-change is cheap but can strand a case recorded
+    -- as done in _case_ward_state while its real collision is wrong (an unlock restore that
+    -- silently didn't take, or a reset the canary's single mesh missed). Every RECONCILE_EVERY
+    -- passes, drop the ward cache to force a clean full re-assert from _shelves_open. Gated on
+    -- gameplay+apply_safe so it never races teardown; cheap (~1-8 calls/mesh). Captures kept.
     local RECONCILE_EVERY = 30
     if M._gameplay_active and M._apply_safe then
         M._reconcile_tick = (M._reconcile_tick or 0) + 1
@@ -2405,8 +1957,7 @@ function M._apply_bookcases_impl()
         local shelves_open = M._shelves_open[section_id] or 0
         local visible_count = math.min(shelves_open, #cases)
 
-        -- Stable per-section order: smaller-vol cases first, BookOrderIdx
-        -- breaks ties.
+        -- Stable order: smaller-vol cases first, BookOrderIdx breaks ties.
         local sorted = {}
         for i, c in ipairs(cases) do sorted[i] = c end
         table.sort(sorted, function(a, b)
@@ -2424,22 +1975,15 @@ function M._apply_bookcases_impl()
                 local case_key
                 pcall(function() case_key = case:GetFullName() end)
 
-                -- Apply-on-change gate: only mutate this case when its visible
-                -- (lock) state actually changes. The warding STICKS once applied
-                -- (the BP doesn't fight our collision), so steady-state passes do
-                -- nothing per case — a big perf win that also removes the window
-                -- where a periodic poll could race the world teardown on quit and
-                -- deref a freeing mesh (the 0x0 quit crash). State resets on world
-                -- reload, so every case re-applies fresh next session.
+                -- Apply-on-change gate: only mutate on a visible-state change. Warding sticks
+                -- (the BP doesn't fight our collision), so steady-state passes are no-ops —
+                -- perf, and it closes the window where a poll races world teardown on quit.
                 M._case_ward_state = M._case_ward_state or {}
-                -- Decide whether to (re)ward by reading the case's ACTUAL collision rather
-                -- than trusting our cache. The placement mesh's Camera channel (4) reads
-                -- Ignore(0) when warded, Block(2) when unwarded (see _ward_collision). So a
-                -- correctly-warded case is a no-op every pass -> NO render-state churn (the
-                -- recurring crash is a main-thread mesh write racing the render/instance
-                -- worker), while game-side drift (Menu->Continue silently resetting collision)
-                -- is still caught within one pass. Falls back to the cache on a case's first
-                -- pass (placement mesh not stashed yet) or whenever the read is unavailable.
+                -- Decide by reading the case's ACTUAL collision, not the cache: the placement
+                -- mesh's Camera channel (4) reads Ignore(0)=warded, Block(2)=unwarded. A
+                -- correctly-warded case is then a no-op (no render-state churn = the crash),
+                -- while game-side drift is still caught within one pass. Falls back to the
+                -- cache on a case's first pass or when the read is unavailable.
                 local desired_warded = not visible
                 local changed
                 if _diag_on("WARD_GROUND_TRUTH") then
@@ -2466,17 +2010,11 @@ function M._apply_bookcases_impl()
                 if changed and _diag_on("CASE_WARDING") then
                     trace.begin(visible and "ward-show" or "ward-hide", case)
                     local ok = pcall(function()
-                        -- Warding (Lua-only, crash-free) — 2e: LOCKED cases keep their
-                        -- body meshes solid to OBJECT channels (block player + thrown
-                        -- books) but IGNORE trace channels so the placement line-trace
-                        -- misses → solid AND un-interactable. UNLOCKED restores them.
-                        -- See `_ward_collision`.
+                        -- Collision warding via _ward_collision. The case actor itself stays
+                        -- shown; warding is collision-only so the mesh remains a visible stack.
                         case:SetActorHiddenInGame(false)
                         _ward_collision(case, case_key, not visible)
-                        -- Tree-walk child components to ensure visibility
-                        -- propagates. BP_BookCase children
-                        -- (StaticMesh, PreviewBookLocation) don't always
-                        -- inherit the actor flag.
+                        -- Tree-walk children: BP_BookCase children don't always inherit the actor flag.
                         local root = case:K2_GetRootComponent()
                         if root and root:IsValid() then
                             _walk_set_visibility(root, true)
@@ -2506,26 +2044,15 @@ function M._apply_bookcases_impl()
                     end
                 end
 
-                -- Cover-actor overlay. If the pak is loaded, ModActor
-                -- exposes SpawnWardCover / SpawnWardCover_Cabinet /
-                -- SpawnWardCover_Small + DespawnWardCover. We pick the
-                -- variant per (section, case_idx) so cabinet alcoves get
-                -- the taller fence with wider collision, and 5-vol cases
-                -- of mixed sections get the narrower fence sized for the
-                -- smaller bookcase. All wrapped in pcall so an older pak
-                -- without the new variants falls back to standard
-                -- SpawnWardCover where possible.
-                -- v1.1.0 diagnostic: cover spawning is GATED OFF (M._covers_enabled
-                -- is nil/false). Runtime cover actors are the connect/quit crash
-                -- source — disabling them restores the stable connect path. The
-                -- [row-diag] probe above doesn't depend on covers. The rewrite
-                -- replaces this whole path; for now we just need stable play to
-                -- capture the row structure.
+                -- Cover-actor overlay (chain-link fence) per (section, case_idx) variant, all
+                -- pcall-wrapped so an older pak falls back to standard SpawnWardCover.
+                -- GATED OFF (M._covers_enabled nil/false): runtime cover actors are a
+                -- connect/quit crash source, so warding is collision-only for now.
                 if case_key and M._covers_enabled then
                     local mod_actor = FindFirstOf("ModActor_C")
                     if mod_actor and mod_actor:IsValid() then
                         if visible then
-                            -- Should be visible: despawn cover if any.
+                            -- Visible: despawn cover if any.
                             local existing_cover = M._case_covers[case_key]
                             if existing_cover and existing_cover:IsValid() then
                                 pcall(function()
@@ -2534,14 +2061,12 @@ function M._apply_bookcases_impl()
                             end
                             M._case_covers[case_key] = nil
                         else
-                            -- Should be warded: spawn cover if not present.
+                            -- Warded: spawn cover if not present.
                             local existing_cover = M._case_covers[case_key]
                             if not existing_cover or not existing_cover:IsValid() then
                                 local variant = _fence_variant_for_case(section_id, i)
                                 local fn_name = FENCE_BP_FUNC[variant] or "SpawnWardCover"
-                                -- One-shot per (section, case_idx) log
-                                -- so we can confirm the variant assignment
-                                -- matches the in-game bookcases.
+                                -- One-shot per (section, case_idx): confirm the variant assignment.
                                 M._diag_fence_dispatch_logged = M._diag_fence_dispatch_logged or {}
                                 local diag_key = section_id .. "|" .. tostring(i)
                                 if not M._diag_fence_dispatch_logged[diag_key] then
@@ -2552,20 +2077,13 @@ function M._apply_bookcases_impl()
                                 local spawned
                                 local out_table = {}
                                 local pcall_ok, pcall_err = pcall(function()
-                                    -- UE4SS BP out-params: pass an EMPTY
-                                    -- TABLE that UE4SS populates with
-                                    -- the output value under the BP
-                                    -- parameter's name. Passing nil fails
-                                    -- with "no table was on the stack";
-                                    -- {} works and the value lands in
-                                    -- out_table.spawned_cover.
+                                    -- UE4SS BP out-params: pass an empty table UE4SS populates
+                                    -- under the BP param name (nil fails "no table on the stack").
                                     local fn = mod_actor[fn_name]
                                     if fn ~= nil then
                                         fn(mod_actor, case, out_table)
                                     else
-                                        -- Variant not in this pak; fall
-                                        -- back to standard so the player
-                                        -- still gets some kind of gate.
+                                        -- Variant absent in this pak; fall back to standard.
                                         mod_actor:SpawnWardCover(case, out_table)
                                     end
                                 end)
@@ -2573,10 +2091,7 @@ function M._apply_bookcases_impl()
                                     or out_table.SpawnedCover
                                     or out_table[1]
                                     or out_table.ReturnValue
-                                -- One-shot dump of table keys on first
-                                -- call so we can see what UE4SS actually
-                                -- populated, in case the field name we
-                                -- assumed is wrong.
+                                -- One-shot: dump out_table keys to see what UE4SS populated.
                                 if not M._diag_spawnwardcover_table_dumped then
                                     M._diag_spawnwardcover_table_dumped = true
                                     local keys = {}
@@ -2586,18 +2101,8 @@ function M._apply_bookcases_impl()
                                     log(("[ward-diag] SpawnWardCover out_table keys: {%s}"):format(
                                         table.concat(keys, ", ")))
                                 end
-                                -- One-shot geometry diagnostic. Each step in
-                                -- its own pcall + log so we get partial
-                                -- output even when one accessor throws.
-                                -- Uses tostring() (UE4SS wrapper has a
-                                -- friendly tostring); .X/.Y/.Z field access
-                                -- previously failed silently with no output.
-                                -- +25 X in BP_WardCover places the fence in
-                                -- front of the bookcase. Mesh component
-                                -- access (spawned.MeshFence) and
-                                -- GetActorBounds don't work cleanly from
-                                -- UE4SS Lua, so we rely on fixed BP
-                                -- component defaults instead.
+                                -- One-shot geometry diagnostic via tostring() (the UE4SS
+                                -- wrapper's; raw .X/.Y/.Z field access fails silently here).
                                 if spawned and spawned:IsValid()
                                         and not M._diag_geometry_dumped then
                                     M._diag_geometry_dumped = true
@@ -2620,11 +2125,9 @@ function M._apply_bookcases_impl()
                                         log(("[ward-diag] SpawnWardCover SUCCEEDED for first time: section=%s case_idx=%d -> %s"):format(
                                             section_id, i, tostring(sname)))
                                     end
-                                    -- Runtime override: BP saved values for the BlockerBox keep
-                                    -- coming through as Overlap (1) at runtime even when the
-                                    -- editor shows Block. Force-set every channel to Block
-                                    -- (ECR_Block = 2) on the BlockerBox component directly.
-                                    -- Idempotent — re-setting an already-Block channel is free.
+                                    -- BlockerBox saved values come through as Overlap(1) at
+                                    -- runtime despite the editor showing Block, so force every
+                                    -- channel to Block(2) on it directly. Idempotent.
                                     pcall(function()
                                         local force_comps = spawned.BlueprintCreatedComponents
                                         local fn = 0; pcall(function() fn = #force_comps end)
@@ -2670,9 +2173,8 @@ function M._apply_bookcases_impl()
         end
     end
 
-    -- Stray cases: cases that exist in the level but aren't tied to any
-    -- section via CabinetLabel. Keep them permanently hidden + collision-
-    -- off so the placement system can't drop books on them.
+    -- Stray cases (not tied to any section): keep permanently hidden + collision-off so
+    -- placement can't drop books on them.
     local stray_disabled, stray_dead = 0, 0
     for i = 1, (_diag_on("CASE_WARDING") and #M._stray_cases or 0) do
         local case = M._stray_cases[i]
@@ -2707,8 +2209,7 @@ function M._apply_bookcases_impl()
         end
     end
 
-    -- Only log when something changed vs the last apply (the periodic
-    -- re-apply runs every 5s and used to spam identical lines).
+    -- Only log on change vs the last apply (the 5s re-apply spammed identical lines).
     local _diag_total = 0
     for _, _cs in pairs(M._section_to_cases) do _diag_total = _diag_total + #_cs end
     local key = string.format("%d/%d/%d/%d/%d", _diag_total, shown, hidden, dead, stray_disabled)
@@ -2721,9 +2222,8 @@ function M._apply_bookcases_impl()
 
 end
 
---- Logs a per-section summary of which series each VISIBLE case accepts vs
---- which of those series are currently UNLOCKED. Useful when the player
---- can't find any book that fits an open shelf. Marker `*` = unlocked.
+--- Per-section log of which series each VISIBLE case accepts vs which are UNLOCKED (* marker).
+--- Useful when the player can't find a book that fits an open shelf.
 function M.log_visible_case_series()
     if not M._cases_indexed then return end
 
@@ -2789,20 +2289,12 @@ end
 -- Row completion detection (FinishRow → AP location check)
 -- ============================================================================
 
--- Walks every indexed bookcase and fires the AP row-completion location for each
--- GENUINELY-completed shelf. AUTHORITATIVE signal: the game's per-case RowStatus
--- (BP_BookCase: TArray<bool>, ONE ENTRY PER SHELF) -- rs[i]==true ONLY when shelf i's
--- designated series is fully placed IN ORDER on that single shelf (the game validates
--- order + section before flipping the bit). Wrong order, wrong section, or a series
--- split across shelves never flips a bit -> never fires.
---   • Uniform case  -> completed shelf i maps to series CorrectBookDataIndex[i] (exact).
---   • Mixed cabinet -> fall back to "fully present in home section", capped by the count
---     of completed shelves.
--- BUG THIS FIXED: the old code read #case.RowStatus as a completion COUNT, but that is
--- the SHELF COUNT (TArray length), so the gate was always true and any series merely
--- PRESENT in its section fired regardless of order/single-row. Read the bool VALUES,
--- never the length (#RowStatus is still the right SHELF count for _case_accepted_assets).
-
+-- Fire the AP row-completion location for each genuinely-completed shelf. AUTHORITATIVE
+-- signal: per-case RowStatus (TArray<bool>, ONE ENTRY PER SHELF); rs[i]==true ONLY when
+-- shelf i's series is fully placed IN ORDER (the game validates order + section first).
+-- Read the bool VALUES, never #RowStatus (that's the shelf count, not a completion count).
+--   • Uniform case  -> completed shelf i maps to series CorrectBookDataIndex[i].
+--   • Mixed cabinet -> "fully present in home section", capped by # completed shelves.
 function M.detect_completed_rows()
     if not M._cases_indexed then return 0 end
     if not M._slot_data then return 0 end
@@ -2831,13 +2323,8 @@ function M.detect_completed_rows()
     for sid, cases in pairs(M._section_to_cases) do
         for _, case in ipairs(cases) do
             if case and case:IsValid() then
-                -- AUTHORITATIVE per-shelf completion. RowStatus is a TArray<bool> (game class
-                -- BP_BookCase) with ONE ENTRY PER SHELF; rs[i]==true ONLY when shelf i holds its
-                -- designated series fully placed IN ORDER -- the game validates order + section
-                -- before flipping it. The old code read #case.RowStatus, but that is the SHELF
-                -- COUNT, not the completed count: the gate was always true and ANY series merely
-                -- PRESENT in its home section (count >= volumes) fired, regardless of order or
-                -- whether it sat on one row. We now read the bool VALUES.
+                -- RowStatus[i] (TArray<bool>, one per shelf) == true only when shelf i holds
+                -- its series fully placed in order. Read the bool values, not the length.
                 local rs = nil; pcall(function() rs = case.RowStatus end)
                 local rs_n = 0; if rs then pcall(function() rs_n = #rs end) end
                 local completed = {}   -- 1-based shelf indices with rs[i] == true
@@ -2848,23 +2335,19 @@ function M.detect_completed_rows()
                 end
 
                 if #completed > 0 then
-                    -- Read the completed series from the books ACTUALLY on each completed row.
-                    -- Under free placement (any series on any row), CorrectBookDataIndex is the
-                    -- SECTION's answer-set, NOT a per-row map -- using cdi[i] fired the wrong series
-                    -- (1J row 3 held series 113 but cdi[3]=110). PlacingBookInfo is a flat row-major
-                    -- grid of rows*per_row slots (CONFIRMED: 40 slots / 4 rows = 10/row, RowNumArray
-                    -- corroborates 10), so row i's books are slots (i-1)*per_row+1 .. i*per_row.
-                    -- Split ItemInfo access keeps the crash-safe path (a book sub-object can be
-                    -- transiently freed mid-completion; pcall can't catch that native AV).
+                    -- Read the completed series from the books ACTUALLY on each row: under free
+                    -- placement CorrectBookDataIndex is the section's answer-set, not a per-row
+                    -- map, so cdi[i] fires the wrong series. PlacingBookInfo is a flat row-major
+                    -- grid of rows*per_row slots, so row i's books are slots (i-1)*per_row+1..i*per_row.
+                    -- Split ItemInfo access — a book sub-object can be transiently freed (native AV).
                     local pbi = nil; pcall(function() pbi = case.PlacingBookInfo end)
                     local pbi_n = 0; if pbi then pcall(function() pbi_n = #pbi end) end
                     local per_row = (rs_n > 0 and pbi_n > 0 and pbi_n % rs_n == 0)
                         and math.floor(pbi_n / rs_n) or 0
 
                     if pbi and per_row > 0 then
-                        -- GRID: each completed row holds exactly one series in order -> read that
-                        -- row's own slots and take the AssetIdx filling them (dominant guards a
-                        -- transient partial read). No cdi[i], no section-wide guessing.
+                        -- GRID: read each completed row's own slots and take the dominant AssetIdx
+                        -- (dominant guards a transient partial read). No cdi[i], no section guessing.
                         for _, i in ipairs(completed) do
                             local counts = {}
                             for slot = (i - 1) * per_row + 1, i * per_row do
@@ -2885,11 +2368,8 @@ function M.detect_completed_rows()
                             for aidx, c in pairs(counts) do
                                 if c > best_n then best_aidx, best_n = aidx, c end
                             end
-                            -- Fire ONLY for the correct section: the series found on the row must
-                            -- belong to THIS bookcase's section. Under home-section placement that
-                            -- always holds. If a row's series ever maps elsewhere (mis-indexed
-                            -- bookcase / unexpected cross-section placement / transient mis-read),
-                            -- log it loudly and do NOT fire a foreign section's location.
+                            -- Fire ONLY when the row's series belongs to THIS case's section;
+                            -- a foreign mapping (mis-index / cross-section / mis-read) is logged, not fired.
                             local best_sid = best_aidx and M._asset_to_section[best_aidx]
                             if best_aidx and best_sid == sid then
                                 if fire_row(sid, M._asset_to_series[best_aidx],
@@ -2902,10 +2382,9 @@ function M.detect_completed_rows()
                             end
                         end
                     else
-                        -- FALLBACK (non-grid PBI -- a cabinet whose slot count isn't rows*per_row):
-                        -- "series fully present in its home section" scan, capped by #completed. Less
-                        -- precise (can mis-pick among several fully-present series) but never invents
-                        -- a not-present series; only used where rows can't be sliced.
+                        -- FALLBACK (non-grid PBI: slot count isn't rows*per_row): "fully present in
+                        -- home section" scan capped by #completed. Less precise but never invents a
+                        -- not-present series.
                         local current = {}
                         pcall(function()
                             if pbi then
@@ -2961,12 +2440,9 @@ function M.detect_completed_rows()
     return sent_count
 end
 
---- Walk APClient._sent_checks and mark every matching row location in
---- _sent_row_locations. This recovers row-completion state across reconnects:
---- prior-session row checks the server already knows about end up populating
---- _sent_row_locations so fire_section_completions() can see that all rows
---- of a section are complete without having to re-discover each one via
---- detect_completed_rows. Returns the number of newly-marked entries.
+--- Mark every row location the server already knows checked (APClient._sent_checks) into
+--- _sent_row_locations, so fire_section_completions sees prior-session-completed sections
+--- without re-discovering each row. Returns the count newly marked.
 function M._sync_sent_row_locations_from_server()
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient._sent_checks) then return 0 end
@@ -2984,32 +2460,17 @@ function M._sync_sent_row_locations_from_server()
     return synced
 end
 
---- Fire any unfired "Section Complete: <id>" location checks whose section
---- has had every row location marked sent. Tracks the firing in
---- _sent_section_completions so we don't re-send during the same session.
----
---- Derived from _sent_row_locations rather than an in-game event:
---- the game emits no "section complete" signal, and row-completion is
---- the only authoritative "this series's row is done" trigger we have.
---- Every row fired = every series in the section was correctly shelved.
----
---- Called from:
----   • The FinishRow hook (after detect_completed_rows) — catches new
----     section completions right when the player finishes the section's
----     last row.
----   • run_baseline_sync — fires any sections that were already complete
----     in a prior session (we sync _sent_row_locations from the server's
----     _sent_checks first so this works on reload).
+--- Fire "Section Complete: <id>" for any section whose every row location is marked sent
+--- (de-duped via _sent_section_completions). Derived from _sent_row_locations since the
+--- game emits no section-complete signal. Called from the FinishRow hook and run_baseline_sync.
 function M.fire_section_completions()
     if not M._slot_data then return 0 end
     if not M._section_to_row_locs then return 0 end
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient.send_check) then return 0 end
 
-    -- Prefer slot_data's section_location_map (new seeds). Fall back
-    -- to AP_LOC_SECTION_FIRST + SECTION_IDX[sid] for legacy seeds —
-    -- location ids are allocated identically apworld-side, so the
-    -- fallback maps correctly.
+    -- Prefer slot_data.section_location_map; fall back to AP_LOC_SECTION_FIRST + SECTION_IDX[sid]
+    -- for legacy seeds (location ids are allocated identically apworld-side).
     local sec_loc_map = M._slot_data.section_location_map
     local use_slot_map = (type(sec_loc_map) == "table")
 
@@ -3045,32 +2506,17 @@ function M.fire_section_completions()
     return sent
 end
 
---- Fire any unfired "Floor N Complete" location checks whose floor has had
---- every row location in its active sections marked sent. Mirrors
---- fire_section_completions but at the floor granularity.
----
---- Locations: AP IDs 1910550 (Floor 1) and 1910551 (Floor 2). Defined in
---- apworld/librarian/Locations.py:_floor_locations.
----
---- Called from:
----   • The FinishRow hook (after fire_section_completions) — catches the
----     final row that closes out a floor.
----   • The 3s detect_completed_rows poll (for swap completions that
----     don't go through FinishRow).
----   • run_baseline_sync — fires any floors that were already complete in
----     a prior session, after _sync_sent_row_locations_from_server has
----     hydrated _sent_row_locations from the server's _sent_checks.
+--- Fire "Floor N Complete" for any floor whose every active-section row location is sent.
+--- Like fire_section_completions at floor granularity (loc 1910550/1910551). Called from
+--- the FinishRow hook, the 3s detect_completed_rows poll, and run_baseline_sync.
 function M.fire_floor_completions()
     if not M._slot_data then return 0 end
     if not M._floor_to_row_locs then return 0 end
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient.send_check) then return 0 end
 
-    -- Prefer slot_data's authoritative floor_location_map (post-1.0.4
-    -- seeds). Fall back to AP_LOC_FLOOR_FIRST + FLOOR_IDX[floor_n] for
-    -- legacy seeds. Map keys are stringified ints ("1", "2") per the
-    -- apworld-side convention, but try the int key first defensively in
-    -- case any AP client surface delivers them unwrapped.
+    -- Prefer slot_data.floor_location_map; fall back to AP_LOC_FLOOR_FIRST + FLOOR_IDX[floor_n].
+    -- Map keys are stringified ints; try the int key first defensively.
     local floor_loc_map = M._slot_data.floor_location_map
     local use_slot_map = (type(floor_loc_map) == "table")
 
@@ -3106,10 +2552,8 @@ function M.fire_floor_completions()
     return sent
 end
 
---- Fire any unfired "Complete N Rows" location checks whose threshold the
---- player has now reached. `total_rows` is the game's authoritative
---- correct-row counter (FinishRow event parameter or
---- GameSaveData.CurrentFinishedRowNum). Returns the number of checks sent.
+--- Fire "Complete N Rows" for any threshold <= total_rows (the game's correct-row counter
+--- from FinishRow or CurrentFinishedRowNum). Returns the count sent.
 function M.fire_row_completion_checks(total_rows)
     if not M._slot_data then return 0 end
     if not total_rows or total_rows <= 0 then return 0 end
@@ -3137,23 +2581,16 @@ end
 -- Progress sync (level-ups + milestones)
 -- ============================================================================
 
--- Live book-placement counter from BP hook. Currently dormant — none of the
--- BP function-name candidates we registered fired in testing. The widget
--- read below is the real source. Kept around in case we add a pak-side BP
--- hook later that forwards a per-book event.
+-- Live book-placement counter from a BP hook. Dormant — no registered BP function fired;
+-- the widget read below is the real source. Kept in case a pak-side per-book hook is added.
 M._books_placed_observed = 0
 
--- Highest book count we've seen this session. The widget counter can DROP
--- when the player removes books from a shelf, but milestones should never
--- un-fire — once you've placed N books total, the threshold is achieved.
--- Reset on slot-connect.
+-- Highest book count seen this session. The widget can DROP when books are removed, but
+-- milestones never un-fire. Reset on slot-connect.
 M._books_placed_peak = 0
 
--- Read the live "books placed" count from the in-game HUD widget. There are
--- multiple WBP_PlayerInfo_C instances in the world; FindFirstOf returns a
--- stale title-screen one that always reads 0. We walk FindAllOf and take
--- the max — the active gameplay widget has the live count, stale ones read
--- 0. Returns nil if no widget is available yet.
+-- Live "books placed" from the HUD widget. Multiple WBP_PlayerInfo_C exist; FindFirstOf
+-- returns a stale title-screen one reading 0, so walk FindAllOf and take the max. nil if none.
 function M._read_widget_book_count()
     local best = -1
     local infos = FindAllOf("WBP_PlayerInfo_C")
@@ -3177,15 +2614,9 @@ function M._read_widget_book_count()
     return best
 end
 
--- Returns the highest level-up location marked sent in
--- APClient._sent_checks. The server populates _sent_checks with every
--- previously-checked location at slot_connect, making this the truth
--- source for "what level has this slot reached" across sessions —
--- independent of GameSaveData and the player BP.
---
--- Scans the full 1..AP_MAX_PLAYER_LEVEL range (not contiguous-only)
--- so prior-session gaps still produce a correct upper bound — better
--- to over-credit than under-credit.
+-- Highest level-up location in APClient._sent_checks (server-populated at slot_connect),
+-- the cross-session truth for "what level has this slot reached", independent of GameSaveData.
+-- Scans the full range (not contiguous-only) so prior-session gaps still give a correct bound.
 function M._compute_sent_level_baseline()
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient._sent_checks) then return 0 end
@@ -3198,22 +2629,12 @@ function M._compute_sent_level_baseline()
     return max_sent
 end
 
--- Increments `_levels_reached` by 1 and sends the corresponding AP
--- location check. Called from main.lua's OnLevelUp BP hook — one event
--- per in-game level-up, no dependency on GameSaveData being synced.
---
--- Self-heals from _sent_checks BEFORE incrementing: if baseline sync
--- missed and _levels_reached=0 after a reload, the first OnLevelUp
--- would queue "Reached Level 1" which the server silently dedupes,
--- then Level 2 (dedup), etc. — _levels_reached lags forever. Catching
--- up to the server's view first guarantees the next increment fires a
--- new, unsent level location.
+-- Bump _levels_reached and send the level-up check. Called from main.lua's OnLevelUp hook,
+-- one per in-game level-up. Self-heals from _sent_checks BEFORE incrementing: else after a
+-- reload (_levels_reached=0) every OnLevelUp re-queues an already-deduped level and lags forever.
 function M.on_level_up_event()
     if not M._slot_data then return end
-    -- Defensive: only fire if we're actually in gameplay. BP-level
-    -- events should never fire at title, but being explicit prevents a
-    -- stale callback or timing edge from spuriously claiming a level
-    -- check during title-screen save flushes.
+    -- Only fire in gameplay (guards a stale callback claiming a level during a title save flush).
     if not M._gameplay_active then return end
     if M._levels_reached >= AP_MAX_PLAYER_LEVEL then return end
 
@@ -3227,13 +2648,8 @@ function M.on_level_up_event()
     M._levels_reached = M._levels_reached + 1
     local loc = AP_LOC_LEVEL_FIRST + (M._levels_reached - 1)
 
-    -- Calibration diagnostic: log GameSaveData row count + XP-curve
-    -- prediction at OnLevelUp time. CurrentFinishedRowNum may lag by 1
-    -- (row update not committed yet) but we mainly care whether the
-    -- row count at which the game level-ups matches xp_curve. Player
-    -- report: at ~56-59 rows game granted only Level 17, but XP_CURVE
-    -- predicts Level 23 at row 55. Paired (row, level) data points
-    -- help verify whether XP_CURVE is miscalibrated.
+    -- Calibration diagnostic: log row count + XP-curve prediction at level-up time to check
+    -- whether XP_CURVE matches the game's actual level-up rows. CurrentFinishedRowNum may lag 1.
     pcall(function()
         local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
         if not (gi and gi:IsValid()) then return end
@@ -3264,37 +2680,23 @@ function M.on_level_up_event()
     end
 end
 
--- Reads GameSaveData.GameProgressData and the player's XP curve to:
---   • One-time at baseline (apply-safe): catch up _levels_reached to the
---     player's saved level so loaded saves register prior level-ups.
---     Subsequent level-ups arrive via on_level_up_event().
---   • Every call (baseline + each FinishRow): sync milestone checks based
---     on InsertedBookNum.
+-- Reads GameSaveData + the player's XP curve to: (one-time at baseline) catch up
+-- _levels_reached to the saved level; (every call) sync milestone checks from book count.
 function M.sync_progress_state()
     if not M._slot_data then return 0, 0 end
 
-    -- Defensive: never sync state when not in gameplay. Multiple call
-    -- sites hit us (FinishRow / SaveGameData hooks); a bad-timing fire
-    -- mid-transition to title can read the WRONG save slot and flood
-    -- book-milestone checks.
+    -- Never sync outside gameplay: a bad-timing fire mid-transition to title can read the
+    -- WRONG save slot and flood milestone checks.
     if not M._gameplay_active then return 0, 0 end
     if not M._apply_safe then return 0, 0 end
 
-    -- Live book count: WBP_PlayerInfo HUD widget's Text_CurrentBookNum.
-    -- Save struct's InsertedBookNum is a fallback (first frame, right
-    -- after each save). Track peak — a threshold crossed stays crossed
-    -- even if the player later removes books.
-    --
-    -- Save-slot guard: only read GameSaveData when SaveGameName is our
-    -- AP slot (Sav_AP_<seed>_<slot>). Mid-transition to title can
-    -- revert it to the default "Sav" — the non-AP save might have
-    -- books=3072 already and blow past every milestone spuriously.
-    --
-    -- Crash dump (Failure.Hash same class as player reports) faulted at
-    -- null+10 in UE4SS reflection: autosave fired ~330ms before
-    -- FinishRow, then sync_progress_state ran while still writing.
-    -- sg:IsValid() passed but GameProgressData was being reallocated.
-    -- Split chained property reads into validated steps.
+    -- Book count source: HUD widget Text_CurrentBookNum (InsertedBookNum is the fallback).
+    -- Track peak — a crossed threshold stays crossed even if books are later removed.
+    -- Save-slot guard: only read GameSaveData when SaveGameName is our AP slot (Sav_AP_*);
+    -- mid-transition to title it can revert to the default "Sav", which may already have
+    -- books=3072 and blow past every milestone.
+    -- Split the chained property reads into validated steps: an autosave can reallocate
+    -- GameProgressData while sg:IsValid() still passes, AVing the chained read.
     local current_slot = nil
     pcall(function()
         local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
@@ -3317,10 +2719,8 @@ function M.sync_progress_state()
                 local sg
                 pcall(function() sg = gi.GameSaveData end)
                 if sg and sg:IsValid() then
-                    -- Split: capture GameProgressData sub-struct once
-                    -- and verify before reading its fields. Without this,
-                    -- a concurrent autosave reallocating GameProgressData
-                    -- crashes UE4SS's Lua VM on the chained field read.
+                    -- Capture GameProgressData once and verify before reading fields (a
+                    -- concurrent autosave reallocating it would AV the chained read).
                     local gpd
                     pcall(function() gpd = sg.GameProgressData end)
                     if gpd then
@@ -3331,8 +2731,7 @@ function M.sync_progress_state()
             end
         end)
     else
-        -- Log once per save-slot mismatch (no heartbeat spam). When
-        -- SaveGameName isn't our AP slot, don't trust GameSaveData.
+        -- Log once per distinct non-AP slot (no spam); don't trust GameSaveData here.
         if M._last_skipped_save_slot ~= current_slot then
             M._last_skipped_save_slot = current_slot
             log(("[progress] skipping GameSaveData read — current slot %q is not our AP slot"):format(
@@ -3347,18 +2746,14 @@ function M.sync_progress_state()
     end
     local books_placed = M._books_placed_peak or 0
 
-    -- Read XP curve from player to compute current level. SkillLevelUpRowNum
-    -- values are CUMULATIVE thresholds: Level N is reached at rows >= arr[N].
-    -- (Tested empirically: Level 45 = 254 rows total, < 400 total rows in
-    -- the game. Sum-based interpretation gives 3500+ which is unreachable.)
+    -- Current level from the player's XP curve. SkillLevelUpRowNum values are CUMULATIVE
+    -- thresholds: Level N at rows >= arr[N] (Level 45 = 254 rows; a sum interpretation
+    -- gives an unreachable 3500+).
     local current_level = 0
     do
         local player = FindFirstOf("BP_LibrarianCharacter_C")
         if player and player:IsValid() then
-            -- Split the array fetch from the iteration so the TArray
-            -- wrapper is captured once and re-validated — a reallocation
-            -- between fetch and iteration would crash UE4SS reading
-            -- arr[i] on stale memory.
+            -- Split the array fetch from iteration (a reallocation between would AV arr[i]).
             local arr
             pcall(function() arr = player.SkillLevelUpRowNum end)
             if arr then
@@ -3379,13 +2774,8 @@ function M.sync_progress_state()
         end
     end
 
-    -- Level-up baseline is handled by run_baseline_sync (first-movement
-    -- trigger). After that, on_level_up_event maps the NEXT OnLevelUp
-    -- to the right level location.
-    --
-    -- Belt-and-suspenders here: if _levels_reached ever regresses below
-    -- either the XP-curve level or the server's sent floor, raise it
-    -- back up. Guards against any path that leaves the counter stale.
+    -- Level-up baseline lives in run_baseline_sync; here just raise _levels_reached back up
+    -- if it ever regresses below the XP-curve level or the server's sent floor.
     local levels_sent = 0
     if not M._level_baseline_done then
         log(("[progress] baseline rows=%d current_level=%d (sync delegated to run_baseline_sync)"):format(
@@ -3399,11 +2789,8 @@ function M.sync_progress_state()
         log(("[progress] sync catch-up: _levels_reached %d → %d (xp=%d sent=%d) — firing send_check for missed levels"):format(
             prev_levels_reached, floor_level, current_level, sent_level_floor))
         M._levels_reached = floor_level
-        -- Fire send_check for every level in the catch-up range. Without
-        -- this, the counter advances but checks for skipped levels never
-        -- transmit — and the next OnLevelUp would only send N+1, leaving
-        -- 1..N stranded. send_check dedupes against _sent_checks, so
-        -- re-firing already-sent levels is a silent no-op.
+        -- Fire send_check for every level in the catch-up range, else the counter advances
+        -- but skipped levels never transmit (send_check dedupes, so re-firing is a no-op).
         local APClient = package.loaded["AP/APClient"]
         if APClient and APClient.send_check then
             for level = 1, floor_level do
@@ -3413,8 +2800,7 @@ function M.sync_progress_state()
         end
     end
 
-    -- Send milestone checks for crossed thresholds. milestone_thresholds is a
-    -- list (ordinal-indexed) of book-count integers from slot_data.
+    -- Send milestone checks for crossed thresholds (ordinal-indexed book counts from slot_data).
     local milestones_sent = 0
     local thresholds = M._slot_data.milestone_thresholds or {}
     for i, threshold in ipairs(thresholds) do
@@ -3438,8 +2824,7 @@ end
 -- Apply: Skills
 -- ============================================================================
 
--- AP item name → in-game EUpgradeAbility index. Used to build a counter
--- baseline from the saved skill levels (keyed by enum index in the save).
+-- EUpgradeAbility index → AP item name, to baseline the applied counter from saved levels.
 local SKILL_ITEM_BY_ABILITY_IDX = {
     [3] = "Progressive Shelf Guide",     -- ShowMatchingShelf
     [5] = "Progressive Sort",            -- SortBooks
@@ -3448,22 +2833,9 @@ local SKILL_ITEM_BY_ABILITY_IDX = {
     [8] = "Progressive Assemble",        -- GrabSameTypeBook
 }
 
---- Initialise _applied_skill_counts from the loaded save's
---- PlayerExtraData.SkillData TArray. Each entry's CurrentLevel becomes
---- the baseline "applied count" for that AP item, so AP's reconnect
---- re-dump doesn't trigger UpgradePlayer for skills already at level.
----
---- Also refreshes the in-game HUD via WBP_PlayerInfo_C:UpdateSkill —
---- without this, the ability icons stay empty even though the skill is
---- in the save (UpgradePlayer's BP graph normally drives the HUD bind,
---- but we're skipping it here since the level didn't change).
----
---- TArray is 1-indexed in Lua; the array order matches the EUpgradeAbility
---- enum (0..8 → array index 1..9).
--- The game migrated player save data to PlayerExtraDataV1; the legacy PlayerExtraData
--- struct reads EMPTY on current builds (0 entries), which zeroed the applied-skill baseline
--- and re-applied every load (level climbed +1 per relaunch). Return the SkillData TArray +
--- which field it came from + entry count, preferring whichever V-version actually has data.
+-- Return the save's SkillData TArray + which field it came from + entry count, preferring
+-- whichever V-version has data. The game migrated to PlayerExtraDataV1; legacy PlayerExtraData
+-- reads EMPTY on current builds, which zeroed the baseline and re-applied skills every load.
 function M._read_save_skill_data(sg)
     if not (sg and sg:IsValid()) then return nil, nil, 0 end
     local v1; pcall(function() v1 = sg.PlayerExtraDataV1.SkillData end)
@@ -3481,6 +2853,8 @@ function M._read_save_skill_data(sg)
     return nil, nil, 0
 end
 
+--- Seed _applied_skill_counts from the save's SkillData (each CurrentLevel = applied count)
+--- so AP's reconnect re-dump doesn't re-bump skills already at level. Also refreshes the HUD.
 function M._init_applied_skill_counts_from_save()
     M._applied_skill_counts = {}
     local gi = FindFirstOf("BP_LibrarianGameInstance_C")
@@ -3516,21 +2890,14 @@ function M._init_applied_skill_counts_from_save()
         end
     end
 
-    -- HUD refresh via our LogicMod BP (ModActor_C). Direct UpdateSkill
-    -- from Lua crashes (AV, UE4SS in stack) — the BP graph dereferences
-    -- SkillObject internals Lua leaves inconsistent. The BP custom
-    -- event keeps the call inside engine context.
+    -- HUD refresh via our BP (ModActor_C): direct UpdateSkill from Lua AVs (the BP graph
+    -- derefs SkillObject internals Lua leaves inconsistent); the BP event keeps it in engine context.
     M._refresh_hud_from_save()
 end
 
---- Refresh HUD ability icons from save-side levels. Iterates the full
---- 9-entry SkillData TArray and calls our BP mod's RefreshSkillIcon for
---- every skill at level > 0 — including non-AP-tracked skills (Jump,
---- UpgradeBag*, Jogging) which the player gets through normal play.
----
---- Requires LibrarianAPHUDFix.pak in Content/Paks/LogicMods/. If the BP
---- isn't loaded, this no-ops with a warning (skill state still correct
---- in the menu, only the on-screen icon row is missing).
+--- Refresh HUD ability icons from save-side levels via our BP's RefreshSkillIcon (every
+--- skill at level > 0, including non-AP ones). Requires LibrarianAPHUDFix.pak; no-ops with
+--- a warning if the BP isn't loaded (only the on-screen icon row is missing).
 function M._refresh_hud_from_save()
     local mod_actor = FindFirstOf("ModActor_C")
     if not mod_actor or not mod_actor:IsValid() then
@@ -3557,12 +2924,9 @@ function M._refresh_hud_from_save()
     pcall(function() n = #skill_data end)
 
     local refreshed, failed = 0, 0
-    -- Refresh all skill icons EXCEPT bags. UpgradeBag (1) / UpgradeBag2
-    -- (2) re-apply the bag-level increment via RefreshSkillIcon's BP
-    -- graph, double-bumping bag capacity on reload (15 → 20). Bag
-    -- levels restore naturally from save. Jump (0) and Jogging (4)
-    -- don't have that side effect, so their icons (and Major Magic
-    -- icons) ARE refreshed here — else they stay empty until next use.
+    -- Refresh all icons EXCEPT bags: UpgradeBag (1) / UpgradeBag2 (2) re-apply the bag-level
+    -- increment via RefreshSkillIcon's BP graph, double-bumping capacity on reload (15→20).
+    -- Bags restore naturally from save; other icons are refreshed here or stay empty until use.
     local SKIP_INDICES = { [1]=true, [2]=true }
     for i = 1, n do
         local entry
@@ -3572,9 +2936,8 @@ function M._refresh_hud_from_save()
             pcall(function() lvl = tonumber(entry.CurrentLevel) or 0 end)
             local ability_idx = i - 1  -- 1-based array → 0-based enum
             if lvl > 0 and ability_idx >= 0 and ability_idx <= 8 and not SKIP_INDICES[ability_idx] then
-                -- left=-1 (not 0). 0 crashes the UpdateSkill BP path;
-                -- -1 means "no banked points credited" (correct for a
-                -- load refresh). 0 means "0 points just spent" → desync.
+                -- left=-1, not 0: 0 crashes the UpdateSkill BP path; -1 = "no banked points
+                -- credited" (correct for a load refresh), 0 = "0 just spent" → desync.
                 local ok, err = pcall(function()
                     mod_actor:RefreshSkillIcon(player_info, ability_idx, lvl, -1)
                 end)
@@ -3595,21 +2958,16 @@ function M._apply_skill(name)
     local idx = SKILL_ITEM_TO_ABILITY[name]
     if not idx then return end
 
-    -- Gate on apply_safe (which implies gameplay_active). Right after
-    -- Continue, UpgradePlayer can land before the player+world are fully
-    -- wired and the BP graph drops the upgrade silently. Queue until
-    -- set_apply_safe(true) drains us — by then the world is settled.
+    -- Gate on apply_safe: right after Continue, UpgradePlayer can land before the world is
+    -- wired and the BP silently drops it. Queue until set_apply_safe drains us.
     if not M._gameplay_active or not M._apply_safe then
         log(("queued (not yet apply-safe): %s"):format(name))
         M._pending_skill_grants[#M._pending_skill_grants + 1] = name
         return
     end
 
-    -- Counter-based skip: only bump if we've applied fewer times than the
-    -- received-counts say we should. The applied counter is initialised
-    -- from save's PlayerExtraData.SkillData at apply-safe time, so an AP
-    -- reconnect re-dump (which re-sends every received item) doesn't
-    -- double-bump skills already at the right level.
+    -- Counter-based skip: only bump if applied < received. The counter is seeded from save
+    -- at apply-safe, so the reconnect re-dump doesn't double-bump skills already at level.
     local target  = M._received_counts[name] or 0
     local applied = M._applied_skill_counts[name] or 0
     if applied >= target then
@@ -3636,24 +2994,10 @@ function M._apply_skill(name)
     end
 end
 
---- Periodic skill-state resync. Compares "items the player has received"
---- (_received_counts) against "successful UpgradePlayer calls we've made"
---- (_applied_skill_counts). If the latter lags the former, retry the
---- missing levels via _apply_skill.
----
---- IMPORTANT: trusts _applied_skill_counts as truth, NOT
---- GameSaveData.PlayerExtraData.SkillData. Save's SkillData only
---- refreshes on save events; between saves it can read 0 while the
---- in-game player is level 5+. A previous version used save state for
---- the comparison and over-granted catastrophically (every tick read
---- save_level=0 and re-applied the entire target → every skill to
---- level 10 within ~30 seconds).
----
---- _applied_skill_counts is bumped only when UpgradePlayer's pcall
---- returns ok. Silent BP-side drops (pcall ok but no in-game effect)
---- won't be caught here — would need a runtime-state read.
----
---- Conservative: only ever applies UP to received count. Never over-grants.
+--- Periodic skill resync: if _applied_skill_counts lags _received_counts, retry the missing
+--- levels via _apply_skill. Trusts _applied_skill_counts, NOT save's SkillData (which reads 0
+--- between save events — comparing against it once over-granted every skill to level 10).
+--- Conservative: only ever applies up to the received count.
 function M.resync_skill_state()
     if not M._gameplay_active or not M._apply_safe then return 0 end
     if not M._slot_data then return 0 end
@@ -3679,8 +3023,7 @@ end
 -- Diagnostic
 -- ============================================================================
 
---- Print the current derived state. Callable from a UE4SS console / dev
---- keybind for ad-hoc debugging; not wired to any user-facing keybind.
+--- Print the current derived state. For ad-hoc debugging from a UE4SS console.
 function M.dump()
     local series, shelves = {}, {}
     for sn in pairs(M._series_unlocked) do series[#series + 1] = sn end
@@ -3696,15 +3039,9 @@ function M.dump()
     end
 end
 
---- Walk every BP_GrabbingBook_C whose series is in _series_unlocked and
---- report its actor-level state — bHidden, collision-enabled, and the
---- _books_warded tracking flag. If a book in an unlocked series still has
---- bHidden=true or collision=false, our Pass 1 failed to unward it (most
---- likely because _books_warded[key] was nil when the apply ran, so the
---- unward branch was skipped).
----
---- Each problematic book is logged with full identifying info; series
---- with all books in the correct state are summarized as "OK".
+--- Report actor-level state (bHidden, collision, _books_warded) for every unlocked-series
+--- book. A still-hidden / collision-off book means Pass 1 failed to unward it. Logs each
+--- problem book; all-correct series are summarized "OK".
 function M.dump_unlocked_books_state()
     local books = FindAllOf("BP_GrabbingBook_C")
     if not books then log("DUMP unlocked-state: no books in level"); return end
@@ -3778,16 +3115,8 @@ function M.dump_unlocked_books_state()
     end
 end
 
---- Print every book that we couldn't HISM-map. These render via the
---- actor's own mesh component at the actor's RootComponent world position,
---- which can be inside walls/floors if the level designer placed the
---- trigger there (the actual visible HISM instance is elsewhere on the
---- shelf, but we lost the link to it).
----
---- Use this to verify that the books appearing stuck in walls/floors are
---- the SAME books across runs (deterministic level layout → same set).
---- Coordinates are in cm (UE default). The 'unlocked' flag tells you
---- whether the book is currently unwarded (visible) right now.
+--- Print every book with no HISM canonical (renders at its actor position, possibly inside
+--- a wall). Verifies the stuck set is the same across runs. Coords in cm; 'unlocked' = unwarded now.
 function M.dump_unmapped_books()
     local entries = {}
     for _, ud in pairs(M._unmapped_warded_books) do entries[#entries + 1] = ud end
@@ -3812,22 +3141,10 @@ end
 -- ============================================================================
 -- Debug console commands
 -- ============================================================================
--- Force-unward every book whose series name contains a substring (case-
--- insensitive). Bypasses slot_data / _series_unlocked entirely — books just
--- get SetActorHiddenInGame(false) + SetActorEnableCollision(true), and the
--- tracker is cleared so the next normal apply won't re-ward them this session.
--- The fence cover on the case stays in place (we don't touch _shelves_open or
--- _case_covers), which is exactly what's needed for testing whether the fence
--- collision is blocking grabs of books that don't physically stick past the
--- case front.
---
--- Usage (UE4SS console / debug console):
---   ap_unward_series Seduction Magic
---   ap_unward_series Theological Research on Holy Magic
---
--- The pattern matches any series name containing the substring, so you can
--- be as specific or loose as you want. Logs the matched series + count of
--- books that were force-unwarded.
+-- Force-unward every book whose series name contains a substring (case-insensitive),
+-- bypassing slot_data / _series_unlocked. Clears the tracker so a normal apply won't re-ward
+-- this session; leaves _shelves_open / case covers alone (for testing fence-collision grabs).
+--   Usage: ap_unward_series Seduction Magic
 function M.force_unward_series(pattern)
     if type(pattern) ~= "string" or pattern == "" then
         log("[ap_unward] usage: ap_unward_series <series-name-substring>")
@@ -3871,8 +3188,7 @@ function M.force_unward_series(pattern)
 end
 
 RegisterConsoleCommandHandler("ap_unward_series", function(_, params)
-    -- UE4SS passes parameters as a table of space-split tokens; rejoin
-    -- so multi-word series names like "Seduction Magic" work.
+    -- UE4SS passes params as space-split tokens; rejoin for multi-word series names.
     local pattern = ""
     if type(params) == "table" then
         pattern = table.concat(params, " ")
