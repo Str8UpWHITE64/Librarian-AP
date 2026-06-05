@@ -19,10 +19,8 @@ local M = {}
 local LOG_PREFIX = "[HUD]"
 local function log(msg) print(LOG_PREFIX .. " " .. tostring(msg)) end
 
--- Color presets (kept for caller-side semantics; ShowNotification renders
--- in the game's own style so colors don't actually take effect on screen.
--- We could prefix with marker glyphs to differentiate visually — already
--- done by main.lua's push_log calls (★ / ← / → / etc).)
+-- Color presets for caller-side semantics. ShowNotification renders in the game's own style,
+-- so these don't actually colour the on-screen popup (main.lua prefixes glyphs instead).
 M.COL_STATUS_OK   = { R = 0.4,  G = 0.85, B = 0.4,  A = 1.0 }
 M.COL_STATUS_WARN = { R = 0.95, G = 0.85, B = 0.3,  A = 1.0 }
 M.COL_STATUS_BAD  = { R = 0.85, G = 0.3,  B = 0.3,  A = 1.0 }

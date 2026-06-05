@@ -1,31 +1,18 @@
 -- lifecycle.lua — single source of truth for "what phase are we in".
 --
--- Replaces the old scattered lifecycle: a never-reset global `m01_load_count`,
--- `_suppress_next_m01_load_count`, and ~6 booleans (`_gameplay_active`,
--- `_allow_pre_apply`, `_apply_safe`, ...) hand-copied as gates into a dozen
--- loops/hooks across main.lua + ItemApply.lua. That design had no single
--- authority, three redundant activation paths, and gated the dangerous work
--- (forced OpenLevel, actor enumeration) on fixed delays + book-count heuristics
--- instead of real signals — which is the root of the "crash at the main menu
--- during loading" failures.
---
--- This module is PURE LOGIC: it owns the state and the legal transitions, and
--- notifies a listener on every change. All side effects (starting/stopping
--- loops, calling BP functions, enabling the Continue button) live in the
--- listener that the integrator (main.lua) registers — so the state machine
--- itself touches no game state and cannot crash.
+-- Pure logic: owns the state + legal transitions and notifies a listener on every change.
+-- All side effects (starting loops, BP calls, enabling Continue) live in the listener that
+-- main.lua registers, so the state machine itself touches no game state and can't crash.
 --
 -- States:
---   BOOT        process just started; nothing loaded yet.
---   TITLE       at the title screen, not in a connected play session.
---   CONNECTING  AP slot connected; we are (re)loading PL_M01 for this seed.
---   PRE_APPLY   PL_M01 loaded behind the title menu; warding is being applied
---               in the background; Continue/Start stay disabled until done.
+--   BOOT        process started; nothing loaded.
+--   TITLE       at the title screen, no connected session.
+--   CONNECTING  AP slot connected; (re)loading PL_M01 for this seed.
+--   PRE_APPLY   PL_M01 loaded behind the title menu; warding applied in the background.
 --   GAMEPLAY    player pressed Continue; actively playing.
 --
--- The only path that mutates the world is GAMEPLAY (and the tail of PRE_APPLY
--- once the world is confirmed populated). Nothing enumerates or mutates actors
--- in BOOT/TITLE/CONNECTING, which is exactly the window the old code crashed in.
+-- Only GAMEPLAY (and the tail of PRE_APPLY, once the world is confirmed populated) mutates the
+-- world; nothing enumerates/mutates actors in BOOT/TITLE/CONNECTING (the old crash window).
 
 local L = {}
 
@@ -102,9 +89,8 @@ function L.to(new_state, reason)
 end
 
 -- ── Semantic events ────────────────────────────────────────────────────────
--- Integrator (main.lua) translates raw engine signals into these. The mapping
--- of "what signal means what" lives in ONE place (here), not scattered as
--- m01_load_count arithmetic across hooks.
+-- main.lua translates raw engine signals into these; the "what signal means what"
+-- mapping lives here in one place.
 
 --- First time PL_M01 finishes loading (the title-screen preview). BOOT→TITLE.
 function L.on_title_loaded()

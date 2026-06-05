@@ -1,31 +1,16 @@
--- AP/trace.lua
--- Durable, crash-survivable breadcrumb ledger for the Librarian-AP crash hunt.
+-- AP/trace.lua — durable, flush-per-line breadcrumb ledger for crash diagnosis (see CRASH_HANDOFF.md).
 --
--- WHY THIS EXISTS (see CRASH_HANDOFF.md): the recurring crash is a native
--- EXCEPTION_ACCESS_VIOLATION inside a game function that operates on the book pile's
--- render data. It fires either inline on the game thread (hash BAE1A5E0) or on a
--- ParallelFor worker the game thread is blocked waiting on (hash 423B7BBD) -- the SAME
--- operation. The mod is the only thing mutating those live components mid-frame, so the
--- lead hypothesis is a main-thread-mutation-vs-engine-parallel-read race on the book
--- pile. We can't catch the native AV from Lua and we can't name the game UFunction from
--- the dispatch layer (UE4SS v3.0.1 has no global ProcessEvent prehook), so instead we
--- make the LEAD-UP observable: every game-object WRITE the mod performs is bracketed
--- begin/finish here, keyed by the object's raw address (GetAddress).
+-- The crash is a native access violation inside the game's book-pile render code, which Lua can't
+-- catch. So we make the LEAD-UP observable: every game-object WRITE the mod makes is bracketed
+-- begin/finish here, keyed by the object's address. Each line is f:flush()ed immediately (unlike
+-- print() -> UE4SS.log buffering), so the breadcrumb just before a hard crash always reaches disk.
 --
--- The old `[crumb]` line went through print() -> UE4SS.log, whose buffering is
--- unconfirmed; a hard AV can lose the last buffered lines. This module writes its own
--- file and `f:flush()`es on EVERY line, so the breadcrumb immediately preceding the
--- crash always reaches disk.
---
--- READING crash_trace.log after a crash:
---   * tail is a "BEG <op> <addr>" with NO matching "END"  -> the crash happened INSIDE
---     that mutation, on that object: synchronous inline race (BAE1A5E0 shape). The op +
---     object name point straight at the culprit.
---   * tail is an "END" / "MRK hb" (heartbeat)             -> the crash is DECOUPLED from
---     our last write: worker race / deferred corruption (423B7BBD shape). Compare the
---     heartbeat time to the crash time (SecondsSinceStart) for "how long after".
---   * the header line records which DIAG flags were live, so the report is
---     self-describing for the bisection (see diag_flags.lua).
+-- Reading crash_trace.log after a crash:
+--   * tail = "BEG <op> <addr>" with no matching "END"  -> crash happened INSIDE that mutation; the
+--     op + object name point at the culprit.
+--   * tail = "END" / "MRK hb"                           -> crash decoupled from our last write
+--     (worker race / deferred corruption); compare heartbeat time to crash time.
+--   * the header records which diag_flags were live, so the report is self-describing.
 
 local T = {}
 
