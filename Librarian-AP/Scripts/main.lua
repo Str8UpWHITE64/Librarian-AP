@@ -31,7 +31,7 @@ local function diag_flags_str()
                     "BOOK_ACTOR_GAMETHREAD", "WARD_GROUND_TRUTH", "CASE_WARD_GAMETHREAD",
                     "NAMED_HOOKS", "BOOK_EVENT_HOOKS", "BOOK_EVENT_ENFORCE",
                     "BOOK_EVENT_REVEAL", "BOOK_EVENT_GRABFIX", "BOOK_OPACITY_FIX",
-                    "BOOK_REFRESH_FIX", "BOOK_REFRESH_SWEEP", "BOOK_SWEEP", "BOOK_SWEEP_FIX" }
+                    "BOOK_REFRESH_FIX", "BOOK_REFRESH_SWEEP" }
     local parts = {}
     for _, k in ipairs(order) do parts[#parts + 1] = k .. "=" .. tostring(diag_on(k)) end
     return table.concat(parts, ",")
@@ -88,8 +88,7 @@ end
 local BOOK_BP = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingBook.BP_GrabbingBook_C"
 local _book_hooks_attempted = false
 local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0, enforced = 0, enf_samples = 0,
-              revealed = 0, rev_samples = 0, grabbed = 0, grab_samples = 0, grabfix = 0,
-              swept = 0, swept_samples = 0, opacity_samples = 0 }
+              revealed = 0, rev_samples = 0, grabbed = 0, grab_samples = 0, grabfix = 0 }
 
 local function _bh_series(book_obj)
     local IA = package.loaded["AP/ItemApply"]
@@ -219,52 +218,6 @@ local function _inspect_pile(b)
     return ("hi=%d compVis=%s compHidden=%s compMat=%s instN=%d nearDist=%s nearZ=%s"):format(
         hi, tostring(cvis), tostring(chid), tostring(cmat), sn,
         bd2 and tostring(math.floor(math.sqrt(bd2))) or "?", tostring(bz))
-end
-
--- One-time sweep of EVERY unwarded book's "1. Desaturation B" value -- so we find the rare
--- anomaly ourselves instead of asking the player to hunt intermittent broken books. If only a
--- few books read < 0.5, that rarity matches the bug (and we log their series to spot-check);
--- if hundreds do, DesatB=0 is just a normal cover value and the cause is elsewhere. Read-only.
-local _desat_scanned = false
-local function _scan_desat()
-    if _desat_scanned then return end
-    local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA._apply_safe and IA._book_valid_asset_idx and IA._asset_to_series
-            and IA._compute_unwarded_set) then return end
-    local books = FindAllOf("BP_GrabbingBook_C")
-    local n = 0; if books then pcall(function() n = #books end) end
-    if n == 0 then return end
-    _desat_scanned = true
-    local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
-    local uw = IA._compute_unwarded_set(only_shelfable) or {}
-    local nlow, nhigh, nbad, nchk = 0, 0, 0, 0
-    local lows = {}
-    for i = 1, n do
-        local b = books[i]
-        if b and b:IsValid() then
-            local aidx = IA._book_valid_asset_idx(b)
-            local series = aidx and IA._asset_to_series[aidx]
-            if series and uw[series] then
-                local sm; pcall(function() sm = b.SM_Book_1 end)
-                local mid; if sm and sm:IsValid() then pcall(function() mid = sm:GetMaterial(0) end) end
-                if mid and mid:IsValid() then
-                    local dv = _mid_scalar(mid, "1. Desaturation B")
-                    nchk = nchk + 1
-                    if type(dv) == "number" then
-                        if dv < 0.5 then
-                            nlow = nlow + 1
-                            if #lows < 30 then lows[#lows + 1] = series end
-                        else nhigh = nhigh + 1 end
-                    else nbad = nbad + 1 end
-                end
-            end
-        end
-    end
-    log(("[desat-scan] unwarded books: checked=%d  DesatB<0.5=%d  DesatB>=0.5=%d  unreadable=%d"):format(
-        nchk, nlow, nhigh, nbad))
-    if nlow > 0 then
-        log("[desat-scan] DesatB<0.5 series (candidates for the invisible bug): " .. table.concat(lows, " | "))
-    end
 end
 
 -- PROACTIVE RefreshInfo sweep (inc5e): redraw every unwarded book in small chunks so a corrupt
@@ -414,130 +367,6 @@ local function _bh_grab_check(b, tag)
     end
 end
 
--- ======================= PROACTIVE BOOK SWEEP (beta6.2, inc5) =======================
--- The grab-time fix (inc4) is reactive: a book that is BOTH invisible AND un-grabbable can
--- never be grabbed, so a grab-time repair never fires -> the player is stuck reloading. This
--- sweep instead walks ALL book actors on its own and repairs any UNWARDED book it finds in a
--- hidden state, with NO player action required.
---
--- Driver: the existing game-thread SetActorVisible POST-hook (fires constantly during play).
--- So the sweep needs ZERO ExecuteInGameThread of its own -> it CANNOT trip UE4SS #1180 (the
--- concurrent-tick-queue abort that bit layers 1/2), and its writes land on the game thread (no
--- render race). Work is chunked (SWEEP_BUDGET books per hook call) so there's no hitch; the
--- cursor wraps the full ~3072-book list every ~38s of normal play. If the player stands
--- perfectly still the sweep pauses -- benign, since no NEW desync forms while idle and it
--- resumes the moment they move.
---
--- Repairs the CERTAIN, safe signals: actor bHidden, the SM_Book_1 mesh hidden flag, and the
--- mesh VISIBILITY flag (bVisible -- distinct from bHiddenInGame; layer 1 only ever cleared the
--- actor flag, so a stuck mesh bVisible=false survives clearing bHidden, matching Bug 6). Also
--- re-enables collision so an unwarded book can't be left un-grabbable (covers symptom 1 too).
---
--- The book's BookMatInst "Opacity" is OBSERVED (logged) but NOT auto-written yet: GetScalar on a
--- material lacking the param returns 0, which would look like "every book invisible". We log the
--- normal value first; if stuck-at-0 proves to be a cause, the writer already exists
--- (M._start_material_worker uses SetScalarParameterValue("Opacity", v)) -- a one-line follow-up.
-local SWEEP_BUDGET = 16
-local _sweep_books, _sweep_n, _sweep_cursor, _sweep_epoch = nil, 0, 1, nil
-local _sweep_unwarded = nil
-
-local function _sweep_refresh()
-    local IA = package.loaded["AP/ItemApply"]
-    if not IA then return false end
-    _sweep_books = FindAllOf("BP_GrabbingBook_C")
-    _sweep_n = 0
-    if _sweep_books then pcall(function() _sweep_n = #_sweep_books end) end
-    _sweep_cursor = 1
-    _sweep_epoch = IA._world_epoch
-    if IA._compute_unwarded_set then
-        local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
-        _sweep_unwarded = IA._compute_unwarded_set(only_shelfable)
-    else
-        _sweep_unwarded = nil
-    end
-    return _sweep_n > 0
-end
-
--- Inspect (and, if do_fix, repair) one unwarded book that should be fully visible.
-local function _sweep_check_book(b, series, do_fix)
-    local signals = {}
-    local bhidden; pcall(function() bhidden = b.bHidden end)
-    if bhidden == true then
-        if do_fix then
-            pcall(function() b:SetActorHiddenInGame(false) end)
-            pcall(function() b:SetActorEnableCollision(true) end)
-        end
-        signals[#signals + 1] = "actorHidden"
-    end
-    local sm; pcall(function() sm = b.SM_Book_1 end)
-    if sm and sm:IsValid() then
-        local mh; pcall(function() mh = sm.bHiddenInGame end)
-        if mh == true then
-            if do_fix then pcall(function() sm:SetHiddenInGame(false, false) end) end
-            signals[#signals + 1] = "meshHidden"
-        end
-        local vis; pcall(function() vis = sm.bVisible end)
-        if vis == false then
-            if do_fix then pcall(function() sm:SetVisibility(true, false) end) end
-            signals[#signals + 1] = "meshVisible"
-        end
-    end
-    local abnormal = #signals > 0
-    -- read opacity when something's wrong (to diagnose) or to sample the normal value
-    local want_op = abnormal or ((_bh.opacity_samples or 0) < 20)
-    local opacity
-    if want_op then
-        pcall(function()
-            local m = b.BookMatInst
-            if m and m:IsValid() then opacity = m:GetScalarParameterValue("Opacity") end
-        end)
-    end
-    if abnormal then
-        _bh.swept = (_bh.swept or 0) + 1
-        if (_bh.swept_samples or 0) < 40 then
-            _bh.swept_samples = (_bh.swept_samples or 0) + 1
-            log(("[book-sweep] %s series=%s signals=%s opacity=%s"):format(
-                do_fix and "FIX" or "FOUND", tostring(series),
-                table.concat(signals, "+"), tostring(opacity)))
-        end
-    elseif want_op then
-        _bh.opacity_samples = (_bh.opacity_samples or 0) + 1
-        log(("[book-sweep] sample series=%s opacity=%s (normal visible book)"):format(
-            tostring(series), tostring(opacity)))
-    end
-end
-
--- One chunk of the proactive sweep. Called from the SetActorVisible post-hook (game thread).
-local function _sweep_step()
-    if not diag_on("BOOK_SWEEP") then return end
-    local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA._apply_safe and IA._book_valid_asset_idx and IA._asset_to_series) then return end
-    -- world reloaded since we cached the list? drop it -- stale actor wrappers can native-AV.
-    if _sweep_books and (IA._world_epoch or 0) ~= (_sweep_epoch or 0) then
-        _sweep_books = nil
-    end
-    if not _sweep_books or _sweep_cursor > _sweep_n then
-        if not _sweep_refresh() then return end
-    end
-    local uw = _sweep_unwarded
-    if not uw then return end
-    local do_fix = diag_on("BOOK_SWEEP_FIX")
-    local last = math.min(_sweep_cursor + SWEEP_BUDGET - 1, _sweep_n)
-    for i = _sweep_cursor, last do
-        local b = _sweep_books[i]
-        if b and b:IsValid() then
-            local aidx = IA._book_valid_asset_idx(b)
-            if aidx ~= nil then
-                local series = IA._asset_to_series[aidx]
-                if series and uw[series] then
-                    pcall(_sweep_check_book, b, series, do_fix)
-                end
-            end
-        end
-    end
-    _sweep_cursor = last + 1
-end
-
 local function try_register_book_hooks()
     if _book_hooks_attempted then return end
     if not diag_on("BOOK_EVENT_HOOKS") then return end
@@ -557,10 +386,9 @@ local function try_register_book_hooks()
             if not diag_on("BOOK_EVENT_HOOKS") then return end
             _bh.setvis = _bh.setvis + 1
             pcall(_refresh_sweep_step)    -- proactive: redraw unwarded books in chunks (heal corrupt ones)
-            -- (inc5 timer-sweep SHELVED: it churned against the game's per-frame visibility
-            -- Tick -- see the sweep block above + BOOK_SWEEP in diag_flags. Visibility is now
-            -- corrected by riding the game's OWN SetActorVisible call: ENFORCE + REVEAL-complete
-            -- below. The POST-hook -- 2nd RegisterHook cb -- never fires in this UE4SS build.)
+            -- Visibility is corrected by riding the game's OWN SetActorVisible call: ENFORCE +
+            -- REVEAL-complete below. (The earlier inc5 timer-sweep and the post-hook REVEAL were
+            -- both removed as inert in this UE4SS build.)
             local b, v
             pcall(function() b = self:get() end)
             pcall(function() v = is_visible:get() end)
@@ -629,38 +457,6 @@ local function try_register_book_hooks()
                             end
                         end
                     end
-                end
-            end
-        end,
-        -- Increment 3: REVEAL net (POST-hook; symptom 2 = the "vanishing" unlocked book).
-        -- Runs AFTER the game's SetActorVisible. If the game tried to SHOW (v==true) an
-        -- UNWARDED book but it is STILL hidden (bHidden==true) afterward -- the "fine after
-        -- dropping, invisible when looked at / picked up" glitch -- clear the stale hide so
-        -- it actually shows. Only fires on the real edge case, so the log's revealed=N is
-        -- how often it was caught. SetActorHiddenInGame isn't hooked (no re-entrancy), and
-        -- it's aligned with the game's own show intent (no fight). Gated BOOK_EVENT_REVEAL.
-        function(self, is_visible)
-            if not diag_on("BOOK_EVENT_HOOKS") then return end
-            if not diag_on("BOOK_EVENT_REVEAL") then return end
-            local b, v
-            pcall(function() b = self:get() end)
-            pcall(function() v = is_visible:get() end)
-            if v ~= true or not b then return end
-            local _, series = _bh_series(b)
-            local IA = package.loaded["AP/ItemApply"]
-            if not (series and IA and IA._compute_unwarded_set) then return end
-            local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
-            local unwarded = IA._compute_unwarded_set(only_shelfable)
-            if not (unwarded and unwarded[series]) then return end   -- warded -> the pre-hook's job
-            local still_hidden
-            pcall(function() still_hidden = b.bHidden end)
-            if still_hidden == true then
-                pcall(function() b:SetActorHiddenInGame(false) end)
-                _bh.revealed = _bh.revealed + 1
-                if _bh.rev_samples < 10 then
-                    _bh.rev_samples = _bh.rev_samples + 1
-                    log(("[book-hook] REVEAL unwarded-but-hidden series=%s (cleared stale hide)"):format(
-                        tostring(series)))
                 end
             end
         end)
@@ -1521,11 +1317,10 @@ local function start_gameplay_loops()
         end
 
         if s.phase == "draining" then
-            -- Hold the draining phase while either the chunked Pass-1
-            -- flush is still running OR the hidden-mode deferred
-            -- tree-walk worker is still draining. Both are async; the
-            -- world isn't truly settled until both have idled.
-            if IA._flush_in_progress or IA._deferred_worker_running then
+            -- Hold the draining phase while the chunked Pass-1 flush is
+            -- still running — it's async, so the world isn't truly
+            -- settled until it has idled.
+            if IA._flush_in_progress then
                 s.quiet_ticks = 0
                 return false
             end
@@ -1714,28 +1509,6 @@ local function start_gameplay_loops()
         log("[crumb] resync")
         pcall(function() IA.resync_skill_state() end)
         log("[crumb] idle:3s")
-        return false
-    end)
-
-    -- Periodic book straggler re-walk every 3 minutes (hidden mode only).
-    -- The initial tree-walk can miss a component or two — e.g., a book
-    -- whose mesh sub-components weren't fully streamed in when its
-    -- tree-walk ran. Re-queueing the known-warded books catches these.
-    -- Spread out enough that the queue drain (~10s of background work)
-    -- doesn't constantly run.
-    LoopAsync(180000, function()
-        local IA = package.loaded["AP/ItemApply"]
-        if not IA then return false end
-        if not IA._gameplay_active then
-            return true  -- stop; will restart on next gameplay activation
-        end
-        if not IA._apply_safe then return false end
-        if not (IA._slot_data and IA._slot_data.book_visibility == "hidden") then
-            return false  -- stacked mode doesn't use tree-walk
-        end
-        local queued = 0
-        pcall(function() queued = IA.requeue_warded_books_for_treewalk() or 0 end)
-        log(("[periodic-rewalk] re-queued %d warded books for tree-walk"):format(queued))
         return false
     end)
 
