@@ -1763,30 +1763,17 @@ function M.reconcile_book_actors()
     if not _diag_on("BOOK_ACTOR_RECONCILE") then return end
     if not M._apply_safe then return end
     if M._flush_in_progress then return end          -- don't race an active Pass-1 flush
-    if not M._recon_started then
-        M._recon_started = true
-        log(("[reconcile] active (budget=%d) -- periodic actor-state reconcile for Bug 1/Bug 2"):format(RECONCILE_BUDGET))
-    end
     -- (Re)snapshot the book list + unwarded set when the cursor wraps or the world reloaded.
     if M._recon_books and (M._world_epoch or 0) ~= (M._recon_epoch or 0) then
         M._recon_books = nil
     end
     if not M._recon_books or (M._recon_cursor or 1) > (M._recon_n or 0) then
-        -- Sweep boundary: emit a heartbeat for the sweep that just finished -- proves the
-        -- reconcile is alive and shows how many unwarded books it examined, so a run with
-        -- corrected=0 is distinguishable from one where the scan never ran -- then reset.
-        if M._recon_sweep_actors then
-            log(("[reconcile] sweep done: %d actors, examined %d unwarded, corrected=%d"):format(
-                M._recon_sweep_actors, M._recon_sweep_checked or 0, M._recon_sweep_corrected or 0))
-        end
+        -- Sweep boundary: re-snapshot the book list + unwarded set.
         M._recon_books = FindAllOf("BP_GrabbingBook_C")
         M._recon_n = 0
         if M._recon_books then pcall(function() M._recon_n = #M._recon_books end) end
         M._recon_cursor = 1
         M._recon_epoch = M._world_epoch
-        M._recon_sweep_actors = M._recon_n
-        M._recon_sweep_checked = 0
-        M._recon_sweep_corrected = 0
         local only_shelfable = M._slot_data and M._slot_data.only_unward_shelfable_books == 1
         M._recon_uw = M._compute_unwarded_set(only_shelfable)
         if M._recon_n == 0 then return end
@@ -1832,7 +1819,6 @@ function M.reconcile_book_actors()
         end
     end
     M._recon_cursor = hi + 1
-    M._recon_sweep_checked = (M._recon_sweep_checked or 0) + checked_unwarded
     if #fixes == 0 then return end
     -- WRITE pass: only the mismatched books. Same thread gate as Pass 1
     -- (BOOK_ACTOR_GAMETHREAD): marshals to the game thread when that flag is on, inline
@@ -1855,9 +1841,8 @@ function M.reconcile_book_actors()
                 end
             end
         end
-        M._recon_sweep_corrected = (M._recon_sweep_corrected or 0) + #fixes
-        log(("[reconcile] window[%d-%d/%d] unwarded=%d corrected=%d (coll=%d mesh=%d)"):format(
-            lo, hi, M._recon_n, checked_unwarded, #fixes, c_coll, c_mesh))
+        log(("[reconcile] corrected %d book(s) (coll=%d mesh=%d) of %d examined"):format(
+            #fixes, c_coll, c_mesh, checked_unwarded))
     end, "BOOK_ACTOR_GAMETHREAD")
 end
 

@@ -1575,14 +1575,9 @@ local function start_gameplay_loops()
         if not IA._apply_safe then return false end
         pcall(try_register_book_hooks)   -- beta6 inc1: one-shot observe-hook register (game thread)
         pcall(bh_report_periodic)        -- beta6 inc1: ~30s [book-hook] count report
-        -- [crumb] BAE1A5E0 crash-hunt (TEMP): the LAST "[crumb]" line in the log
-        -- before a crash names the periodic op that was mid-flight. "idle:*" means
-        -- none of ours was running -> the game's own tick (e.g. on an object the mod
-        -- left in a bad state). Remove once the culprit is found.
-        log("[crumb] idx");  pcall(function() IA.refresh_index_if_changed() end)
-        log("[crumb] ward"); pcall(function() IA._apply_bookcases_to_world() end)
-        log("[crumb] idle:5s")
-        pcall(apply_book_visibility) -- async; postdates BAE1A5E0, so left uncrumbed
+        pcall(function() IA.refresh_index_if_changed() end)   -- catch lazy-spawned bookcases
+        pcall(function() IA._apply_bookcases_to_world() end)  -- Layer 2 bookcase ward
+        pcall(apply_book_visibility)                          -- Layer 3 HISM pile mask (async)
         -- Periodic actor-state reconcile: the continuous counterpart to Layer 3, for the
         -- BP_GrabbingBook ACTOR. Heals Bug 1 (visible-not-grabbable) + Bug 2 (grabbable-
         -- invisible) by re-asserting collision + SM_Book_1 mesh on unwarded books whose
@@ -1617,7 +1612,6 @@ local function start_gameplay_loops()
         if not IA._gameplay_active then return false end
         if not IA._apply_safe then return false end
         if not IA._slot_data then return false end
-        log("[crumb] sync")
         pcall(function() IA.sync_progress_state() end)
         -- Also re-run row-completion detection periodically. FinishRow
         -- only fires when the global row count INCREASES — so if the
@@ -1627,9 +1621,7 @@ local function start_gameplay_loops()
         -- those swap completions promptly. detect_completed_rows is
         -- idempotent (de-dup via _sent_row_locations), so re-running
         -- when nothing has changed is a no-op.
-        log("[crumb] detect")
         pcall(function() IA.detect_completed_rows() end)
-        log("[crumb] rowchecks")
         -- Row-completion threshold catch-up: read rows_finished from the
         -- save and re-fire any "Complete N Rows" threshold whose value
         -- the player has now reached. Belt-and-suspenders for cases
@@ -1667,9 +1659,7 @@ local function start_gameplay_loops()
         -- (e.g., a UpgradePlayer call dropped silently when the player
         -- was mid-transition), retry the missing applies. Idempotent
         -- and conservative — never over-grants past received counts.
-        log("[crumb] resync")
         pcall(function() IA.resync_skill_state() end)
-        log("[crumb] idle:3s")
         return false
     end)
 
