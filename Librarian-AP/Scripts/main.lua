@@ -557,7 +557,7 @@ end
 -- with the full grab-style dump, so a wild occurrence is captured for later analysis with zero
 -- manual repro. A per-sweep census (logged only when something was not-drawn, so a clean session
 -- stays silent) reports the scale -- and self-calibrates how well bHidden tracks "near". Gated
--- BOOK_INVIS_SCAN; budgeted so it never starves the AP poll loop. See KNOWN_ISSUES for the markers.
+-- BOOK_INVIS_SCAN; budgeted so it never starves the AP poll loop. See known_bugs.txt for the markers.
 local _invis_books, _invis_cursor, _invis_n, _invis_epoch, _invis_uw = nil, 1, 0, nil, nil
 local _invis_streak, _invis_dumped = {}, {}
 local _invis_sw_shown, _invis_sw_notdrawn, _invis_sw_nearnd, _invis_sw_suspects = 0, 0, 0, 0
@@ -1202,8 +1202,8 @@ end
 -- isn't in TESTED_GAME_VERSIONS, append "(UNTESTED)" so the player knows
 -- compatibility isn't validated against their game build.
 
-local MOD_VERSION = "1.1.0-beta7"
-local TESTED_GAME_VERSIONS = { "1.0.8" }
+local MOD_VERSION = "1.1.0"
+local TESTED_GAME_VERSIONS = { "1.0.8", "1.0.9" }
 
 local function get_game_version()
     local gi = find_game_instance()

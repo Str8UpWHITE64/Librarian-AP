@@ -2,6 +2,36 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0 — 2026-06-05
+
+The stable 1.1.0 release: brings the beta line (crash fixes, warding sync, book-visibility work) to a
+shippable build, plus a large code cleanup and two gameplay fixes.
+
+**Gameplay fixes**
+- **Row completion** now reads the completed series from the books actually placed in the row (the
+  row-major `PlacingBookInfo` grid), not `CorrectBookDataIndex` — fixes wrong-series row checks on
+  free-placement sections (e.g. 1B / 1C / 1J).
+- **Level inflation on reload** fixed: the applied-skill baseline is read from `PlayerExtraDataV1` (the
+  migrated save struct), so re-loading a save no longer re-applies skills and climbs the level.
+
+**Book hiding**
+- **Periodic actor-state reconcile** (`BOOK_ACTOR_RECONCILE`): a read-before-write pass that continuously
+  heals the flag-based "visible-but-not-grabbable" / "grabbable-but-mesh-hidden" cases.
+- **Known issue (documented):** a rare, random, hidden-mode-only "visible in the pile, invisible when
+  held" book that self-heals on reload — a stale render-proxy fault with no flag trace. Ships with passive
+  diagnostics that capture it automatically; workaround is title → Continue or relaunch. See `known_bugs.txt`.
+
+**Cleanup (no behavior change)**
+- Removed ~1,000+ lines of dead/vestigial book-hiding code: the ~600-line per-book HISM mapping pipeline
+  (I3), the inert deferred tree-walk (I4), the shelved PROACTIVE BOOK SWEEP, the disabled Pass 2, the
+  HISM-teleport pair, the dead Phase 5b/6/7 workers, and the dormant material worker (R1–R7). Hiding is now
+  Layer 3 (HISM pile mask) + Pass 1 (actor warding) only.
+- Comment/doc drift fixes (D1/D2).
+
+Incorporates everything from 1.1.0-beta1 … beta7 (the recurring access-violation crash resolved via
+game-thread marshaling + a world-epoch teardown guard; beta6 event-hook warding sync; the beta6.2
+RefreshInfo redraw). Tested on game builds 1.0.8 and 1.0.9.
+
 ## 1.1.0-beta6.2 — 2026-06-04 (released)
 
 Candidate fix for the rare **"unlocked book renders invisible (but still grabbable)"** glitch (symptom 2).

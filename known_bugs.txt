@@ -38,3 +38,36 @@ Book visibility edge cases (rare ~3/3072 over a 1-4h run; ADDRESSED in v1.1.0-be
   These are the two directions of the same actor-vs-pile desync. Confirm via the [book-hook]
   ENFORCE/REVEAL log counts over a full playthrough + tester reports. If REVEAL stays 0 but vanishing
   books persist, symptom 2 isn't the stale-hide we targeted — look elsewhere. See WARDING_SYNC_PLAN.md.
+
+1.1.0 Known Issues:
+
+- "Visible in the pile, invisible when held" (hidden mode only). A received (unwarded) book occasionally
+  renders invisible while held or looked at, though it's visible in the shelf pile and still grabbable.
+  Rare and RANDOM — different books each session, sometimes 1 book, sometimes a few, sometimes a whole
+  series. WORKAROUND: return to the title screen and Continue, or relaunch — it's per-session only and the
+  affected books come back normal (nothing is lost; the save is never corrupted).
+
+  Confirmed: hidden mode only (stacks never hides books, so it never exercises the machinery); runtime-only,
+  self-heals on world reload (book actors re-spawn); it's the actor's SM_Book_1 mesh that's affected, not the
+  pile/HISM. A captured grab read 100% HEALTHY on every field (bHidden=false, mesh shown, scale 1.0, opacity
+  nil, transform/CPD normal, tints in range), and it SURVIVES RefreshInfo (called 3,467x in one session) — so
+  it's below the appearance layer. Leading hypothesis: a stale/detached render proxy on the held actor (it's
+  "visible" by every flag but not actually drawn), cleared only by the full actor re-spawn a reload does.
+
+  Ruled out: opacity, WPO / CustomPrimitiveData displacement (UpdateWPO is dead code; cpd empty), transform /
+  mesh-Z, scale, the bHidden / mesh-visibility flags, null mesh, tint corruption, BookInfo (RefreshInfo).
+
+  Mitigation shipped: BOOK_ACTOR_RECONCILE heals the flag-based variants (NOT this render-proxy one).
+  Read-only DIAGNOSTICS ship enabled (gated, silent unless something's wrong) to capture a wild occurrence —
+  send UE4SS.log and grep for:
+    [invis-scan] *** SUSPECT ***             passive detector: an unwarded book shown+near but not drawn
+    [book-hook] *** BROKEN-GRAB ***          a grabbed book that looks broken (full state dump follows)
+    [book-hook] *** INVISIBLE-CONFIRMED ***  a held book confirmed genuinely not-drawn (~0.6s after grab)
+  Toggle off via BOOK_INVIS_SCAN / BOOK_EVENT_HOOKS in Scripts/diag_flags.lua (changes no gameplay).
+
+  Next fix step (from a captured dump): renderInMainPass=false -> re-assert it in the reconcile; everything
+  reads visible but WasRecentlyRendered=false -> force a component re-register on the held actor (the
+  lightweight equivalent of the re-spawn that already heals it). Crash-stabilized rendering code, so gate + A/B.
+
+  (Supersedes the beta6 "Book visibility edge cases" note above: symptom 1 "visible but not grabbable" is now
+  handled by ENFORCE + the reconcile; symptom 2's render-proxy form is the open issue here.)
