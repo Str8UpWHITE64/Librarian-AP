@@ -2,10 +2,12 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
-## 1.1.0 — 2026-06-05
+## 1.1.0-rc1 — 2026-06-05
 
-The stable 1.1.0 release: brings the beta line (crash fixes, warding sync, book-visibility work) to a
-shippable build, plus a large code cleanup and two gameplay fixes.
+First 1.1.0 release candidate: brings the beta line (crash fixes, warding sync, book-visibility work) to a
+shippable build, plus a large code cleanup and two gameplay fixes. Two intermittent warding-race crashes
+(in-play render race + return-to-menu teardown freeze) remain KNOWN ISSUES — see known_bugs.txt; testers,
+please send crash_trace.log + UE4SS.log if you hit them.
 
 **Gameplay fixes**
 - **Row completion** now reads the completed series from the books actually placed in the row (the

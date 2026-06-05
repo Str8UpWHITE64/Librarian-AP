@@ -73,3 +73,21 @@ Book visibility edge cases (rare ~3/3072 over a 1-4h run; ADDRESSED in v1.1.0-be
 
   (Supersedes the beta6 "Book visibility edge cases" note above: symptom 1 "visible but not grabbable" is now
   handled by ENFORCE + the reconcile; symptom 2's render-proxy form is the open issue here.)
+
+- Intermittent native crash / freeze from the warding-vs-engine render race (hidden mode). Two shapes seen:
+    * During play: a routine 5s warding pass (esp. the OFF-thread Layer-2 bookcase ward) races the engine's
+      parallel render reads -> a native access violation the mod can't catch. Decoupled (the crash_trace tail
+      is heartbeats, no mod write in flight). Rare; previously ~3/3072 books over a 1-4h run.
+    * Return-to-menu: a heavy ward pass right before the world reload leaves book/bookcase/HISM components
+      mutated, and the engine's teardown of them hangs (multi-minute freeze) then crashes.
+  Long-standing (see CRASH_HANDOFF.md). 1.1.0 mitigates Layer 3 (game-thread + world-epoch teardown guard) but
+  Layers 1-2 still run off-thread and the menu-teardown window isn't fully guarded, so both shapes can still
+  occur. Planned real fix (post-1.1.0): a game-thread "pump" moving Layers 1-2 on-thread without the UE4SS
+  #1180 burst, plus un-warding before teardown.
+
+  REPORTING (on the 1.1.0 build, please): if you crash or freeze, send the crash-report folder, especially:
+    - Mods/Librarian-AP/crash_trace.log   (breadcrumb ledger -- the TAIL names the last mod op before death)
+    - .../Win64/UE4SS.log                  (last 100-200 lines)
+    - one line on what you were doing (placing a row, returning to menu, walking a shelf, ...)
+  Confirm the trace header says mod=1.1.0-rc1 (older builds don't help). Optional A/B: set CASE_WARDING=false
+  or BOOK_VISIBILITY=false in Scripts/diag_flags.lua and report whether the crash stops.
