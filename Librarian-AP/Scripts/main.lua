@@ -1,8 +1,6 @@
 -- Librarian Archipelago Mod (UE4SS Lua)
--- Top-level wiring: AP client setup, save-slot redirection, title-screen
--- text + button gating, BP hooks (UpgradePlayer, FinishRow, OnLevelUp,
--- StartGame), F4/F12 keybinds, and the post-connect pre-apply loop.
--- World mutations live in AP/ItemApply.lua.
+-- Top-level wiring: AP client, save-slot redirection, title gating, BP hooks,
+-- F4/F12 keybinds, post-connect pre-apply loop. World mutations live in AP/ItemApply.lua.
 
 local MOD = "LibrarianAP"
 
@@ -13,9 +11,7 @@ end
 -- ============================================================
 -- Crash-hunt instrumentation (see AP/trace.lua, diag_flags.lua, CRASH_HANDOFF.md)
 -- ============================================================
--- diag_flags: runtime bisection switches. Each flag DEFAULTS to ON (current behavior);
--- a tester flips one to false, relaunches, and reports crash/no-crash to localize the
--- subsystem. Loaded via pcall so a missing/broken file just means "all flags on".
+-- diag_flags: runtime bisection switches. Each defaults ON; unknown/missing flag -> ON.
 local DIAG = (function()
     local ok, t = pcall(require, "diag_flags")
     return (ok and type(t) == "table") and t or {}
@@ -37,8 +33,7 @@ local function diag_flags_str()
     return table.concat(parts, ",")
 end
 
--- trace: durable, flushed-on-every-write crash breadcrumb ledger. Stubbed to no-ops if
--- the module is somehow absent, so call sites can never error.
+-- trace: durable, flushed-on-every-write crash breadcrumb ledger. Stubbed to no-ops if absent.
 local trace = (function()
     local ok, t = pcall(require, "AP/trace")
     if ok and type(t) == "table" and t.begin then return t end
@@ -47,21 +42,10 @@ local trace = (function()
 end)()
 _G._librarian_trace = trace   -- reachable from hook callbacks if ever needed
 
--- on_game_thread(fn): run `fn` on the GAME THREAD. CRITICAL: UE4SS LoopAsync /
--- ExecuteWithDelay callbacks run on a SEPARATE async thread -- only RegisterHook
--- and NotifyOnNewObject callbacks run on the game thread. So any UObject mutation
--- fired from inside a LoopAsync callback (e.g. the book-pile HISM SetVisibility /
--- SetMaterial / SetHiddenInGame writes in apply_book_visibility below) races the
--- engine's own game/render/cluster-tree workers that read those same components.
--- That cross-thread race -- NOT merely a "mid-frame" write on the game thread, as
--- the handoffs assumed -- is the lead suspect for the recurring native crash (see
--- CRASH_HANDOFF.md). ExecuteInGameThread marshals the work onto the game thread
--- (drained on the engine tick), where it can no longer race them.
---
--- Gated by diag_on("BOOK_VIS_GAMETHREAD") for A/B bisection: flip that false to
--- restore the OLD off-thread behavior (fn runs inline here on the async thread) and
--- confirm the crash returns. Also falls back to inline if ExecuteInGameThread is
--- somehow unavailable, so a missing global can never break mod loading.
+-- on_game_thread(fn): marshal `fn` onto the game thread. CRITICAL: LoopAsync/ExecuteWithDelay
+-- run on a separate async thread; off-thread HISM writes race the engine's render/cluster-tree
+-- workers -> native crash (CRASH_HANDOFF.md). Gated BOOK_VIS_GAMETHREAD; falls back to inline if
+-- ExecuteInGameThread is unavailable.
 local function on_game_thread(fn)
     if diag_on("BOOK_VIS_GAMETHREAD") and type(ExecuteInGameThread) == "function" then
         ExecuteInGameThread(fn)
@@ -72,18 +56,10 @@ end
 
 
 -- ============================================================================
--- beta6 (warding sync) — Increment 1: OBSERVE-ONLY book-event hooks.
--- See WARDING_SYNC_PLAN.md + BETA6_PROGRESS.md. The plan: keep ONE locked-set and
--- enforce it at the game's own book events. Before relying on those events, this
--- increment only VALIDATES them — it hooks the book's SetActorVisible / SetBookInfo
--- / CanBeGrab UFunctions and LOGS ([book-hook] lines), changing NO behaviour. Goal:
--- confirm they're hookable, see how often SetActorVisible fires, and confirm we can
--- resolve a book's series at hook time. Enforcement is increment 2 (separate flag).
---
--- Gated by diag_on("BOOK_EVENT_HOOKS"). Registers ONCE, on the game thread (a single
--- one-shot ExecuteInGameThread — safe, not a #1180 storm), triggered from the 5s loop
--- after books are loaded. Each callback re-checks the flag, so flipping it false makes
--- them no-ops (rollback without a code revert).
+-- Book-event hooks: enforce the warded set at the game's own book events
+-- (SetActorVisible / SetBookInfo / CanBeGrab). See WARDING_SYNC_PLAN.md.
+-- Gated BOOK_EVENT_HOOKS; registered once on the game thread (single one-shot
+-- ExecuteInGameThread). Each callback re-checks its flag, so a flip = no-op.
 -- ============================================================================
 local BOOK_BP = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingBook.BP_GrabbingBook_C"
 local _book_hooks_attempted = false
@@ -108,9 +84,8 @@ local function _bh_sample(tag, book_obj, extra)
     end)
 end
 
--- Read a named scalar param from a MID's OVERRIDDEN list (ScalarParameterValues). This is the
--- reliable path: plain GetScalarParameterValue read nil, and b.BookMatInst is nil. Returns a
--- number or nil (nil = that param isn't overridden on this MID).
+-- Read a named scalar param from a MID's OVERRIDDEN list (ScalarParameterValues). Must read the
+-- array directly: GetScalarParameterValue returns nil here. nil = param not overridden on this MID.
 local function _mid_scalar(mid, name)
     local out
     pcall(function()
@@ -129,8 +104,7 @@ local function _mid_scalar(mid, name)
     return out
 end
 
--- Dump all overridden scalar params as "name=value,..." -- DEFINITIVE diagnosis of which
--- parameter the game animates (we've guessed the name twice; this shows what's actually set).
+-- Dump all overridden scalar params as "name=value,..." for diagnostics.
 local function _mid_dump(mid)
     local s = "?"
     pcall(function()
@@ -152,8 +126,7 @@ local function _mid_dump(mid)
     return s
 end
 
--- Same, for VECTOR params (colors) -- opacity could be a color's alpha, which the scalar dump
--- can't see. Logs name=(R,G,B,a=A).
+-- Same for VECTOR params (colors): opacity may live in a color's alpha. Logs name=(R,G,B,a=A).
 local function _mid_dump_vec(mid)
     local s = "?"
     pcall(function()
@@ -176,11 +149,9 @@ local function _mid_dump_vec(mid)
     return s
 end
 
--- Inspect the grabbed book's COSMETIC pile instance (the HISM that layer 3 wards) -- the one
--- thing we write that the GRAB hook (which reads the ACTOR) can't see. Reports whether WE left
--- this book's HISM component hidden / swapped to M_APBookMask, or its instance moved off-screen,
--- while the series is unwarded -- i.e. our warding not reversed. hi = AssetIdx+1 (the layer-3
--- index mapping). Read-only; pcall-guarded; game thread (same as layer 3).
+-- Inspect a book's cosmetic pile HISM (what layer 3 wards; the GRAB hook reads the ACTOR and
+-- can't see it). Reports whether we left the HISM hidden/masked/moved while series is unwarded.
+-- hi = AssetIdx+1 (the layer-3 index mapping). Read-only; game thread (same as layer 3).
 local function _inspect_pile(b)
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._book_valid_asset_idx) then return "no-IA" end
@@ -220,14 +191,10 @@ local function _inspect_pile(b)
         bd2 and tostring(math.floor(math.sqrt(bd2))) or "?", tostring(bz))
 end
 
--- PROACTIVE RefreshInfo sweep (inc5e): redraw every unwarded book in small chunks so a corrupt
--- one (invisible, but with correct identity) self-heals WITHOUT the player grabbing it. We can't
--- DETECT broken books by value -- they don't share one (one had out-of-range Tints, another
--- normal) -- so we redraw ALL of them; RefreshInfo re-derives a book's look from its BookInfo, so
--- for a healthy book it just re-applies the SAME look (a no-op redraw), and for a corrupt one it
--- rebuilds it. Chunked across the (game-thread) SetActorVisible pre-hook -> no mass-update burst,
--- no new ExecuteInGameThread. RefreshInfo is a redraw (not a flag the game's Tick reverts), so it
--- does NOT churn like the shelved bHidden sweep. World-epoch guarded. Gated BOOK_REFRESH_SWEEP.
+-- Proactive RefreshInfo sweep: redraw every unwarded book in chunks so a corrupt one (invisible
+-- but correct identity) self-heals without a grab. Can't detect broken books by value, so redraw
+-- all; RefreshInfo re-derives look from BookInfo (no-op for healthy, rebuild for corrupt) and is a
+-- redraw the Tick won't revert (no churn). World-epoch guarded. Gated BOOK_REFRESH_SWEEP.
 local _rsw_books, _rsw_n, _rsw_cursor, _rsw_epoch, _rsw_uw = nil, 0, 1, nil, nil
 local RSWEEP_BUDGET = 12
 local function _refresh_sweep_step()
@@ -262,13 +229,10 @@ local function _refresh_sweep_step()
     _rsw_cursor = last + 1
 end
 
--- Shared grab-path check, called from BOTH GrabFromPlayer and CanBeGrab. (CanBeGrab is
--- proven to fire on grab attempts -- Bug Report 5, ~10/run -- so routing through it hedges
--- against GrabFromPlayer not firing.) Logs the book's full visibility state to pinpoint the
--- "pickable book invisible" cause (symptom 2, which SetActorVisible/REVEAL never sees), then
--- conservatively restores an UNWARDED book that's hidden. Logging gated by BOOK_EVENT_HOOKS
--- (the caller), restore by BOOK_EVENT_GRABFIX. Game thread; the setters used aren't hooked
--- (no re-entrancy) and align with "you grabbed it, it should be visible" (no fight).
+-- Shared grab-path check, called from BOTH GrabFromPlayer and CanBeGrab (routing through both
+-- hedges against GrabFromPlayer not firing). Logs the book's full visibility state, then restores
+-- an unwarded book that's hidden. Logging gated BOOK_EVENT_HOOKS, restore gated BOOK_EVENT_GRABFIX.
+-- Game thread; the setters used aren't hooked (no re-entrancy).
 local function _bh_grab_check(b, tag)
     if not b then return end
     local _, series = _bh_series(b)
@@ -311,17 +275,15 @@ local function _bh_grab_check(b, tag)
         local uw = IA._compute_unwarded_set(only_shelfable)
         unwarded_here = uw and uw[series] or false
     end
-    -- BROKEN detection: any signal that would render an unwarded book invisible / unpickable.
-    -- meshZ far from actorZ = the deep-Z hide pattern; opacity<1 = stuck-transparent MID;
-    -- scaleX~0 = zero-scaled; plus the raw bHidden / mesh-visibility flags.
+    -- BROKEN = any signal that renders an unwarded book invisible/unpickable: meshZ far from
+    -- actorZ (deep-Z hide), opacity<1 (stuck-transparent MID), scaleX~0, or the raw hide flags.
     local meshz_off = (type(meshz) == "number" and type(actorz) == "number") and math.abs(meshz - actorz) or 0
     local looks_broken = (bhidden == true) or (mesh_hidden == true) or (mesh_vis == false)
         or (type(opacity) == "number" and opacity < 1.0)
         or (type(scalex) == "number" and scalex < 0.01)
         or (meshz_off > 1000.0)
-    -- Dump the full state for the first 100 grabs (healthy baseline) AND for any BROKEN-looking
-    -- grab beyond that (bounded) -- so the intermittent invisible book is captured even when it's
-    -- grabbed long after the baseline cap, the gap that hid "Breaking the Curse of the Trophyless".
+    -- Dump full state for the first 100 grabs (baseline) AND any broken-looking grab beyond that
+    -- (bounded), so an intermittent invisible book is captured long after the baseline cap.
     local dump = (tag == "SCAN") or (_bh.grab_samples < 100) or (looks_broken and (_bh.broken_dumps or 0) < 60)
     if dump then
         if looks_broken then
@@ -341,13 +303,9 @@ local function _bh_grab_check(b, tag)
         log(("[book-hook] %s-MESH series=%s actorZ=%s meshZ=%s cpd=%s mesh=%s"):format(
             tostring(tag), tostring(series), tostring(actorz), tostring(meshz), tostring(cpd), tostring(meshname)))
     end
-    -- DEFERRED RENDER-TRUTH (the decisive probe). WasRecentlyRendered read AT grab-start is
-    -- unreliable -- the actor was in HISM/pile form a moment earlier, so it reads "not drawn"
-    -- even for a healthy book. Re-check ~0.6s later, once the held copy has had frames to draw.
-    -- If the actor is STILL shown (bHidden=false) yet NOT drawn, the book is genuinely invisible
-    -- -- the ground truth no flag exposes -- so log it + the render-pass fields (bRenderInMainPass /
-    -- IsVisible), which are the leading suspects: true/false regardless of every flag we read,
-    -- untouched by RefreshInfo, reset on actor re-spawn (matches "self-heals on reload"). One-shot.
+    -- Deferred render-truth: WasRecentlyRendered at grab-start is unreliable (actor was pile form
+    -- a moment earlier). Re-check ~0.6s later; still-shown-but-not-drawn = genuinely invisible.
+    -- One-shot; logs the render-pass fields no flag exposes.
     if unwarded_here == true then
         local b_ref, series_ref = b, series
         LoopAsync(600, function()
@@ -386,11 +344,9 @@ local function _bh_grab_check(b, tag)
                 did[#did + 1] = "meshVisible"
             end
         end
-        -- The cause for "all flags say visible but it's invisible" (the reproducible book):
-        -- the per-book MID's "Opacity" is stuck < 1. Restore it via the mesh material -- the
-        -- same GetMaterial(0) MID we logged at grab time (b.BookMatInst returned nil). Gated
-        -- BOOK_OPACITY_FIX. Setting a scalar on the EXISTING actor MID is what the dormant
-        -- material worker does -- NOT creating a MID on the HISM (the documented crash).
+        -- "all flags visible but invisible" = the per-book MID's "Opacity" stuck < 1. Restore via
+        -- the mesh material's GetMaterial(0) MID (b.BookMatInst is nil). Gated BOOK_OPACITY_FIX.
+        -- Setting a scalar on the EXISTING actor MID is safe; creating a MID on the HISM crashes.
         if diag_on("BOOK_OPACITY_FIX") and midref and type(opacity) == "number" and opacity < 1.0 then
             pcall(function() midref:SetScalarParameterValue("Opacity", 1.0) end)
             did[#did + 1] = "opacity(" .. tostring(opacity) .. ")"
@@ -401,10 +357,9 @@ local function _bh_grab_check(b, tag)
             log("[book-hook] GRAB-FIX series=" .. tostring(series) .. " fixed=" .. table.concat(did, "+"))
         end
     end
-    -- inc5d: the broken book's IDENTITY (series) is correct but its DISPLAY is corrupt (out-of-
-    -- range Tint colors like 2.0/3.0 + invisible, while every flag, scale, mesh position and pile
-    -- read normal). The game's own RefreshInfo() re-derives a book's appearance from its BookInfo
-    -- -- so on grab of an unwarded book, redraw it. Gated BOOK_REFRESH_FIX.
+    -- Some broken books have correct identity but corrupt display (out-of-range Tints + invisible)
+    -- while every flag reads normal. RefreshInfo re-derives appearance from BookInfo; redraw on
+    -- grab of an unwarded book. Gated BOOK_REFRESH_FIX.
     if diag_on("BOOK_REFRESH_FIX") and unwarded_here == true then
         local ok = pcall(function() b:RefreshInfo() end)
         _bh.refreshed = (_bh.refreshed or 0) + 1
@@ -434,28 +389,23 @@ local function try_register_book_hooks()
             if not diag_on("BOOK_EVENT_HOOKS") then return end
             _bh.setvis = _bh.setvis + 1
             pcall(_refresh_sweep_step)    -- proactive: redraw unwarded books in chunks (heal corrupt ones)
-            -- Visibility is corrected by riding the game's OWN SetActorVisible call: ENFORCE +
-            -- REVEAL-complete below. (The earlier inc5 timer-sweep and the post-hook REVEAL were
-            -- both removed as inert in this UE4SS build.)
+            -- Visibility is corrected by riding the game's OWN SetActorVisible call (ENFORCE +
+            -- REVEAL-complete below) -- no separate timer-sweep, no post-hook.
             local b, v
             pcall(function() b = self:get() end)
             pcall(function() v = is_visible:get() end)
             _bh_sample("SetActorVisible", b, "vis=" .. tostring(v))
-            -- Increment 2: ENFORCE. When the game tries to SHOW (v==true) a book whose
-            -- series is WARDED, override the argument to false so the game's own
-            -- SetActorVisible keeps it hidden -- no flicker, no re-entrancy (we change
-            -- the argument, we don't re-call the function), no material-swap risk.
-            -- Unwarded books are never touched (allowed to show), so an unlock takes
-            -- effect the next time the game shows the book. Reads the LIVE unwarded set
-            -- (same _compute_unwarded_set the pile uses), so it cannot lag behind it.
+            -- ENFORCE: when the game tries to SHOW (v==true) a WARDED book, override the arg to
+            -- false so its own call keeps it hidden -- no flicker, no re-entrancy. Unwarded books
+            -- show normally (unlock takes effect on next show). Reads the LIVE unwarded set.
             if diag_on("BOOK_EVENT_ENFORCE") and v == true and b then
                 local _, series = _bh_series(b)
                 local IA = package.loaded["AP/ItemApply"]
                 if series and IA and IA._compute_unwarded_set then
                     local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
                     local unwarded = IA._compute_unwarded_set(only_shelfable)
-                    -- stacks mode (IA._book_hide_mode == false): never force-hide a warded book
-                    -- actor -- it stays visible, just non-grabbable (collision is layer 1's job).
+                    -- stacks mode (_book_hide_mode==false): warded actor stays visible, just
+                    -- non-grabbable (collision is layer 1's job) -- never force-hide it.
                     if IA._book_hide_mode ~= false and not (unwarded and unwarded[series]) then
                         local set_ok = pcall(function() is_visible:set(false) end)
                         _bh.enforced = _bh.enforced + 1
@@ -467,12 +417,9 @@ local function try_register_book_hooks()
                     end
                 end
             end
-            -- REVEAL-complete (supersedes the dead post-hook REVEAL): when the game SHOWS an
-            -- UNWARDED book (you looked at / approached it) it sets the actor visible but does
-            -- NOT always restore the MESH -- a stuck SM_Book_1 bHiddenInGame / bVisible leaves
-            -- the book "shown" yet invisible (Bug 6). Complete the show: clear the mesh hide
-            -- flags + ensure collision (grabbable). Rides the game's own show call so the
-            -- per-frame Tick keeps it -- no churn (unlike the shelved inc5 timer-sweep).
+            -- REVEAL-complete: when the game SHOWS an UNWARDED book it doesn't always restore the
+            -- MESH -- a stuck SM_Book_1 bHiddenInGame/bVisible leaves it "shown" yet invisible.
+            -- Clear the mesh hide flags + ensure collision. Rides the show call, so Tick keeps it.
             if diag_on("BOOK_EVENT_REVEAL") and v == true and b then
                 local _, rseries = _bh_series(b)
                 local IA = package.loaded["AP/ItemApply"]
@@ -487,9 +434,8 @@ local function try_register_book_hooks()
                             pcall(function() vis = sm.bVisible end)
                             pcall(function() mid = sm:GetMaterial(0) end)
                             if mid and mid:IsValid() then op = _mid_scalar(mid, "Opacity") end
-                            -- op < 1 = the stuck-transparent book (all flags say visible). Fix it
-                            -- by restoring the MID's Opacity here too, so just LOOKING at the book
-                            -- (the show that triggers the glitch) repairs it. Gated BOOK_OPACITY_FIX.
+                            -- op < 1 = stuck-transparent book; restore Opacity here too so just
+                            -- LOOKING at it repairs it. Gated BOOK_OPACITY_FIX.
                             local op_bad = diag_on("BOOK_OPACITY_FIX") and type(op) == "number" and op < 1.0
                             if mh == true or vis == false or op_bad then
                                 if mh == true then pcall(function() sm:SetHiddenInGame(false, false) end) end
@@ -520,9 +466,8 @@ local function try_register_book_hooks()
             local b; pcall(function() b = self:get() end)
             _bh_grab_check(b, "CANGRAB")
         end)
-        -- Increment 4: GRAB-path observe + conservative fix (symptom 2 = "pickable book
-        -- invisible", which SetActorVisible/REVEAL never sees). The shared _bh_grab_check
-        -- runs from BOTH CanBeGrab (above; proven to fire) and GrabFromPlayer.
+        -- GRAB-path observe + fix for "pickable book invisible" (which SetActorVisible/REVEAL
+        -- never sees). _bh_grab_check runs from BOTH CanBeGrab (above) and GrabFromPlayer.
         reg("GrabFromPlayer", function(self)
             if not diag_on("BOOK_EVENT_HOOKS") then return end
             _bh.grabbed = _bh.grabbed + 1
@@ -543,21 +488,12 @@ local function bh_report_periodic()
 end
 
 -- ============================================================================
--- Passive invisible-book scanner (Bug 2 diagnostic / known-issue capture)
+-- Passive invisible-book scanner. The "visible in pile, invisible when held" bug
+-- leaves no flag/material/transform trace; only WasRecentlyRendered exposes it.
+-- Every 5s, walk a budget of unwarded shown books; one NEAR + shown-but-not-drawn
+-- across INVIS_STREAK scans is a SUSPECT, dumped once. Gated BOOK_INVIS_SCAN;
+-- budgeted so it never starves the AP poll loop. See known_bugs.txt.
 -- ============================================================================
--- The intermittent "visible in the pile, invisible when held" bug leaves NO flag, material,
--- transform, scale or BookInfo trace -- every field reads healthy -- yet the held actor is not
--- actually drawn. It self-heals on world reload (actor re-spawn), survives RefreshInfo, hits
--- random books, and is rare: nearly impossible to catch by hand. So we catch it PASSIVELY.
---
--- Every 5s this walks a budget of BP_GrabbingBook actors and, for each UNWARDED book whose actor
--- is in SHOWN form (bHidden=false), reads the one ground-truth signal the flags can't fake --
--- WasRecentlyRendered. A book that stays shown-but-not-drawn across INVIS_STREAK consecutive
--- scans (so it is genuinely stuck, not merely off-screen for a moment) is a SUSPECT: logged once
--- with the full grab-style dump, so a wild occurrence is captured for later analysis with zero
--- manual repro. A per-sweep census (logged only when something was not-drawn, so a clean session
--- stays silent) reports the scale -- and self-calibrates how well bHidden tracks "near". Gated
--- BOOK_INVIS_SCAN; budgeted so it never starves the AP poll loop. See known_bugs.txt for the markers.
 local _invis_books, _invis_cursor, _invis_n, _invis_epoch, _invis_uw = nil, 1, 0, nil, nil
 local _invis_streak, _invis_dumped = {}, {}
 local _invis_sw_shown, _invis_sw_notdrawn, _invis_sw_nearnd, _invis_sw_suspects = 0, 0, 0, 0
@@ -575,8 +511,7 @@ local function _invis_scan_step()
         _invis_books = nil; _invis_streak = {}; _invis_dumped = {}
     end
     if not _invis_books or _invis_cursor > _invis_n then
-        -- Sweep boundary: report the sweep just finished (only when something was shown-but-not-
-        -- drawn, so a clean session logs nothing), then reset the snapshot + accumulators.
+        -- Sweep boundary: report (only if something was not-drawn), then reset snapshot + counters.
         if (_invis_sw_notdrawn or 0) > 0 or (_invis_sw_suspects or 0) > 0 then
             log(("[invis-scan] census: shown(bHidden=false)=%d notDrawn=%d nearNotDrawn=%d newSuspects=%d (of %d actors)"):format(
                 _invis_sw_shown, _invis_sw_notdrawn, _invis_sw_nearnd, _invis_sw_suspects, _invis_n or 0))
@@ -592,10 +527,8 @@ local function _invis_scan_step()
     end
     local uw = _invis_uw
     if not uw then return end
-    -- Player location (read once per pass). A book not-drawn while FAR from the player is just
-    -- normal off-screen culling; only one that is NEAR yet still not drawn is a real suspect. If
-    -- the player can't be located, px stays nil -> nothing is treated as near -> no suspects (a
-    -- safe no-op, never a false flood).
+    -- Player location (once per pass). Far + not-drawn = normal cull; only NEAR + not-drawn is a
+    -- suspect. No player loc -> px nil -> nothing near -> no suspects (safe no-op).
     local px, py, pz = nil, nil, nil
     do
         local pawn = FindFirstOf("BP_LibrarianCharacter_C")
@@ -650,49 +583,32 @@ local function _invis_scan_step()
 end
 
 
--- Runtime book visibility: hide warded shelves + REVEAL on unlock. Each book HISM is one cover
--- design = one series; classify its instances by a 2D spatial match to the nearest BP_GrabbingBook
--- actor -> series -> warded (via _compute_unwarded_set), majority-vote per shelf (robust to a few
--- mismatches). A warded shelf is hidden by turning the whole HISM component invisible
--- (SetVisibility/SetHiddenInGame false) -> it renders in NO pass, so no checker/depth/occlusion
--- residual; we also swap to M_APBookMask + clear custom data as a belt-and-suspenders, recording
--- the originals first. REVEAL: when a series unlocks (the unwarded set grows), the shelf is made
--- visible again and its ORIGINAL materials restored. Re-runs only when the unwarded set changes.
--- NOTE: a MID on the book HISM crashes this game (confirmed) -- never reintroduce CreateDynamicMaterial*.
+-- Layer 3: hide warded book-pile shelves (HISM) + REVEAL on unlock. Each HISM = one series (via
+-- the index mapping); hide = SetVisibility/SetHiddenInGame false + swap to M_APBookMask (originals
+-- recorded first), REVEAL restores them. Runs every pass; cheap when nothing drifted.
+-- CRASH RULE: a MID on the book HISM crashes this game -- never reintroduce CreateDynamicMaterial*.
 local _b2_state = {}        -- [hi] = { hidden = bool, ns = N, mats = {[s] = origMaterial} }
 local _b2_last_sig = nil
 local _b2_running = false
 local _b2_load_requested = false
 local _b2_mat_ref = nil
--- v2 classifier (probe-confirmed: each pile-group / HISM is ONE series). Instead of
--- re-reading actor positions every pass (which drifts as books swap actor<->HISM and
--- can leak a warded cover), we ACCUMULATE each group's series votes across passes (its
--- instances' nearest actors) until a dominant, well-sampled leader locks in -- so an
--- occasional stacked-neighbor mis-vote averages out instead of deciding a small group
--- from one noisy pass. Hide/reveal is driven off that leader + the warded set:
--- deterministic, self-correcting, no flicker. The OLD spatial/conservative classifier
--- still runs each pass for COMPARISON logging ([b2-cmp]) only. Resets on world reload.
+-- Spatial vote-accumulation classifier (used only by the disabled cross-check below).
 local _b2_group = {}   -- [hi] = { tally={series:count}, total, leader, leadn, locked }
--- Spatial cross-check (vote accumulation + index-vs-spatial mismatch logging) is
--- DISABLED. The index mapping (series = _asset_to_series[hi-1]) proved correct on both
--- fresh and resumed saves, so it drives book visibility alone. Flip this to true to
--- re-run the spatial classifier as a ground-truth comparison (e.g. to re-confirm the
--- HISM<->data order after a game patch). All the spatial code is kept, just gated.
+-- Spatial cross-check, DISABLED: the index mapping (series = _asset_to_series[hi-1]) proved
+-- correct on fresh + resumed saves and drives visibility alone. Flip true to re-run the spatial
+-- classifier as a ground-truth comparison (e.g. to re-confirm HISM<->data order after a patch).
 local B2_SPATIAL_CROSSCHECK = false
 local function apply_book_visibility()
     if not diag_on("BOOK_VISIBILITY") then return end
     if _b2_running then return end
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._compute_unwarded_set and IA._asset_to_series) then return end
-    -- stacks mode (book_visibility="stacks"): leave the cosmetic HISM pile fully visible -- the
-    -- only warding is layer-1 collision-off. Skip all pile hiding. (== false so a nil mode before
-    -- slot_data arrives still runs the legacy hide path.)
+    -- stacks mode: leave the pile visible (warding is layer-1 collision-off only); skip pile hiding.
+    -- (==false so a nil mode before slot_data arrives still runs the hide path.)
     if IA._book_hide_mode == false then return end
-    -- Snapshot the world epoch (bumped by reset_hism_state on every LoadMap). The
-    -- game-thread chunk closure re-checks it before touching the captured HISM array;
-    -- if the world reloaded between scheduling and running, it bails -- the captured
-    -- arr/HISMs are freed, so arr[hi] would be a native AV that pcall can't catch
-    -- (the main-menu teardown crash).
+    -- Snapshot the world epoch (bumped by reset_hism_state each LoadMap). The game-thread chunk
+    -- re-checks it before touching the captured HISM array: if the world reloaded, the freed
+    -- arr[hi] is a native AV pcall can't catch (the main-menu teardown crash).
     local epoch0 = IA._world_epoch
     local mgr = FindFirstOf("BP_HISM_Manager_C")
     if not (mgr and mgr:IsValid()) then return end
@@ -707,9 +623,8 @@ local function apply_book_visibility()
     pcall(function() local info = books[1].ItemInfo; if info and info:IsValid() then ready = true end end)
     if not ready then return end
     local mat = nil
-    -- M_APBookMask is unreferenced, so LoadAsset can't pull it from the LogicMod pak.
-    -- It must be hard-referenced by ModActor (a Material var named BookMaskMat) so it
-    -- loads with the mod; read it from there. Fallback: StaticFindObject if already loaded.
+    -- M_APBookMask is unreferenced (LoadAsset can't pull it from the pak); it must be hard-ref'd
+    -- by ModActor's BookMaskMat var to load. Read it there; fallback StaticFindObject if loaded.
     local ma = FindFirstOf("ModActor_C")
     if ma and ma:IsValid() then pcall(function() mat = ma.BookMaskMat end) end
     if not (mat and mat:IsValid()) then
@@ -723,15 +638,9 @@ local function apply_book_visibility()
         return
     end
     _b2_mat_ref = mat  -- pin against GC
-    -- Periodic re-classification: run on EVERY call (every ~5s from the gameplay
-    -- loop), NOT only when the unwarded set changes. The actor<->HISM swap fired
-    -- by looking at / moving past a series reshuffles which books are static
-    -- instances vs grabbable actors, so a pile-group classified correctly earlier
-    -- can drift wrong -- an unwarded book's instance lands in a hidden group and
-    -- vanishes. Re-running with fresh actor positions self-corrects that within
-    -- one pass instead of waiting for the next unlock. Steady state is cheap: when
-    -- nothing drifted, every group hits kept_hidden/kept_shown below (reads only,
-    -- no HISM mutations). sig is kept only to label the log (set change vs drift).
+    -- Re-classify on EVERY call, not just on unwarded-set change: the actor<->HISM swap can drift
+    -- a group's classification, so an unwarded book's instance lands in a hidden group and vanishes;
+    -- re-running self-corrects within a pass. Cheap at steady state (reads only). sig labels the log.
     local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
     local unwarded = IA._compute_unwarded_set(only_shelfable) or {}
     local skeys = {}
@@ -741,10 +650,8 @@ local function apply_book_visibility()
     local sig_changed = (sig ~= _b2_last_sig)
     _b2_last_sig = sig
     _b2_running = true
-    -- 2D nearest-match (X,Y only). HISM instance transforms are component-LOCAL, so
-    -- their Z doesn't line up with the actor's WORLD Z -- including Z broke matching
-    -- (113 -> 10 correct). X,Y line up, so match on those. Stacked books share X,Y
-    -- (minor ambiguity, acceptable for now) but every instance gets classified.
+    -- 2D nearest-match (X,Y only): HISM instance transforms are component-LOCAL, so their Z doesn't
+    -- match the actor's WORLD Z. Stacked books share X,Y (minor ambiguity) but all get classified.
     local CELL = 25.0
     local function gkey(ix, iy) return ix .. "_" .. iy end
     local grid = {}
@@ -781,29 +688,18 @@ local function apply_book_visibility()
         end end
         return best
     end
-    -- ONE ExecuteInGameThread per pass: CHUNK = hn processes ALL HISMs in a single
-    -- game-thread call, so process_chunk never reschedules. The old per-chunk
-    -- reschedule issued ~10 ExecuteInGameThread calls/pass; that churn (amplified by
-    -- Stage 2's layer-1 burst) tripped UE4SS #1180 -- overlapping engine-tick actions
-    -- -> abort() ("Abort signal received"). Chunking only ever existed to keep the
-    -- ASYNC poll loop pumping, which is moot now the work runs on the game thread.
-    -- One marshal/pass = minimal queue churn. (Cost: one ~400-HISM tick; a brief
-    -- hitch on connect / unwarded-set change, acceptable vs an abort.)
+    -- ONE ExecuteInGameThread per pass (CHUNK = hn does all HISMs in one game-thread call). Many
+    -- marshals/pass trip UE4SS #1180 (overlapping engine-tick actions -> abort). Cost: one ~400-HISM
+    -- tick, a brief hitch on connect / set-change. Chunking only existed to pump the async poll loop.
     local cursor, CHUNK = 1, hn
     local newly_hidden, revealed, kept_hidden, kept_shown = 0, 0, 0, 0
     local n_new_hide, mismatch, leader_changed, n_locked = 0, 0, 0, 0
-    -- run_chunk is forward-declared so process_chunk can reschedule through it
-    -- (Lua binds the upvalue at process_chunk's definition, so the local must
-    -- exist first). process_chunk = one chunk of HISM work (runs on the game
-    -- thread); run_chunk = the game-thread driver that invokes it. See
-    -- on_game_thread above.
+    -- run_chunk forward-declared so process_chunk can reschedule through it (upvalue must exist
+    -- first). process_chunk = one chunk of HISM work; run_chunk = the game-thread driver.
     local run_chunk
     local function process_chunk()
-        -- Teardown guard (runs on the game thread). If the world reloaded since this
-        -- pass was scheduled (epoch changed), the captured `arr` + HISM components are
-        -- from the freed old world; arr[hi] would be a native access violation that
-        -- pcall CANNOT catch (the main-menu / LoadMap use-after-free). Bail without
-        -- touching any captured ref -- the next pass re-resolves the new world fresh.
+        -- Teardown guard: if the world reloaded since this pass was scheduled (epoch changed), the
+        -- captured arr/HISMs are freed and arr[hi] is a native AV pcall can't catch. Bail untouched.
         if (IA._world_epoch or 0) ~= (epoch0 or 0) then
             _b2_running = false
             trace.mark("b2-stale-world", nil,
@@ -816,11 +712,8 @@ local function apply_book_visibility()
             if h and h:IsValid() then
                 local sm; pcall(function() sm = h.PerInstanceSMData end)
                 local sn = 0; if sm then pcall(function() sn = #sm end) end
-                -- DRIVER: the index mapping. hi == the series' position in the data
-                -- order (hi==gi, confirmed on fresh + resumed saves), so the hi-th HISM's
-                -- series is just _asset_to_series[hi-1] (AssetIdx hi-1). Deterministic,
-                -- position- and shelving-independent, RESUME-SAFE, no warm-up: a row
-                -- classifies correctly on the first pass regardless of save state.
+                -- DRIVER: the index mapping. hi == the series' position in the data order, so the
+                -- hi-th HISM's series is _asset_to_series[hi-1]. Deterministic, resume-safe, no warm-up.
                 local idx_series = IA._asset_to_series[hi - 1]
                 local should_hide_new
                 if sn == 0 then should_hide_new = false
@@ -828,12 +721,8 @@ local function apply_book_visibility()
                 else should_hide_new = (not unwarded[idx_series]) end
                 if should_hide_new then n_new_hide = n_new_hide + 1 end
 
-                -- SPATIAL CROSS-CHECK -- DISABLED (B2_SPATIAL_CROSSCHECK=false). Kept
-                -- verbatim for reference / re-validation: the per-instance nearest-actor
-                -- vote, the vote accumulation + size-aware lock, and the index-vs-spatial
-                -- mismatch log that proved the index mapping correct. The index lookup
-                -- above made all of this unnecessary; flip the flag on to re-run it as a
-                -- ground-truth comparison (e.g. to re-confirm the data order after a patch).
+                -- SPATIAL CROSS-CHECK -- DISABLED. Per-instance nearest-actor vote + size-aware lock
+                -- + index-vs-spatial mismatch log; flip the flag on to re-validate the data order.
                 if B2_SPATIAL_CROSSCHECK then
                     local nw, nu = 0, 0
                     local votes = {}
@@ -876,7 +765,6 @@ local function apply_book_visibility()
                     end
                 end
 
-                -- Apply the NEW verdict (no freeze -- the cache is stable, no flicker).
                 local should_hide = should_hide_new
                 local st = _b2_state[hi]; if not st then st = { hidden = false }; _b2_state[hi] = st end
                 if should_hide and not st.hidden then
@@ -916,8 +804,7 @@ local function apply_book_visibility()
             LoopAsync(50, function() run_chunk() return true end)
         else
             _b2_running = false
-            -- Index mapping drives; spatial vote is the cross-check. Log when anything
-            -- changed OR the two disagree, so we can watch the index correct conflated rows.
+            -- Log only when something changed or the cross-check disagrees.
             if sig_changed or (newly_hidden + revealed) > 0 or mismatch > 0 or leader_changed > 0 or n_locked > 0 then
                 log(("[b2] applied: newly_hidden=%d revealed=%d kept_hidden=%d kept_shown=%d / %d HISMs"):format(
                     newly_hidden, revealed, kept_hidden, kept_shown, hn))
@@ -932,9 +819,8 @@ local function apply_book_visibility()
                     end
                     log(("[b2-cmp] index-driver hides=%d | index-vs-spatial mismatches=%d | spatial cached=%d locked=%d/%d (corrections=%d newly-locked=%d)"):format(
                         n_new_hide, mismatch, cached, locked, hn, leader_changed, n_locked))
-                    -- diagnostic: split the still-unlocked groups into SPLIT (leader <70% ->
-                    -- conflated, the residual leak risk) vs clean (high-confidence, just not
-                    -- yet vote-saturated). List the split ones so we see exactly what they are.
+                    -- Split unlocked groups into SPLIT (leader <70% = conflated, leak risk) vs clean
+                    -- (just under-sampled); list the split ones.
                     if #splits > 0 then
                         log(("[b2-cmp] unlocked breakdown: split/conflated=%d clean=%d -- listing split (residual-risk groups):"):format(#splits, clean_unlocked))
                         for i = 1, math.min(#splits, 12) do
@@ -949,15 +835,9 @@ local function apply_book_visibility()
             end
         end
     end
-    -- Driver: run ONE chunk's HISM work on the GAME THREAD (on_game_thread).
-    -- process_chunk does all the UObject reads/writes and, while chunks remain,
-    -- reschedules via LoopAsync -> run_chunk -- which bounces back onto the async
-    -- thread before the next ExecuteInGameThread, so we never nest
-    -- ExecuteInGameThread calls (UE4SS issue #1180). The body is pcall-guarded and
-    -- ALWAYS clears _b2_running on error: a throw that left the flag set would wedge
-    -- layer 3 permanently (every later pass early-returns on _b2_running, so the
-    -- pile would never hide or reveal again -- a likely cause of the field report
-    -- where the pile stopped re-revealing after the unwarded set grew).
+    -- Driver: run process_chunk's HISM work on the game thread. Reschedules via LoopAsync so we
+    -- never nest ExecuteInGameThread calls (UE4SS #1180). MUST clear _b2_running on error -- a
+    -- stuck flag wedges layer 3 permanently (every later pass early-returns on it).
     run_chunk = function()
         on_game_thread(function()
             local ok, err = pcall(process_chunk)
@@ -975,9 +855,8 @@ local function apply_book_visibility()
 end
 
 
--- v1.1.0 (rewrite): emit a lifecycle state-machine event. No-op until the SM
--- module is loaded (see the require below). The SM is OBSERVATIONAL for now —
--- these events drive its state + [lifecycle] logging, but it gates nothing yet.
+-- Emit a lifecycle state-machine event. No-op until the SM module loads.
+-- Observational only: drives [lifecycle] logging, gates nothing yet.
 local function lc_event(name)
     pcall(function()
         local L = package.loaded["AP/lifecycle"]
@@ -987,9 +866,8 @@ end
 
 log("Loading Librarian-AP")
 
--- Native level-up grants 1 free skill point. For AP play that's invalid
--- — skills are granted via AP items (Progressive Sort / Progressive
--- Auto-Shelving / etc.) so we zero out EnableUpgradeNum on each OnLevelUp.
+-- Native level-up grants a free skill point; invalid for AP (skills come via AP items),
+-- so zero EnableUpgradeNum on each OnLevelUp.
 local suppress_levelup = true
 
 -- ============================================================
@@ -1000,10 +878,8 @@ local suppress_levelup = true
 -- doesn't echo the call back as a "key pickup" location check.
 local _ap_grant = false
 
--- AP location ID layout (mirrors apworld/librarian/Locations.py).
--- (Row, level, and milestone IDs are owned by ItemApply for state-sync logic;
--- main.lua only needs the chest-opening IDs since the UpgradePlayer hook —
--- which fires when the chest grants its ability — lives here.)
+-- AP location ID layout (mirrors apworld/librarian/Locations.py). main.lua only needs the
+-- chest-opening IDs (ItemApply owns row/level/milestone); the UpgradePlayer hook lives here.
 local AP_BASE = 1910000
 local AP_LOC_CHEST_CRIMSON = AP_BASE + 620
 local AP_LOC_CHEST_EMERALD = AP_BASE + 621
@@ -1021,11 +897,8 @@ local AP_CHEST_LOC_BY_ABILITY = {
 -- ============================================================
 -- Save slot redirection
 -- ============================================================
--- The game uses GameInstance.SaveGameName as the slot name for
--- UGameplayStatics::SaveGameToSlot/LoadGameFromSlot. Default is "Sav"
--- (file: <UserDir>/Saved/SaveGames/Sav.sav). For AP runs we point this
--- at "Sav_AP_<seed>_<slot>" so each AP seed has its own save file and
--- doesn't clobber the player's normal save.
+-- GameInstance.SaveGameName is the SaveGameToSlot/LoadGameFromSlot slot (default "Sav").
+-- For AP runs we point it at "Sav_AP_<seed>_<slot>" so each seed has its own save file.
 
 local DEFAULT_SAVE_SLOT = "Sav"
 local _original_save_slot = nil  -- captured the first time we redirect
@@ -1078,9 +951,7 @@ local function restore_save_slot()
     set_save_slot(target)
 end
 
--- Read a fingerprint of the in-memory GameSaveData so we can tell whether
--- a forced reload actually swapped the contents. Returns "valid:<rows>r/<books>b/bgm=<n>"
--- or "<invalid>"/"<no-savegamedata>".
+-- Fingerprint the in-memory GameSaveData (rows/books/bgm) to confirm a forced reload swapped it.
 local function snapshot_save_data()
     local gi = find_game_instance()
     if not gi then return "<no-gameinstance>" end
@@ -1103,8 +974,7 @@ end
 -- Disable Start Game / Continue while not AP-connected. After connect:
 --   - Continue enabled iff Sav_AP_<seed>_<slot>.sav exists.
 --   - Start Game enabled iff that save does NOT exist (fresh AP run).
--- The other title buttons (Options / Quit / How to Play / etc.) are left
--- alone.
+-- Other title buttons are left alone.
 
 local function ap_save_exists(slot_name)
     if not slot_name or slot_name == "" then return false end
@@ -1136,11 +1006,9 @@ local function set_button_enabled(btn, enabled)
     pcall(function() btn:SetIsEnabled(enabled) end)
 end
 
--- Vanilla latch: set true when the player clicks "Close" on the AP connection
--- window (ModActor.BroadcastCloseRequest). It enables the real Continue/New Game
--- buttons and makes EVERY gameplay modification gate off (warding, book-hiding,
--- level-up suppression, tracking) -- the mod becomes fully passive. One-way for
--- the session: only relaunching the game re-enables connecting.
+-- Vanilla latch: set when the player clicks Close on the AP window. Restores the real
+-- Continue/New Game buttons and gates off every gameplay mod (fully passive). One-way:
+-- only relaunching re-enables connecting.
 local _vanilla_mode = false
 
 local function update_title_buttons()
@@ -1197,10 +1065,8 @@ end
 -- ============================================================
 -- Title-screen status text hijack
 -- ============================================================
--- WBP_Title.Text_Version is the bottom-right version line. We overwrite
--- it with: <Game version> | LibAP vX.YY | AP: <state>. If GetProjectVersion
--- isn't in TESTED_GAME_VERSIONS, append "(UNTESTED)" so the player knows
--- compatibility isn't validated against their game build.
+-- WBP_Title.Text_Version (bottom-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
+-- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
 local MOD_VERSION = "1.1.0"
 local TESTED_GAME_VERSIONS = { "1.0.8", "1.0.9" }
@@ -1242,10 +1108,8 @@ local function compose_title_status_text()
     return string.format("%s | LibAP v%s | %s", game_part, MOD_VERSION, ap_part)
 end
 
--- Logging-only: tv:SetText(luaString) crashes (UE expects an FText that
--- UE4SS Lua doesn't auto-wrap from a Lua string). Composing the text and
--- reading the existing field is safe; an actual overwrite would need a
--- companion UMG widget BP that owns its own text element.
+-- Logging-only: tv:SetText(luaString) crashes (UE wants an FText UE4SS Lua won't auto-wrap).
+-- Composing + reading is safe; a real overwrite needs a companion UMG widget BP.
 local function update_title_status_text()
     local widget = find_title_widget()
     if not widget then return end
@@ -1263,9 +1127,7 @@ local function update_title_status_text()
         text, tostring(current)))
 end
 
--- Lookup helper. Uses package.loaded so we can call it before main.lua's
--- `local APClient = require(...)` line at the bottom has resolved (the hooks
--- registered above run later, by which time package.loaded is populated).
+-- Via package.loaded so callable before the require() at the bottom resolves (hooks fire later).
 local function ap_send_check(loc_id)
     local c = package.loaded["AP/APClient"]
     if c and c.send_check then c:send_check(loc_id) end
@@ -1325,21 +1187,12 @@ end
 -- ============================================================
 local register_bp_hooks_once  -- forward declaration; defined below
 
--- M01 LoadMap counter. The title screen loads M01 as a background once;
--- the actual gameplay save-load loads it a second time. We use the counter
--- as the primary signal for whether the player is actually in gameplay
--- when the player picks "New Game" (which forces a fresh LoadMap).
---
--- The "Continue" path is different: M01 is already loaded from the title
--- screen, and the game just transitions UI state. There's no second
--- LoadMap. So we ALSO watch BP_LibrarianGameInstance.SelectedLevel for a
--- -1 → ≥0 transition (set when the player picks any save). The activation
--- function below is idempotent so both paths can converge safely.
+-- M01 LoadMap counter. Title loads M01 once (background); New Game forces a 2nd load -> 2nd+
+-- M01 load = gameplay. Continue reuses the title's M01 (no 2nd load), so the SelectedLevel
+-- watcher below catches that path too. activate_gameplay is idempotent, so both can converge.
 local m01_load_count = 0
--- Set just before our forced OpenLevel(PL_M01) on AP connect. Cleared by
--- the next M01 LoadMap hook. Tells the LoadMap handler to NOT bump
--- m01_load_count for that load (and therefore not incorrectly infer
--- in_gameplay) — user is still at the title screen.
+-- Set just before our forced OpenLevel(PL_M01) on connect; cleared by the next M01 LoadMap.
+-- Tells the handler NOT to count that load as gameplay (user is still at the title).
 local _suppress_next_m01_load_count = false
 local _gameplay_loops_started = false
 local _pre_apply_settle_state = nil  -- {empty_ticks, reapplies_done} during pre-apply settle
@@ -1372,11 +1225,8 @@ local function start_gameplay_loops()
             for i = 1, math.min(APPLY_SAMPLE_SIZE, n) do
                 local b = books[i]
                 if b and b:IsValid() then
-                    -- Split ItemInfo access to defend against a UE4SS
-                    -- reflection-layer AV (Failure.Hash e40fc030...).
-                    -- Direct b.ItemInfo.AssetIdx hands a possibly-stale
-                    -- sub-UObject ref to UE4SS, which crashes in IsA /
-                    -- resolve_function_address before pcall can catch it.
+                    -- Split the ItemInfo access: a chained b.ItemInfo.AssetIdx hands a stale
+                    -- sub-UObject to UE4SS and crashes before pcall can catch it.
                     local item_info
                     pcall(function() item_info = b.ItemInfo end)
                     if item_info and item_info:IsValid() then
@@ -1415,9 +1265,7 @@ local function start_gameplay_loops()
                 :format(n, distinct, apply_attempts))
             pcall(function() IA.set_apply_safe(true) end)
             lc_event("on_world_ready")  -- world populated → CONNECTING→PRE_APPLY
-            -- During pre-apply: the settle loop below fires flush_apply once
-            -- items quiet down. Otherwise (gameplay-active path): trigger
-            -- the flush now as before.
+            -- Pre-apply path defers flush to the settle loop below; gameplay-active flushes now.
             if IA._gameplay_active then
                 pcall(function() IA.flush_apply() end)
             end
@@ -1499,22 +1347,13 @@ local function start_gameplay_loops()
         return false
     end)
 
-    -- Reconnect-settle watcher. While ItemApply has its
-    -- _reconnect_settle_active flag set (mid-gameplay slot_data refresh),
-    -- the AP server is re-sending every received item one at a time. We
-    -- want to apply them all THEN do one flush_apply with the fully
-    -- rebuilt state — otherwise bookcases flicker hidden as
-    -- shelves_open[X] grows back from zero per item. apply_item already
-    -- defers flush_apply while the flag is set; this watcher fires the
-    -- single flush_apply once the item storm has quieted and clears the
-    -- flag. Mirrors the pre-apply settle loop but is gated on a
-    -- different flag and runs alongside the rest of the gameplay loops.
+    -- Reconnect-settle watcher. On a mid-gameplay reconnect (_reconnect_settle_active) the server
+    -- re-sends every item one at a time; apply them all THEN flush once, else bookcases flicker as
+    -- shelves_open[X] rebuilds from zero. Fires the single flush once the item storm quiets.
     LoopAsync(500, function()
         local IA = package.loaded["AP/ItemApply"]
         if not IA then return false end
-        -- Tie lifecycle to the same "are we still in gameplay context"
-        -- check the 5-second loop uses — die when we leave gameplay so
-        -- the next entry can spawn a fresh one.
+        -- Die when we leave gameplay (same context check the 5s loop uses) so the next entry respawns it.
         if not (IA._gameplay_active or IA._allow_pre_apply) then
             _reconnect_settle_state = nil
             return true
@@ -1545,11 +1384,8 @@ local function start_gameplay_loops()
         end
         s.quiet_ticks = s.quiet_ticks + 1
 
-        -- Fire once items have been quiet for ≥2 ticks (1s) OR we've
-        -- waited 10 ticks (5s) total as a safety net. Either way, one
-        -- flush_apply runs with the fully-rebuilt state and we clear
-        -- the settle flag so subsequent apply_item calls go through
-        -- the normal per-item path again.
+        -- Fire after items quiet ≥2 ticks (1s), or 10 ticks (5s) as a safety net; then clear the
+        -- flag so apply_item resumes the per-item path.
         if s.quiet_ticks >= 2 or s.total_ticks >= 10 then
             log(("[reconnect-settle] items quiet (%d total apply ticks, %d settle ticks); firing single flush_apply"):format(
                 cur, s.total_ticks))
@@ -1573,36 +1409,27 @@ local function start_gameplay_loops()
             return true
         end
         if not IA._apply_safe then return false end
-        pcall(try_register_book_hooks)   -- beta6 inc1: one-shot observe-hook register (game thread)
-        pcall(bh_report_periodic)        -- beta6 inc1: ~30s [book-hook] count report
+        pcall(try_register_book_hooks)   -- register the book hooks (one-shot, game thread)
+        pcall(bh_report_periodic)        -- ~30s [book-hook] count report
         pcall(function() IA.refresh_index_if_changed() end)   -- catch lazy-spawned bookcases
         pcall(function() IA._apply_bookcases_to_world() end)  -- Layer 2 bookcase ward
         pcall(apply_book_visibility)                          -- Layer 3 HISM pile mask (async)
-        -- Periodic actor-state reconcile: the continuous counterpart to Layer 3, for the
-        -- BP_GrabbingBook ACTOR. Heals Bug 1 (visible-not-grabbable) + Bug 2 (grabbable-
-        -- invisible) by re-asserting collision + SM_Book_1 mesh on unwarded books whose
-        -- flags drifted. Read-before-write, budgeted, gated BOOK_ACTOR_RECONCILE.
+        -- Actor-state reconcile: Layer 3's continuous counterpart for the BP_GrabbingBook ACTOR.
+        -- Re-asserts collision + SM_Book_1 mesh on unwarded books whose flags drifted (heals
+        -- visible-not-grabbable + grabbable-invisible). Read-before-write, gated BOOK_ACTOR_RECONCILE.
         pcall(function() IA.reconcile_book_actors() end)
-        pcall(_invis_scan_step)   -- passive invisible-book detector + census (Bug 2 capture)
+        pcall(_invis_scan_step)   -- passive invisible-book detector (off by default)
         return false
     end)
 
-    -- Periodic milestone / level sync. Book-placement milestones fire from
-    -- GameSaveData.GameProgressData.InsertedBookNum, which the game updates
-    -- as the player places books. The FinishRow hook above only fires when
-    -- a ROW completes — so a player who places many books without finishing
-    -- rows (mid-sort, mis-shelving and recovering, etc.) wouldn't trigger
-    -- their milestones until the next row completion. This 3-second poll
-    -- closes that gap. Level-ups are event-driven via OnLevelUp, so this
-    -- loop is mostly milestones in practice.
+    -- Periodic milestone / level sync (3s). Book-placement milestones key off InsertedBookNum,
+    -- which grows without finishing rows; the FinishRow hook would miss those until the next row.
+    -- Level-ups are event-driven (OnLevelUp), so this poll is mostly milestones.
     LoopAsync(3000, function()
         local IA = package.loaded["AP/ItemApply"]
         if not IA then return false end
-        -- Stop only when fully out of gameplay/pre-apply context (matches
-        -- the 5-second loop's lifecycle above). Returning true here ENDS
-        -- the loop permanently; the early-exit-on-gameplay-false bug we
-        -- shipped originally killed the loop at startup before gameplay
-        -- ever became active, so progress sync never ran.
+        -- Stop only when fully out of gameplay/pre-apply (returning true ENDS the loop). Don't
+        -- early-exit on _gameplay_active alone -- that kills the loop before gameplay starts.
         if not (IA._gameplay_active or IA._allow_pre_apply) then
             _gameplay_loops_started = false   -- allow restart on next entry
             return true
@@ -1613,23 +1440,11 @@ local function start_gameplay_loops()
         if not IA._apply_safe then return false end
         if not IA._slot_data then return false end
         pcall(function() IA.sync_progress_state() end)
-        -- Also re-run row-completion detection periodically. FinishRow
-        -- only fires when the global row count INCREASES — so if the
-        -- player removes a completed series and replaces it with a
-        -- different one in the same row slot, the new completion goes
-        -- undetected until the count grows again. Polling here catches
-        -- those swap completions promptly. detect_completed_rows is
-        -- idempotent (de-dup via _sent_row_locations), so re-running
-        -- when nothing has changed is a no-op.
+        -- Re-run row-completion detection: FinishRow only fires when the row count INCREASES, so a
+        -- swap (remove a completed series, refill the slot with another) goes undetected. Idempotent.
         pcall(function() IA.detect_completed_rows() end)
-        -- Row-completion threshold catch-up: read rows_finished from the
-        -- save and re-fire any "Complete N Rows" threshold whose value
-        -- the player has now reached. Belt-and-suspenders for cases
-        -- where run_baseline_sync ran with stale GameSaveData and
-        -- silently skipped thresholds; fire_row_completion_checks is
-        -- idempotent (de-dup via _sent_row_completions) and send_check
-        -- itself dedupes against the server's _sent_checks, so this is
-        -- a safe periodic re-evaluation.
+        -- Row-threshold catch-up: re-fire any "Complete N Rows" threshold the save shows reached
+        -- (catches a run_baseline_sync that ran with stale GameSaveData). Idempotent.
         pcall(function()
             local rf = 0
             local gi = FindFirstOf("BP_LibrarianGameInstance_C")
@@ -1642,35 +1457,19 @@ local function start_gameplay_loops()
             end
             if rf > 0 then IA.fire_row_completion_checks(rf) end
         end)
-        -- Section-completion check: detect_completed_rows above may have
-        -- just added the last row of a section to _sent_row_locations
-        -- (swap-completion path that doesn't go through FinishRow).
-        -- Re-run the section-completion sweep so its location fires
-        -- without waiting for the next FinishRow event. Idempotent —
-        -- _sent_section_completions guards against re-firing.
+        -- Section-completion: a swap above may have closed out a section without a FinishRow. Idempotent.
         pcall(function() IA.fire_section_completions() end)
-        -- Floor-completion check: same reasoning at a coarser
-        -- granularity. The section-sweep above may have just closed
-        -- out the last section in a floor; re-run the floor sweep
-        -- so its check fires this tick instead of waiting for the
-        -- next FinishRow. Idempotent.
+        -- Floor-completion: same, one granularity coarser. Idempotent.
         pcall(function() IA.fire_floor_completions() end)
-        -- Skill resync: if save-side level lags the received item count
-        -- (e.g., a UpgradePlayer call dropped silently when the player
-        -- was mid-transition), retry the missing applies. Idempotent
-        -- and conservative — never over-grants past received counts.
+        -- Skill resync: if save-side level lags received item count (a dropped UpgradePlayer),
+        -- retry the missing applies. Never over-grants past received counts.
         pcall(function() IA.resync_skill_state() end)
         return false
     end)
 
-    -- First-movement detection. The title menu has the previous save loaded
-    -- behind the scenes, so reading GameSaveData (rows finished, books
-    -- placed) at apply-safe time can return stale values — we observed
-    -- spurious "Reached Level 1" / "Milestone: 50 Books Placed" checks
-    -- firing for fresh New Game saves that inherited the previous run's
-    -- counters. Player movement only becomes possible once the new save's
-    -- state has fully taken over in memory, so we use it as the trigger
-    -- for baseline syncs (row catch-up + level/milestone catch-up).
+    -- First-movement detection. At the title the previous save is still loaded, so GameSaveData
+    -- reads stale (spurious milestone/level checks on a fresh New Game). Movement only becomes
+    -- possible once the new save takes over in memory, so use it as the baseline-sync trigger.
     local title_pos = nil
     LoopAsync(500, function()
         local IA = package.loaded["AP/ItemApply"]
@@ -1711,11 +1510,8 @@ local function start_gameplay_loops()
 end
 
 local function activate_gameplay(reason)
-    -- Only activate the mod's gameplay processing when connected to AP. In Vanilla
-    -- mode (or simply not connected) we stay fully passive: no warding, no
-    -- book-hiding, no apply loops, no tracking. This is the single gate that covers
-    -- every world mutation regardless of which path (button / SelectedLevel watcher
-    -- / LoadMap) tried to activate.
+    -- Only activate when AP-connected; otherwise (vanilla / not connected) stay fully passive.
+    -- The single gate every activation path (button / SelectedLevel / LoadMap) funnels through.
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient._slot_connected) then
         log(("activate_gameplay skipped — not connected (reason: %s)"):format(reason or "?"))
@@ -1736,11 +1532,8 @@ local function deactivate_gameplay(reason)
     if APClient and APClient.set_in_game then APClient:set_in_game(false) end
     local IA = package.loaded["AP/ItemApply"]
     if IA and IA.set_gameplay_active then IA.set_gameplay_active(false) end
-    -- Reset the apply-gate guard so the next gameplay entry runs the
-    -- LoopAsync again. Without this, returning to title and clicking
-    -- Continue a second time skips set_apply_safe(true), which means
-    -- books never re-ward (bookcases hide via a different path so the
-    -- bug only manifests as "books visible, cases hidden").
+    -- Reset the apply-gate guard so the next gameplay entry re-runs the gate. Without this, a
+    -- second Continue skips set_apply_safe(true) and books never re-ward ("books visible, cases hidden").
     _gameplay_loops_started = false
 end
 
@@ -1772,20 +1565,12 @@ RegisterLoadMapPostHook(function(Engine, World)
     pcall(function() lvlname = World:get():GetFullName() end)
     log("LoadMap post: " .. lvlname)
 
-    -- Determine in_gameplay.
-    -- We tried using GameSaveData/LibrarianGameMode to differentiate title
-    -- screen from real play; both are non-null at title. The most reliable
-    -- signal in observed traces is "this is the 2nd+ M01 LoadMap" — first
-    -- M01 LoadMap is title-screen preview, second is when player actually
-    -- loaded their save. SelectedLevel is a secondary positive signal
-    -- (>= 0 only after player picks a level).
+    -- Determine in_gameplay. GameSaveData/LibrarianGameMode are non-null even at the title, so
+    -- the reliable signal is the 2nd+ M01 LoadMap; SelectedLevel >= 0 is a secondary positive.
     local in_gameplay = false
     if lvlname:find("PL_M01", 1, true) then
-        -- If this LoadMap is from our forced OpenLevel (on AP connect),
-        -- the user is still at the title screen — don't count it toward
-        -- the gameplay-detection threshold. The user will click Continue
-        -- afterward; HideTitleMenu hook will activate gameplay at the
-        -- correct moment.
+        -- Our forced OpenLevel (on connect) leaves the user at the title -- don't count it toward
+        -- the gameplay threshold; the HideTitleMenu hook activates gameplay when they click Continue.
         local is_our_forced_reload = _suppress_next_m01_load_count or false
         _suppress_next_m01_load_count = false
 
@@ -1804,29 +1589,19 @@ RegisterLoadMapPostHook(function(Engine, World)
             m01_load_count, tostring(selected), tostring(in_gameplay),
             is_our_forced_reload and " [forced reload, count suppressed]" or ""))
 
-        -- Fresh world load → reset our HISM mapping state regardless of
-        -- whether it's our forced reload or natural — previous captured
-        -- transforms refer to the old world.
+        -- Fresh world -> reset HISM mapping state (captured transforms refer to the old world).
         local IA = package.loaded["AP/ItemApply"]
         if IA and IA.reset_hism_state then IA.reset_hism_state() end
 
-        -- Book-visibility (cosmetic pile-hiding) is per-world: the fresh world's HISM
-        -- components start visible AND the per-group series snapshot is tied to the old
-        -- world's actors, so clear both -- this world re-snapshots its series cache and
-        -- re-hides from scratch. Without this a Menu->Continue keeps stale "already
-        -- hidden" flags and a stale series cache.
+        -- Layer-3 state is per-world (fresh HISMs start visible; the series cache is tied to the
+        -- old world's actors). Clear it so this world re-snapshots and re-hides from scratch.
         _b2_state = {}
         _b2_last_sig = nil
         _b2_group = {}
 
-        -- Re-arm the apply-gate for this fresh world. Menu→Continue reloads M01 but
-        -- never calls deactivate_gameplay, so _apply_safe stays true and the
-        -- loop-started guard stays set → the apply-gate LoopAsync never re-runs, the
-        -- "wait for the SL_M01_BG sublevel actors to stream" step is skipped, and
-        -- the warding indexes 0 bookcases → cases stay un-warded (signs still light,
-        -- since labels live in the persistent level). Reset both so the
-        -- start_gameplay_loops() call below actually re-runs the gate: re-wait for
-        -- the new world's actors, then re-index + re-ward. (Mirrors deactivate_gameplay.)
+        -- Re-arm the apply-gate for this fresh world. Menu->Continue reloads M01 but never calls
+        -- deactivate_gameplay, so without this reset the gate never re-runs and warding indexes 0
+        -- bookcases ("books visible, cases hidden"). Mirrors deactivate_gameplay.
         if IA and IA.set_apply_safe then pcall(function() IA.set_apply_safe(false) end) end
         _gameplay_loops_started = false
 
@@ -1867,21 +1642,16 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:UpgradePlayer", function(self
     pcall(function() idx = ability:get() end)
     log((">> UpgradePlayer    ability=%s (%s)"):format(tostring(idx), ability_name(idx or -1)))
 
-    -- Don't echo AP-delivered grants back as location checks.
-    -- Check both legacy local flag (always false now) and ItemApply._ap_grant
-    -- which is set true around AP-driven UpgradePlayer calls.
+    -- Don't echo AP-delivered grants back as location checks (ItemApply._ap_grant is set
+    -- true around AP-driven UpgradePlayer calls).
     do
         local IA = package.loaded["AP/ItemApply"]
         if IA and IA._ap_grant then return end
     end
     if _ap_grant then return end
 
-    -- Minor Magic chest openings (idx 0/1/2/4) → AP chest location check.
-    -- UpgradePlayer fires when the chest grants its ability, so this hook
-    -- catches the chest-opening event (not the earlier key pickup). The
-    -- native ability grant (Jump/Run/Bag/Bag2) proceeds normally; AP just
-    -- records the chest opening as a location check. Major Magic point
-    -- spends (idx 3/5/6/7/8) are filtered by the table miss.
+    -- Minor Magic chest openings (idx 0/1/2/4) -> AP chest location check; native grant proceeds.
+    -- Major Magic point-spends (idx 3/5/6/7/8) fall through the table miss.
     local loc = AP_CHEST_LOC_BY_ABILITY[idx]
     if loc then
         log(("[AP] queueing chest-open check id=%d (ability=%d %s)"):format(
@@ -1901,9 +1671,8 @@ end)
 -- ============================================================
 -- HOOK: Save/Load probes (verify SaveGameName redirect lands)
 -- ============================================================
--- Read-only diagnostics. UE4SS hook callbacks always receive `self` as the
--- first argument (even for static UFunctions), then the function params.
--- Param accessors return wrapper objects; FString needs :ToString().
+-- Read-only diagnostics. UE4SS hook callbacks always get `self` first (even static UFunctions),
+-- then params; param accessors return wrappers, FString needs :ToString().
 local function fstring_to_str(p)
     if not p then return "<nil>" end
     local v
@@ -1936,10 +1705,8 @@ RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:SaveGameData", functio
     pcall(function() n = tostring(slot_num_param:get()) end)
     log(("[AP][save-probe] GI.SaveGameData(slot=%s) — current SaveGameName='%s'")
         :format(n, tostring(read_save_slot())))
-    -- After save, GameSaveData.InsertedBookNum is fresh — re-run the
-    -- progress sync so book milestones catch up. This is a safety net for
-    -- the in-between window where our own BP-hook counter might miss an
-    -- event (or hasn't been wired correctly yet).
+    -- After save, InsertedBookNum is fresh -> re-run the progress sync so book milestones catch
+    -- up (safety net if a BP-hook counter missed an event).
     local IA = package.loaded["AP/ItemApply"]
     if IA and IA.sync_progress_state and IA._gameplay_active
             and IA._apply_safe and IA._slot_data then
@@ -1961,9 +1728,8 @@ RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:LoadGameDataBP", funct
         :format(tostring(read_save_slot())))
 end)
 
--- OnLevelUp / ShowSkillLevelUp are redeclared on BP_LibrarianCharacter, so the
--- runtime call dispatches to the BP version. Hook both paths and tag which one
--- fires; we only need the BP-path hook to register after the BP class is loaded.
+-- OnLevelUp is redeclared on BP_LibrarianCharacter, so runtime dispatches to the BP version;
+-- the BP-path hook must register after the BP class loads (hence hook_safe's deferred retry).
 local function hook_safe(path, label, handler)
     local ok, err = pcall(function() RegisterHook(path, handler) end)
     if not ok then
@@ -1990,35 +1756,26 @@ local function on_level_up_bp(self)
         end)
     end
 
-    -- Use event-based level increment. Reading CurrentFinishedRowNum at this
-    -- moment is unreliable (game hasn't yet committed the row update before
-    -- firing OnLevelUp). One increment per fired event keeps us in sync.
+    -- Event-based increment: CurrentFinishedRowNum isn't committed yet when OnLevelUp fires, so
+    -- count one per event instead of reading it.
     local IA = package.loaded["AP/ItemApply"]
     if IA and IA.on_level_up_event then
         pcall(function() IA.on_level_up_event() end)
     end
 end
 
--- Title-widget button handlers. The title screen's Continue button does NOT
--- always fire LoadMap or LoadGameFromSlot — when the M01 level is already
--- pre-loaded behind the title, Continue just hides the title and unpauses.
--- We hook the button-press event itself to detect the title→gameplay
--- transition, then force activate_gameplay() so flush_apply runs.
+-- Title-widget button handlers. Continue doesn't always fire LoadMap (when M01 is pre-loaded
+-- behind the title it just hides + unpauses), so hook the button press to force activate_gameplay.
 local function on_title_load_game_pressed(self)
     log(">> [WBP_Title] Continue/LoadGame button pressed")
     log(("    SaveGameName='%s'  GameSaveData: %s"):format(
         tostring(read_save_slot()), snapshot_save_data()))
 
-    -- (The earlier auto-reload via gi:LoadGameData(0) was removed: with
-    -- the OpenLevel(PL_M01) we now trigger at slot-connect, the world
-    -- and GameSaveData are already loaded from the AP slot by the time
-    -- Continue fires. Re-loading the save here additionally re-applied
-    -- bag-skill level increments through the game's load post-processing,
-    -- bumping the bag capacity past its intended cap on every reload.)
+    -- Do NOT reload the save here (gi:LoadGameData): the world is already AP-loaded from the
+    -- connect-time OpenLevel, and a reload re-applies bag-skill increments past the bag cap.
 
-    -- Force gameplay activation on the next tick so AP item application runs
-    -- even if the game doesn't fire LoadMap. We delay slightly so the title
-    -- widget's own handler runs first (level transition / UI hide).
+    -- Force gameplay activation next tick in case LoadMap never fires. Delay so the widget's own
+    -- handler (level transition / UI hide) runs first.
     LoopAsync(100, function()
         local IA = package.loaded["AP/ItemApply"]
         if APClient and APClient._slot_connected and IA and not IA._gameplay_active then
@@ -2050,9 +1807,7 @@ local function on_title_hide_menu(self)
     end)
 end
 
--- Fire once per game session: shows a 12s notification at the title
--- screen with mod + game version and a compatibility marker. Helps the
--- player notice if they're running an untested game version.
+-- Once per session: a 12s title-screen notification with mod/game version + compatibility marker.
 local _compat_notified = false
 local function notify_version_compat()
     if _compat_notified then return end
@@ -2064,17 +1819,14 @@ local function notify_version_compat()
     else
         msg = ("LibAP v%s — Game v%s UNTESTED, may have issues"):format(MOD_VERSION, game_v)
     end
-    -- Use an explicit notify call (no state mutation, custom 12s duration).
     local HUD = package.loaded["AP/HUD"]
     if HUD and HUD.notify then HUD.notify(msg, 12.0) end
 end
 
 local function on_title_construct(self)
     log(">> [WBP_Title] Construct")
-    -- Defer slightly so the widget's own Construct logic runs first (button
-    -- bindings, default styles). Then we apply the AP-gating state and
-    -- overwrite Text_Version with our composite "Game v? | LibAP v? | AP: ?"
-    -- status line.
+    -- Defer so the widget's own Construct (button bindings, styles) runs first, then apply gating
+    -- state + the Text_Version status line.
     LoopAsync(50, function()
         update_title_buttons()
         update_title_status_text()
@@ -2105,10 +1857,8 @@ register_bp_hooks_once = function()
         "/Game/Librarian/UI/Title/WBP_Title.WBP_Title_C:Construct",
         "WBP_Title.Construct", on_title_construct)
 
-    -- Connection-menu signal: the Connect button calls
-    -- ModActor.BroadcastConnectRequest with the three field strings. We
-    -- read them, push them into APClient, and trigger the deferred
-    -- connect.
+    -- Connect button calls ModActor.BroadcastConnectRequest(server, slot, password); read them
+    -- into APClient and connect.
     hook_safe(
         "/Game/Mods/LibrarianAPHUDFix/ModActor.ModActor_C:BroadcastConnectRequest",
         "ModActor.BroadcastConnectRequest",
@@ -2142,11 +1892,8 @@ register_bp_hooks_once = function()
             c:connect()
         end)
 
-    -- Close button on the AP window -> player declined to connect: latch Vanilla
-    -- mode (mirrors the Connect path; the pak's ModActor needs a BroadcastCloseRequest
-    -- custom event wired to Btn_Close.OnClicked). Until that pak event exists this
-    -- hook just defers harmlessly. enter_vanilla() is reached via the global menu
-    -- table because hook callbacks can't see this file's locals.
+    -- Close button -> latch Vanilla mode. Needs the pak's ModActor to wire a BroadcastCloseRequest
+    -- event to Btn_Close.OnClicked; until then this hook defers harmlessly. Reached via _G menu table.
     hook_safe(
         "/Game/Mods/LibrarianAPHUDFix/ModActor.ModActor_C:BroadcastCloseRequest",
         "ModActor.BroadcastCloseRequest",
@@ -2165,19 +1912,12 @@ end
 -- ============================================================
 -- HOOK: Row / level completion
 -- ============================================================
--- FinishRow gives a global running counter (Nth row completed) but doesn't
--- tell us which (section, series) was completed. To resolve that, we ask
--- ItemApply to compare its per-bookcase RowStatus snapshot against current
--- state and emit checks for any newly-completed rows. The ordinal `row`
--- parameter is logged for diagnostics only.
--- Goal-completion latch: set true the first time we send STATUS_GOAL so
--- a re-fire (e.g., row 200 → row 201 in half goal) doesn't double-send.
--- Reset on slot_connected / disconnected.
+-- FinishRow gives a global Nth-row counter but not which (section, series); ItemApply resolves
+-- that by diffing its per-bookcase RowStatus snapshot. `row` is logged for diagnostics only.
+-- Goal latch: set on the first STATUS_GOAL so a re-fire doesn't double-send. Reset on connect/disconnect.
 local _goal_sent = false
 
--- Goal-progress milestones: announce at 25/50/75% so the player has a
--- sense of pace through the goal. Each breakpoint fires at most once
--- per connection; cleared in lockstep with _goal_sent.
+-- Goal-progress milestones at 25/50/75%, each at most once per connection; cleared with _goal_sent.
 local _progress_milestones_fired = {}
 
 local function announce_goal_progress(row)
@@ -2207,12 +1947,8 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
 
     if row then announce_goal_progress(row) end
 
-    -- Goal trigger by row count (for non-full goals). Full goal lets the
-    -- game's natural EndGame fire when the player walks through the end
-    -- door. Custom / floor_1 / floor_2 goals fire STATUS_GOAL as soon
-    -- as their threshold row is finished.
-    -- Options.py defines option_full=0 (the others are 1/2/3) — must
-    -- compare goal against 0, not 1, or custom goals never fire.
+    -- Row-count goal trigger for non-full goals (full goal waits for the game's EndGame at the end
+    -- door). option_full=0 in Options.py -- compare goal against 0, not 1, or custom goals never fire.
     if not _goal_sent and row then
         local APClient_mod = package.loaded["AP/APClient"]
         local sd = APClient_mod and APClient_mod.slot_data
@@ -2233,18 +1969,10 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
     end
 
     local IA = package.loaded["AP/ItemApply"]
-    -- detect_completed_rows() is deliberately NOT called here. It walks
-    -- PlacingBookInfo, and on the FinishRow frame the just-placed final book
-    -- is mid-conversion (freed sub-object) → native EXCEPTION_ACCESS_VIOLATION
-    -- that pcall cannot catch. This is THE row-completion crash. The 3s poll
-    -- (start_gameplay_loops) runs detection at a stable time instead — the
-    -- per-(section,series) checks fire within ~3s of completing a row, which is
-    -- fine for AP. The calls below use the row counter + Lua state only (no
-    -- book deref), so they stay here for immediacy.
-    -- Fire any "Complete N Rows" milestone checks the player has now
-    -- reached. `row` is the game's authoritative correct-row counter
-    -- (FinishRow only fires when a row is actually completed in-game,
-    -- so we trust this value).
+    -- detect_completed_rows() is deliberately NOT called here: it walks PlacingBookInfo, and on the
+    -- FinishRow frame the just-placed book is mid-conversion (freed sub-object) -> native AV pcall
+    -- can't catch. THE row-completion crash; the 3s poll runs detection at a stable time instead.
+    -- The calls below use only the row counter + Lua state (no book deref), so they're safe here.
     if IA and IA.fire_row_completion_checks and row then
         local rc_sent = 0
         pcall(function() rc_sent = IA.fire_row_completion_checks(row) end)
@@ -2252,12 +1980,7 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
             log(("[AP] row-completion: sent %d location check(s)"):format(rc_sent))
         end
     end
-    -- Fire any "Section Complete: <id>" checks whose section just hit
-    -- 100% row completion. detect_completed_rows above populates
-    -- _sent_row_locations for the rows finished this tick, so checking
-    -- whether the section is now fully shelved is cheap. The server's
-    -- _sent_checks won't have the section loc yet (we never sent it
-    -- without this hook), so APClient.send_check will actually transmit.
+    -- Fire "Section Complete: <id>" for any section that just hit 100%.
     if IA and IA.fire_section_completions then
         local sec_sent = 0
         pcall(function() sec_sent = IA.fire_section_completions() end)
@@ -2265,10 +1988,8 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
             log(("[AP] section-completion: sent %d location check(s)"):format(sec_sent))
         end
     end
-    -- Fire "Floor N Complete" if this row closed out the last section
-    -- on a floor. fire_floor_completions uses _sent_row_locations as
-    -- the truth source so order-of-firing with section-complete above
-    -- doesn't matter.
+    -- Fire "Floor N Complete" if this closed out a floor's last section. Order vs section-complete
+    -- above doesn't matter (both read _sent_row_locations).
     if IA and IA.fire_floor_completions then
         local floor_sent = 0
         pcall(function() floor_sent = IA.fire_floor_completions() end)
@@ -2328,19 +2049,12 @@ local HUD = require("AP/HUD")
 trace.init({ version = MOD_VERSION, flags = diag_flags_str() })
 trace.mark("boot")
 
--- Crash-ledger heartbeat: a flushed 1 Hz marker so a post-crash read of crash_trace.log
--- reveals how long after the mod's last mutation the crash landed — i.e. whether the
--- fault was synchronous-in-op (tail = unmatched BEG) or decoupled/idle (tail = several
--- "hb" lines after the last END). CR1 ("crash ~1 min after a series unlock") would show
--- ~60 hb lines between the last b2-reveal and the crash.
+-- Crash-ledger heartbeat: a flushed 1 Hz marker so the crash_trace.log tail shows whether the
+-- crash was synchronous-in-op (unmatched BEG) or idle (several "hb" lines after the last END).
 LoopAsync(1000, function() trace.mark("hb"); return false end)
 
--- v1.1.0 (rewrite): the lifecycle state machine. Now driven by EVENTS at the
--- real signal points (lc_event(...) calls below) rather than a polling derive
--- loop. Still OBSERVATIONAL — it logs [lifecycle] transitions but gates nothing
--- yet; once the event-driven flow is confirmed across connect/play/reconnect we
--- cut the scattered gates over to it. The require is pcall'd so it can never
--- break mod loading.
+-- Lifecycle state machine, driven by the lc_event(...) calls below. Observational only: logs
+-- [lifecycle] transitions, gates nothing yet. pcall'd require so it can't break mod loading.
 do
     local ok, Lifecycle = pcall(require, "AP/lifecycle")
     if ok and Lifecycle then
@@ -2364,11 +2078,8 @@ APClient.on_item = function(it, item_name)
         tostring(it.location),
         tonumber(it.flags) or 0))
 
-    -- HUD: classify by sender. player=0 means server (starting items /
-    -- the bulk re-dump on slot connect — we LOG these but skip the
-    -- on-screen popup since the dump can flood the BP notification
-    -- system. player=our_slot is a self-completed check echo, anything
-    -- else is from another player in the multiworld.
+    -- HUD: classify by sender. player=0 = server (starting items / connect re-dump) -- logged but
+    -- no popup (the dump floods the BP notifier); player=us = self-check echo; else = another player.
     local sender = tonumber(it.player) or -1
     local me = APClient.slot_number or -1
     local color, prefix = HUD.COL_RECEIVED, "← "
@@ -2379,11 +2090,8 @@ APClient.on_item = function(it, item_name)
     elseif sender ~= me and sender > 0 then
         color, prefix = HUD.COL_RECEIVED_X, "← "
     end
-    -- During pre-apply (post-connect title, before player clicks Continue),
-    -- silence ALL item toasts. Self-sent re-deliveries (the player's own
-    -- previously-completed checks) crowd out the "Preparing world..." status
-    -- message. Items still get logged + applied; only the on-screen toast
-    -- is suppressed.
+    -- During pre-apply, silence all item toasts (self re-deliveries crowd out "Preparing world...").
+    -- Items still log + apply; only the toast is suppressed.
     do
         local IA_mod = package.loaded["AP/ItemApply"]
         if IA_mod and IA_mod._allow_pre_apply and not IA_mod._gameplay_active then
@@ -2406,11 +2114,8 @@ APClient.on_item = function(it, item_name)
     end
 end
 
--- Outgoing location check → "You sent ITEM to PLAYER (LOCATION)".
--- All native lookups (item_name / player_alias / location_name) happened
--- in the location_info handler when the scout response arrived; on_check_sent
--- just reads the cache. Falls back to "→ loc N" if the location isn't in
--- the cache (scout response not yet returned, or a non-AP location id).
+-- Outgoing location check -> "You sent ITEM to PLAYER (LOCATION)". Reads the scout cache (filled
+-- by the location_info handler); falls back to "→ loc N" if the scout response hasn't returned.
 APClient.on_check_sent = function(loc_id)
     local entry = APClient._scout_cache and APClient._scout_cache[loc_id]
     if not entry or not entry.item_name or entry.item_name == "" then
@@ -2474,13 +2179,9 @@ APClient.on_slot_connected = function(slot_data)
     local ap_slot_name = ("Sav_AP_%s_%s"):format(seed, sanitize_slot(slot_num))
     set_save_slot(ap_slot_name)
 
-    -- Force a fresh world reload now that SaveGameName points to the
-    -- AP slot. The boot-time world was loaded with default 'Sav' state;
-    -- without this, BP_GrabbingBook + HISM render data remains stale
-    -- ("books in default-save orientation until you look at them").
-    -- We trigger OpenLevel(PL_M01) only if we're still at title (not
-    -- mid-gameplay, e.g. a reconnect during play would be disruptive).
-    -- Defer 200ms so set_save_slot + slot-data store all settle first.
+    -- Force a fresh world reload now SaveGameName points at the AP slot -- the boot world used
+    -- default 'Sav', so without this the books/HISM stay stale ("default orientation until you look").
+    -- Only when still at title (a mid-gameplay reconnect would be disruptive). Defer 200ms to settle.
     LoopAsync(200, function()
         local IA = package.loaded["AP/ItemApply"]
         if IA and IA._gameplay_active then
@@ -2521,10 +2222,7 @@ APClient.on_slot_connected = function(slot_data)
         tostring(APClient.slot_number or -1)),
         HUD.COL_STATUS_OK)
     HUD.clear_log()
-    -- Connect menu: status + auto-hide on success. The status message is
-    -- short-lived — once the menu hides, the player sees the title screen
-    -- with Continue disabled while pre-apply runs (status surfaces on
-    -- Text_Version line below).
+    -- Connect menu: status + auto-hide on success (pre-apply status then surfaces on Text_Version).
     if _G._librarian_menu then
         _G._librarian_menu.set_status(
             ("Connected as %s — preparing world..."):format(
@@ -2545,17 +2243,12 @@ APClient.on_slot_connected = function(slot_data)
     -- Hand slot data to ItemApply; it will flush any queued items.
     ItemApply.set_slot_data(slot_data)
 
-    -- Let the starting-item dump flow immediately during pre-apply: items
-    -- update derived state (series_unlocked, sections, etc.) but the
-    -- per-item flush is suppressed (see ItemApply.apply_item). The settle
-    -- loop will fire ONE flush_apply once items quiet down — that way
-    -- the world is warded exactly once with final state, instead of
-    -- 14× wasteful flushes that ward-then-unward the starting series.
+    -- Let the starting-item dump flow during pre-apply: items update derived state but their
+    -- per-item flush is suppressed (ItemApply.apply_item), so the settle loop wards once with final
+    -- state instead of ward-then-unwarding the starting series on every item.
     APClient:set_in_game(true)
 
-    -- Tell the player a wait is coming. Pre-apply takes ~10–20s depending
-    -- on book count and book_visibility mode. Long duration so the toast
-    -- stays visible across the whole window.
+    -- Warn the player: pre-apply takes ~10-20s. Long toast to span the window.
     if HUD and HUD.notify then
         HUD.notify("AP: Preparing world — Continue will enable when ready...", 30.0)
     end
@@ -2566,14 +2259,12 @@ APClient.on_disconnected = function()
     restore_save_slot()
     _goal_sent = false
     _progress_milestones_fired = {}
-    -- Clear pre-apply state so a reconnect starts the whole sequence
-    -- fresh (otherwise the buttons could enable prematurely or the
-    -- settle loop would think it's already done).
+    -- Clear pre-apply state so a reconnect starts fresh (else buttons enable early / settle thinks
+    -- it's done).
     local IA = package.loaded["AP/ItemApply"]
     if IA and IA.clear_pre_apply then IA.clear_pre_apply() end
     _pre_apply_settle_state = nil
-    -- With AP no longer connected, both gameplay buttons return to the
-    -- disabled-by-default state.
+    -- Disconnected: both gameplay buttons return to disabled-by-default.
     LoopAsync(50, function()
         update_title_buttons()
         update_title_status_text()
@@ -2608,8 +2299,7 @@ end
 -- Connection is NOT triggered automatically — press F12 to connect.
 APClient:init(AP_CONFIG_PATH)
 
--- Initial HUD status. Wait briefly so the world / player exists for the
--- WorldContextObject argument to PrintString.
+-- Initial HUD status. Wait briefly so the world exists for PrintString's WorldContextObject.
 LoopAsync(2000, function()
     HUD.set_status(
         ("AP: not connected (server=%s, slot=%s) — F4 for menu, F12 to connect"):format(
@@ -2633,19 +2323,12 @@ log("Press F12 to connect to Archipelago.")
 
 -- ============================================================
 -- Connection menu (F4 toggle, default on)
---
--- ModActor (in LibrarianAPHUDFix.pak) hosts a UMG widget with
--- Server / Slot / Password fields plus a Connect button. The
--- Connect button calls ModActor.BroadcastConnectRequest with the
--- three strings; we hook that below and feed them into APClient.
--- Status callbacks drive the on-widget status line so the player
--- sees Connecting / Connected / Refused without alt-tabbing to
--- the UE4SS log.
+-- ModActor (LibrarianAPHUDFix.pak) hosts a UMG widget (Server/Slot/Password + Connect). The
+-- menu_* helpers below drive it; status callbacks show Connecting/Connected/Refused in-widget.
 -- ============================================================
 local _menu_initial_shown = false
--- Gate the initial show on M01 being the loaded level. The Intro level
--- (game splash) also spawns a ModActor, but its widget gets destroyed
--- when Intro unloads — so we wait until we know we're on M01.
+-- Gate the initial show on M01: the Intro level also spawns a ModActor, but its widget dies when
+-- Intro unloads, so wait until we know we're on M01.
 _G._librarian_menu_m01_loaded = _G._librarian_menu_m01_loaded or false
 
 local function _get_mod_actor()
@@ -2739,11 +2422,8 @@ RegisterKeyBind(Key.F4, function()
     menu_toggle()
 end)
 
--- TEMP custom-data probe (F6). Question: does any HISM PerInstanceCustomData float
--- encode the book's AssetIdx/series? If yes, we can hide warded books PER-INSTANCE
--- (accurate even for stacked books) instead of the spatial whole-group guess that
--- occasionally leaks a warded cover. Press F6 in-game while the pile is visible,
--- then send the UE4SS.log. Remove this once answered.
+-- TEMP probe (F6): does any HISM PerInstanceCustomData float encode the book's AssetIdx/series?
+-- If so we could hide warded books per-instance. Press F6 with the pile visible. Remove once answered.
 local function probe_customdata()
     log("[cd-probe] === START ===")
     local mgr = FindFirstOf("BP_HISM_Manager_C")
