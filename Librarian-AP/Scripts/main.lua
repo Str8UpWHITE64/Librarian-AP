@@ -311,8 +311,27 @@ local function _bh_grab_check(b, tag)
         local uw = IA._compute_unwarded_set(only_shelfable)
         unwarded_here = uw and uw[series] or false
     end
-    if _bh.grab_samples < 30 then
-        _bh.grab_samples = _bh.grab_samples + 1
+    -- BROKEN detection: any signal that would render an unwarded book invisible / unpickable.
+    -- meshZ far from actorZ = the deep-Z hide pattern; opacity<1 = stuck-transparent MID;
+    -- scaleX~0 = zero-scaled; plus the raw bHidden / mesh-visibility flags.
+    local meshz_off = (type(meshz) == "number" and type(actorz) == "number") and math.abs(meshz - actorz) or 0
+    local looks_broken = (bhidden == true) or (mesh_hidden == true) or (mesh_vis == false)
+        or (type(opacity) == "number" and opacity < 1.0)
+        or (type(scalex) == "number" and scalex < 0.01)
+        or (meshz_off > 1000.0)
+    -- Dump the full state for the first 100 grabs (healthy baseline) AND for any BROKEN-looking
+    -- grab beyond that (bounded) -- so the intermittent invisible book is captured even when it's
+    -- grabbed long after the baseline cap, the gap that hid "Breaking the Curse of the Trophyless".
+    local dump = (tag == "SCAN") or (_bh.grab_samples < 100) or (looks_broken and (_bh.broken_dumps or 0) < 60)
+    if dump then
+        if looks_broken then
+            _bh.broken_dumps = (_bh.broken_dumps or 0) + 1
+            log(("[book-hook] *** BROKEN-GRAB *** %s series=%s unwarded=%s bHidden=%s meshHidden=%s meshVis=%s opacity=%s scaleX=%s meshZoff=%.1f"):format(
+                tostring(tag), tostring(series), tostring(unwarded_here), tostring(bhidden),
+                tostring(mesh_hidden), tostring(mesh_vis), tostring(opacity), tostring(scalex), meshz_off))
+        elseif tag ~= "SCAN" then
+            _bh.grab_samples = _bh.grab_samples + 1
+        end
         log(("[book-hook] %s series=%s unwarded=%s bHidden=%s meshHidden=%s meshVis=%s opacity=%s scaleX=%s mat=%s"):format(
             tostring(tag), tostring(series), tostring(unwarded_here), tostring(bhidden),
             tostring(mesh_hidden), tostring(mesh_vis), tostring(opacity), tostring(scalex), tostring(mat)))
@@ -321,6 +340,35 @@ local function _bh_grab_check(b, tag)
         log(("[book-hook] %s-PILE series=%s %s"):format(tostring(tag), tostring(series), _inspect_pile(b)))
         log(("[book-hook] %s-MESH series=%s actorZ=%s meshZ=%s cpd=%s mesh=%s"):format(
             tostring(tag), tostring(series), tostring(actorz), tostring(meshz), tostring(cpd), tostring(meshname)))
+    end
+    -- DEFERRED RENDER-TRUTH (the decisive probe). WasRecentlyRendered read AT grab-start is
+    -- unreliable -- the actor was in HISM/pile form a moment earlier, so it reads "not drawn"
+    -- even for a healthy book. Re-check ~0.6s later, once the held copy has had frames to draw.
+    -- If the actor is STILL shown (bHidden=false) yet NOT drawn, the book is genuinely invisible
+    -- -- the ground truth no flag exposes -- so log it + the render-pass fields (bRenderInMainPass /
+    -- IsVisible), which are the leading suspects: true/false regardless of every flag we read,
+    -- untouched by RefreshInfo, reset on actor re-spawn (matches "self-heals on reload"). One-shot.
+    if unwarded_here == true then
+        local b_ref, series_ref = b, series
+        LoopAsync(600, function()
+            if b_ref and b_ref:IsValid() then
+                local ar, hid2 = nil, nil
+                pcall(function() ar = b_ref:WasRecentlyRendered(0.5) end)
+                pcall(function() hid2 = b_ref.bHidden end)
+                if ar == false and hid2 == false then
+                    local sm2; pcall(function() sm2 = b_ref.SM_Book_1 end)
+                    local v2, rmp2, mn2 = nil, nil, "?"
+                    if sm2 and sm2:IsValid() then
+                        pcall(function() v2 = sm2:IsVisible() end)
+                        pcall(function() rmp2 = sm2.bRenderInMainPass end)
+                        pcall(function() local msh = sm2.StaticMesh; if msh and msh:IsValid() then mn2 = msh:GetFullName() end end)
+                    end
+                    log(("[book-hook] *** INVISIBLE-CONFIRMED *** series=%s bHidden=%s smIsVisible=%s renderInMainPass=%s mesh=%s (held ~0.6s, actor NOT drawn)"):format(
+                        tostring(series_ref), tostring(hid2), tostring(v2), tostring(rmp2), tostring(mn2)))
+                end
+            end
+            return true   -- one-shot
+        end)
     end
     if diag_on("BOOK_EVENT_GRABFIX") and unwarded_here == true then
         local did = {}
@@ -492,6 +540,113 @@ local function bh_report_periodic()
     if _bh_report_tick % 6 ~= 0 then return end   -- ~every 30s (6 ticks of the 5s loop)
     log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d Grab=%d (grabfix=%d) refresh-sweep=%d"):format(
         _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab, _bh.grabbed, _bh.grabfix, _bh.rsweep or 0))
+end
+
+-- ============================================================================
+-- Passive invisible-book scanner (Bug 2 diagnostic / known-issue capture)
+-- ============================================================================
+-- The intermittent "visible in the pile, invisible when held" bug leaves NO flag, material,
+-- transform, scale or BookInfo trace -- every field reads healthy -- yet the held actor is not
+-- actually drawn. It self-heals on world reload (actor re-spawn), survives RefreshInfo, hits
+-- random books, and is rare: nearly impossible to catch by hand. So we catch it PASSIVELY.
+--
+-- Every 5s this walks a budget of BP_GrabbingBook actors and, for each UNWARDED book whose actor
+-- is in SHOWN form (bHidden=false), reads the one ground-truth signal the flags can't fake --
+-- WasRecentlyRendered. A book that stays shown-but-not-drawn across INVIS_STREAK consecutive
+-- scans (so it is genuinely stuck, not merely off-screen for a moment) is a SUSPECT: logged once
+-- with the full grab-style dump, so a wild occurrence is captured for later analysis with zero
+-- manual repro. A per-sweep census (logged only when something was not-drawn, so a clean session
+-- stays silent) reports the scale -- and self-calibrates how well bHidden tracks "near". Gated
+-- BOOK_INVIS_SCAN; budgeted so it never starves the AP poll loop. See KNOWN_ISSUES for the markers.
+local _invis_books, _invis_cursor, _invis_n, _invis_epoch, _invis_uw = nil, 1, 0, nil, nil
+local _invis_streak, _invis_dumped = {}, {}
+local _invis_sw_shown, _invis_sw_notdrawn, _invis_sw_nearnd, _invis_sw_suspects = 0, 0, 0, 0
+local INVIS_BUDGET = 400
+local INVIS_STREAK = 3        -- consecutive NEAR shown-but-not-drawn scans before we call it a suspect
+local INVIS_NEAR   = 2000.0   -- "near the player" radius (UE cm). Beyond this, not-drawn = normal cull
+local INVIS_NEAR2  = INVIS_NEAR * INVIS_NEAR
+
+local function _invis_scan_step()
+    if not diag_on("BOOK_INVIS_SCAN") then return end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._apply_safe and IA._book_valid_asset_idx and IA._asset_to_series
+            and IA._compute_unwarded_set) then return end
+    if _invis_books and (IA._world_epoch or 0) ~= (_invis_epoch or 0) then
+        _invis_books = nil; _invis_streak = {}; _invis_dumped = {}
+    end
+    if not _invis_books or _invis_cursor > _invis_n then
+        -- Sweep boundary: report the sweep just finished (only when something was shown-but-not-
+        -- drawn, so a clean session logs nothing), then reset the snapshot + accumulators.
+        if (_invis_sw_notdrawn or 0) > 0 or (_invis_sw_suspects or 0) > 0 then
+            log(("[invis-scan] census: shown(bHidden=false)=%d notDrawn=%d nearNotDrawn=%d newSuspects=%d (of %d actors)"):format(
+                _invis_sw_shown, _invis_sw_notdrawn, _invis_sw_nearnd, _invis_sw_suspects, _invis_n or 0))
+        end
+        _invis_books = FindAllOf("BP_GrabbingBook_C")
+        _invis_n = 0; if _invis_books then pcall(function() _invis_n = #_invis_books end) end
+        _invis_cursor = 1
+        _invis_epoch = IA._world_epoch
+        _invis_sw_shown, _invis_sw_notdrawn, _invis_sw_nearnd, _invis_sw_suspects = 0, 0, 0, 0
+        local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
+        _invis_uw = IA._compute_unwarded_set(only_shelfable)
+        if _invis_n == 0 then return end
+    end
+    local uw = _invis_uw
+    if not uw then return end
+    -- Player location (read once per pass). A book not-drawn while FAR from the player is just
+    -- normal off-screen culling; only one that is NEAR yet still not drawn is a real suspect. If
+    -- the player can't be located, px stays nil -> nothing is treated as near -> no suspects (a
+    -- safe no-op, never a false flood).
+    local px, py, pz = nil, nil, nil
+    do
+        local pawn = FindFirstOf("BP_LibrarianCharacter_C")
+        if pawn and pawn:IsValid() then
+            pcall(function() local loc = pawn:K2_GetActorLocation(); px, py, pz = loc.X, loc.Y, loc.Z end)
+        end
+    end
+    local last = math.min(_invis_cursor + INVIS_BUDGET - 1, _invis_n)
+    for i = _invis_cursor, last do
+        local b = _invis_books[i]
+        if b and b:IsValid() then
+            local aidx = IA._book_valid_asset_idx(b)
+            local series = aidx and IA._asset_to_series[aidx]
+            if series and uw[series] then
+                local hid; pcall(function() hid = b.bHidden end)
+                if hid == false then
+                    _invis_sw_shown = _invis_sw_shown + 1
+                    local ar; pcall(function() ar = b:WasRecentlyRendered(0.5) end)
+                    local key; pcall(function() key = b:GetFullName() end)
+                    if ar == false then
+                        _invis_sw_notdrawn = _invis_sw_notdrawn + 1
+                        -- Proximity gate: far + not-drawn = normal cull (ignore). Only NEAR books count.
+                        local near = false
+                        if px then
+                            local bl; pcall(function() bl = b:K2_GetActorLocation() end)
+                            if bl then
+                                local dx, dy, dz = (bl.X or 0) - px, (bl.Y or 0) - py, (bl.Z or 0) - pz
+                                if (dx*dx + dy*dy + dz*dz) < INVIS_NEAR2 then near = true end
+                            end
+                        end
+                        if near and key then
+                            _invis_sw_nearnd = _invis_sw_nearnd + 1
+                            _invis_streak[key] = (_invis_streak[key] or 0) + 1
+                            if _invis_streak[key] >= INVIS_STREAK and not _invis_dumped[key] then
+                                _invis_dumped[key] = true
+                                _invis_sw_suspects = _invis_sw_suspects + 1
+                                log(("[invis-scan] *** SUSPECT *** series=%s streak=%d -- NEAR player + SHOWN but NOT drawn across %d scans; full dump follows:"):format(
+                                    tostring(series), _invis_streak[key], _invis_streak[key]))
+                                pcall(function() _bh_grab_check(b, "SCAN") end)
+                            end
+                        elseif key then
+                            _invis_streak[key] = nil   -- far / no player loc -> not a suspect, clear streak
+                        end
+                    elseif key then
+                        _invis_streak[key] = nil   -- drawn this scan -> not stuck, clear streak
+                    end
+                end
+            end
+        end
+    end
+    _invis_cursor = last + 1
 end
 
 
@@ -1433,6 +1588,7 @@ local function start_gameplay_loops()
         -- invisible) by re-asserting collision + SM_Book_1 mesh on unwarded books whose
         -- flags drifted. Read-before-write, budgeted, gated BOOK_ACTOR_RECONCILE.
         pcall(function() IA.reconcile_book_actors() end)
+        pcall(_invis_scan_step)   -- passive invisible-book detector + census (Bug 2 capture)
         return false
     end)
 

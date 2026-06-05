@@ -162,4 +162,14 @@ return {
     -- Logs [reconcile] lines only when it corrects something. Flip false to A/B back to the old
     -- reactive-only behavior (Pass 1 on flush + the beta6 hooks) and confirm the bugs return.
     BOOK_ACTOR_RECONCILE = true,
+
+    -- v1.1.0 PASSIVE invisible-book scanner (Bug 2 diagnostic / known-issue capture). Every 5s,
+    -- walks a budget of book actors and flags any UNWARDED book that is in shown form (bHidden=
+    -- false) yet WasRecentlyRendered=false across several consecutive scans -- the "visible in the
+    -- pile, invisible when held" fault, which leaves no other trace. A SUSPECT is logged once with
+    -- a full state dump ([invis-scan] *** SUSPECT *** + [book-hook] SCAN... lines); a per-sweep
+    -- [invis-scan] census line reports scale (silent when nothing is amiss). Read-only diagnostic.
+    -- Flip false to silence it (e.g. if the census shows bHidden is a poor "near" proxy and it's
+    -- noisy on this build) -- it changes NO gameplay either way.
+    BOOK_INVIS_SCAN = true,
 }
