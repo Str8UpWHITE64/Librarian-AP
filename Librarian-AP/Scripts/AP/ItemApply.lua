@@ -3920,6 +3920,7 @@ end
 -- the SHELF COUNT (TArray length), so the gate was always true and any series merely
 -- PRESENT in its section fired regardless of order/single-row. Read the bool VALUES,
 -- never the length (#RowStatus is still the right SHELF count for _case_accepted_assets).
+
 function M.detect_completed_rows()
     if not M._cases_indexed then return 0 end
     if not M._slot_data then return 0 end
@@ -3965,44 +3966,68 @@ function M.detect_completed_rows()
                 end
 
                 if #completed > 0 then
-                    -- Uniform case (BP_BookCase_C / 4x5): CorrectBookDataIndex is per-shelf and
-                    -- aligned with RowStatus (CDI[i] = the designated series AssetIdx for shelf i
-                    -- -- the same indexing _case_accepted_assets relies on). So a completed shelf
-                    -- maps DIRECTLY + EXACTLY to its series, with NO PlacingBookInfo deref (which
-                    -- also dodges the freed-sub-object crash class entirely). Mixed cabinets
-                    -- (4x16/6x16) use a "decorator" CDI not aligned 1:1 to shelves -> fallback.
-                    local cdi = nil; pcall(function() cdi = case.CorrectBookDataIndex end)
-                    local cdi_first = nil
-                    if cdi then pcall(function() cdi_first = tonumber(cdi[1]) end) end
-                    local uniform = cdi_first ~= nil and M._asset_to_section[cdi_first] == sid
+                    -- Read the completed series from the books ACTUALLY on each completed row.
+                    -- Under free placement (any series on any row), CorrectBookDataIndex is the
+                    -- SECTION's answer-set, NOT a per-row map -- using cdi[i] fired the wrong series
+                    -- (1J row 3 held series 113 but cdi[3]=110). PlacingBookInfo is a flat row-major
+                    -- grid of rows*per_row slots (CONFIRMED: 40 slots / 4 rows = 10/row, RowNumArray
+                    -- corroborates 10), so row i's books are slots (i-1)*per_row+1 .. i*per_row.
+                    -- Split ItemInfo access keeps the crash-safe path (a book sub-object can be
+                    -- transiently freed mid-completion; pcall can't catch that native AV).
+                    local pbi = nil; pcall(function() pbi = case.PlacingBookInfo end)
+                    local pbi_n = 0; if pbi then pcall(function() pbi_n = #pbi end) end
+                    local per_row = (rs_n > 0 and pbi_n > 0 and pbi_n % rs_n == 0)
+                        and math.floor(pbi_n / rs_n) or 0
 
-                    if uniform and cdi then
+                    if pbi and per_row > 0 then
+                        -- GRID: each completed row holds exactly one series in order -> read that
+                        -- row's own slots and take the AssetIdx filling them (dominant guards a
+                        -- transient partial read). No cdi[i], no section-wide guessing.
                         for _, i in ipairs(completed) do
-                            local aidx = nil; pcall(function() aidx = tonumber(cdi[i]) end)
-                            if aidx and aidx >= 0 and M._asset_to_section[aidx] == sid then
-                                if fire_row(sid, M._asset_to_series[aidx],
-                                        ("(shelf %d, AssetIdx %d) [uniform]"):format(i, aidx)) then
+                            local counts = {}
+                            for slot = (i - 1) * per_row + 1, i * per_row do
+                                local book = pbi[slot]
+                                if book and book:IsValid() then
+                                    local item_info
+                                    pcall(function() item_info = book.ItemInfo end)
+                                    if item_info and item_info:IsValid() then
+                                        local aidx
+                                        pcall(function() aidx = tonumber(item_info.AssetIdx) end)
+                                        if aidx and aidx >= 0 then
+                                            counts[aidx] = (counts[aidx] or 0) + 1
+                                        end
+                                    end
+                                end
+                            end
+                            local best_aidx, best_n = nil, 0
+                            for aidx, c in pairs(counts) do
+                                if c > best_n then best_aidx, best_n = aidx, c end
+                            end
+                            -- Fire ONLY for the correct section: the series found on the row must
+                            -- belong to THIS bookcase's section. Under home-section placement that
+                            -- always holds. If a row's series ever maps elsewhere (mis-indexed
+                            -- bookcase / unexpected cross-section placement / transient mis-read),
+                            -- log it loudly and do NOT fire a foreign section's location.
+                            local best_sid = best_aidx and M._asset_to_section[best_aidx]
+                            if best_aidx and best_sid == sid then
+                                if fire_row(sid, M._asset_to_series[best_aidx],
+                                        ("(row %d, AssetIdx %d, %d/%d slots)"):format(i, best_aidx, best_n, per_row)) then
                                     sent_count = sent_count + 1
                                 end
+                            elseif best_aidx then
+                                log(("[row-detect] SKIP cross-section: row %d series=%s is section %s, not %s -- not firing"):format(
+                                    i, tostring(M._asset_to_series[best_aidx]), tostring(best_sid), sid))
                             end
                         end
                     else
-                        -- MIXED cabinet: which series sits on a completed shelf is not a straight
-                        -- CDI[i] lookup, so fall back to the "series fully present in its home
-                        -- section" scan -- but CAP by the number of GENUINELY-completed shelves
-                        -- (#completed), not the shelf count. This can no longer fire a series with
-                        -- ZERO completed rows; the only residual imprecision is WHICH of several
-                        -- present+complete series in the same cabinet fires when fewer rows are
-                        -- complete -- it never fires a not-present series and never misses a real
-                        -- completion. PBI walk keeps the crash-safe split access (book.ItemInfo
-                        -- can be a transiently-freed sub-object mid-completion; pcall can't catch
-                        -- the native AV -- never hand UE4SS a stale sub-object ref).
+                        -- FALLBACK (non-grid PBI -- a cabinet whose slot count isn't rows*per_row):
+                        -- "series fully present in its home section" scan, capped by #completed. Less
+                        -- precise (can mis-pick among several fully-present series) but never invents
+                        -- a not-present series; only used where rows can't be sliced.
                         local current = {}
                         pcall(function()
-                            local pbi = case.PlacingBookInfo
                             if pbi then
-                                local n = 0; pcall(function() n = #pbi end)
-                                for i = 1, n do
+                                for i = 1, pbi_n do
                                     local book = pbi[i]
                                     if book and book:IsValid() then
                                         local item_info
@@ -4041,7 +4066,7 @@ function M.detect_completed_rows()
                             for k = 1, math.min(cap, #candidates) do
                                 local c = candidates[k]
                                 if fire_row(sid, c.name,
-                                        ("(AssetIdx %d) [mixed %d/%d rows]"):format(c.aidx, #completed, rs_n)) then
+                                        ("(AssetIdx %d) [scan %d/%d rows]"):format(c.aidx, #completed, rs_n)) then
                                     sent_count = sent_count + 1
                                 end
                             end
