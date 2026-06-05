@@ -1161,33 +1161,12 @@ local function _decompose_matrix(xp, yp, zp, wp)
     }
 end
 
---- Brute-force build per-book HISM mapping. The game's BookInfo →
---- (HISM, instance_idx) lookup table is internal to BP_HISM_Manager_C
---- and not exposed. We discover the mapping by:
----   1. Capture every HISM instance's current transform.
----   2. Mark each warded book by calling mgr.UpdateInstance(BookInfo, marker)
----      with a unique Z (-1000000 - book_idx) so each book ends up at
----      a distinct underground position we can identify by Z.
----   3. Scan all HISM instances; if transform.Z is in the marker range,
----      recover book_idx from Z and record book → original_transform.
----   4. For dupe-partner books (multiple BPs sharing a BookInfo), spawn
----      a fresh HISM instance via ModActor:AddHISMInstance so each loses
----      and gains an independent (HISM, idx) for hide/show.
----
---- After this runs, M._book_captured_transforms[book_full_name] holds
---- the natural HISM transform for every warded book. We use that for
---- showing previously-warded books (warded → unwarded transitions).
----
---- Only runs when slot_data.book_visibility == "hidden", the DEFAULT since beta7.
---- NOTE: this HISM-mapping pipeline is currently vestigial FOR HIDING -- Layer 3
---- (apply_book_visibility) + Pass 1 actor warding do the actual hiding. The I3 gate-off test
---- confirmed the per-book HISM mapping pipeline was vestigial, so _initialize_hism_book_mapping
---- was REMOVED; these stay as empty remnants read only by diagnostics (a follow-up can drop them).
-M._hism_initialized = false              -- vestigial: pipeline removed (I3)
-M._book_hism_refs = {}                    -- vestigial: pipeline removed (I3); dump-read only
-M._book_captured_transforms = {}         -- vestigial: pipeline removed (I3)
-M._books_we_have_hidden = {}             -- key → true if our hide moved this book (now inert)
-M._books_warded = {}                     -- key → true if actor.bHidden + collision-off applied
+-- Pass 1 actor-warding tracker: key → true once actor.bHidden + collision-off
+-- has been applied to a book. Live — read by the warding / unward passes and the
+-- unlocked-state dump. (The former brute-force per-book HISM mapping pipeline that
+-- also populated _book_hism_refs / _book_captured_transforms / _books_we_have_hidden
+-- was removed in I3; Layer 3 pile-hiding + this Pass 1 warding do all book hiding now.)
+M._books_warded = {}
 
 -- Diagnostic probe for B10 / B9. For each bookcase we touched on the
 -- previous _apply_bookcases_to_world call, remember what we set
@@ -1259,16 +1238,6 @@ M._unmapped_warded_books = {}  -- key → { asset_idx, series, section, x, y, z 
 -- when a Progressive Series Unlock is received.
 M._last_applied_series_unlocked = {}
 
--- Deferred tree-walk queue. Tree-walking every warded book's component
--- tree synchronously costs ~24s for 3000 books (blocks main thread, AP
--- socket disconnects). Instead we enqueue books here and a LoopAsync
--- worker drains the queue ~50 books per tick. Books are first hidden
--- via actor.bHidden + HISM displacement (which catches most cases);
--- the deferred tree-walk catches the stragglers where actor.bHidden
--- doesn't propagate to a child component.
-M._deferred_visibility_queue = {}  -- list of {book, visible}
-M._deferred_worker_running = false
-
 -- B7: chunked Pass-1 flush state.
 --
 -- _apply_books_to_world walks ~3000 book actors and toggles bHidden +
@@ -1287,64 +1256,6 @@ M._deferred_worker_running = false
 M._flush_in_progress = false
 M._flush_pending     = false
 
-local function _drain_visibility_queue()
-    local q = M._deferred_visibility_queue
-    local processed = 0
-    -- Batch size tradeoff: bigger = faster total drain, but blocks the
-    -- main thread longer per tick. 150 was measured at ~4ms/book × 150 =
-    -- ~600ms per tick, which is still well under the AP socket-poll
-    -- timeout (we observed disconnects only past ~3s blocking).
-    while #q > 0 and processed < 150 do
-        local entry = table.remove(q, 1)
-        if entry and entry.book and entry.book:IsValid() then
-            M._set_book_mesh_visible(entry.book, entry.visible)
-        end
-        processed = processed + 1
-    end
-    if #q == 0 then
-        M._deferred_worker_running = false
-        return true  -- stop loop
-    end
-    return false  -- keep draining
-end
-
-function M._queue_book_visibility(book, visible)
-    M._deferred_visibility_queue[#M._deferred_visibility_queue + 1] = {
-        book = book, visible = visible,
-    }
-    if not M._deferred_worker_running then
-        M._deferred_worker_running = true
-        LoopAsync(50, _drain_visibility_queue)
-    end
-end
-
---- Re-walk all known-warded books and re-queue them for tree-walk hide.
---- Catches drift cases: a component that wasn't fully streamed in at the
---- original apply time, or one that re-enabled itself somehow. Idempotent
---- — books already fully hidden just get their components re-set to
---- hidden (no-op at the engine level).
----
---- Only meaningful in "hidden" book_visibility mode; stacked mode doesn't
---- use tree-walk at all. Caller is expected to gate.
-function M.requeue_warded_books_for_treewalk()
-    local books = FindAllOf("BP_GrabbingBook_C")
-    if not books then return 0 end
-    local n = 0
-    pcall(function() n = #books end)
-    local queued = 0
-    for i = 1, n do
-        local book = books[i]
-        if book and book:IsValid() then
-            local ok, key = pcall(function() return book:GetFullName() end)
-            if ok and key and M._books_we_have_hidden[key] then
-                M._queue_book_visibility(book, false)
-                queued = queued + 1
-            end
-        end
-    end
-    return queued
-end
-
 --- Reset per-world state on every LoadMap into M01 — a fresh world has fresh
 --- BP_GrabbingBook actors, HISM instances, bookcase actors and sign-glow, so any
 --- captured refs from a previous world load are stale and must be dropped. (Also bumps
@@ -1356,9 +1267,6 @@ function M.reset_hism_state()
     -- bails instead of dereferencing freed memory -- the main-menu / LoadMap teardown
     -- use-after-free (a NATIVE access violation, uncatchable by Lua pcall).
     M._world_epoch = (M._world_epoch or 0) + 1
-    M._hism_initialized = false
-    M._book_captured_transforms = {}
-    M._books_we_have_hidden = {}
     M._books_warded = {}
     M._unmapped_warded_books = {}
     M._last_applied_series_unlocked = {}
@@ -1392,37 +1300,6 @@ function M.reset_hism_state()
     M._cases_indexed = false
     M._ward_canary = nil
     log("[hism-reset] cleared HISM mapping state (will re-init on next apply-safe)")
-end
-
---- Toggle a book actor's mesh visibility. Tree-walk AttachChildren +
---- BlueprintCreatedComponents.
----
---- NOTE: We do NOT call SetActorVisible(visible) here. That's the game's
---- own BP-graph visibility function, and the BP Tick reverts it to the
---- "expected" state every frame — leading to a brief disappear-then-
---- reappear flicker, so we set the component flags directly instead. (Warded
---- books are kept hidden by Layer 3 pile hiding + Pass 1 actor warding.)
-function M._set_book_mesh_visible(book, visible)
-    if not book or not book:IsValid() then return end
-    local root = book:K2_GetRootComponent()
-    if root and root:IsValid() then
-        _walk_set_visibility(root, visible)
-    end
-    local comps
-    pcall(function() comps = book.BlueprintCreatedComponents end)
-    if comps then
-        local cn = 0; pcall(function() cn = #comps end)
-        for i = 1, cn do
-            local c = comps[i]
-            if c and c:IsValid() then
-                pcall(function() c:SetVisibility(visible, false) end)
-                pcall(function() c:SetHiddenInGame(not visible, false) end)
-                if _diag_on("RENDER_STATE_DIRTY") then
-                    pcall(function() c:MarkRenderStateDirty() end)
-                end
-            end
-        end
-    end
 end
 
 --- Compute the set of series that should be unwarded (pickable) right now, given
@@ -3695,10 +3572,10 @@ end
 
 --- Walk every BP_GrabbingBook_C whose series is in _series_unlocked and
 --- report its actor-level state — bHidden, collision-enabled, and the
---- _books_warded/_books_we_have_hidden tracking flags. If a book in an
---- unlocked series still has bHidden=true or collision=false, our Pass 1
---- failed to unward it (most likely because _books_warded[key] was nil
---- when the apply ran, so the unward branch was skipped).
+--- _books_warded tracking flag. If a book in an unlocked series still has
+--- bHidden=true or collision=false, our Pass 1 failed to unward it (most
+--- likely because _books_warded[key] was nil when the apply ran, so the
+--- unward branch was skipped).
 ---
 --- Each problematic book is logged with full identifying info; series
 --- with all books in the correct state are summarized as "OK".
@@ -3736,8 +3613,6 @@ function M.dump_unlocked_books_state()
                             hidden = hidden,
                             coll = coll,
                             warded_tracked = M._books_warded[key] and true or false,
-                            hidden_by_us = M._books_we_have_hidden[key] and true or false,
-                            has_ref = M._book_hism_refs[key] and true or false,
                             is_unmapped = M._unmapped_warded_books[key] and true or false,
                             x = x, y = y, z = z,
                         })
@@ -3765,11 +3640,10 @@ function M.dump_unlocked_books_state()
             log(("  [%s] '%s' UNPICKABLE: %d / %d"):format(
                 b.section, sname, #b.problems, b.total))
             for _, p in ipairs(b.problems) do
-                log(("      aidx=%d hidden=%s coll=%s _warded=%s _hidden_by_us=%s has_ref=%s unmapped=%s @ (%.0f, %.0f, %.0f)"):format(
+                log(("      aidx=%d hidden=%s coll=%s _warded=%s unmapped=%s @ (%.0f, %.0f, %.0f)"):format(
                     p.aidx,
                     tostring(p.hidden), tostring(p.coll),
-                    tostring(p.warded_tracked), tostring(p.hidden_by_us),
-                    tostring(p.has_ref), tostring(p.is_unmapped),
+                    tostring(p.warded_tracked), tostring(p.is_unmapped),
                     p.x, p.y, p.z))
             end
         else

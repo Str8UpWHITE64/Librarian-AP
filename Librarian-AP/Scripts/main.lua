@@ -1317,11 +1317,10 @@ local function start_gameplay_loops()
         end
 
         if s.phase == "draining" then
-            -- Hold the draining phase while either the chunked Pass-1
-            -- flush is still running OR the hidden-mode deferred
-            -- tree-walk worker is still draining. Both are async; the
-            -- world isn't truly settled until both have idled.
-            if IA._flush_in_progress or IA._deferred_worker_running then
+            -- Hold the draining phase while the chunked Pass-1 flush is
+            -- still running — it's async, so the world isn't truly
+            -- settled until it has idled.
+            if IA._flush_in_progress then
                 s.quiet_ticks = 0
                 return false
             end
@@ -1510,28 +1509,6 @@ local function start_gameplay_loops()
         log("[crumb] resync")
         pcall(function() IA.resync_skill_state() end)
         log("[crumb] idle:3s")
-        return false
-    end)
-
-    -- Periodic book straggler re-walk every 3 minutes (hidden mode only).
-    -- The initial tree-walk can miss a component or two — e.g., a book
-    -- whose mesh sub-components weren't fully streamed in when its
-    -- tree-walk ran. Re-queueing the known-warded books catches these.
-    -- Spread out enough that the queue drain (~10s of background work)
-    -- doesn't constantly run.
-    LoopAsync(180000, function()
-        local IA = package.loaded["AP/ItemApply"]
-        if not IA then return false end
-        if not IA._gameplay_active then
-            return true  -- stop; will restart on next gameplay activation
-        end
-        if not IA._apply_safe then return false end
-        if not (IA._slot_data and IA._slot_data.book_visibility == "hidden") then
-            return false  -- stacked mode doesn't use tree-walk
-        end
-        local queued = 0
-        pcall(function() queued = IA.requeue_warded_books_for_treewalk() or 0 end)
-        log(("[periodic-rewalk] re-queued %d warded books for tree-walk"):format(queued))
         return false
     end)
 
