@@ -4067,6 +4067,27 @@ local SKILL_ITEM_BY_ABILITY_IDX = {
 ---
 --- TArray is 1-indexed in Lua; the array order matches the EUpgradeAbility
 --- enum (0..8 → array index 1..9).
+-- The game migrated player save data to PlayerExtraDataV1; the legacy PlayerExtraData
+-- struct reads EMPTY on current builds (0 entries), which zeroed the applied-skill baseline
+-- and re-applied every load (level climbed +1 per relaunch). Return the SkillData TArray +
+-- which field it came from + entry count, preferring whichever V-version actually has data.
+function M._read_save_skill_data(sg)
+    if not (sg and sg:IsValid()) then return nil, nil, 0 end
+    local v1; pcall(function() v1 = sg.PlayerExtraDataV1.SkillData end)
+    local c1 = 0; if v1 then pcall(function() c1 = #v1 end) end
+    local v0; pcall(function() v0 = sg.PlayerExtraData.SkillData end)
+    local c0 = 0; if v0 then pcall(function() c0 = #v0 end) end
+    if not M._skill_src_logged then
+        M._skill_src_logged = true
+        log(("[skill-baseline] SkillData counts: PlayerExtraDataV1=%d PlayerExtraData(legacy)=%d"):format(c1, c0))
+    end
+    if c1 > 0 then return v1, "PlayerExtraDataV1", c1 end
+    if c0 > 0 then return v0, "PlayerExtraData", c0 end
+    if v1 then return v1, "PlayerExtraDataV1", 0 end
+    if v0 then return v0, "PlayerExtraData", 0 end
+    return nil, nil, 0
+end
+
 function M._init_applied_skill_counts_from_save()
     M._applied_skill_counts = {}
     local gi = FindFirstOf("BP_LibrarianGameInstance_C")
@@ -4081,15 +4102,12 @@ function M._init_applied_skill_counts_from_save()
         log("[skill-baseline] no GameSaveData — skipping init")
         return
     end
-    local skill_data
-    pcall(function() skill_data = sg.PlayerExtraData.SkillData end)
+    local skill_data, src, n = M._read_save_skill_data(sg)
     if not skill_data then
-        log("[skill-baseline] no PlayerExtraData.SkillData — skipping init")
+        log("[skill-baseline] no SkillData (PlayerExtraDataV1 or legacy) — skipping init")
         return
     end
-    local n = 0
-    pcall(function() n = #skill_data end)
-    log(("[skill-baseline] save SkillData has %d entries"):format(n))
+    log(("[skill-baseline] using %s.SkillData (%d entries)"):format(tostring(src), n))
     for i = 1, n do
         local entry
         pcall(function() entry = skill_data[i] end)
@@ -4139,8 +4157,7 @@ function M._refresh_hud_from_save()
     local sg
     pcall(function() sg = gi.GameSaveData end)
     if not sg or not sg:IsValid() then return end
-    local skill_data
-    pcall(function() skill_data = sg.PlayerExtraData.SkillData end)
+    local skill_data = M._read_save_skill_data(sg)
     if not skill_data then return end
 
     local n = 0
