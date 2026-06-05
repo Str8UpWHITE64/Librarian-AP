@@ -58,12 +58,14 @@ Book visibility edge cases (rare ~3/3072 over a 1-4h run; ADDRESSED in v1.1.0-be
   mesh-Z, scale, the bHidden / mesh-visibility flags, null mesh, tint corruption, BookInfo (RefreshInfo).
 
   Mitigation shipped: BOOK_ACTOR_RECONCILE heals the flag-based variants (NOT this render-proxy one).
-  Read-only DIAGNOSTICS ship enabled (gated, silent unless something's wrong) to capture a wild occurrence —
-  send UE4SS.log and grep for:
-    [invis-scan] *** SUSPECT ***             passive detector: an unwarded book shown+near but not drawn
+  CAPTURE for the open variant ships via the GRAB-PATH (BOOK_EVENT_HOOKS, on by default) — pick up an
+  affected book and the log records its full state. Grep UE4SS.log for:
     [book-hook] *** BROKEN-GRAB ***          a grabbed book that looks broken (full state dump follows)
     [book-hook] *** INVISIBLE-CONFIRMED ***  a held book confirmed genuinely not-drawn (~0.6s after grab)
-  Toggle off via BOOK_INVIS_SCAN / BOOK_EVENT_HOOKS in Scripts/diag_flags.lua (changes no gameplay).
+  A passive auto-scanner (BOOK_INVIS_SCAN) also exists but SHIPS OFF: on this build the game keeps nearly
+  all book actors bHidden=false, so "shown but not drawn" is dominated by normal off-screen frustum culling
+  (~365/sweep -> ~27 false suspects in 2 min) and it floods the log. It needs a camera-FOV filter to be
+  usable. Toggle either via Scripts/diag_flags.lua (changes no gameplay).
 
   Next fix step (from a captured dump): renderInMainPass=false -> re-assert it in the reconcile; everything
   reads visible but WasRecentlyRendered=false -> force a component re-register on the held actor (the

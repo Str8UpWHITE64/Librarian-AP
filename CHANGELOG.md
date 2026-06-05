@@ -18,8 +18,9 @@ shippable build, plus a large code cleanup and two gameplay fixes.
 - **Periodic actor-state reconcile** (`BOOK_ACTOR_RECONCILE`): a read-before-write pass that continuously
   heals the flag-based "visible-but-not-grabbable" / "grabbable-but-mesh-hidden" cases.
 - **Known issue (documented):** a rare, random, hidden-mode-only "visible in the pile, invisible when
-  held" book that self-heals on reload — a stale render-proxy fault with no flag trace. Ships with passive
-  diagnostics that capture it automatically; workaround is title → Continue or relaunch. See `known_bugs.txt`.
+  held" book that self-heals on reload — a stale render-proxy fault with no flag trace. Ships with grab-path
+  diagnostics that capture it when an affected book is picked up; workaround is title → Continue or relaunch.
+  See `known_bugs.txt`.
 
 **Cleanup (no behavior change)**
 - Removed ~1,000+ lines of dead/vestigial book-hiding code: the ~600-line per-book HISM mapping pipeline

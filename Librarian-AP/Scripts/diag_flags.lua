@@ -163,13 +163,13 @@ return {
     -- reactive-only behavior (Pass 1 on flush + the beta6 hooks) and confirm the bugs return.
     BOOK_ACTOR_RECONCILE = true,
 
-    -- v1.1.0 PASSIVE invisible-book scanner (Bug 2 diagnostic / known-issue capture). Every 5s,
-    -- walks a budget of book actors and flags any UNWARDED book that is in shown form (bHidden=
-    -- false) yet WasRecentlyRendered=false across several consecutive scans -- the "visible in the
-    -- pile, invisible when held" fault, which leaves no other trace. A SUSPECT is logged once with
-    -- a full state dump ([invis-scan] *** SUSPECT *** + [book-hook] SCAN... lines); a per-sweep
-    -- [invis-scan] census line reports scale (silent when nothing is amiss). Read-only diagnostic.
-    -- Flip false to silence it (e.g. if the census shows bHidden is a poor "near" proxy and it's
-    -- noisy on this build) -- it changes NO gameplay either way.
-    BOOK_INVIS_SCAN = true,
+    -- v1.1.0 PASSIVE invisible-book scanner (Bug 2 diagnostic). Walks book actors for any UNWARDED
+    -- book shown (bHidden=false) + near the player yet WasRecentlyRendered=false across several
+    -- scans, and dumps it as a SUSPECT. SHIPS OFF: calibration showed the game keeps almost ALL
+    -- actors bHidden=false and "not drawn" is dominated by normal off-screen frustum culling (~365
+    -- near-not-drawn per sweep -> ~27 false SUSPECT dumps in a 2-min test). Without a camera view-
+    -- frustum (FOV) filter it just floods the log. The RELIABLE capture is the grab-path
+    -- (BROKEN-GRAB / INVISIBLE-CONFIRMED, gated BOOK_EVENT_HOOKS) -- those only fire when a book is
+    -- actually picked up, i.e. guaranteed in view. Flip true ONLY after adding the FOV filter.
+    BOOK_INVIS_SCAN = false,
 }
