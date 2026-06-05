@@ -1018,9 +1018,10 @@ class LibrarianWorld(World):
             goal_row_threshold = sum(s.shelf_count for s in data.SECTIONS)
 
         return {
-            # Keep in sync with archipelago.json:world_version + main.lua MOD_VERSION.
-            # (The Lua client parses only the numeric 1.1.0 from this for its warding-rule
-            # gate; the -betaN suffix is informational, used in logs/telemetry.)
+            # Build label sent to the Lua client (matches main.lua MOD_VERSION). Lua parses only
+            # the numeric X.Y.Z for its warding-rule gate; the -rcN/-betaN suffix is informational.
+            # NOT the AP world version -- archipelago.json:world_version is a CLEAN semver (no suffix)
+            # so AP can parse it for YAML `requires: game:` checks (a suffix there reads as 0.0.0).
             "version": "1.1.0-rc1",
             "goal": goal_value,
             # Row count at which the Lua client should send STATUS_GOAL.
