@@ -52,7 +52,9 @@ return {
     BOOK_REFRESH_FIX   = true,
 
     -- Proactively RefreshInfo() unwarded books so corruption self-heals as you walk past.
-    BOOK_REFRESH_SWEEP = true,
+    -- OFF: RefreshInfo on a cached book that's mid-destruction during heavy manipulation = a native
+    -- AV (RC1 crash). Grab-path BOOK_REFRESH_FIX still covers the targeted case. Set true to re-enable.
+    BOOK_REFRESH_SWEEP = false,
 
     -- Every 5s, re-assert collision + mesh-visible on unwarded books (heals flag drift). Logs only on a fix.
     BOOK_ACTOR_RECONCILE = true,

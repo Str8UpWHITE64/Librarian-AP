@@ -27,7 +27,8 @@ local function diag_flags_str()
                     "BOOK_ACTOR_GAMETHREAD", "WARD_GROUND_TRUTH", "CASE_WARD_GAMETHREAD",
                     "NAMED_HOOKS", "BOOK_EVENT_HOOKS", "BOOK_EVENT_ENFORCE",
                     "BOOK_EVENT_REVEAL", "BOOK_EVENT_GRABFIX", "BOOK_OPACITY_FIX",
-                    "BOOK_REFRESH_FIX", "BOOK_REFRESH_SWEEP" }
+                    "BOOK_REFRESH_FIX", "BOOK_REFRESH_SWEEP",
+                    "BOOK_ACTOR_RECONCILE", "BOOK_INVIS_SCAN" }
     local parts = {}
     for _, k in ipairs(order) do parts[#parts + 1] = k .. "=" .. tostring(diag_on(k)) end
     return table.concat(parts, ",")
@@ -1068,7 +1069,7 @@ end
 -- WBP_Title.Text_Version (bottom-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
-local MOD_VERSION = "1.1.0-rc1"
+local MOD_VERSION = "1.1.0-rc2"
 local TESTED_GAME_VERSIONS = { "1.0.8", "1.0.9" }
 
 local function get_game_version()

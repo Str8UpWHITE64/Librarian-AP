@@ -42,37 +42,38 @@ Book visibility edge cases (rare ~3/3072 over a 1-4h run; ADDRESSED in v1.1.0-be
 1.1.0 Known Issues:
 
 - "Visible in the pile, invisible when held" (hidden mode only). A received (unwarded) book occasionally
-  renders invisible while held or looked at, though it's visible in the shelf pile and still grabbable.
-  Rare and RANDOM — different books each session, sometimes 1 book, sometimes a few, sometimes a whole
-  series. WORKAROUND: return to the title screen and Continue, or relaunch — it's per-session only and the
-  affected books come back normal (nothing is lost; the save is never corrupted).
+  renders invisible the instant it's grabbed — it's fine in the shelf pile and stays grabbable. Rare and
+  RANDOM: different books each session, sometimes 1, sometimes a few, sometimes a whole series.
 
-  Confirmed: hidden mode only (stacks never hides books, so it never exercises the machinery); runtime-only,
-  self-heals on world reload (book actors re-spawn); it's the actor's SM_Book_1 mesh that's affected, not the
-  pile/HISM. A captured grab read 100% HEALTHY on every field (bHidden=false, mesh shown, scale 1.0, opacity
-  nil, transform/CPD normal, tints in range), and it SURVIVES RefreshInfo (called 3,467x in one session) — so
-  it's below the appearance layer. Leading hypothesis: a stale/detached render proxy on the held actor (it's
-  "visible" by every flag but not actually drawn), cleared only by the full actor re-spawn a reload does.
+  WORKAROUNDS (either clears it; nothing is lost, the save is never corrupted):
+    * Throw the affected book OUT OF BOUNDS. The game's stray-book recovery teleports it back to its slot a
+      few seconds later and it returns visible. Lightest fix — no reload, no progress lost.
+    * Or go to the title screen and Continue, or relaunch. Per-session only; affected books come back normal.
 
-  Ruled out: opacity, WPO / CustomPrimitiveData displacement (UpdateWPO is dead code; cpd empty), transform /
-  mesh-Z, scale, the bHidden / mesh-visibility flags, null mesh, tint corruption, BookInfo (RefreshInfo).
+  ROOT CAUSE (confirmed via live debugging 2026-06-05): a stuck RENDER PROXY on the held actor's SM_Book_1.
+  The actor is "visible" by every readable flag but the renderer never draws it. A side-by-side capture showed
+  the broken book IDENTICAL to a healthy one on every reflected field (bHidden=false, mesh shown, scale 1.0,
+  opacity nil, bRenderInMainPass=true, bounds/owner normal); the ONLY signal is WasRecentlyRendered=false. The
+  fault is BELOW the reflection layer — nothing the mod can read or set is wrong.
 
-  Mitigation shipped: BOOK_ACTOR_RECONCILE heals the flag-based variants (NOT this render-proxy one).
-  CAPTURE for the open variant ships via the GRAB-PATH (BOOK_EVENT_HOOKS, on by default) — pick up an
-  affected book and the log records its full state. Grep UE4SS.log for:
-    [book-hook] *** BROKEN-GRAB ***          a grabbed book that looks broken (full state dump follows)
+  NOT fixable from the mod side (confirmed live): a full render-proxy rebuild does NOT clear it — SetVisibility
+  toggle, SetStaticMesh cycle, actor hide/show, and the game's own SetNewMesh / RefreshInfo all produce an
+  equally-invisible proxy. Only a BRAND-NEW component clears it, which happens on a full actor re-spawn (reload)
+  or when the game recovers an out-of-bounds book to its slot. (Destroying the actor from Lua to force a
+  re-spawn is NOT viable — it desyncs the spawner's bookkeeping and corrupts the save.)
+
+  Detection is grab-only: the book is fine in the pile and breaks the instant it's picked up, so there's no
+  pre-grab state to scan for, and an automatic in-place heal isn't possible without the disruptive
+  fling-and-recover. Confirmed hidden-mode only (stacks never hides books); runtime/per-session only; it's the
+  actor's SM_Book_1, not the pile/HISM. BOOK_ACTOR_RECONCILE still heals the unrelated flag-based variants.
+
+  Ruled out: opacity, WPO / CustomPrimitiveData displacement, transform / mesh-Z, scale, the bHidden /
+  mesh-visibility flags, null mesh, tint corruption, BookInfo (RefreshInfo, called 3,467x in one session).
+
+  Diagnostics ship via the grab path (BOOK_EVENT_HOOKS, on by default) — grep UE4SS.log for:
     [book-hook] *** INVISIBLE-CONFIRMED ***  a held book confirmed genuinely not-drawn (~0.6s after grab)
-  A passive auto-scanner (BOOK_INVIS_SCAN) also exists but SHIPS OFF: on this build the game keeps nearly
-  all book actors bHidden=false, so "shown but not drawn" is dominated by normal off-screen frustum culling
-  (~365/sweep -> ~27 false suspects in 2 min) and it floods the log. It needs a camera-FOV filter to be
-  usable. Toggle either via Scripts/diag_flags.lua (changes no gameplay).
-
-  Next fix step (from a captured dump): renderInMainPass=false -> re-assert it in the reconcile; everything
-  reads visible but WasRecentlyRendered=false -> force a component re-register on the held actor (the
-  lightweight equivalent of the re-spawn that already heals it). Crash-stabilized rendering code, so gate + A/B.
-
-  (Supersedes the beta6 "Book visibility edge cases" note above: symptom 1 "visible but not grabbable" is now
-  handled by ENFORCE + the reconcile; symptom 2's render-proxy form is the open issue here.)
+  (The passive BOOK_INVIS_SCAN ships OFF — without a camera-FOV filter "shown but not drawn" is dominated by
+  normal off-screen frustum culling and floods the log. Toggle via Scripts/diag_flags.lua; changes no gameplay.)
 
 - Intermittent native crash / freeze from the warding-vs-engine render race (hidden mode). Two shapes seen:
     * During play: a routine 5s warding pass (esp. the OFF-thread Layer-2 bookcase ward) races the engine's
@@ -89,5 +90,5 @@ Book visibility edge cases (rare ~3/3072 over a 1-4h run; ADDRESSED in v1.1.0-be
     - Mods/Librarian-AP/crash_trace.log   (breadcrumb ledger -- the TAIL names the last mod op before death)
     - .../Win64/UE4SS.log                  (last 100-200 lines)
     - one line on what you were doing (placing a row, returning to menu, walking a shelf, ...)
-  Confirm the trace header says mod=1.1.0-rc1 (older builds don't help). Optional A/B: set CASE_WARDING=false
+  Confirm the trace header says mod=1.1.0-rc2 (older builds don't help). Optional A/B: set CASE_WARDING=false
   or BOOK_VISIBILITY=false in Scripts/diag_flags.lua and report whether the crash stops.

@@ -2,6 +2,30 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0-rc2 — 2026-06-05
+
+Second release candidate. Same gameplay as rc1; this build hardens against a crash seen on rc1 and documents
+the "invisible when held" book more fully (now with a lighter workaround).
+
+**Crash mitigation**
+- **Proactive RefreshInfo sweep disabled** (`BOOK_REFRESH_SWEEP=false`). A heavy-manipulation crash on rc1
+  (throwing a book pile → native access violation in book-hook dispatch) pointed at the periodic RefreshInfo
+  sweep calling into a book actor mid-destruction. The sweep is now off; the targeted grab-path redraw
+  (`BOOK_REFRESH_FIX`) still covers the case it was meant to. Testers: please report whether the
+  heavy-manipulation crash recurs.
+
+**Known issue — "invisible when held"**
+- Root cause now CONFIRMED via live debugging: a stuck render proxy on the held book actor — identical to a
+  healthy book on every readable field, cleared only by a fresh component (reload, or the game recovering an
+  out-of-bounds book). Established that no in-place mod fix works (proxy rebuilds, re-mesh, the game's own
+  SetNewMesh/RefreshInfo all fail). NEW lighter workaround: **throw the book out of bounds** — the game returns
+  it to its slot visible in a few seconds, no reload and no progress lost. See `known_bugs.txt`.
+
+**Minor**
+- Crash-trace header now lists all diag flags (added `BOOK_ACTOR_RECONCILE`, `BOOK_INVIS_SCAN`).
+
+Tested on game builds 1.0.8 and 1.0.9.
+
 ## 1.1.0-rc1 — 2026-06-05
 
 First 1.1.0 release candidate: brings the beta line (crash fixes, warding sync, book-visibility work) to a
