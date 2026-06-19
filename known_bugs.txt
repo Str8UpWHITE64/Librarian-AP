@@ -81,14 +81,17 @@ Book visibility edge cases (rare ~3/3072 over a 1-4h run; ADDRESSED in v1.1.0-be
       is heartbeats, no mod write in flight). Rare; previously ~3/3072 books over a 1-4h run.
     * Return-to-menu: a heavy ward pass right before the world reload leaves book/bookcase/HISM components
       mutated, and the engine's teardown of them hangs (multi-minute freeze) then crashes.
-  Long-standing (see CRASH_HANDOFF.md). 1.1.0 mitigates Layer 3 (game-thread + world-epoch teardown guard) but
-  Layers 1-2 still run off-thread and the menu-teardown window isn't fully guarded, so both shapes can still
-  occur. Planned real fix (post-1.1.0): a game-thread "pump" moving Layers 1-2 on-thread without the UE4SS
-  #1180 burst, plus un-warding before teardown.
+  Long-standing (see CRASH_HANDOFF.md). rc3 ADDRESSES the in-play crash: every warding marshal (Layers 1-3 +
+  the reconcile pass) now drains through ONE serialized game-thread pump -- at most one ExecuteInGameThread is
+  ever in flight, moving Layers 1-2 on-thread (no render race) without the UE4SS #1180 burst. Field-validation
+  pending. The return-to-menu teardown FREEZE is a separate, still-open follow-up (explicit un-warding before
+  reload): the world-epoch guard + queue-flush prevent the CRASH there, but the freeze on the Menu->Continue
+  path (which skips deactivate_gameplay) is not yet mitigated.
 
   REPORTING (on the 1.1.0 build, please): if you crash or freeze, send the crash-report folder, especially:
     - Mods/Librarian-AP/crash_trace.log   (breadcrumb ledger -- the TAIL names the last mod op before death)
     - .../Win64/UE4SS.log                  (last 100-200 lines)
     - one line on what you were doing (placing a row, returning to menu, walking a shelf, ...)
-  Confirm the trace header says mod=1.1.0-rc2 (older builds don't help). Optional A/B: set CASE_WARDING=false
-  or BOOK_VISIBILITY=false in Scripts/diag_flags.lua and report whether the crash stops.
+  Confirm the trace header says mod=1.1.0-rc3 (older builds don't help). Optional A/B: flip
+  BOOK_ACTOR_GAMETHREAD=false (or CASE_WARD_GAMETHREAD=false) in Scripts/diag_flags.lua to route that layer
+  back to the legacy off-thread path, and report whether the crash returns.

@@ -21,14 +21,16 @@ return {
     -- Layer 1: BP_GrabbingBook actor warding (SetActorHiddenInGame + collision-off).
     BOOK_ACTOR_WARDING = true,
 
-    -- Layer 1 on the game thread. OFF: the connect-time burst trips UE4SS #1180.
-    BOOK_ACTOR_GAMETHREAD = false,
+    -- Layer 1 -> the serialized ward pump (game thread). Was OFF because the raw
+    -- connect-time marshal burst tripped UE4SS #1180; the pump serializes to 1 in-flight.
+    BOOK_ACTOR_GAMETHREAD = true,
 
     -- Ward each bookcase from its live collision, not a cache (kills render-state churn).
     WARD_GROUND_TRUTH  = true,
 
-    -- Layer 2 on the game thread. OFF: two marshaled layers per pass trip UE4SS #1180.
-    CASE_WARD_GAMETHREAD = false,
+    -- Layer 2 -> the serialized ward pump (game thread). Was OFF because two marshaled
+    -- layers per pass tripped UE4SS #1180; the pump keeps the in-flight count at 1.
+    CASE_WARD_GAMETHREAD = true,
 
     -- Register the gameplay BP hooks (FinishRow / OnLevelUp / save-load / title). Off = no AP tracking.
     NAMED_HOOKS        = true,

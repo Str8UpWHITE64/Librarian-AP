@@ -41,10 +41,94 @@ end
 -- falls back to inline when off or ExecuteInGameThread is missing, so loading never breaks.
 local function _on_game_thread(fn, flag)
     if _diag_on(flag) and type(ExecuteInGameThread) == "function" then
-        ExecuteInGameThread(fn)
+        M._pump_enqueue(fn)
     else
         fn()
     end
+end
+
+-- ============================================================================
+-- Ward pump: ONE serialized game-thread drain for every warding marshal.
+-- ----------------------------------------------------------------------------
+-- L1 (book actors), L2 (bookcases), L3 (HISM pile, from main.lua), and the
+-- reconcile write pass all append a work unit to ONE FIFO; the pump drains it
+-- ONE AT A TIME via ExecuteInGameThread, so at most one marshal is ever in
+-- flight. That moves the writes onto the game thread (killing the off-thread
+-- render race) while keeping the concurrent-marshal count at 1 -- structurally
+-- under UE4SS #1180 regardless of burst size. Producers keep their own chunking,
+-- LoopAsync reschedule, and re-entry guards verbatim; the ONLY change is that the
+-- marshal point (_on_game_thread / main.lua on_game_thread) enqueues here instead
+-- of calling ExecuteInGameThread directly. FIFO preserves the existing
+-- L2-before-L1 order (flush_apply enqueues L2 first).
+-- Threading: enqueue + pop run on the async (LoopAsync) thread; _pump_busy is set
+-- async and cleared in the game-thread closure -- the same cross-thread flag
+-- pattern the field-proven layer-3 _b2_running already relies on.
+-- ============================================================================
+local PUMP_MS   = 25     -- drain cadence (between the ~16ms frame and the 50ms chunk delay)
+M._ward_q       = {}
+M._ward_q_head  = 1
+M._ward_q_tail  = 0
+M._pump_busy    = false
+M._pump_gen     = 0
+M._pump_started = false
+
+-- Append a game-thread work unit, stamped with the current world epoch. A reload
+-- between enqueue and drain bumps the epoch; the pump drops the unit before it
+-- marshals -- the L1 chunk worker has no epoch guard of its own, so this is it.
+function M._pump_enqueue(fn)
+    M._ward_q_tail = M._ward_q_tail + 1
+    M._ward_q[M._ward_q_tail] = { run = fn, epoch = M._world_epoch or 0 }
+end
+
+-- True when nothing is queued and no marshal is in flight. The title-settle loop
+-- gates Continue on this so the menu doesn't re-enable mid-drain.
+function M._pump_idle()
+    return (not M._pump_busy) and (M._ward_q_head > M._ward_q_tail)
+end
+
+local function _pump_tick()
+    -- One marshal at a time. The busy gate clears only via the closure (gen-guarded
+    -- below) or reset_hism_state. There is deliberately NO time-based watchdog: a
+    -- closure that never runs means the game thread is stalled/dead, and the gate then
+    -- correctly PAUSES the pump until the thread resumes (the queued closure clears it).
+    -- Force-clearing during a stall would issue overlapping marshals -- the very #1180
+    -- abort the pump exists to prevent. The title-settle drain cap (main.lua) keeps a
+    -- stalled pump from soft-locking the menu on its own.
+    if M._pump_busy then return false end
+    if M._ward_q_head > M._ward_q_tail then return false end   -- queue empty
+    local unit = M._ward_q[M._ward_q_head]
+    M._ward_q[M._ward_q_head] = nil
+    M._ward_q_head = M._ward_q_head + 1
+    if not unit then return false end
+    if (unit.epoch or 0) ~= (M._world_epoch or 0) then return false end   -- stale world -> drop
+    if type(ExecuteInGameThread) ~= "function" then
+        pcall(unit.run)   -- no marshal available (loading edge): run inline
+        return false
+    end
+    M._pump_busy = true
+    local gen = M._pump_gen
+    if not M._pump_alive_logged then
+        M._pump_alive_logged = true
+        log("[ward-pump] alive: draining first unit on the game thread")
+    end
+    ExecuteInGameThread(function()
+        -- Re-check the epoch INSIDE the closure (the world can reload between the
+        -- async pop and this game-thread run). pcall so a throw still clears the gate.
+        if (unit.epoch or 0) == (M._world_epoch or 0) then pcall(unit.run) end
+        -- Unconditional, generation-guarded clear (finally-style). A reset mid-marshal
+        -- bumped _pump_gen, so a stale closure leaves the new world's gate untouched.
+        if gen == M._pump_gen then M._pump_busy = false end
+    end)
+    return false
+end
+
+-- Install the pump once. LoopAsync ticks in ALL phases (title + gameplay), so the
+-- connect-time burst -- the worst crash window, behind the title menu -- is covered.
+function M._ward_pump_start()
+    if M._pump_started then return end
+    if type(LoopAsync) ~= "function" then return end
+    M._pump_started = true
+    LoopAsync(PUMP_MS, _pump_tick)
 end
 
 -- ============================================================================
@@ -272,6 +356,9 @@ function M.set_slot_data(slot_data)
     -- but non-grabbable. The three hide paths gate on this so stacks keeps only collision-off.
     -- "~= stacks" defaults any missing/unknown value to the safe hide.
     M._book_hide_mode = (slot_data and slot_data.book_visibility ~= "stacks")
+    log(("[book-vis] mode=%s (slot_data.book_visibility=%s)"):format(
+        M._book_hide_mode and "HIDDEN" or "stacks",
+        tostring(slot_data and slot_data.book_visibility)))
     M._received_counts    = {}
     M._series_unlocked    = {}
     M._shelves_open       = {}
@@ -1013,6 +1100,16 @@ function M.reset_hism_state()
     -- the OLD world's refs (notably layer 3's HISM array) re-checks this and bails instead
     -- of dereferencing freed memory — the LoadMap-teardown use-after-free (a native AV).
     M._world_epoch = (M._world_epoch or 0) + 1
+    -- Ward pump: invalidate the old world. Bump the generation (so an in-flight stale
+    -- closure self-noops its gen-guarded busy-clear), free the gate, reset the alive
+    -- log, and release the L1 flush lock. The queue is deliberately NOT rebound here --
+    -- that would race the async pump's pop; the old-epoch units still in it are dropped
+    -- harmlessly by the pump's epoch check as it drains.
+    M._pump_gen = (M._pump_gen or 0) + 1
+    M._pump_busy = false
+    M._pump_alive_logged = false
+    M._flush_in_progress = false
+    M._flush_pending = false
     M._books_warded = {}
     M._unmapped_warded_books = {}
     M._last_applied_series_unlocked = {}
@@ -1133,6 +1230,12 @@ function M._apply_books_to_world()
 
     -- Committed to a flush: take the lock and start the chunked Pass-1 driver.
     M._flush_in_progress = true
+    -- Capture the world epoch at flush start. The chunk worker closes over `books`
+    -- (the old-world actor array); if the world reloads mid-flush, a pending LoopAsync
+    -- reschedule would re-stamp its pump unit with the NEW epoch and pass the pump's
+    -- guard, then iterate freed actors -> native AV. The per-flush epoch closes that
+    -- gap (mirrors layer 3 + reconcile, which the chunk worker otherwise lacks).
+    local flush_epoch = M._world_epoch
     -- The ~3000-actor walk is too high-volume to mark per book; timestamp the whole flush
     -- so a crash trace shows a flush was in flight. BOOK_ACTOR_WARDING is the bisection lever.
     trace.mark("books-flush", nil, "n=" .. tostring(n))
@@ -1275,6 +1378,11 @@ function M._apply_books_to_world()
     end
     _book_run_chunk = function()
         _on_game_thread(function()
+            -- World reloaded mid-flush: `books`/cursor point at the freed old world.
+            -- Abort without touching them, and without rescheduling or running the
+            -- finalizer (which would clobber a new flush's lock -- reset_hism_state owns
+            -- it now). The orphaned driver self-terminates here.
+            if (M._world_epoch or 0) ~= flush_epoch then return end
             local ok, err = pcall(_book_process_one_chunk)
             if not ok then
                 M._flush_in_progress = false
@@ -3198,5 +3306,10 @@ RegisterConsoleCommandHandler("ap_unward_series", function(_, params)
     pcall(function() M.force_unward_series(pattern) end)
     return true
 end)
+
+-- Start the serialized ward pump (drains every game-thread warding marshal one at a
+-- time; see _on_game_thread above). Safe at module load -- it ticks idle until warding
+-- begins, and covers the connect-time burst at the title before gameplay.
+M._ward_pump_start()
 
 return M

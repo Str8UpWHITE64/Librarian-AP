@@ -2,6 +2,22 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0-rc3 — 2026-06-18
+
+Third release candidate. Headline: the **warding-vs-engine crash fix** the rc2 field reports pointed at.
+
+**Crash fix — serialized ward pump**
+- Layers 1 (book actors) and 2 (bookcases) were still writing render/collision state OFF the game
+  thread, racing the engine's parallel render workers into a native access violation — the rc2 crashes
+  (decoupled, often right after a series-unlock re-ward). All warding marshals — Layers 1-3 plus the
+  reconcile pass — now drain through ONE serialized game-thread pump: at most one `ExecuteInGameThread`
+  is ever in flight, putting the writes on the game thread (no render race) while structurally staying
+  under the UE4SS #1180 overlapping-marshal limit. Epoch-guarded against world reloads; covers the
+  connect-time burst behind the title menu. `BOOK_ACTOR_GAMETHREAD` / `CASE_WARD_GAMETHREAD` now route
+  to the pump (flip either to `false` to bisect that layer back to the legacy off-thread path).
+
+Tested on game builds 1.0.8 and 1.0.9.
+
 ## 1.1.0-rc2 — 2026-06-05
 
 Second release candidate. Same gameplay as rc1; this build hardens against a crash seen on rc1 and documents

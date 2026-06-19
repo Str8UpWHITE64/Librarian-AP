@@ -49,7 +49,14 @@ _G._librarian_trace = trace   -- reachable from hook callbacks if ever needed
 -- ExecuteInGameThread is unavailable.
 local function on_game_thread(fn)
     if diag_on("BOOK_VIS_GAMETHREAD") and type(ExecuteInGameThread) == "function" then
-        ExecuteInGameThread(fn)
+        -- Route layer 3 through ItemApply's serialized ward pump so it shares the
+        -- single in-flight gate with layers 1-2 (no overlapping marshals = no #1180).
+        local IA = package.loaded["AP/ItemApply"]
+        if IA and IA._pump_enqueue then
+            IA._pump_enqueue(fn)
+        else
+            ExecuteInGameThread(fn)   -- pump not loaded yet (rare): marshal directly
+        end
     else
         fn()
     end
@@ -1069,7 +1076,7 @@ end
 -- WBP_Title.Text_Version (bottom-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
-local MOD_VERSION = "1.1.0-rc2"
+local MOD_VERSION = "1.1.0-rc3"
 local TESTED_GAME_VERSIONS = { "1.0.8", "1.0.9" }
 
 local function get_game_version()
@@ -1321,10 +1328,13 @@ local function start_gameplay_loops()
         end
 
         if s.phase == "draining" then
-            -- Hold the draining phase while the chunked Pass-1 flush is
-            -- still running — it's async, so the world isn't truly
-            -- settled until it has idled.
-            if IA._flush_in_progress then
+            -- Hold the draining phase while the chunked Pass-1 flush is still running
+            -- OR the ward pump still has queued/in-flight units — both are async, so the
+            -- world isn't truly settled until each idles. The drain_ticks cap is a safety
+            -- net: a wedged pump must not permanently soft-lock the title menu.
+            s.drain_ticks = (s.drain_ticks or 0) + 1
+            local pump_idle = (not IA._pump_idle) or IA._pump_idle()
+            if (IA._flush_in_progress or not pump_idle) and s.drain_ticks < 30 then
                 s.quiet_ticks = 0
                 return false
             end
