@@ -81,17 +81,22 @@ Book visibility edge cases (rare ~3/3072 over a 1-4h run; ADDRESSED in v1.1.0-be
       is heartbeats, no mod write in flight). Rare; previously ~3/3072 books over a 1-4h run.
     * Return-to-menu: a heavy ward pass right before the world reload leaves book/bookcase/HISM components
       mutated, and the engine's teardown of them hangs (multi-minute freeze) then crashes.
-  Long-standing (see CRASH_HANDOFF.md). rc3 ADDRESSES the in-play crash: every warding marshal (Layers 1-3 +
-  the reconcile pass) now drains through ONE serialized game-thread pump -- at most one ExecuteInGameThread is
-  ever in flight, moving Layers 1-2 on-thread (no render race) without the UE4SS #1180 burst. Field-validation
-  pending. The return-to-menu teardown FREEZE is a separate, still-open follow-up (explicit un-warding before
-  reload): the world-epoch guard + queue-flush prevent the CRASH there, but the freeze on the Menu->Continue
-  path (which skips deactivate_gameplay) is not yet mitigated.
+  Long-standing (see CRASH_HANDOFF.md). rc3's serialized ward pump fixed the off-thread RENDER race (Layers 1-2
+  writes now drain through one game-thread pump). But rc3 still crashed (5 reports): a SEPARATE cross-thread
+  LUA-STATE race. UE4SS runs the mod's Lua on a background thread, yet RegisterHook callbacks AND the pump's async
+  ExecuteInGameThread closures run Lua on the GAME thread -- so game-thread Lua iterating/allocating against the
+  same Lua tables the mod thread rewrites (e.g. the SetActorVisible hook walking _series_unlocked while an item
+  arrival rebuilt it) corrupts the Lua heap -> a next/compare error or a UE4SS abort(). rc4 FIXES this: the game
+  thread now only reads immutable mod-thread snapshots, atomically-swapped tables, or scalar flags
+  (snapshot-before-marshal for the L1/L2 pump passes; a precomputed _unwarded_snapshot for the hooks;
+  FinishRow/SaveGameData/OnLevelUp progress writes deferred to the 3s mod loop). Field-validated clean by the
+  maintainer. The return-to-menu teardown FREEZE remains a separate, still-open follow-up (the world-epoch guard +
+  queue-flush prevent the CRASH there, but the Menu->Continue freeze is not yet mitigated).
 
   REPORTING (on the 1.1.0 build, please): if you crash or freeze, send the crash-report folder, especially:
     - Mods/Librarian-AP/crash_trace.log   (breadcrumb ledger -- the TAIL names the last mod op before death)
     - .../Win64/UE4SS.log                  (last 100-200 lines)
     - one line on what you were doing (placing a row, returning to menu, walking a shelf, ...)
-  Confirm the trace header says mod=1.1.0-rc3 (older builds don't help). Optional A/B: flip
-  BOOK_ACTOR_GAMETHREAD=false (or CASE_WARD_GAMETHREAD=false) in Scripts/diag_flags.lua to route that layer
-  back to the legacy off-thread path, and report whether the crash returns.
+  Confirm the trace header says mod=1.1.0-rc4 (older builds don't help). If you crash, the crash_trace tail +
+  the UE4SS.log tail (look for a Lua 'next'/'compare' traceback or an 'abort') tell us whether a game-thread
+  shared-table access slipped through.

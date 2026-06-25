@@ -210,6 +210,13 @@ M._slot_data = nil
 M._received_counts   = {}  -- { [item_name] = count }
 M._series_unlocked   = {}  -- { [series_name] = true }
 M._shelves_open      = {}  -- { [section_id] = open_count }
+-- Read-only {[series]=true} snapshot for the GAME-THREAD book hooks (ENFORCE/REVEAL/grab-check).
+-- They must NOT call _compute_unwarded_set: it allocates a table and iterates _series_unlocked on
+-- the game thread, racing _recompute_state's mod-thread rebuild -> Lua-heap corruption / UE4SS abort
+-- (the rc3 crash). Published atomically by _recompute_state; hooks do a single lookup, no alloc.
+M._unwarded_snapshot = {}
+-- Count of OnLevelUp events deferred off the game thread; drained by the 3s mod-thread loop.
+M._pending_level_ups = 0
 
 -- True around AP-driven UpgradePlayer calls so the main.lua hook doesn't echo a check.
 M._ap_grant = false
@@ -362,6 +369,8 @@ function M.set_slot_data(slot_data)
     M._received_counts    = {}
     M._series_unlocked    = {}
     M._shelves_open       = {}
+    M._unwarded_snapshot  = {}
+    M._pending_level_ups  = 0
     M._pending_skill_grants = {}
     M._applied_skill_counts = {}
     M._sent_row_locations = {}
@@ -753,24 +762,41 @@ end
 function M._recompute_state()
     if not M._slot_data then return end
 
+    -- THREADING: the game-thread book hooks read M._series_unlocked / M._shelves_open / the unwarded
+    -- snapshot concurrently with this mod-thread rebuild. Build into LOCALS and swap each M.* reference
+    -- in ONE assignment -- never mutate a published table in place. A reader then observes the whole
+    -- old table or the whole new one, never a half-built one mid-pairs() (which corrupts the Lua heap
+    -- across threads -> the rc3 'next'/'compare' errors + UE4SS abort). See _unwarded_snapshot.
+
     -- Series: series_order[1..N*per_unlock]
-    M._series_unlocked = {}
+    local series_unlocked = {}
     local series_count = M._received_counts["Progressive Series Unlock"] or 0
     local per_unlock = M._slot_data.series_per_unlock or 5
     local series_order = M._slot_data.series_order or {}
     local total_series = math.min(series_count * per_unlock, #series_order)
     for i = 1, total_series do
-        M._series_unlocked[series_order[i]] = true
+        series_unlocked[series_order[i]] = true
     end
 
     -- Shelf unlocks: per-section open_count = received count of that section's item.
-    M._shelves_open = {}
+    local shelves_open = {}
     for item_name, count in pairs(M._received_counts) do
         local section_id = item_name:match("^Progressive Shelf Unlock %((.+)%)$")
         if section_id then
-            M._shelves_open[section_id] = count
+            shelves_open[section_id] = count
         end
     end
+
+    -- Publish atomically (single reference assignment each), tables first so the snapshot below is
+    -- computed from the fresh state.
+    M._series_unlocked = series_unlocked
+    M._shelves_open    = shelves_open
+    -- Precompute the read-only unwarded snapshot the game-thread hooks lookup against (no per-call
+    -- alloc/iterate on the game thread). only_unward_shelfable_books is constant per session, so one
+    -- snapshot in the active gating mode serves every hook. _compute_unwarded_set allocates here on
+    -- the MOD thread (safe) and reads the just-published tables.
+    M._unwarded_snapshot = M._compute_unwarded_set(
+        M._slot_data.only_unward_shelfable_books == 1)
 end
 
 -- ============================================================================
@@ -1198,6 +1224,17 @@ function M._apply_books_to_world()
         and M._slot_data.only_unward_shelfable_books == 1
     local unwarded_set = M._compute_unwarded_set(only_shelfable)
 
+    -- MOD-thread snapshots of the Lua state tables the game-thread finalizer (_finalize_apply_books,
+    -- which runs INSIDE the L1 pump closure) diffs against. The finalizer must never iterate the live
+    -- M._series_unlocked / M._shelves_open / M._last_applied_series_unlocked that the mod thread
+    -- (_recompute_state / reset_hism_state) rewrites concurrently -> the rc3 cross-thread Lua-heap
+    -- race. Captured here on the mod thread (serialized with _recompute_state).
+    local series_snap = {}
+    for s in pairs(M._series_unlocked) do series_snap[s] = true end
+    local shelves_snap = {}
+    for sid, c in pairs(M._shelves_open) do shelves_snap[sid] = c end
+    local last_applied_snap = M._last_applied_series_unlocked or {}
+
     -- Are book actors INITIALIZED yet? On first M01 load ItemInfo.AssetIdx is default 0
     -- until the game's population logic runs, and warding un-init actors crashes. Require
     -- >=2 distinct non-zero AssetIdx in the first 20 books before treating it as safe.
@@ -1352,7 +1389,7 @@ function M._apply_books_to_world()
 
     -- Finalizer after the last chunk: diff log, state summary, in-progress/pending bookkeeping.
     local function _finalize_apply()
-        M._finalize_apply_books(books, n, stats)
+        M._finalize_apply_books(books, n, stats, series_snap, shelves_snap, last_applied_snap)
         M._flush_in_progress = false
 
         if M._flush_pending then
@@ -1402,12 +1439,19 @@ function M._apply_books_to_world()
 end
 
 --- Pass-1 finalizer: diff log, state summary.
-function M._finalize_apply_books(books, n, stats)
-    -- Diff _series_unlocked vs the last snapshot for newly-unwarded series; logs per-series
+function M._finalize_apply_books(books, n, stats, series_snap, shelves_snap, last_applied_snap)
+    -- series_snap / shelves_snap / last_applied_snap are MOD-thread snapshots passed by
+    -- _apply_books_to_world. This runs on the GAME thread (L1 pump closure), so it must NOT iterate
+    -- the live M._series_unlocked / M._shelves_open / M._last_applied_series_unlocked (the mod thread
+    -- rewrites them) -> use the immutable snapshots. Fallback to live for any direct call.
+    series_snap = series_snap or M._series_unlocked
+    shelves_snap = shelves_snap or M._shelves_open
+    last_applied_snap = last_applied_snap or M._last_applied_series_unlocked
+    -- Diff series vs the last snapshot for newly-unwarded series; logs per-series
     -- counts and flags any unmapped books (may appear stuck at an internal trigger location).
     local newly_unlocked = {}
-    for s in pairs(M._series_unlocked) do
-        if not M._last_applied_series_unlocked[s] then
+    for s in pairs(series_snap) do
+        if not last_applied_snap[s] then
             newly_unlocked[#newly_unlocked+1] = s
         end
     end
@@ -1460,16 +1504,17 @@ function M._finalize_apply_books(books, n, stats)
             end
         end
     end
-    -- Update snapshot for next diff.
-    M._last_applied_series_unlocked = {}
-    for s in pairs(M._series_unlocked) do M._last_applied_series_unlocked[s] = true end
+    -- Update snapshot for next diff (build local, swap the reference atomically).
+    local new_last_applied = {}
+    for s in pairs(series_snap) do new_last_applied[s] = true end
+    M._last_applied_series_unlocked = new_last_applied
 
     local section_n = 0
-    for _, c in pairs(M._shelves_open) do
+    for _, c in pairs(shelves_snap) do
         if c > 0 then section_n = section_n + 1 end
     end
     local series_n = 0
-    for _ in pairs(M._series_unlocked) do series_n = series_n + 1 end
+    for _ in pairs(series_snap) do series_n = series_n + 1 end
     log(("State: sections-active=%d series=%d | applied: unwarded=%d warded=%d skipped=%d gate-skipped-unwards=%d"):format(
         section_n, series_n, stats.unwarded, stats.warded, stats.skipped, stats.gate_skipped_unwards))
 end
@@ -1928,13 +1973,14 @@ local GLOW_INTENSITY = { [0] = 0.5, [1] = 0.5, [2] = 180.0, [3] = 1.0 }
 -- fresh map first (drops stale label refs from the prior world) so it's safe right after Continue.
 function M._maybe_glow_now()
     if not (M._gameplay_active and M._apply_safe) then return end
-    M._section_to_label = nil
-    M._section_glow_state = {}
-    M._section_glow_orig = {}
-    pcall(M._apply_label_glow)
+    -- Request a glow remap on the GAME thread (the L2 pump impl honors it). Do NOT clear the glow
+    -- tables or run _apply_label_glow here -- this runs on the MOD thread and would rebuild/iterate
+    -- M._section_to_label concurrently with the game-thread _apply_label_glow (the L2 impl) -> the
+    -- rc3 cross-thread Lua-heap race. The remap lands on the next L2 pass (<=5s; cosmetic).
+    M._glow_remap_pending = true
 end
 
-function M._apply_label_glow()
+function M._apply_label_glow(cases_snap)
     -- Map sections → CabinetLabel via `Label Number`, once per session in gameplay. Done here
     -- (not at index/load) so nothing touches these actors during the fragile streaming window.
     if not M._section_to_label then
@@ -1958,7 +2004,7 @@ function M._apply_label_glow()
         -- RED = none unlocked, YELLOW = some, OFF (game owns the light) = all, by
         -- shelves-open vs the section's total case count.
         local open = M._shelves_open[sid] or 0
-        local total = (M._section_to_cases[sid] and #M._section_to_cases[sid]) or 0
+        local total = (cases_snap and cases_snap[sid] and #cases_snap[sid]) or 0
         if total == 0 and M._section_bookcase_count then
             total = M._section_bookcase_count[sid] or 0
         end
@@ -2014,14 +2060,46 @@ end
 -- Layer-2 ward marshaled onto the GAME THREAD (gated CASE_WARD_GAMETHREAD) for both callers,
 -- so its collision/visibility writes + reads can't race the engine's collision/render workers.
 function M._apply_bookcases_to_world()
-    _on_game_thread(M._apply_bookcases_impl, "CASE_WARD_GAMETHREAD")
+    if not M._cases_indexed then return end
+    -- Snapshot the section->cases map + shelf counts on the MOD thread so the game-thread impl
+    -- iterates an immutable copy, never the live M._section_to_cases that _index_bookcases rebuilds
+    -- in place (the rc3 cross-thread Lua-heap race). Shallow copy: new outer + inner lists, same
+    -- case UObjects (read on the game thread).
+    local cases_snap = {}
+    for sid, list in pairs(M._section_to_cases) do
+        local ln = 0; pcall(function() ln = #list end)
+        local copy = {}
+        for i = 1, ln do copy[i] = list[i] end
+        cases_snap[sid] = copy
+    end
+    local shelves_snap = {}
+    for sid, c in pairs(M._shelves_open) do shelves_snap[sid] = c end
+    -- Stray cases (no section) are warded by an index loop in the impl; snapshot them too so the
+    -- game thread never reads M._stray_cases while _index_bookcases rebuilds it on the mod thread.
+    local stray_snap = {}
+    do local sn = 0; pcall(function() sn = #M._stray_cases end)
+       for i = 1, sn do stray_snap[i] = M._stray_cases[i] end end
+    _on_game_thread(function() M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap) end, "CASE_WARD_GAMETHREAD")
 end
 
-function M._apply_bookcases_impl()
+function M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap)
     if not M._cases_indexed then return end
-    -- Section sign glow (gameplay-only, apply-on-change).
+    -- Iterate the MOD-thread snapshots, not live M._section_to_cases / M._shelves_open / M._stray_cases
+    -- (the mod thread rewrites them). Fallback to live for a direct/legacy call.
+    cases_snap = cases_snap or M._section_to_cases
+    shelves_snap = shelves_snap or M._shelves_open
+    stray_snap = stray_snap or M._stray_cases
+    -- Section sign glow (gameplay-only, apply-on-change). ALL glow-table mutation happens HERE on
+    -- the game thread; _maybe_glow_now (mod thread) only sets _glow_remap_pending so a Continue
+    -- re-maps the labels without touching the glow tables off-thread.
     if M._gameplay_active and M._apply_safe then
-        pcall(M._apply_label_glow)
+        if M._glow_remap_pending then
+            M._glow_remap_pending = false
+            M._section_to_label = nil
+            M._section_glow_state = {}
+            M._section_glow_orig = {}
+        end
+        pcall(function() M._apply_label_glow(cases_snap) end)
     end
     -- Drift canary: the game silently resets case collision on some transitions (Menu→Continue)
     -- with NO mod event, so apply-on-change would skip the now-unwarded cases forever. If our
@@ -2061,8 +2139,8 @@ function M._apply_bookcases_impl()
     end
 
     local shown, hidden, dead = 0, 0, 0
-    for section_id, cases in pairs(M._section_to_cases) do
-        local shelves_open = M._shelves_open[section_id] or 0
+    for section_id, cases in pairs(cases_snap) do
+        local shelves_open = shelves_snap[section_id] or 0
         local visible_count = math.min(shelves_open, #cases)
 
         -- Stable order: smaller-vol cases first, BookOrderIdx breaks ties.
@@ -2284,8 +2362,8 @@ function M._apply_bookcases_impl()
     -- Stray cases (not tied to any section): keep permanently hidden + collision-off so
     -- placement can't drop books on them.
     local stray_disabled, stray_dead = 0, 0
-    for i = 1, (_diag_on("CASE_WARDING") and #M._stray_cases or 0) do
-        local case = M._stray_cases[i]
+    for i = 1, (_diag_on("CASE_WARDING") and #stray_snap or 0) do
+        local case = stray_snap[i]
         if case and case:IsValid() then
             local ok = pcall(function()
                 case:SetActorHiddenInGame(true)
@@ -2319,7 +2397,7 @@ function M._apply_bookcases_impl()
 
     -- Only log on change vs the last apply (the 5s re-apply spammed identical lines).
     local _diag_total = 0
-    for _, _cs in pairs(M._section_to_cases) do _diag_total = _diag_total + #_cs end
+    for _, _cs in pairs(cases_snap) do _diag_total = _diag_total + #_cs end
     local key = string.format("%d/%d/%d/%d/%d", _diag_total, shown, hidden, dead, stray_disabled)
     if M._last_apply_log_key ~= key then
         log(("Bookcases: cases=%d shown=%d hidden=%d dead=%d stray=%d (gp=%s as=%s)"):format(

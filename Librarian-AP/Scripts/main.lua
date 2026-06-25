@@ -216,8 +216,8 @@ local function _refresh_sweep_step()
         _rsw_n = 0; if _rsw_books then pcall(function() _rsw_n = #_rsw_books end) end
         _rsw_cursor = 1
         _rsw_epoch = IA._world_epoch
-        local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
-        _rsw_uw = IA._compute_unwarded_set(only_shelfable)
+        -- GAME THREAD (rides SetActorVisible): cache the snapshot ref, never compute on this thread.
+        _rsw_uw = IA._unwarded_snapshot
         if _rsw_n == 0 then return end
     end
     local uw = _rsw_uw
@@ -278,9 +278,11 @@ local function _bh_grab_check(b, tag)
     end
     local IA = package.loaded["AP/ItemApply"]
     local unwarded_here
-    if series and IA and IA._compute_unwarded_set then
-        local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
-        local uw = IA._compute_unwarded_set(only_shelfable)
+    if series and IA and IA._unwarded_snapshot then
+        -- GAME THREAD (grab path): single snapshot lookup, no alloc/iterate. Calling
+        -- _compute_unwarded_set here races _recompute_state -> the rc3 crash. See
+        -- ItemApply._unwarded_snapshot.
+        local uw = IA._unwarded_snapshot
         unwarded_here = uw and uw[series] or false
     end
     -- BROKEN = any signal that renders an unwarded book invisible/unpickable: meshZ far from
@@ -409,9 +411,10 @@ local function try_register_book_hooks()
             if diag_on("BOOK_EVENT_ENFORCE") and v == true and b then
                 local _, series = _bh_series(b)
                 local IA = package.loaded["AP/ItemApply"]
-                if series and IA and IA._compute_unwarded_set then
-                    local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
-                    local unwarded = IA._compute_unwarded_set(only_shelfable)
+                if series and IA and IA._unwarded_snapshot then
+                    -- GAME THREAD: read the precomputed snapshot (single lookup, no alloc/iterate).
+                    -- Calling _compute_unwarded_set here is the rc3 crash (races _recompute_state).
+                    local unwarded = IA._unwarded_snapshot
                     -- stacks mode (_book_hide_mode==false): warded actor stays visible, just
                     -- non-grabbable (collision is layer 1's job) -- never force-hide it.
                     if IA._book_hide_mode ~= false and not (unwarded and unwarded[series]) then
@@ -431,9 +434,9 @@ local function try_register_book_hooks()
             if diag_on("BOOK_EVENT_REVEAL") and v == true and b then
                 local _, rseries = _bh_series(b)
                 local IA = package.loaded["AP/ItemApply"]
-                if rseries and IA and IA._compute_unwarded_set then
-                    local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
-                    local unwarded = IA._compute_unwarded_set(only_shelfable)
+                if rseries and IA and IA._unwarded_snapshot then
+                    -- GAME THREAD: snapshot lookup only (see ENFORCE above / ItemApply._unwarded_snapshot).
+                    local unwarded = IA._unwarded_snapshot
                     if unwarded and unwarded[rseries] then
                         local sm; pcall(function() sm = b.SM_Book_1 end)
                         if sm and sm:IsValid() then
@@ -529,8 +532,8 @@ local function _invis_scan_step()
         _invis_cursor = 1
         _invis_epoch = IA._world_epoch
         _invis_sw_shown, _invis_sw_notdrawn, _invis_sw_nearnd, _invis_sw_suspects = 0, 0, 0, 0
-        local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
-        _invis_uw = IA._compute_unwarded_set(only_shelfable)
+        -- GAME THREAD: cache the snapshot ref, never compute on this thread.
+        _invis_uw = IA._unwarded_snapshot
         if _invis_n == 0 then return end
     end
     local uw = _invis_uw
@@ -1076,7 +1079,7 @@ end
 -- WBP_Title.Text_Version (bottom-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
-local MOD_VERSION = "1.1.0-rc3"
+local MOD_VERSION = "1.1.0-rc4"
 local TESTED_GAME_VERSIONS = { "1.0.8", "1.0.9" }
 
 local function get_game_version()
@@ -1450,6 +1453,13 @@ local function start_gameplay_loops()
         if not IA._gameplay_active then return false end
         if not IA._apply_safe then return false end
         if not IA._slot_data then return false end
+        -- Drain OnLevelUp events deferred off the game thread (see the OnLevelUp hook). Run them on
+        -- THIS mod thread before the sync so M._levels_reached is current.
+        local _lvls = IA._pending_level_ups or 0
+        if _lvls > 0 then
+            IA._pending_level_ups = 0
+            for _ = 1, _lvls do pcall(function() IA.on_level_up_event() end) end
+        end
         pcall(function() IA.sync_progress_state() end)
         -- Re-run row-completion detection: FinishRow only fires when the row count INCREASES, so a
         -- swap (remove a completed series, refill the slot with another) goes undetected. Idempotent.
@@ -1718,11 +1728,10 @@ RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:SaveGameData", functio
         :format(n, tostring(read_save_slot())))
     -- After save, InsertedBookNum is fresh -> re-run the progress sync so book milestones catch
     -- up (safety net if a BP-hook counter missed an event).
-    local IA = package.loaded["AP/ItemApply"]
-    if IA and IA.sync_progress_state and IA._gameplay_active
-            and IA._apply_safe and IA._slot_data then
-        pcall(function() IA.sync_progress_state() end)
-    end
+    -- Post-save resync used to call IA.sync_progress_state() here, but SaveGameData fires on the GAME
+    -- thread and sync_progress_state mutates the shared _milestones_sent / _levels_reached tables the
+    -- 3s mod-thread loop also writes -> cross-thread Lua-heap race. The 3s loop already resyncs; no
+    -- game-thread mutation needed.
 end)
 
 -- /Script/Librarian.LibrarianGameInstanceBase:LoadGameData(loadSlotNum) → bool
@@ -1769,9 +1778,13 @@ local function on_level_up_bp(self)
 
     -- Event-based increment: CurrentFinishedRowNum isn't committed yet when OnLevelUp fires, so
     -- count one per event instead of reading it.
+    -- on_level_up_event() mutates the shared M._levels_reached table + sends a check; OnLevelUp fires
+    -- on the GAME thread, so doing that here races the 3s mod-thread sync_progress_state (rc3 crash
+    -- class). Defer: record the event as a scalar count the mod-thread 3s loop drains. (The skill-
+    -- point suppression above stays inline -- it writes a BP property, not a Lua table.)
     local IA = package.loaded["AP/ItemApply"]
-    if IA and IA.on_level_up_event then
-        pcall(function() IA.on_level_up_event() end)
+    if IA then
+        IA._pending_level_ups = (IA._pending_level_ups or 0) + 1
     end
 end
 
@@ -1979,44 +1992,12 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
         end
     end
 
-    local IA = package.loaded["AP/ItemApply"]
-    -- detect_completed_rows() is deliberately NOT called here: it walks PlacingBookInfo, and on the
-    -- FinishRow frame the just-placed book is mid-conversion (freed sub-object) -> native AV pcall
-    -- can't catch. THE row-completion crash; the 3s poll runs detection at a stable time instead.
-    -- The calls below use only the row counter + Lua state (no book deref), so they're safe here.
-    if IA and IA.fire_row_completion_checks and row then
-        local rc_sent = 0
-        pcall(function() rc_sent = IA.fire_row_completion_checks(row) end)
-        if rc_sent > 0 then
-            log(("[AP] row-completion: sent %d location check(s)"):format(rc_sent))
-        end
-    end
-    -- Fire "Section Complete: <id>" for any section that just hit 100%.
-    if IA and IA.fire_section_completions then
-        local sec_sent = 0
-        pcall(function() sec_sent = IA.fire_section_completions() end)
-        if sec_sent > 0 then
-            log(("[AP] section-completion: sent %d location check(s)"):format(sec_sent))
-        end
-    end
-    -- Fire "Floor N Complete" if this closed out a floor's last section. Order vs section-complete
-    -- above doesn't matter (both read _sent_row_locations).
-    if IA and IA.fire_floor_completions then
-        local floor_sent = 0
-        pcall(function() floor_sent = IA.fire_floor_completions() end)
-        if floor_sent > 0 then
-            log(("[AP] floor-completion: sent %d location check(s)"):format(floor_sent))
-        end
-    end
-    -- Also sync milestones (book count) and any level-ups whose threshold
-    -- was crossed during this row's completion.
-    if IA and IA.sync_progress_state then
-        local lvl_sent, ms_sent = 0, 0
-        pcall(function() lvl_sent, ms_sent = IA.sync_progress_state() end)
-        if (lvl_sent or 0) + (ms_sent or 0) > 0 then
-            log(("[AP] progress: %d level(s), %d milestone(s)"):format(lvl_sent, ms_sent))
-        end
-    end
+    -- Completion checks + progress sync used to run INLINE here, but FinishRow fires on the GAME
+    -- thread, and fire_row_completion_checks / fire_section_completions / fire_floor_completions /
+    -- sync_progress_state mutate the shared _sent_* / _milestones_sent / _levels_reached de-dup
+    -- tables that the 3s mod-thread loop ALSO writes -> cross-thread Lua-heap race (the rc3 crash
+    -- class). The 3s loop already runs every one of these each tick (plus detect_completed_rows), so
+    -- they are covered there on the mod thread (<=3s latency). Nothing to do on the game thread here.
 end)
 
 RegisterHook("/Script/Librarian.LibrarianGameMode:NewRowFinished", function(self, num)

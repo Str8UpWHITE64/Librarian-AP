@@ -2,6 +2,35 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0-rc4 — 2026-06-25
+
+Fourth release candidate. Headline: the **rc3 crash fix** — the intermittent native crash testers still hit on rc3
+was a *different* bug than the render race rc3's pump fixed.
+
+**Crash fix — cross-thread Lua-state race**
+- The 5 rc3 reports were a **Lua-state race**, not the render race. UE4SS runs the mod's Lua on a background
+  thread, but RegisterHook callbacks — and the ward pump's `ExecuteInGameThread` closures, which run
+  asynchronously — execute Lua on the GAME thread. When game-thread Lua and the mod thread iterate/allocate
+  against the same Lua tables at once, the Lua heap corrupts → a `next`/`compare` error or a UE4SS `abort()`
+  (decoupled, clustered on item receipt / row + series completion). Crash 4's traceback named it exactly: the
+  `SetActorVisible` hook walking `_series_unlocked` while an item arrival rebuilt that table.
+- Fix — the game thread now only ever touches immutable snapshots, atomically-swapped tables, or scalar flags,
+  never a live shared table mid-rewrite:
+  - the 5 game-thread book hooks read a precomputed `_unwarded_snapshot` (one lookup) instead of recomputing the
+    unwarded set per call;
+  - `_recompute_state` builds its tables into locals and swaps each reference in a single assignment;
+  - the L1 finalizer and L2 bookcase pass (both run inside the game-thread pump) iterate mod-thread snapshots
+    captured before the marshal — the "snapshot-before-marshal" model layer 3 has always used (and why layer 3
+    never crashed);
+  - the section-sign glow remap is game-thread-only now (a flag replaces the off-thread rebuild);
+  - the FinishRow / SaveGameData / OnLevelUp hooks no longer mutate shared progress tables on the game thread —
+    the 3s sync loop owns those writes.
+- **Client-side only — replace your `Scripts/` folder.** Your apworld and existing seeds are unchanged (no regen).
+- Minor behavior: completion/level checks now send within ≤3s (they ride the 3s sync loop) and the Continue glow
+  refreshes within ≤5s — both intentional, neither a regression.
+
+Field-validated clean by the maintainer, after a careful review of every game-thread Lua path.
+
 ## 1.1.0-rc3 — 2026-06-18
 
 Third release candidate. Headline: the **warding-vs-engine crash fix** the rc2 field reports pointed at.
