@@ -39,7 +39,12 @@ end
 -- separate async thread, so warding writes from there race the engine's collision/render/
 -- cluster-tree workers -> crash (CRASH_HANDOFF.md). `flag` gates the marshal for bisection;
 -- falls back to inline when off or ExecuteInGameThread is missing, so loading never breaks.
+-- Cached once at load: single-thread (pawn-tick) mode. When on, warding runs inline on the caller
+-- (already the game thread) -- no async pump marshal (Stage 2 single-thread fix).
+M._poll_on_game_thread = _diag_on("POLL_ON_GAME_THREAD")
+
 local function _on_game_thread(fn, flag)
+    if M._poll_on_game_thread then return fn() end   -- single-thread: run inline on the pawn tick
     if _diag_on(flag) and type(ExecuteInGameThread) == "function" then
         M._pump_enqueue(fn)
     else
@@ -125,6 +130,7 @@ end
 -- Install the pump once. LoopAsync ticks in ALL phases (title + gameplay), so the
 -- connect-time burst -- the worst crash window, behind the title menu -- is covered.
 function M._ward_pump_start()
+    if M._poll_on_game_thread then return end   -- single-thread: no async pump (warding runs inline)
     if M._pump_started then return end
     if type(LoopAsync) ~= "function" then return end
     M._pump_started = true
@@ -562,6 +568,18 @@ function M.set_apply_safe(state)
     state = state and true or false
     if M._apply_safe == state then return end
     M._apply_safe = state
+    -- Readiness-settle reset -- ONLY when LEAVING apply-safe (world changing / reloading): the bookcases
+    -- are (re)streaming, so re-require the settle before the title buttons re-enable. Must NOT reset on the
+    -- false->TRUE edge: the ward_ready poller latches M._ward_settled during pre-apply, and the apply-gate
+    -- PASS then calls set_apply_safe(true) -- wiping it there left the buttons stuck (never both-ready at
+    -- once). reset_hism_state still clears it on an actual world reload.
+    if not state then
+        M._ward_settled = false
+        M._ward_stable_passes = 0
+        M._ward_total_passes = 0
+        M._ward_prev_case_n = nil
+        M._fast_stable = 0; M._fast_total = 0; M._fast_prev_case_n = nil   -- reset the button-gate readiness poller
+    end
     log(("Apply-safe: %s"):format(tostring(state)))
     if state then
         -- Save is stable here — seed the applied counter from its skill levels BEFORE
@@ -829,22 +847,27 @@ M._book_valid_asset_idx = _book_valid_asset_idx  -- expose for diagnostics
 
 --- Recursively set visibility on a SceneComponent tree. bHiddenInGame alone doesn't
 --- always refresh the render proxy in UE 5.5; MarkRenderStateDirty forces invalidation.
-local function _walk_set_visibility(comp, visible)
+local function _walk_set_visibility(comp, visible, owner, depth)
     if not comp or not comp:IsValid() then return end
+    if (depth or 0) >= 6 then return end   -- bound recursion depth (runaway / cyclic trees)
+    -- Stay within THIS bookcase actor. A child owned by a DIFFERENT actor is an attached book/prop
+    -- (handled by L1/L3); recursing into one mid-stream or being torn down derefs freed memory -- the
+    -- recurring ward native AV. Fail OPEN (process) if GetOwner is unavailable so warding still works.
+    if owner then local same = true; pcall(function() same = (comp:GetOwner() == owner) end); if not same then return end end
     pcall(function() comp:SetVisibility(visible, false) end)
     pcall(function() comp:SetHiddenInGame(not visible, false) end)
-    if _diag_on("RENDER_STATE_DIRTY") then
-        pcall(function() comp:MarkRenderStateDirty() end)
-    end
+    -- MarkRenderStateDirty dropped: it force-recreates the render proxy and native-faults on a not-ready
+    -- component (a confirmed mid-stream AV site); SetVisibility/SetHiddenInGame above already refresh it.
     local children
     pcall(function() children = comp.AttachChildren end)
     if children then
         local n = 0
         pcall(function() n = #children end)
+        if n > 32 then n = 32 end   -- bound a corrupt AttachChildren count (huge Num -> OOB read -> AV @ 0xffff...)
         for i = 1, n do
             local child = children[i]
             if child and child:IsValid() then
-                _walk_set_visibility(child, visible)
+                _walk_set_visibility(child, visible, owner, (depth or 0) + 1)
             end
         end
     end
@@ -880,11 +903,15 @@ local function _ward_collision(case, case_key, locked)
     end
     local root; pcall(function() root = case:K2_GetRootComponent() end)
     local function walk(c, depth)
-        if not (c and c:IsValid()) or depth > 8 then return end
+        if not (c and c:IsValid()) or depth > 6 then return end
+        -- Stay within this bookcase actor (skip attached books/props being torn down); fail OPEN if
+        -- GetOwner is unavailable so collision warding still finds the case's own meshes.
+        local same = true; pcall(function() same = (c:GetOwner() == case) end); if not same then return end
         consider(c)
         local kids; pcall(function() kids = c.AttachChildren end)
         if kids then
             local n = 0; pcall(function() n = #kids end)
+            if n > 32 then n = 32 end   -- bound a corrupt AttachChildren count (huge Num -> OOB read -> AV)
             for i = 1, n do walk(kids[i], depth + 1) end
         end
     end
@@ -892,6 +919,7 @@ local function _ward_collision(case, case_key, locked)
     local comps; pcall(function() comps = case.BlueprintCreatedComponents end)
     if comps then
         local n = 0; pcall(function() n = #comps end)
+        if n > 32 then n = 32 end   -- corrupt-count cap (mid-stream BlueprintCreatedComponents Num -> OOB -> AV)
         for i = 1, n do consider(comps[i]) end
     end
 
@@ -900,6 +928,7 @@ local function _ward_collision(case, case_key, locked)
     if case_key and M._case_orig_collision[case_key] == nil then
         local rec = {}
         for i = 1, #meshes do
+            if not (meshes[i] and meshes[i]:IsValid()) then goto capture_next end  -- mesh not-ready mid-stream: skip its collision read (native AV)
             local en, pf = 3, "?"
             pcall(function() en = meshes[i]:GetCollisionEnabled() end)
             pcall(function() pf = meshes[i]:GetCollisionProfileName():ToString() end)
@@ -913,6 +942,7 @@ local function _ward_collision(case, case_key, locked)
                 resp[ch] = tonumber(v) or 0
             end
             rec[i] = { en = tonumber(en) or 3, pf = pf, resp = resp }
+            ::capture_next::
         end
         M._case_orig_collision[case_key] = rec
     end
@@ -969,6 +999,7 @@ local function _ward_collision(case, case_key, locked)
     end
 
     for i = 1, #meshes do
+        if not (meshes[i] and meshes[i]:IsValid()) then goto ward_mesh_next end  -- mesh went not-ready mid-stream: skip BodyInstance mutation (native AV)
         local r = rec[i] or { en = 3, pf = "?" }
         local is_placement = (i == placement_idx)
         -- Safe enabled value for the placement mesh: captured if real, else QueryAndPhysics
@@ -1015,6 +1046,7 @@ local function _ward_collision(case, case_key, locked)
                 end
             end
         end
+        ::ward_mesh_next::
     end
 
 end
@@ -1136,6 +1168,13 @@ function M.reset_hism_state()
     M._pump_alive_logged = false
     M._flush_in_progress = false
     M._flush_pending = false
+    M._l1_resume = nil   -- drop any cross-frame L1 book-flush resume that captured the old world's actors
+    M._ward_settled = false   -- fresh world: bookcase sublevels re-streaming; re-require the settle before warding
+    M._ward_stable_passes = 0
+    M._ward_total_passes = 0
+    M._ward_prev_case_n = nil
+    M._fast_stable = 0; M._fast_total = 0; M._fast_prev_case_n = nil   -- reset the button-gate readiness poller
+    M._section_sorted_cache = nil   -- old world's case refs; rebuild the cached per-section sort next pass
     M._books_warded = {}
     M._unmapped_warded_books = {}
     M._last_applied_series_unlocked = {}
@@ -1190,7 +1229,7 @@ end
 
 -- Chunked-flush tuning: books per tick, and the yield between chunks so the LoopAsync poll
 -- thread can pump c:poll(). 50ms < the 100-150ms AP heartbeat, keeping the socket alive.
-local BOOK_APPLY_CHUNK_SIZE     = 300
+local BOOK_APPLY_CHUNK_SIZE     = M._poll_on_game_thread and 30 or 300  -- single-thread: tiny chunks/frame (spread the flush over ~100 frames, <1s even at 120fps)
 local BOOK_APPLY_CHUNK_DELAY_MS = 50
 
 --- Ward/unward every BP_GrabbingBook_C by whether its series is in the unwarded set.
@@ -1394,10 +1433,16 @@ function M._apply_books_to_world()
 
         if M._flush_pending then
             M._flush_pending = false
-            -- Bounce to the ASYNC thread, not inline: this finalizer can run inside a
-            -- game-thread closure, and flush_apply → ExecuteInGameThread would then NEST
-            -- those calls (UE4SS #1180: scheduling a tick-action mid-iteration of the list).
-            LoopAsync(10, function() M.flush_apply() return true end)
+            if M._poll_on_game_thread then
+                -- Single-thread: no marshal to nest -- let the pawn-tick scheduler re-fire flush next
+                -- frame (a flag, not recursion, so a self-re-pending flush can't starve the tick).
+                M._flush_reflush_pending = true
+            else
+                -- Bounce to the ASYNC thread, not inline: this finalizer can run inside a
+                -- game-thread closure, and flush_apply → ExecuteInGameThread would then NEST
+                -- those calls (UE4SS #1180: scheduling a tick-action mid-iteration of the list).
+                LoopAsync(10, function() M.flush_apply() return true end)
+            end
         end
     end
 
@@ -1419,17 +1464,25 @@ function M._apply_books_to_world()
             -- Abort without touching them, and without rescheduling or running the
             -- finalizer (which would clobber a new flush's lock -- reset_hism_state owns
             -- it now). The orphaned driver self-terminates here.
-            if (M._world_epoch or 0) ~= flush_epoch then return end
+            if (M._world_epoch or 0) ~= flush_epoch then M._l1_resume = nil; return end
             local ok, err = pcall(_book_process_one_chunk)
             if not ok then
                 M._flush_in_progress = false
+                M._l1_resume = nil
                 trace.mark("books-chunk-error", nil, tostring(err))
                 log("[apply] book chunk error -> released flush lock: " .. tostring(err))
                 return
             end
             if cursor <= n then
-                LoopAsync(BOOK_APPLY_CHUNK_DELAY_MS, function() _book_run_chunk() return true end)
+                if M._poll_on_game_thread then
+                    -- single-thread: process ONE 300-book chunk per pawn-tick frame (doing all ~3072
+                    -- in one frame is the item-receipt hitch). The master scheduler calls M._l1_resume().
+                    M._l1_resume = _book_run_chunk
+                else
+                    LoopAsync(BOOK_APPLY_CHUNK_DELAY_MS, function() _book_run_chunk() return true end)
+                end
             else
+                M._l1_resume = nil
                 _finalize_apply()
             end
         end, "BOOK_ACTOR_GAMETHREAD")
@@ -1533,7 +1586,9 @@ end
 -- (the game's distance swap — pinning it would double-render a far book), and corrects
 -- SM_Book_1 only when bHidden=false (the shown form). Rolling cursor + budget keeps the async
 -- poll loop pumping; warded books are skipped (ENFORCE + Layer 3 keep them hidden).
-local RECONCILE_BUDGET = 1000
+-- Single-thread runs the reconcile pass on the 60fps pawn tick, so a 1000-book pass hitches; use a
+-- smaller per-pass budget (its rolling cursor still covers everything over a few passes). Legacy async = 1000.
+local RECONCILE_BUDGET = M._poll_on_game_thread and 20 or 1000
 function M.reconcile_book_actors()
     if not _diag_on("BOOK_ACTOR_RECONCILE") then return end
     if not M._apply_safe then return end
@@ -1645,6 +1700,8 @@ function M._index_bookcases(silent)
     -- A (re)index means our view of the world changed (e.g. quit→Continue reuses actor
     -- paths). Drop the warding tracker so every case re-wards fresh.
     M._case_ward_state = {}
+    M._section_sorted_cache = nil   -- case membership/order changed -> rebuild the cached per-section sort
+    M._ward_ground_truth_due = true -- first pass after (re)index reads real collision to seed the ward cache
     -- Do NOT drop the sign-glow caches here. refresh_index_if_changed re-indexes on every
     -- streaming change, but CabinetLabels + their SpotLights live in the PERSISTENT level.
     -- Clearing the caches forced _apply_label_glow to re-touch all 31 SpotLights every
@@ -1820,8 +1877,46 @@ end
 
 --- Re-index and return true iff the index grew (new sections/cases). main.lua's refresh
 --- loop uses this to catch lazily-streamed bookcases without re-applying when unchanged.
+local REFRESH_FORCE_EVERY = 12   -- full-rebuild backstop (catches same-count case swaps) ~ every 12 maint passes
 function M.refresh_index_if_changed()
     if not M._gameplay_active or not M._apply_safe then return false end
+
+    -- Cheap streaming pre-check. A full _index_bookcases() rebuild (multiple FindAllOf + per-case
+    -- GetClass/GetFName/GetFullName reflection) every 5s IS the maintenance-pass hitch. Streaming
+    -- sublevels change the live BookCase COUNT, so skip the rebuild while the count is unchanged;
+    -- rebuild only on a count delta (a case streamed in/out), every REFRESH_FORCE_EVERY passes as a
+    -- same-count-swap backstop, or when not yet indexed (post-reload).
+    local live = FindAllOf("BookCaseBase")
+    local live_n = 0; if live then pcall(function() live_n = #live end) end
+    if live_n == 0 then
+        live = FindAllOf("BP_BookCase_C")
+        if live then pcall(function() live_n = #live end) end
+    end
+    -- Streaming-settle tracking: the connect-time crash is the bookcase ward walking a case whose
+    -- sublevel is still streaming (deep component-tree walk derefs a freed/half-built child -> native
+    -- AV, worse as the connect item-sync grows). The live case count only holds steady once streaming
+    -- has quiesced, so require a couple of stable passes before warding is allowed. Latches true after
+    -- the first settle; only a world transition (set_apply_safe / reset_hism_state) re-arms it.
+    M._ward_total_passes = (M._ward_total_passes or 0) + 1
+    if live_n == (M._ward_prev_case_n or -1) then
+        M._ward_stable_passes = (M._ward_stable_passes or 0) + 1
+    else
+        M._ward_stable_passes = 0
+    end
+    M._ward_prev_case_n = live_n
+    -- Latch after a couple of stable passes, OR after a hard cap so constant streaming churn (a player
+    -- walking through the library during the settle) can't wedge warding off forever. By the cap the
+    -- connect item-sync burst is long over, so forcing it on is safe.
+    if (M._ward_stable_passes or 0) >= 2 or (M._ward_total_passes or 0) >= 6 then
+        M._ward_settled = true
+    end
+
+    M._refresh_pass = (M._refresh_pass or 0) + 1
+    local must_rebuild = (not M._cases_indexed) or (M._refresh_pass % REFRESH_FORCE_EVERY == 0)
+    if not must_rebuild and live_n == M._last_case_scan_count then
+        return false
+    end
+    M._last_case_scan_count = live_n
 
     local before_total = 0
     local before_sections = {}
@@ -1987,6 +2082,7 @@ function M._apply_label_glow(cases_snap)
         M._section_to_label = {}
         local labels = FindAllOf("BP_M01_CabinetLabel_01_C")
         local nl = 0; if labels then pcall(function() nl = #labels end) end
+        if nl > 64 then nl = 64 end   -- corrupt-count cap (a mid-stream/teardown FindAllOf Num -> OOB read -> AV)
         for i = 1, nl do
             local lb = labels[i]
             if lb and lb:IsValid() then
@@ -2019,9 +2115,10 @@ function M._apply_label_glow(cases_snap)
                 local spot
                 local comps; pcall(function() comps = lbl.BlueprintCreatedComponents end)
                 local cn = 0; if comps then pcall(function() cn = #comps end) end
+                if cn > 32 then cn = 32 end   -- corrupt-count cap (mid-stream BlueprintCreatedComponents Num -> OOB -> AV)
                 for j = 1, cn do
                     local c = comps[j]
-                    if c then
+                    if c and c:IsValid() then
                         local cls = ""; pcall(function() cls = c:GetClass():GetFName():ToString() end)
                         if cls == "SpotLightComponent" then spot = c; break end
                     end
@@ -2084,6 +2181,10 @@ end
 
 function M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap)
     if not M._cases_indexed then return end
+    -- Streaming-settle gate REMOVED: the whole L2 path is now mid-stream-safe like book warding -- every
+    -- component-array read is corrupt-count-capped, every mesh/component IsValid-guarded at point of use,
+    -- and the render-proxy-recreate MarkRenderStateDirty calls are gone. So the ward + glow run as soon
+    -- as gameplay is active (no ~15s wait) and just skip any not-yet-ready actor/mesh they encounter.
     -- Iterate the MOD-thread snapshots, not live M._section_to_cases / M._shelves_open / M._stray_cases
     -- (the mod thread rewrites them). Fallback to live for a direct/legacy call.
     cases_snap = cases_snap or M._section_to_cases
@@ -2111,6 +2212,7 @@ function M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap)
             if resp ~= nil and resp ~= 0 then
                 log("[ward-canary] warding drift detected — re-warding + re-glowing")
                 M._case_ward_state = {}
+                M._ward_ground_truth_due = true   -- drift: re-read every case's real collision this pass
                 M._section_to_label = nil
                 M._section_glow_state = {}
                 M._section_glow_orig = {}
@@ -2134,32 +2236,58 @@ function M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap)
             if M._case_ward_state and next(M._case_ward_state) ~= nil then
                 log("[ward-reconcile] periodic re-assert of all bookcase ward state")
                 M._case_ward_state = {}
+                M._ward_ground_truth_due = true   -- reconcile: force a full ground-truth re-read this pass
             end
         end
     end
+
+    -- Skip the whole ~71-case re-assert loop when nothing affecting case warding changed: the shelf-open
+    -- counts (which drive visible_count) are identical to last pass AND no drift/reconcile/reindex was
+    -- flagged (_ward_ground_truth_due). Steady state then costs a canary read + a tiny signature compare
+    -- instead of 71 case:IsValid()+lookups every 5s (the 18ms maintenance hitch). Drift is still caught:
+    -- the canary sets the flag, which forces the full re-assert next pass -- same detection as today.
+    local _sids = {}
+    for sid in pairs(shelves_snap) do _sids[#_sids + 1] = sid end
+    table.sort(_sids)
+    local shelf_sig = ""
+    for _, sid in ipairs(_sids) do shelf_sig = shelf_sig .. tostring(sid) .. "=" .. tostring(shelves_snap[sid]) .. ";" end
+    if not (M._ward_ground_truth_due or shelf_sig ~= M._last_shelf_sig) then
+        M._last_shelf_sig = shelf_sig
+        return
+    end
+    M._last_shelf_sig = shelf_sig
 
     local shown, hidden, dead = 0, 0, 0
     for section_id, cases in pairs(cases_snap) do
         local shelves_open = shelves_snap[section_id] or 0
         local visible_count = math.min(shelves_open, #cases)
 
-        -- Stable order: smaller-vol cases first, BookOrderIdx breaks ties.
-        local sorted = {}
-        for i, c in ipairs(cases) do sorted[i] = c end
-        table.sort(sorted, function(a, b)
-            local at, bt = _case_tier(a), _case_tier(b)
-            if at ~= bt then return at < bt end
-            local ai, bi = -2, -2
-            pcall(function() ai = a.BookOrderIdx end)
-            pcall(function() bi = b.BookOrderIdx end)
-            return (ai or -2) < (bi or -2)
-        end)
+        -- Stable order: smaller-vol cases first, BookOrderIdx breaks ties. The order + all sort keys
+        -- (_case_tier = GetClass():GetFName():ToString(), BookOrderIdx, GetFullName) are INVARIANT
+        -- between re-indexes, so build + cache the sorted list ONCE per section instead of redoing ~4
+        -- reflection round-trips per case every 5s pass (the maintenance hitch). Invalidated in
+        -- _index_bookcases (the sole rebuild of M._section_to_cases) + reset_hism_state.
+        M._section_sorted_cache = M._section_sorted_cache or {}
+        local sorted = M._section_sorted_cache[section_id]
+        if not sorted or #sorted ~= #cases then
+            sorted = {}
+            for i, c in ipairs(cases) do
+                local bi = -2; pcall(function() bi = c.BookOrderIdx end)
+                local key; pcall(function() key = c:GetFullName() end)
+                sorted[i] = { case = c, tier = _case_tier(c), boi = bi or -2, key = key }
+            end
+            table.sort(sorted, function(a, b)
+                if a.tier ~= b.tier then return a.tier < b.tier end
+                return a.boi < b.boi
+            end)
+            M._section_sorted_cache[section_id] = sorted
+        end
 
-        for i, case in ipairs(sorted) do
+        for i, e in ipairs(sorted) do
+            local case = e.case
             local visible = i <= visible_count
             if case and case:IsValid() then
-                local case_key
-                pcall(function() case_key = case:GetFullName() end)
+                local case_key = e.key   -- cached at sort-build time (GetFullName is invariant per case)
 
                 -- Apply-on-change gate: only mutate on a visible-state change. Warding sticks
                 -- (the BP doesn't fight our collision), so steady-state passes are no-ops —
@@ -2172,7 +2300,11 @@ function M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap)
                 -- cache on a case's first pass or when the read is unavailable.
                 local desired_warded = not visible
                 local changed
-                if _diag_on("WARD_GROUND_TRUTH") then
+                -- Steady state (no drift) trusts the ward cache and SKIPS the per-case collision read
+                -- (GetCollisionResponseToChannel x71/pass was the L2 maintenance hitch). The single-
+                -- sample canary + RECONCILE_EVERY set _ward_ground_truth_due to force a real re-read on
+                -- drift, which then corrects every case via the cache-miss path -- so drift is still caught.
+                if _diag_on("WARD_GROUND_TRUTH") and M._ward_ground_truth_due then
                     local actual_warded = nil
                     local pm = case_key and M._case_placement_mesh and M._case_placement_mesh[case_key]
                     if pm then
@@ -2203,20 +2335,19 @@ function M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap)
                         -- Tree-walk children: BP_BookCase children don't always inherit the actor flag.
                         local root = case:K2_GetRootComponent()
                         if root and root:IsValid() then
-                            _walk_set_visibility(root, true)
+                            _walk_set_visibility(root, true, case)
                         end
                         local comps
                         pcall(function() comps = case.BlueprintCreatedComponents end)
                         if comps then
                             local cn = 0; pcall(function() cn = #comps end)
+                            if cn > 32 then cn = 32 end   -- corrupt-count cap (mid-stream BlueprintCreatedComponents -> OOB -> AV)
                             for j = 1, cn do
                                 local c = comps[j]
                                 if c and c:IsValid() then
                                     pcall(function() c:SetVisibility(true, false) end)
                                     pcall(function() c:SetHiddenInGame(false, false) end)
-                                    if _diag_on("RENDER_STATE_DIRTY") then
-                                        pcall(function() c:MarkRenderStateDirty() end)
-                                    end
+                                    -- MarkRenderStateDirty dropped (render-proxy recreate AVs on a not-ready comp)
                                 end
                             end
                         end
@@ -2317,6 +2448,7 @@ function M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap)
                                     pcall(function()
                                         local force_comps = spawned.BlueprintCreatedComponents
                                         local fn = 0; pcall(function() fn = #force_comps end)
+                                        if fn > 32 then fn = 32 end   -- corrupt-count cap
                                         for fj = 1, fn do
                                             local c = force_comps[fj]
                                             if c and c:IsValid() then
@@ -2370,20 +2502,19 @@ function M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap)
                 case:SetActorEnableCollision(false)
                 local root = case:K2_GetRootComponent()
                 if root and root:IsValid() then
-                    _walk_set_visibility(root, false)
+                    _walk_set_visibility(root, false, case)
                 end
                 local comps
                 pcall(function() comps = case.BlueprintCreatedComponents end)
                 if comps then
                     local cn = 0; pcall(function() cn = #comps end)
+                    if cn > 32 then cn = 32 end   -- corrupt-count cap (mid-stream BlueprintCreatedComponents -> OOB -> AV)
                     for j = 1, cn do
                         local c = comps[j]
                         if c and c:IsValid() then
                             pcall(function() c:SetVisibility(false, false) end)
                             pcall(function() c:SetHiddenInGame(true, false) end)
-                            if _diag_on("RENDER_STATE_DIRTY") then
-                                pcall(function() c:MarkRenderStateDirty() end)
-                            end
+                            -- MarkRenderStateDirty dropped (render-proxy recreate AVs on a not-ready comp)
                         end
                     end
                 end
@@ -2394,6 +2525,8 @@ function M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap)
             stray_dead = stray_dead + 1
         end
     end
+
+    M._ward_ground_truth_due = false   -- consumed for this full pass; canary/reconcile re-arm it on drift
 
     -- Only log on change vs the last apply (the 5s re-apply spammed identical lines).
     local _diag_total = 0

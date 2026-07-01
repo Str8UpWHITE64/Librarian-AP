@@ -121,21 +121,48 @@ function Client:connect()
     log("Connecting...")
 end
 
+-- Per-tick body: (first tick) create the client, then poll + drain outgoing + apply pending items.
+-- Runs on EXACTLY ONE thread at a time: the async LoopAsync below when _poll_on_game_thread is off
+-- (legacy), or the game-thread pawn tick (main.lua BP_LibrarianCharacter_C:ReceiveTick) when on.
+-- apclientpp requires create + poll + handlers on ONE consistent thread, so this must never run on
+-- both threads concurrently -- the LoopAsync below stays idle whenever the pawn tick is advancing.
+function Client:_tick_once()
+    if self._deferred_init then self:_create_client() end
+    if not self._client then return end
+    self._client:poll()
+    self:_process_outgoing()
+    self:_apply_pending_items()
+end
+
+-- Bumped by the game-thread pawn tick each frame it drives _tick_once (main.lua). The async loop
+-- watches it to tell whether the pawn tick is alive (advancing) and stays idle if so. Set true by
+-- main.lua from the POLL_ON_GAME_THREAD diag flag.
+Client._gt_tick_count = 0
+Client._poll_on_game_thread = false
+
 function Client:_start_async_loop()
     local self_ref = self
+    local async_last_seen = -1
     LoopAsync(500, function()
         if not self_ref.enabled then return false end
 
-        local ok, err = pcall(function()
-            if self_ref._deferred_init then
-                self_ref:_create_client()
+        if self_ref._poll_on_game_thread then
+            -- The game-thread pawn tick owns create+poll+apply. Only cover the window where it is NOT
+            -- firing yet (pre-connect title / LoadMap gap, no pawn): marshal ONE tick onto the game
+            -- thread via ExecuteInGameThread, so the DLL is still only ever touched from the game thread.
+            local tc = self_ref._gt_tick_count or 0
+            if tc ~= async_last_seen then async_last_seen = tc; return false end   -- pawn tick alive -> idle
+            if type(ExecuteInGameThread) == "function" then
+                ExecuteInGameThread(function()
+                    local ok, e = pcall(function() self_ref:_tick_once() end)
+                    if not ok then log("game-thread tick error: " .. tostring(e)) end
+                end)
             end
-            if not self_ref._client then return end
+            return false
+        end
 
-            self_ref._client:poll()
-            self_ref:_process_outgoing()
-            self_ref:_apply_pending_items()
-        end)
+        -- Legacy path (flag off): run the whole tick inline on the async thread (unchanged behavior).
+        local ok, err = pcall(function() self_ref:_tick_once() end)
         if not ok then log("Async loop error: " .. tostring(err)) end
         return false
     end)
@@ -302,6 +329,14 @@ function Client:scout_missing()
         #list, total_batches, SCOUT_BATCH_SIZE,
         total_batches * SCOUT_BATCH_DELAY_MS / 1000))
 
+    if self._poll_on_game_thread then
+        -- Single-thread: DLL calls must stay on the polling (game) thread. Stash the list; the pawn
+        -- tick's _process_outgoing drains ONE batch per ~12 polls (keeps the ~200ms cadence).
+        self._scout_list = list
+        self._scout_idx = 1
+        return
+    end
+
     local idx = 1
     local self_ref = self
     LoopAsync(SCOUT_BATCH_DELAY_MS, function()
@@ -418,6 +453,25 @@ function Client:_process_outgoing()
     if self._outgoing_status ~= nil then
         self._client:StatusUpdate(self._outgoing_status)
         self._outgoing_status = nil
+    end
+
+    -- Single-thread: drain ONE stashed scout batch per ~12 polls, so all DLL LocationScouts calls
+    -- happen on the game (polling) thread and at roughly the old SCOUT_BATCH_DELAY_MS cadence.
+    if self._scout_list then
+        self._scout_tick = (self._scout_tick or 0) + 1
+        if self._scout_tick % 12 == 0 then
+            local list = self._scout_list
+            if self._scout_idx > #list then
+                log(("scout_missing: all batches sent (%d locations queued)"):format(#list))
+                self._scout_list = nil
+            else
+                local batch = {}
+                local end_idx = math.min(self._scout_idx + SCOUT_BATCH_SIZE - 1, #list)
+                for i = self._scout_idx, end_idx do batch[#batch + 1] = list[i] end
+                self._scout_idx = end_idx + 1
+                pcall(function() self._client:LocationScouts(batch, 0) end)
+            end
+        end
     end
 end
 

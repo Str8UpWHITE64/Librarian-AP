@@ -2,6 +2,49 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0-rc5 — 2026-07-01
+
+Fifth release candidate. Headline: the **single-thread rewrite**. The rc4 crash — an intermittent native access
+violation on the game thread, clustered on connect and item receipt — was Lua-VM **heap corruption from running the
+mod's Lua on two OS threads** at once. rc4 patched the symptom on the mod thread; rc5 removes the cause.
+
+**Crash fix — one Lua executor (`POLL_ON_GAME_THREAD`)**
+- UE4SS runs the mod's Lua on a background thread, but RegisterHook callbacks and the ward pump's game-thread
+  closures execute Lua on the GAME thread. Two threads driving one `lua_State` corrupts the Lua heap → an
+  `EXCEPTION_ACCESS_VIOLATION` reading tiny or garbage addresses inside UE4SS's Lua↔UObject machinery, which no
+  `pcall` can catch.
+- Fix: everything the mod does — AP client create, `poll()`, item-apply, and all three warding layers — now runs on
+  ONE thread, the `BP_LibrarianCharacter` per-frame pawn tick. A single scheduler drives the poll and the periodic
+  passes; the async `LoopAsync` path is gated off (`POLL_ON_GAME_THREAD=true`). One Lua executor, no cross-thread
+  corruption.
+
+**Crash fix — bookcase warding no longer touches not-ready actors**
+- A second crash hit on connect: the bookcase (Layer 2) ward walks each case's component tree and touches render
+  state, and doing that on a bookcase whose sublevel was still streaming in (or an old world still tearing down)
+  read freed or half-built memory — the same access violation. Book warding never had this, because it only sets
+  actor-level flags behind `IsValid`.
+- Fix: the bookcase ward is now mid-stream-safe like book warding. Every component-array read is bounded against a
+  corrupt count, every mesh and component is re-checked with `IsValid` at the point of use, and the
+  render-proxy-recreate `MarkRenderStateDirty` calls are dropped (`SetVisibility` / `SetHiddenInGame` already
+  refresh). The old wait-for-streaming delay is gone — shelves ward as soon as the world is active.
+
+**Performance — the periodic stutter**
+- The 5-second maintenance pass re-scanned everything each time (re-indexing bookcases, re-sorting each section with
+  class-name reflection, an all-books object scan, per-case collision reads) — a ~40 ms frame every 5 s. The
+  bookcase sort and object lookups are now cached and rebuilt only when the world changes, per-case reads are
+  skipped when nothing changed, and the book/HISM warding is chunked across frames. Steady-state maintenance is now
+  a few ms.
+
+**New — Continue / New Game gated on world-ready**
+- The title buttons now stay disabled until the world is fully streamed AND warded, then enable — so Continue drops
+  you into an already-warded world (the shelf lights come on the moment you enter). A hard timeout guarantees the
+  buttons always enable, even on a slow-streaming or book-sparse world (which also no longer stalls the menu).
+
+- **Client-side only — replace your `Scripts/` folder and the bundled apworld.** Its `version` /
+  `compatible_version` moved to 6, but your existing seeds are unchanged (no regen).
+
+Field-validated clean by the maintainer.
+
 ## 1.1.0-rc4 — 2026-06-25
 
 Fourth release candidate. Headline: the **rc3 crash fix** — the intermittent native crash testers still hit on rc3

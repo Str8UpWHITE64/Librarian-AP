@@ -63,4 +63,10 @@ return {
 
     -- Passive invisible-book scanner. OFF: too noisy without a camera-FOV filter (see known_bugs.txt).
     BOOK_INVIS_SCAN = false,
+
+    -- Single-thread mode -- the rc5 crash cure. Drives AP client create + poll() + item-apply AND all
+    -- warding on ONE thread (the BP_LibrarianCharacter pawn tick) instead of the async LoopAsync, so the
+    -- DLL + apply + warding + hooks share one Lua executor -- no cross-thread lua_State corruption (the
+    -- rc4 heap-corruption crash). OFF = legacy async poll (the pre-rc5 path). Shipping ON.
+    POLL_ON_GAME_THREAD = true,
 }

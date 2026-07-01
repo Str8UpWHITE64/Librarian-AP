@@ -47,7 +47,45 @@ _G._librarian_trace = trace   -- reachable from hook callbacks if ever needed
 -- run on a separate async thread; off-thread HISM writes race the engine's render/cluster-tree
 -- workers -> native crash (CRASH_HANDOFF.md). Gated BOOK_VIS_GAMETHREAD; falls back to inline if
 -- ExecuteInGameThread is unavailable.
+-- Cached once at load: single-thread (game-thread pawn tick) mode. When on, warding runs inline on
+-- the caller (the pawn tick IS the game thread) instead of via the async pump; the async LoopAsync
+-- loops are gated off and their work moves to the pawn-tick master scheduler (Stage 2 single-thread fix).
+local POLL_GT = diag_on("POLL_ON_GAME_THREAD")
+
+-- Stage-2 single-thread scheduler. When POLL_GT, periodic work that used to run on the async LoopAsync
+-- thread is registered here and driven by the game-thread pawn tick (the ReceiveTick master scheduler)
+-- at each step's own interval, via a DeltaSeconds accumulator. When off, gt_loop just starts a normal
+-- LoopAsync (legacy, unchanged). A step that returns true is latched off (mirrors LoopAsync stop).
+local _gt_steps = {}          -- name -> { fn, interval, accum, stopped }
+local _gt_step_order = {}
+local _gt_pending_activate = nil  -- reason string set by a title-button hook; consumed on the game thread by the scheduler
+local _l3_resume = nil            -- L3 (book-pile HISM) chunk resume; the master scheduler advances it one chunk/frame
+local _l3c_ep, _l3c_mgr, _l3c_mat, _l3c_ready   -- L3 setup scan cache (per world epoch): HISM mgr / mask material / ready flag
+local _gt_last_epoch = -1         -- last world epoch the scheduler saw; a bump means the captured warding arrays are freed
+local function gt_loop(name, interval_ms, fn)
+    if POLL_GT then
+        if not _gt_steps[name] then _gt_step_order[#_gt_step_order + 1] = name end
+        _gt_steps[name] = { fn = fn, interval = interval_ms, accum = 0, stopped = false }
+    else
+        LoopAsync(interval_ms, fn)
+    end
+end
+local function gt_run_steps(dt_ms)
+    for i = 1, #_gt_step_order do
+        local st = _gt_steps[_gt_step_order[i]]
+        if st and not st.stopped then
+            st.accum = st.accum + dt_ms
+            if st.accum >= st.interval then
+                st.accum = 0
+                local ok, res = pcall(st.fn)
+                if ok and res == true then st.stopped = true end
+            end
+        end
+    end
+end
+
 local function on_game_thread(fn)
+    if POLL_GT then return fn() end   -- single-thread mode: already on the game thread; run inline
     if diag_on("BOOK_VIS_GAMETHREAD") and type(ExecuteInGameThread) == "function" then
         -- Route layer 3 through ItemApply's serialized ward pump so it shares the
         -- single in-flight gate with layers 1-2 (no overlapping marshals = no #1180).
@@ -621,32 +659,50 @@ local function apply_book_visibility()
     -- re-checks it before touching the captured HISM array: if the world reloaded, the freed
     -- arr[hi] is a native AV pcall can't catch (the main-menu teardown crash).
     local epoch0 = IA._world_epoch
-    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    -- Cache the world-stable scan targets per world epoch. Each FindFirstOf / StaticFindObject walks the
+    -- whole (huge) GUObjectArray (~3-4ms); doing 3-4 of them every 5s was the L3 setup hitch. Re-scan only
+    -- when the cached object was freed (streaming) or the world reloaded (epoch bump).
+    if _l3c_ep ~= (epoch0 or 0) then _l3c_ep = epoch0 or 0; _l3c_mgr = nil; _l3c_mat = nil; _l3c_ready = false end
+    local mgr = _l3c_mgr
+    if not (mgr and mgr:IsValid()) then mgr = FindFirstOf("BP_HISM_Manager_C"); _l3c_mgr = mgr end
     if not (mgr and mgr:IsValid()) then return end
     local arr = nil; pcall(function() arr = mgr.HISMArray end)
     local hn = 0; if arr then pcall(function() hn = #arr end) end
     if hn == 0 then return end
-    local books = FindAllOf("BP_GrabbingBook_C")
-    if not books then return end
-    local bn = 0; pcall(function() bn = #books end)
-    if bn == 0 then return end
-    local ready = false
-    pcall(function() local info = books[1].ItemInfo; if info and info:IsValid() then ready = true end end)
-    if not ready then return end
-    local mat = nil
-    -- M_APBookMask is unreferenced (LoadAsset can't pull it from the pak); it must be hard-ref'd
-    -- by ModActor's BookMaskMat var to load. Read it there; fallback StaticFindObject if loaded.
-    local ma = FindFirstOf("ModActor_C")
-    if ma and ma:IsValid() then pcall(function() mat = ma.BookMaskMat end) end
-    if not (mat and mat:IsValid()) then
-        pcall(function() mat = StaticFindObject("/Game/Mods/LibrarianAPHUDFix/M_APBookMask.M_APBookMask") end)
+    -- Ready-check (cached once true): only ONE book's ItemInfo matters. The full book list is only used
+    -- by the DISABLED spatial cross-check, so fetch it lazily under that flag; otherwise a single probe.
+    local books, bn = nil, 0
+    if B2_SPATIAL_CROSSCHECK then
+        books = FindAllOf("BP_GrabbingBook_C")
+        if not books then return end
+        pcall(function() bn = #books end)
+        if bn == 0 then return end
     end
+    if not _l3c_ready then
+        local rb = (B2_SPATIAL_CROSSCHECK and books and books[1]) or FindFirstOf("BP_GrabbingBook_C")
+        if not (rb and rb:IsValid()) then return end
+        local rok = false
+        pcall(function() local info = rb.ItemInfo; if info and info:IsValid() then rok = true end end)
+        if not rok then return end
+        _l3c_ready = true
+    end
+    -- Mask material (cached): M_APBookMask is unreferenced, so it must be hard-ref'd by ModActor's
+    -- BookMaskMat var to load; read it there, fallback StaticFindObject. Scan only until found.
+    local mat = _l3c_mat
     if not (mat and mat:IsValid()) then
-        if not _b2_load_requested then
-            _b2_load_requested = true
-            log("[b2] M_APBookMask not available yet (add ModActor Material var 'BookMaskMat' = M_APBookMask, recook); will retry")
+        local ma = FindFirstOf("ModActor_C")
+        if ma and ma:IsValid() then pcall(function() mat = ma.BookMaskMat end) end
+        if not (mat and mat:IsValid()) then
+            pcall(function() mat = StaticFindObject("/Game/Mods/LibrarianAPHUDFix/M_APBookMask.M_APBookMask") end)
         end
-        return
+        if not (mat and mat:IsValid()) then
+            if not _b2_load_requested then
+                _b2_load_requested = true
+                log("[b2] M_APBookMask not available yet (add ModActor Material var 'BookMaskMat' = M_APBookMask, recook); will retry")
+            end
+            return
+        end
+        _l3c_mat = mat
     end
     _b2_mat_ref = mat  -- pin against GC
     -- Re-classify on EVERY call, not just on unwarded-set change: the actor<->HISM swap can drift
@@ -702,7 +758,7 @@ local function apply_book_visibility()
     -- ONE ExecuteInGameThread per pass (CHUNK = hn does all HISMs in one game-thread call). Many
     -- marshals/pass trip UE4SS #1180 (overlapping engine-tick actions -> abort). Cost: one ~400-HISM
     -- tick, a brief hitch on connect / set-change. Chunking only existed to pump the async poll loop.
-    local cursor, CHUNK = 1, hn
+    local cursor, CHUNK = 1, (POLL_GT and 40 or hn)  -- single-thread: 40 HISMs/frame (spread the ~400 over ~10 frames); legacy = one pass
     local newly_hidden, revealed, kept_hidden, kept_shown = 0, 0, 0, 0
     local n_new_hide, mismatch, leader_changed, n_locked = 0, 0, 0, 0
     -- run_chunk forward-declared so process_chunk can reschedule through it (upvalue must exist
@@ -712,12 +768,23 @@ local function apply_book_visibility()
         -- Teardown guard: if the world reloaded since this pass was scheduled (epoch changed), the
         -- captured arr/HISMs are freed and arr[hi] is a native AV pcall can't catch. Bail untouched.
         if (IA._world_epoch or 0) ~= (epoch0 or 0) then
-            _b2_running = false
+            _b2_running = false; _l3_resume = nil
             trace.mark("b2-stale-world", nil,
                 "epoch " .. tostring(epoch0) .. " -> " .. tostring(IA._world_epoch))
             return
         end
-        local last = math.min(cursor + CHUNK - 1, hn)
+        -- Streaming backstop: the HISM manager can be freed by a sublevel unload MID-PASS (no LoadMap,
+        -- so neither the epoch bump nor the LoadMap pre-hook fires). `arr` is bound to mgr.HISMArray, so
+        -- a freed mgr makes arr[hi] a native AV the per-element IsValid can't prevent. Re-validate the
+        -- captured mgr live each chunk before indexing, and re-read the current length so a shrunk array
+        -- can't OOB. IsValid() checks the GUObjectArray slot+serial (UAF-safe); a freed mgr -> bail.
+        if not (mgr and mgr:IsValid()) then
+            _b2_running = false; _l3_resume = nil
+            trace.mark("b2-mgr-gone", nil, "HISM manager freed mid-pass -> released layer-3 lock")
+            return
+        end
+        local cur_hn = hn; pcall(function() cur_hn = #arr end)
+        local last = math.min(cursor + CHUNK - 1, cur_hn)
         for hi = cursor, last do
             local h; pcall(function() h = arr[hi] end)
             if h and h:IsValid() then
@@ -811,9 +878,13 @@ local function apply_book_visibility()
             end
         end
         cursor = last + 1
-        if cursor <= hn then
-            LoopAsync(50, function() run_chunk() return true end)
+        if cursor <= cur_hn then
+            -- Single-thread: process ONE small chunk per pawn-tick frame (the master scheduler calls
+            -- _l3_resume) so the ~400-HISM pass spreads over frames instead of hitching one. Legacy
+            -- path keeps the LoopAsync chunk pacing.
+            if POLL_GT then _l3_resume = run_chunk else LoopAsync(50, function() run_chunk() return true end) end
         else
+            _l3_resume = nil
             _b2_running = false
             -- Log only when something changed or the cross-check disagrees.
             if sig_changed or (newly_hidden + revealed) > 0 or mismatch > 0 or leader_changed > 0 or n_locked > 0 then
@@ -854,6 +925,7 @@ local function apply_book_visibility()
             local ok, err = pcall(process_chunk)
             if not ok then
                 _b2_running = false
+                _l3_resume = nil
                 trace.mark("b2-chunk-error", nil, tostring(err))
                 log("[b2] chunk error -> cleared _b2_running: " .. tostring(err))
             end
@@ -862,7 +934,9 @@ local function apply_book_visibility()
     if sig_changed then
         log("[b2] unwarded-set change -> re-evaluate (NEW drives off cached series, OLD logged for comparison)")
     end
-    run_chunk()
+    -- Single-thread: defer even the FIRST chunk to the master scheduler so the maintenance frame does
+    -- only L3 setup (the 40-HISM chunk was ~8ms of the 5s hitch); all chunks then spread across frames.
+    if POLL_GT then _l3_resume = run_chunk else run_chunk() end
 end
 
 
@@ -1033,9 +1107,14 @@ local function update_title_buttons()
 
     if connected then
         local IA = package.loaded["AP/ItemApply"]
-        local pre_apply_pending = IA and IA._allow_pre_apply and not IA._pre_apply_complete
-        if pre_apply_pending then
-            log("[title-buttons] connected; pre-apply in progress → buttons disabled")
+        -- Keep Continue/New Game disabled until the world is fully READY: items pre-applied
+        -- (_pre_apply_complete) AND the bookcases finished streaming + warding (_ward_settled). Entering
+        -- before the shelves are warded shows an un-warded world for a beat; gating the buttons on both
+        -- means the player only enters a world that's already warded (lights then come on right after).
+        local not_ready = IA and IA._allow_pre_apply and (not IA._pre_apply_complete or not IA._ward_settled)
+        if not_ready then
+            log(("[title-buttons] connected; not ready (pre_apply=%s ward_settled=%s) → buttons disabled"):format(
+                tostring(IA and IA._pre_apply_complete), tostring(IA and IA._ward_settled)))
         else
             local current_slot = read_save_slot()
             local has_save = ap_save_exists(current_slot)
@@ -1079,7 +1158,7 @@ end
 -- WBP_Title.Text_Version (bottom-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
-local MOD_VERSION = "1.1.0-rc4"
+local MOD_VERSION = "1.1.0-rc5"
 local TESTED_GAME_VERSIONS = { "1.0.8", "1.0.9" }
 
 local function get_game_version()
@@ -1213,6 +1292,37 @@ local function start_gameplay_loops()
     if _gameplay_loops_started then return end
     _gameplay_loops_started = true
 
+    -- Fast world-ready poller (gates the Continue/New Game buttons ONLY -- never warding, which is now
+    -- mid-stream-safe). Poll the live BookCase count at 1s; once it holds steady (streaming done) or a
+    -- hard cap (soft-lock guard), latch M._ward_settled, force one full bookcase-ward pass so the shelves
+    -- are done, then re-enable the title buttons. Runs behind the title menu, so by the time the buttons
+    -- light up the world is fully streamed + warded. Stops once latched. (This poller drove a CRASH when
+    -- it gated WARDING; now warding is safe regardless of timing, so it only affects button enablement.)
+    gt_loop("ward_ready_fast", 1000, function()
+        local IA = package.loaded["AP/ItemApply"]
+        if not IA then return false end
+        if IA._ward_settled then return true end                 -- already ready -> stop
+        if not (IA._gameplay_active or IA._allow_pre_apply) then return false end
+        IA._fast_total = (IA._fast_total or 0) + 1
+        local live = FindAllOf("BookCaseBase")
+        local n = 0; if live then pcall(function() n = #live end) end
+        if n > 0 and n == (IA._fast_prev_case_n or -1) then
+            IA._fast_stable = (IA._fast_stable or 0) + 1
+        else
+            IA._fast_stable = 0
+        end
+        IA._fast_prev_case_n = n
+        if (n > 0 and (IA._fast_stable or 0) >= 3) or (IA._fast_total or 0) >= 30 then
+            IA._ward_settled = true
+            IA._ward_ground_truth_due = true                      -- force a full ward pass so shelves are done...
+            pcall(function() IA._apply_bookcases_to_world() end)  -- ...before the buttons enable
+            log(("[ward-ready] %d bookcases stable -> world warded, enabling Continue/New Game"):format(n))
+            pcall(function() update_title_buttons() end)
+            return true                                           -- stop the poller
+        end
+        return false
+    end)
+
     -- Apply-gate retry loop: wait for books to fully populate before mutating
     -- the world. Cheap once gate passes (returns true immediately).
     local APPLY_MIN_TICKS    = 10   -- 5s of grace before mutating
@@ -1222,7 +1332,7 @@ local function start_gameplay_loops()
     local APPLY_GIVEUP_TICKS = 40   -- 20s
 
     local apply_attempts = 0
-    LoopAsync(500, function()
+    gt_loop("apply_gate", 500, function()
         apply_attempts = apply_attempts + 1
         local books = FindAllOf("BP_GrabbingBook_C")
         local n = 0
@@ -1258,8 +1368,18 @@ local function start_gameplay_loops()
 
         if not ready then
             if apply_attempts >= APPLY_GIVEUP_TICKS then
-                log(("LoadMap apply-gate → giving up after %d attempts (books=%d distinct=%d ticks_ok=%s)")
+                log(("LoadMap apply-gate → giving up after %d attempts (books=%d distinct=%d ticks_ok=%s) — marking apply-safe anyway so pre-apply completes")
                     :format(apply_attempts, n, distinct, tostring(enough_ticks)))
+                -- Unblock the downstream pipeline exactly like the PASS path below: preapply_settle waits
+                -- on _apply_safe, and the Continue/New Game buttons gate on _pre_apply_complete (which only
+                -- latches after that). Silently dropping the pipeline here would leave the menu
+                -- unenterable forever (the apply-gate/settle giveup contracts were inconsistent).
+                local IA = package.loaded["AP/ItemApply"]
+                if IA and IA.set_apply_safe then
+                    pcall(function() IA.set_apply_safe(true) end)
+                    lc_event("on_world_ready")
+                    if IA._gameplay_active then pcall(function() IA.flush_apply() end) end
+                end
                 return true
             end
             if apply_attempts % 4 == 0 then
@@ -1291,7 +1411,7 @@ local function start_gameplay_loops()
     --   2. Fire ONE flush_apply with final state (single warding pass).
     --   3. Wait for the deferred tree-walk queue to drain + a short settle.
     --      Then mark _pre_apply_complete and re-enable Continue/Start.
-    LoopAsync(500, function()
+    gt_loop("preapply_settle", 500, function()
         local IA = package.loaded["AP/ItemApply"]
         if not IA then return false end
         if not IA._allow_pre_apply then return true end
@@ -1364,7 +1484,7 @@ local function start_gameplay_loops()
     -- Reconnect-settle watcher. On a mid-gameplay reconnect (_reconnect_settle_active) the server
     -- re-sends every item one at a time; apply them all THEN flush once, else bookcases flicker as
     -- shelves_open[X] rebuilds from zero. Fires the single flush once the item storm quiets.
-    LoopAsync(500, function()
+    gt_loop("reconnect_settle", 500, function()
         local IA = package.loaded["AP/ItemApply"]
         if not IA then return false end
         -- Die when we leave gameplay (same context check the 5s loop uses) so the next entry respawns it.
@@ -1413,7 +1533,7 @@ local function start_gameplay_loops()
     -- Periodic re-index + force re-apply every 5s. The re-index catches
     -- bookcases that may have lazy-spawned. The force re-apply is a safety
     -- net for any visibility drift (rare but observed). Both are cheap.
-    LoopAsync(5000, function()
+    gt_loop("warding_maint", 5000, function()
         local IA = package.loaded["AP/ItemApply"]
         if not IA then return false end
         -- Keep running during the post-connect pre-apply window too, so
@@ -1427,7 +1547,7 @@ local function start_gameplay_loops()
         pcall(bh_report_periodic)        -- ~30s [book-hook] count report
         pcall(function() IA.refresh_index_if_changed() end)   -- catch lazy-spawned bookcases
         pcall(function() IA._apply_bookcases_to_world() end)  -- Layer 2 bookcase ward
-        pcall(apply_book_visibility)                          -- Layer 3 HISM pile mask (async)
+        pcall(apply_book_visibility)                          -- Layer 3 HISM pile mask
         -- Actor-state reconcile: Layer 3's continuous counterpart for the BP_GrabbingBook ACTOR.
         -- Re-asserts collision + SM_Book_1 mesh on unwarded books whose flags drifted (heals
         -- visible-not-grabbable + grabbable-invisible). Read-before-write, gated BOOK_ACTOR_RECONCILE.
@@ -1439,7 +1559,7 @@ local function start_gameplay_loops()
     -- Periodic milestone / level sync (3s). Book-placement milestones key off InsertedBookNum,
     -- which grows without finishing rows; the FinishRow hook would miss those until the next row.
     -- Level-ups are event-driven (OnLevelUp), so this poll is mostly milestones.
-    LoopAsync(3000, function()
+    gt_loop("sync", 3000, function()
         local IA = package.loaded["AP/ItemApply"]
         if not IA then return false end
         -- Stop only when fully out of gameplay/pre-apply (returning true ENDS the loop). Don't
@@ -1492,7 +1612,7 @@ local function start_gameplay_loops()
     -- reads stale (spurious milestone/level checks on a fresh New Game). Movement only becomes
     -- possible once the new save takes over in memory, so use it as the baseline-sync trigger.
     local title_pos = nil
-    LoopAsync(500, function()
+    gt_loop("first_move", 500, function()
         local IA = package.loaded["AP/ItemApply"]
         if not IA then return false end
         if not IA._gameplay_active then return true end          -- exit on title return
@@ -1563,7 +1683,7 @@ end
 -- player has picked a save. We poll once per second and activate/deactivate
 -- on transitions.
 local _prev_selected_level = -1
-LoopAsync(1000, function()
+gt_loop("selected_level", 1000, function()
     local gi = FindFirstOf("BP_LibrarianGameInstance_C")
     if not gi or not gi:IsValid() then return false end
     local selected = -1
@@ -1579,6 +1699,24 @@ LoopAsync(1000, function()
         _prev_selected_level = selected
     end
     return false
+end)
+
+-- LoadMap PRE-hook: fires as UEngine::LoadMap begins, BEFORE the old world is torn down -- the only
+-- signal that LEADS the world-free on every transition (New Game, Continue, quit-to-title, and the
+-- forced connect-time reload). Disarm the cross-frame warding resumes here: an L1 (book-flush) or L3
+-- (book-pile HISM) resume closure captured the OLD world's actor/HISM arrays, and firing it after the
+-- free is a native access violation pcall can't catch. The epoch guard and the 1Hz SelectedLevel
+-- watcher both LAG the free (the epoch only bumps on M01 ENTRY via reset_hism_state; apply_safe drops
+-- ~1s later on the watcher), so those guards miss the leave side -- this closes it. Runs on the game
+-- thread (LoadMap is game-thread), so clearing these here is not a cross-thread write.
+RegisterLoadMapPreHook(function()
+    _l3_resume = nil
+    _b2_running = false
+    local IA = package.loaded["AP/ItemApply"]
+    if IA then
+        IA._l1_resume = nil
+        pcall(function() IA.set_apply_safe(false) end)
+    end
 end)
 
 RegisterLoadMapPostHook(function(Engine, World)
@@ -1800,13 +1938,17 @@ local function on_title_load_game_pressed(self)
 
     -- Force gameplay activation next tick in case LoadMap never fires. Delay so the widget's own
     -- handler (level transition / UI hide) runs first.
-    LoopAsync(100, function()
-        local IA = package.loaded["AP/ItemApply"]
-        if APClient and APClient._slot_connected and IA and not IA._gameplay_active then
-            activate_gameplay("WBP_Title.LoadGame button → forced")
-        end
-        return true  -- one-shot
-    end)
+    if POLL_GT then
+        _gt_pending_activate = "WBP_Title.LoadGame button → forced"   -- single-thread: activate on the pawn tick
+    else
+        LoopAsync(100, function()
+            local IA = package.loaded["AP/ItemApply"]
+            if APClient and APClient._slot_connected and IA and not IA._gameplay_active then
+                activate_gameplay("WBP_Title.LoadGame button → forced")
+            end
+            return true  -- one-shot
+        end)
+    end
 end
 
 local function on_title_start_game_pressed(self)
@@ -1819,16 +1961,20 @@ local function on_title_hide_menu(self)
         tostring(read_save_slot()), snapshot_save_data()))
     -- Belt-and-suspenders: also activate on HideTitleMenu (covers both
     -- Continue and StartGame paths). activate_gameplay is idempotent.
-    LoopAsync(150, function()
-        local APClient = package.loaded["AP/APClient"]
-        if APClient and APClient._slot_connected then
-            local IA = package.loaded["AP/ItemApply"]
-            if IA and not IA._gameplay_active then
-                activate_gameplay("WBP_Title.HideTitleMenu → forced")
+    if POLL_GT then
+        _gt_pending_activate = "WBP_Title.HideTitleMenu → forced"   -- single-thread: activate on the pawn tick
+    else
+        LoopAsync(150, function()
+            local APClient = package.loaded["AP/APClient"]
+            if APClient and APClient._slot_connected then
+                local IA = package.loaded["AP/ItemApply"]
+                if IA and not IA._gameplay_active then
+                    activate_gameplay("WBP_Title.HideTitleMenu → forced")
+                end
             end
-        end
-        return true
-    end)
+            return true
+        end)
+    end
 end
 
 -- Once per session: a 12s title-screen notification with mod/game version + compatibility marker.
@@ -1859,6 +2005,50 @@ local function on_title_construct(self)
     end)
 end
 
+-- Stage-2 master game-thread scheduler body. Runs in main.lua scope (sees all module locals) and is
+-- published to _G so the ReceiveTick hook callback can reach it regardless of hook-state visibility.
+-- Every frame: poll+apply the AP client, drain a deferred title activation + a deferred L1 re-flush,
+-- then drive all the throttled periodic steps (apply-gate / settle / warding / sync / SelectedLevel).
+_G._librarian_gt_master_tick = function(dt_ms)
+    local c = package.loaded["AP/APClient"]
+    if not (c and c._poll_on_game_thread) then return end
+    c._gt_tick_count = (c._gt_tick_count or 0) + 1
+    pcall(function() c:_tick_once() end)                 -- create + poll + outgoing + item-apply
+    if _gt_pending_activate then                         -- title-button activation, on the game thread
+        local reason = _gt_pending_activate; _gt_pending_activate = nil
+        pcall(function() activate_gameplay(reason) end)
+    end
+    local IA = package.loaded["AP/ItemApply"]
+    if IA then
+        -- World-reload safety for the cross-frame warding resumes (L1 book actors, L3 book-pile HISMs).
+        -- Each resume closure captured the OLD world's actor/HISM arrays; firing it across a LoadMap is a
+        -- use-after-free the epoch guard alone can't catch in time (the async pump used to drop stale
+        -- marshals; inline per-frame drive lost that net). So: (1) drop both resumes + release L3's pass
+        -- lock the instant the world epoch bumps, and (2) only drive them while the world is confirmed
+        -- stable (apply_safe) -- during a LoadMap sublevels are still streaming/freeing, exactly when the
+        -- captured arrays go dangling and apply_safe is false.
+        local ep = IA._world_epoch or 0
+        if ep ~= _gt_last_epoch then
+            _gt_last_epoch = ep
+            _l3_resume = nil
+            _b2_running = false
+            IA._l1_resume = nil
+        end
+        if IA._apply_safe then
+            if IA._l1_resume then pcall(IA._l1_resume) end   -- one L1 warding chunk / frame
+            if _l3_resume then pcall(_l3_resume) end          -- one L3 book-pile HISM chunk / frame
+        end
+        if IA._flush_reflush_pending then                    -- L1 finalizer re-fire (no marshal to nest now)
+            IA._flush_reflush_pending = false
+            pcall(function() IA.flush_apply() end)
+        end
+    end
+    gt_run_steps(dt_ms)                                      -- apply-gate / settle / warding / sync / etc.
+    if (c._gt_tick_count % 600) == 0 then
+        log(("[gt-tick] master driver (fires=%d, steps=%d)"):format(c._gt_tick_count, #_gt_step_order))
+    end
+end
+
 -- BP-path hooks: defer to first LoadMap so the BP class is loaded.
 -- (register_bp_hooks_once was forward-declared above near the LoadMap hook.)
 local bp_hooks_registered = false
@@ -1866,6 +2056,27 @@ register_bp_hooks_once = function()
     if bp_hooks_registered then return end
     local ok1 = hook_safe("/Game/Librarian/Blueprints/Character/BP_LibrarianCharacter.BP_LibrarianCharacter_C:OnLevelUp",
         "OnLevelUp (BP)", on_level_up_bp)
+
+    -- Single-thread crash-fix driver (Stage 1, gated POLL_ON_GAME_THREAD). Registered ONLY when the
+    -- flag is on, so the default build gains ZERO per-frame overhead. A per-frame GAME-THREAD pawn
+    -- tick drives the AP client (create + poll + apply) so it no longer races the async LoopAsync --
+    -- that concurrency (two threads in one lua_State) is what corrupts the VM. Fetch APClient via
+    -- package.loaded each fire; hook callbacks can't see main.lua's local APClient.
+    if POLL_GT then
+        hook_safe(
+            "/Game/Librarian/Blueprints/Character/BP_LibrarianCharacter.BP_LibrarianCharacter_C:ReceiveTick",
+            "BP_LibrarianCharacter.ReceiveTick (master driver)",
+            function(self, DeltaSeconds)
+                local dt = 16
+                pcall(function()
+                    local d = DeltaSeconds and DeltaSeconds:get()
+                    if d and d > 0 then dt = d * 1000 end
+                end)
+                local f = _G._librarian_gt_master_tick
+                if f then f(dt) end
+            end)
+    end
+
     -- Title-widget hooks. Use hook_safe since the BP class may not be loaded
     -- yet on first attempt; we'll retry on subsequent LoadMaps.
     hook_safe(
@@ -2290,6 +2501,13 @@ end
 -- Initialize the client (loads config + starts LoopAsync poll thread).
 -- Connection is NOT triggered automatically — press F12 to connect.
 APClient:init(AP_CONFIG_PATH)
+-- Stage 1 single-thread fix: when POLL_ON_GAME_THREAD is on, the game-thread pawn tick (registered in
+-- register_bp_hooks_once) owns AP client create+poll+apply; the async loop stays idle while it fires.
+-- Both consult APClient._poll_on_game_thread.
+APClient._poll_on_game_thread = diag_on("POLL_ON_GAME_THREAD")
+if APClient._poll_on_game_thread then
+    log("[single-thread] POLL_ON_GAME_THREAD ON -- AP client will poll on the BP_LibrarianCharacter game-thread tick")
+end
 
 -- Initial HUD status. Wait briefly so the world exists for PrintString's WorldContextObject.
 LoopAsync(2000, function()
