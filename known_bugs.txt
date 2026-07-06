@@ -86,17 +86,19 @@ Book visibility edge cases (rare ~3/3072 over a 1-4h run; ADDRESSED in v1.1.0-be
   LUA-STATE race. UE4SS runs the mod's Lua on a background thread, yet RegisterHook callbacks AND the pump's async
   ExecuteInGameThread closures run Lua on the GAME thread -- so game-thread Lua iterating/allocating against the
   same Lua tables the mod thread rewrites (e.g. the SetActorVisible hook walking _series_unlocked while an item
-  arrival rebuilt it) corrupts the Lua heap -> a next/compare error or a UE4SS abort(). rc4 FIXES this: the game
-  thread now only reads immutable mod-thread snapshots, atomically-swapped tables, or scalar flags
-  (snapshot-before-marshal for the L1/L2 pump passes; a precomputed _unwarded_snapshot for the hooks;
-  FinishRow/SaveGameData/OnLevelUp progress writes deferred to the 3s mod loop). Field-validated clean by the
-  maintainer. The return-to-menu teardown FREEZE remains a separate, still-open follow-up (the world-epoch guard +
-  queue-flush prevent the CRASH there, but the Menu->Continue freeze is not yet mitigated).
+  arrival rebuilt it) corrupts the Lua heap -> a next/compare error or a UE4SS abort(). rc4 patched the mod-thread
+  side (the game thread reads only immutable snapshots / atomically-swapped tables / scalar flags), but the root
+  cause was two threads driving one Lua state at all. 1.1.0 (the single-thread rewrite, shipped in rc5 and
+  validated crash-free by testers) removes the cause: the AP client, item-apply, and all warding now run on ONE
+  thread (the BP_LibrarianCharacter pawn tick; POLL_ON_GAME_THREAD), so there is one Lua executor and no
+  cross-thread corruption. Bookcase warding is also mid-stream-safe now (bounded component reads, per-element
+  IsValid, no MarkRenderStateDirty), which closed the connect-time crash. The return-to-menu teardown FREEZE
+  remains a separate, still-open follow-up (a transient hang on the Menu->Continue path, not a crash).
 
   REPORTING (on the 1.1.0 build, please): if you crash or freeze, send the crash-report folder, especially:
     - Mods/Librarian-AP/crash_trace.log   (breadcrumb ledger -- the TAIL names the last mod op before death)
     - .../Win64/UE4SS.log                  (last 100-200 lines)
     - one line on what you were doing (placing a row, returning to menu, walking a shelf, ...)
-  Confirm the trace header says mod=1.1.0-rc4 (older builds don't help). If you crash, the crash_trace tail +
+  Confirm the trace header says mod=1.1.0 (matches your installed build). If you crash, the crash_trace tail +
   the UE4SS.log tail (look for a Lua 'next'/'compare' traceback or an 'abort') tell us whether a game-thread
   shared-table access slipped through.

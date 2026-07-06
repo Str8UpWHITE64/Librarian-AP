@@ -2,6 +2,25 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.0 — 2026-07-06
+
+First stable release of the 1.1.0 line, promoting `1.1.0-rc5` after a zero-crash field cycle. The shipping Lua is
+the build testers validated; the only changes from rc5 are the version label and the addition of game build
+**1.0.11** to the recognized/tested versions (a display-only list — untested builds still run, just marked as such).
+
+What the 1.1.0 line delivers over 1.0.x:
+- **The long-standing native crash is fixed** — the single-thread rewrite (AP client, item-apply, and all warding on
+  one thread) plus mid-stream-safe bookcase warding.
+- **Book hiding is fully working** — locked books stay hidden cleanly, and the fences in front of locked shelves are
+  replaced by a per-section status light: red = no shelves unlocked yet, yellow = some unlocked, off = fully
+  unlocked.
+- **Check accuracy fixed** — completions no longer send the wrong check, and a row/shelf only counts as complete
+  when its books are actually in order (no false completions from out-of-order placement).
+- General stability hardening across connect, item bursts, and shelf-walking.
+
+Known open item: a rare **return-to-menu freeze** — a transient hang (not a crash) on the Menu→Continue path after a
+heavy ward pass. Documented; a follow-up for a later release.
+
 ## 1.1.0-rc5 — 2026-07-01
 
 Fifth release candidate. Headline: the **single-thread rewrite**. The rc4 crash — an intermittent native access
