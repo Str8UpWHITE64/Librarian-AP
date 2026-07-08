@@ -1,29 +1,22 @@
 """
 Librarian: Tidy Up the Arcane Library -- Archipelago options.
 
-Extra options can be added without breaking existing yamls because
-Options dataclasses use positional fields by name only.
+Options match yaml keys by name, so the order here is cosmetic: goal ->
+progression shape -> visibility / quality-of-life -> niche.
 """
 
 from dataclasses import dataclass
 
-from Options import Choice, Range, Toggle, PerGameCommonOptions
+from Options import Choice, Range, Toggle, DefaultOnToggle, PerGameCommonOptions
 
 
 class Goal(Choice):
     """How much of the library must be tidied to win.
 
-    floor_1   -- Complete Floor 1 only (sections 1A-1N, ~176 rows).
-                 The Floor 2 sections are removed from the item / location
-                 pool entirely.
-    full      -- Complete the entire library, both floors (default).
-                 Goal fires when the game's own EndGame event triggers
-                 (i.e. you walk through the final door after all 400 rows).
-    custom    -- Goal fires after a configurable number of rows. See
-                 custom_goal_row_count. Pool stays full (all 400 rows
-                 remain checkable; player may continue past the goal).
-    floor_2   -- Complete Floor 2 only (sections 2A-2Q, ~224 rows).
-                 The Floor 1 sections are removed from the pool entirely."""
+    full    -- Complete the whole library, both floors (default).
+    floor_1 -- Complete Floor 1 only (1A-1N); Floor 2 leaves the pool.
+    floor_2 -- Complete Floor 2 only (2A-2Q); Floor 1 leaves the pool.
+    custom  -- Win after custom_goal_row_count rows; the full pool stays checkable."""
     display_name = "Goal"
 
     option_full = 0
@@ -34,11 +27,8 @@ class Goal(Choice):
 
 
 class CustomGoalRowCount(Range):
-    """Number of shelf rows needed to win when goal=custom.
-
-    Has no effect for any other goal option. Standard AP Range options
-    apply: you can also use 'random', 'random-low', 'random-high' in
-    your YAML."""
+    """Rows needed to win when goal = custom. Ignored for every other goal.
+    Accepts 'random', 'random-low', 'random-high' in your yaml."""
     display_name = "Custom Goal Row Count"
     range_start = 1
     range_end = 400
@@ -46,11 +36,8 @@ class CustomGoalRowCount(Range):
 
 
 class StartingSeriesCount(Range):
-    """How many series the player begins with unlocked.
-
-    The starting set is randomized per seed but is guaranteed to include
-    at least one series whose shelf row is on the starting bookcase, so the
-    player can always make their first check immediately."""
+    """How many series you begin with unlocked. Always includes at least one whose
+    row is on the starting bookcase, so your first check is available right away."""
     display_name = "Starting Series Count"
     range_start = 5
     range_end = 25
@@ -58,55 +45,67 @@ class StartingSeriesCount(Range):
 
 
 class SeriesPerUnlock(Range):
-    """How many series each Progressive Series Unlock item reveals.
-
-    Lower values mean more granular gating (more items, each smaller in
-    impact). Higher values mean fewer items, each more impactful.
-
-    Minimum is 3 -- values below 3 produce a deep linear progression chain
-    that fill struggles to route on tight configs (multi-player,
-    accessibility: minimal, low custom_goal_row_count). At 3 the chain
-    depth caps at 134, which fill handles reliably across all tested
-    goal / accessibility / player-count combinations.
-    """
+    """How many series each Progressive Series Unlock reveals. Lower means more
+    unlocks with smaller impact; higher means fewer, bigger ones. (Below 3 makes a
+    long unlock chain that's hard to place in tight seeds, so 3 is the minimum.)"""
     display_name = "Series Per Unlock"
     range_start = 3
     range_end = 10
     default = 5
 
 
-class OnlyUnwardShelfableBooks(Toggle):
-    """Require BOTH the series unlock AND its target bookcase before books
-    are pickable.
+class IndividualSeriesItems(Toggle):
+    """Make each series its own item instead of grouped Progressive Series Unlocks.
 
-    Off (default): a book becomes pickable as soon as its series has been
-    received, regardless of whether its bookcase is open yet. The player
-    can pick books up and stash them on any open shelf -- mis-shelving and
-    moving them later is part of the loop.
+    Off (default): series unlock in groups of series_per_unlock.
+    On: each of the ~400 series is its own "Series Unlock: <series>" item -- more
+    granular, larger pool. Every bookcase starts open. Not supported with goal = custom."""
+    display_name = "Individual Series Items"
+    default = 0
 
-    On: a book stays warded until both its series is received AND the
-    bookcase it belongs in has been unlocked. Stricter logic; book-
-    placement milestones fire later in seeds where shelf and series
-    unlocks are spread apart, since the player can't pick anything up
-    until both have arrived for at least one row.
-    """
-    display_name = "Only Unward Shelfable Books"
+
+class BookSanity(Toggle):
+    """Make every individual book its own item and its own check (~3072 of each).
+
+    Off (default): checks are per shelf-row (a whole series).
+    On: each "Book: <series> Vol N" item unlocks that book, and placing it on the
+    correct shelf is its own check. Every bookcase starts open. Can't be combined
+    with individual_series_items. Not supported with goal = custom."""
+    display_name = "BookSanity"
     default = 0
 
 
 class BookVisibility(Choice):
-    """How books from locked series appear before you've unlocked them.
+    """How books from locked series look before you unlock them.
 
-    hidden -- locked books are invisible AND non-grabbable; the library
-              visibly fills in as you unlock series. Default. (The mod hides
-              the book actors + their cosmetic pile instances.)
-    stacks -- locked books stay VISIBLE (preserving shelf density) but are
-              non-grabbable -- you walk through them. Nothing is hidden, so
-              none of the hide-path edge cases can occur. Pick this if you
-              prefer a full-looking library or want to avoid hide glitches."""
+    hidden -- locked books are invisible and non-grabbable; the library fills in as
+              you unlock series (default).
+    stacks -- locked books stay visible but non-grabbable -- you walk through them.
+              Pick this for a full-looking library or to avoid any hide glitches."""
     display_name = "Book Visibility"
     option_hidden = 0
     option_stacks = 1
+    default = 0
+
+
+class LocalFiller(DefaultOnToggle):
+    """Keep this game's filler items in your own world.
+
+    On (default): Librarian filler fills your own locations instead of scattering
+    into other players' worlds; your meaningful items still circulate. Recommended,
+    since Librarian adds a lot of checks.
+    Off: filler is distributed across the multiworld like anything else.
+    Has no effect in a solo game."""
+    display_name = "Local Filler"
+
+
+class OnlyUnwardShelfableBooks(Toggle):
+    """Require both the series unlock AND its bookcase before a book is pickable.
+
+    Off (default): a book is pickable as soon as its series arrives -- you can stash
+    it on any open shelf and move it later.
+    On: stricter -- a book stays warded until its series and its bookcase are both open."""
+    display_name = "Only Unward Shelfable Books"
     default = 0
 
 
@@ -116,5 +115,8 @@ class LibrarianOptions(PerGameCommonOptions):
     custom_goal_row_count: CustomGoalRowCount
     starting_series_count: StartingSeriesCount
     series_per_unlock: SeriesPerUnlock
-    only_unward_shelfable_books: OnlyUnwardShelfableBooks
+    individual_series_items: IndividualSeriesItems
+    book_sanity: BookSanity
     book_visibility: BookVisibility
+    local_filler: LocalFiller
+    only_unward_shelfable_books: OnlyUnwardShelfableBooks

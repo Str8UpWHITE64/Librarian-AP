@@ -7,13 +7,12 @@ Location pool composition (554 real + 1 goal event = 555 entries):
         One per series. Fires when the series is correctly placed.
         Name format: "Shelf: <SectionId> - <Series Name>"
 
-    Row Completions (72)
+    Row Completions
         Cumulative row-completion-count milestones. Fires when the player
         has correctly completed N total rows (any combination of series).
         Hand-tuned distribution — dense early, sparser late — to balance
         coverage against per-rule fill cost (each rule calls
-        feasible_rows, which is O(active_sections)). Expanded from 50 to
-        72 in v1.0.3 to replace the 22 removed book-placement milestones.
+        feasible_rows, which is O(active_sections)).
         Name format: "Complete <N> Rows"
 
     Section Completions (31)
@@ -38,11 +37,11 @@ Location pool composition (554 real + 1 goal event = 555 entries):
 
 Defined but NOT in the active pool:
 
-    Milestones (22, removed in v1.0.3)
+    Milestones (22)
         Cumulative book-placement thresholds. Any book on a shelf counts —
-        correct placement isn't required. Removed from _all_locations in
-        v1.0.3; the 22 slots were replaced by additional row-completion
-        thresholds. Definitions retained for possible future re-enable.
+        correct placement isn't required. Not in _all_locations; their slots
+        were replaced by additional row-completion thresholds. Definitions
+        retained for possible future re-enable.
 
 ID layout within LOCATION_ID_BASE:
     1–499      Shelf rows (400 used: 1..400; 401-499 reserved for future)
@@ -50,9 +49,9 @@ ID layout within LOCATION_ID_BASE:
     550–559    Floor completions (2 used: 550-551)
     560–619    Level-ups (45 used: 560..604)
     620–639    Chest openings (4 used: 620..623)
-    640–679    Milestones (22 used: 640..661; 662-679 reserved for future;
-                            defined but not in active pool as of v1.0.3)
-    1000–1199  Row completions (72 used: 1000..1071; 1072-1199 reserved)
+    640–679    Milestones (22 used: 640..661; 662-679 reserved; defined but
+                            not in the active pool)
+    1000–1199  Row completions (1000..1071; 1072-1199 reserved)
 """
 
 from enum import IntEnum
@@ -79,6 +78,10 @@ class LibrarianLocationCategory(IntEnum):
                          # check as primary row locations). Lua client
                          # tracks total rows completed and fires each
                          # threshold.
+    BOOK           = 9   # book_sanity: one per book. Fires when that book is
+                         # placed correctly. Access rule: has(that book's item).
+    BOOK_COMPLETION = 10 # book_sanity cumulative books-placed-correctly count.
+                         # Access rule: feasible_books(state) >= N.
 
 
 class LibrarianLocationData(NamedTuple):
@@ -120,14 +123,20 @@ for _section in data.SECTIONS:
         _row_idx += 1
 
 
-# --- Row-completion count milestones: 72 entries (1000..1071) ---
+# --- Row-completion count milestones (1000..) ---
 #
 # Fires when the player has correctly completed N total rows (any series).
-# Hand-tuned distribution: very dense early (where fill benefits most
-# from extra sphere-0/1 slots), sparser late. Each rule calls
-# feasible_rows() (O(active_sections)) — count kept modest for multi-
-# player gen speed. Expanded from 50 to 72 in v1.0.3 to replace the 22
-# removed book-placement slots (every row 1-20, every-5 through 100).
+# Each 'Complete N Rows' is gated on feasible_rows(state) >= N -- a fillable
+# location reachable only once N distinct series are held. In
+# individual_series_items mode a deep threshold opens only in a late fill
+# sphere, and a swarm of those late count-gated slots drives a cross-player
+# swap-storm; that mode pre-fills them locally (see LibrarianWorld.pre_fill) so
+# the shared fill only routes into shallow row locations. Grouped (default) mode
+# leaves them in the normal fill, where cached feasible_rows keeps them cheap.
+# These checks are load-bearing, not filler padding: they are the shallow
+# count-gated locations that let fill route the deep series-unlock chain.
+# Removing them breaks fill on tight configs; cut filler on the item side
+# instead. Kept in full.
 ROW_COMPLETION_THRESHOLDS: tuple[int, ...] = (
     # Every row 1-20 (densest part — most fill routing happens here)
     1,   2,   3,   4,   5,   6,   7,   8,   9,  10,
@@ -226,11 +235,52 @@ _goal_locations: list[LibrarianLocationData] = [
 
 
 # --- Combined ---
-# v1.0.3: _milestone_locations no longer added to _all_locations — the
-# 22 book-placement milestones were replaced by 22 additional row-
-# completion thresholds. MILESTONE_THRESHOLDS + _milestone_locations
-# stay defined above so future code can opt back in.
+# _milestone_locations no longer added to _all_locations — the book-placement
+# milestones were replaced by additional row-completion thresholds.
+# MILESTONE_THRESHOLDS + _milestone_locations stay defined above so future
+# code can opt back in.
 
+# --- BookSanity: one book location per book + book-completion milestones ---
+#
+# One location per individual book (volume), created only when book_sanity is
+# on. Fires when that book is placed on its correct shelf. Gated on has(the
+# book's own item) -- depth-1, so the shared fill stays flat. Global order
+# matches data.ALL_BOOKS.
+def _book_name(section_id: str, series_name: str, chapter: int) -> str:
+    return f"Book: {section_id} - {series_name} Vol {chapter + 1}"
+
+
+_book_locations: list[LibrarianLocationData] = [
+    LibrarianLocationData(
+        _book_name(_section_id, _series_name, _chapter),
+        2000 + _idx,
+        LibrarianLocationCategory.BOOK,
+    )
+    for _idx, (_asset_idx, _chapter, _section_id, _series_name)
+    in enumerate(data.ALL_BOOKS)
+]
+
+# Cumulative "Complete N Books" milestones (book_sanity). Dense early, sparse
+# late; count kept modest to bound the deep-lock. Access rule:
+# feasible_books(state) >= N.
+BOOK_COMPLETION_THRESHOLDS: tuple[int, ...] = (
+    5,   10,   25,   50,   75,  100,  150,  200,  300,  400,
+    500, 650,  800, 1000, 1200, 1400, 1600, 1800, 2000, 2200,
+    2400, 2600, 2800, 2900, 3000, 3050, 3072,
+)
+
+_book_completion_locations: list[LibrarianLocationData] = [
+    LibrarianLocationData(
+        f"Complete {_thresh} Books",
+        5100 + _idx,
+        LibrarianLocationCategory.BOOK_COMPLETION,
+    )
+    for _idx, _thresh in enumerate(BOOK_COMPLETION_THRESHOLDS)
+]
+
+
+# _all_locations is the master union across ALL modes (drives the name->id map);
+# create_regions/create_items pick the active subset per option.
 _all_locations: list[LibrarianLocationData] = (
     _row_locations
     + _row_completion_locations
@@ -238,6 +288,8 @@ _all_locations: list[LibrarianLocationData] = (
     + _floor_locations
     + _levelup_locations
     + _chest_locations
+    + _book_locations
+    + _book_completion_locations
     + _goal_locations
 )
 
@@ -258,6 +310,8 @@ location_name_groups: dict[str, set[str]] = {
     "Level-Ups":       {loc.name for loc in _levelup_locations},
     "Chests":          {loc.name for loc in _chest_locations},
     "Milestones":      {loc.name for loc in _milestone_locations},
+    "Books":           {loc.name for loc in _book_locations},
+    "Book Completions": {loc.name for loc in _book_completion_locations},
     "Goal":            {loc.name for loc in _goal_locations},
 }
 
@@ -309,15 +363,23 @@ def chest_open_name(chest_name: str) -> str:
 # ============================================================================
 
 assert len(_row_locations) == 400, f"Expected 400 row locations, got {len(_row_locations)}"
-assert len(_row_completion_locations) == 72, f"Expected 72 row-completion locations, got {len(_row_completion_locations)}"
+assert len(_row_completion_locations) == len(ROW_COMPLETION_THRESHOLDS)
 assert len(_section_locations) == 31
 assert len(_floor_locations) == 2
 assert len(_levelup_locations) == 45
 assert len(_chest_locations) == 4
 assert len(_milestone_locations) == 22
 assert len(_goal_locations) == 1
-assert total_real_locations() == 554, f"Expected 554 real locations, got {total_real_locations()}"
-assert total_locations() == 555
+assert len(_book_locations) == 3072, f"Expected 3072 book locations, got {len(_book_locations)}"
+assert len(_book_completion_locations) == len(BOOK_COMPLETION_THRESHOLDS)
+# Real location count derives from the (tunable) threshold sets. The master
+# union includes both row-mode and book-mode locations; create_regions only
+# instantiates the active subset per option.
+_expected_real = (400 + len(ROW_COMPLETION_THRESHOLDS) + 31 + 2 + 45 + 4
+                  + len(_book_locations) + len(BOOK_COMPLETION_THRESHOLDS))
+assert total_real_locations() == _expected_real, \
+    f"Expected {_expected_real} real locations, got {total_real_locations()}"
+assert total_locations() == _expected_real + 1
 
 # Codes unique
 _codes = [loc.code for loc in _all_locations if loc.code is not None]
@@ -336,6 +398,8 @@ for cat, lo, hi in [
     (LibrarianLocationCategory.CHEST,      620,  639),
     (LibrarianLocationCategory.MILESTONE,      640,  679),
     (LibrarianLocationCategory.ROW_COMPLETION, 1000, 1199),
+    (LibrarianLocationCategory.BOOK,           2000, 5099),
+    (LibrarianLocationCategory.BOOK_COMPLETION, 5100, 5299),
 ]:
     for loc in _all_locations:
         if loc.category == cat:

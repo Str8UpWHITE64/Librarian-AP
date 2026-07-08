@@ -120,6 +120,22 @@ local function _bh_series(book_obj)
     return aidx, IA._asset_to_series[aidx]
 end
 
+-- BookSanity: true when this book's own per-book item has arrived (no series is
+-- unlocked in book mode, so this is what unwards it). Reads the atomic
+-- _books_unlocked; game-thread safe (single lookup + a pcall Chapter read).
+local function _bh_book_unlocked(book_obj, series)
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._book_sanity_enabled and series) then return false end
+    local bu = IA._books_unlocked
+    if not bu then return false end
+    local chapter = nil
+    pcall(function()
+        local info = book_obj.ItemInfo
+        if info and info:IsValid() then chapter = tonumber(info.Chapter) end
+    end)
+    return chapter ~= nil and bu[series .. "|" .. chapter] == true
+end
+
 local function _bh_sample(tag, book_obj, extra)
     if _bh.samples >= 15 then return end
     _bh.samples = _bh.samples + 1
@@ -321,7 +337,7 @@ local function _bh_grab_check(b, tag)
         -- _compute_unwarded_set here races _recompute_state -> the rc3 crash. See
         -- ItemApply._unwarded_snapshot.
         local uw = IA._unwarded_snapshot
-        unwarded_here = uw and uw[series] or false
+        unwarded_here = (uw and uw[series]) or _bh_book_unlocked(b, series) or false
     end
     -- BROKEN = any signal that renders an unwarded book invisible/unpickable: meshZ far from
     -- actorZ (deep-Z hide), opacity<1 (stuck-transparent MID), scaleX~0, or the raw hide flags.
@@ -453,9 +469,13 @@ local function try_register_book_hooks()
                     -- GAME THREAD: read the precomputed snapshot (single lookup, no alloc/iterate).
                     -- Calling _compute_unwarded_set here is the rc3 crash (races _recompute_state).
                     local unwarded = IA._unwarded_snapshot
+                    -- Show if the series is unwarded OR (book_sanity) this book's own item
+                    -- arrived -- else the game's show call re-hides it every time it's looked at.
+                    local show_book = (unwarded and unwarded[series])
+                        or _bh_book_unlocked(b, series)
                     -- stacks mode (_book_hide_mode==false): warded actor stays visible, just
                     -- non-grabbable (collision is layer 1's job) -- never force-hide it.
-                    if IA._book_hide_mode ~= false and not (unwarded and unwarded[series]) then
+                    if IA._book_hide_mode ~= false and not show_book then
                         local set_ok = pcall(function() is_visible:set(false) end)
                         _bh.enforced = _bh.enforced + 1
                         if _bh.enf_samples < 10 then
@@ -475,7 +495,7 @@ local function try_register_book_hooks()
                 if rseries and IA and IA._unwarded_snapshot then
                     -- GAME THREAD: snapshot lookup only (see ENFORCE above / ItemApply._unwarded_snapshot).
                     local unwarded = IA._unwarded_snapshot
-                    if unwarded and unwarded[rseries] then
+                    if (unwarded and unwarded[rseries]) or _bh_book_unlocked(b, rseries) then
                         local sm; pcall(function() sm = b.SM_Book_1 end)
                         if sm and sm:IsValid() then
                             local mh, vis, op, mid
@@ -655,6 +675,11 @@ local function apply_book_visibility()
     -- stacks mode: leave the pile visible (warding is layer-1 collision-off only); skip pile hiding.
     -- (==false so a nil mode before slot_data arrives still runs the hide path.)
     if IA._book_hide_mode == false then return end
+    -- BookSanity: the whole-HISM mask is per-SERIES and can't isolate individual books, and hiding
+    -- every pile removes the backfill the game's actor<->pile toggle relies on (unlocked books then
+    -- flicker/vanish). Leave the piles visible here; locked books are hidden per-instance by
+    -- teleporting their pile instance to deep Z. Skip the series mask.
+    if IA._book_sanity_enabled then return end
     -- Snapshot the world epoch (bumped by reset_hism_state each LoadMap). The game-thread chunk
     -- re-checks it before touching the captured HISM array: if the world reloaded, the freed
     -- arr[hi] is a native AV pcall can't catch (the main-menu teardown crash).
@@ -1584,6 +1609,9 @@ local function start_gameplay_loops()
         -- Re-run row-completion detection: FinishRow only fires when the row count INCREASES, so a
         -- swap (remove a completed series, refill the slot with another) goes undetected. Idempotent.
         pcall(function() IA.detect_completed_rows() end)
+        -- BookSanity: fire per-book location checks for books newly placed correctly (reads each
+        -- book's "Is Abs Correct"). De-duped in ItemApply; no-op unless book_sanity is enabled.
+        pcall(function() IA.detect_correct_books() end)
         -- Row-threshold catch-up: re-fire any "Complete N Rows" threshold the save shows reached
         -- (catches a run_baseline_sync that ran with stale GameSaveData). Idempotent.
         pcall(function()
@@ -2632,93 +2660,17 @@ RegisterKeyBind(Key.F4, function()
     menu_toggle()
 end)
 
--- TEMP probe (F6): does any HISM PerInstanceCustomData float encode the book's AssetIdx/series?
--- If so we could hide warded books per-instance. Press F6 with the pile visible. Remove once answered.
-local function probe_customdata()
-    log("[cd-probe] === START ===")
-    local mgr = FindFirstOf("BP_HISM_Manager_C")
-    if not (mgr and mgr:IsValid()) then log("[cd-probe] no BP_HISM_Manager_C (load a save first)"); return end
-    local arr; pcall(function() arr = mgr.HISMArray end)
-    local hn = 0; if arr then pcall(function() hn = #arr end) end
-    if hn == 0 then log("[cd-probe] HISMArray empty"); return end
-
-    -- Ground truth: distinct AssetIdx values from book actors.
-    local books = FindAllOf("BP_GrabbingBook_C")
-    local bn = 0; if books then pcall(function() bn = #books end) end
-    local aset, acount, amin, amax = {}, 0, math.huge, -math.huge
-    for i = 1, bn do
-        local b = books[i]
-        if b and b:IsValid() then
-            local ai
-            pcall(function() local info = b.ItemInfo; if info and info:IsValid() then ai = info.AssetIdx end end)
-            if ai and ai >= 0 then
-                if not aset[ai] then aset[ai] = true; acount = acount + 1 end
-                if ai < amin then amin = ai end
-                if ai > amax then amax = ai end
-            end
-        end
+-- DEV: feasibility probe harness (AP/probe.lua). Loads only when diag PROBE_MODE is EXPLICITLY
+-- true -- diag_on() defaults missing flags to ON, so gate on the raw table value to keep the
+-- probe out of normal builds. Strip this block + AP/probe.lua before shipping.
+do
+    local _pok, _pf = pcall(require, "diag_flags")
+    if _pok and type(_pf) == "table" and _pf.PROBE_MODE == true then
+        local ok, err = pcall(function() require("AP/probe") end)
+        if ok then log("[probe] AP/probe loaded (PROBE_MODE on)")
+        else log("[probe] failed to load AP/probe: " .. tostring(err)) end
     end
-    log(("[cd-probe] %d book actors, %d distinct AssetIdx (range %s..%s)"):format(
-        bn, acount, tostring(amin), tostring(amax)))
-
-    -- Custom floats per instance = len(PerInstanceSMCustomData) / numInstances.
-    local NUM = 0
-    for hi = 1, hn do
-        local h; pcall(function() h = arr[hi] end)
-        if h and h:IsValid() then
-            local sn = 0; pcall(function() sn = #h.PerInstanceSMData end)
-            local cl = 0; pcall(function() cl = #h.PerInstanceSMCustomData end)
-            if sn > 0 and cl > 0 then NUM = math.floor(cl / sn); break end
-        end
-    end
-    if NUM == 0 then log("[cd-probe] no PerInstanceSMCustomData found"); return end
-    log(("[cd-probe] %d custom floats per instance"):format(NUM))
-
-    local dist, mn, mx, intlike, inA = {}, {}, {}, {}, {}
-    for k = 0, NUM-1 do dist[k]={}; mn[k]=math.huge; mx[k]=-math.huge; intlike[k]=true; inA[k]=0 end
-    local sampled, raw = 0, 0
-    local step = math.max(1, math.floor(hn / 80))   -- ~80 HISMs spread across the pile
-    for hi = 1, hn, step do
-        local h; pcall(function() h = arr[hi] end)
-        if h and h:IsValid() then
-            local sn = 0; pcall(function() sn = #h.PerInstanceSMData end)
-            local cd; pcall(function() cd = h.PerInstanceSMCustomData end)
-            if cd and sn > 0 then
-                for j = 0, sn-1 do
-                    local row = {}
-                    for k = 0, NUM-1 do
-                        local v = 0; pcall(function() v = cd[j*NUM + k + 1] end)
-                        v = tonumber(v) or 0
-                        row[k] = v
-                        dist[k][math.floor(v*100+0.5)/100] = true
-                        if v < mn[k] then mn[k]=v end
-                        if v > mx[k] then mx[k]=v end
-                        if math.abs(v - math.floor(v+0.5)) > 0.01 then intlike[k]=false end
-                        if aset[math.floor(v+0.5)] then inA[k]=inA[k]+1 end
-                    end
-                    sampled = sampled + 1
-                    if raw < 6 then
-                        raw = raw + 1
-                        local p = {}; for k=0,NUM-1 do p[#p+1]=string.format("%.2f", row[k]) end
-                        log(("[cd-probe] raw hi=%d j=%d: [%s]"):format(hi, j, table.concat(p, ",")))
-                    end
-                end
-            end
-        end
-    end
-    log(("[cd-probe] sampled %d instances"):format(sampled))
-    for k = 0, NUM-1 do
-        local dc = 0; for _ in pairs(dist[k]) do dc = dc + 1 end
-        log(("[cd-probe] cd[%2d] distinct=%-4d min=%-9.2f max=%-9.2f int=%-5s in_assetidx=%d/%d"):format(
-            k, dc, mn[k], mx[k], tostring(intlike[k]), inA[k], sampled))
-    end
-    log(("[cd-probe] === END (winner = a float with int=true, distinct~%d, in_assetidx~%d) ==="):format(acount, sampled))
 end
-
-RegisterKeyBind(Key.F6, function()
-    log("[F6] running custom-data probe")
-    pcall(probe_customdata)
-end)
 
 -- Poll for ModActor on startup and show the menu once. Subsequent shows
 -- are user-driven via F4 — auto-show on disconnect is handled in the

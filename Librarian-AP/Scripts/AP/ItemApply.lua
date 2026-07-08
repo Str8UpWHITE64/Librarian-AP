@@ -209,6 +209,18 @@ M._asset_to_series  = {}  -- { [asset_idx_int] = series_name_string }
 M._asset_to_section = {}  -- { [asset_idx_int] = section_id_string }
 M._asset_to_volumes = {}  -- { [asset_idx_int] = volume_count_int (3/5/10) }
 
+-- individual_series_items (set from slot_data in set_slot_data; defaults = grouped mode).
+M._individual_series_items = false
+M._series_item_to_series   = {}
+
+-- BookSanity: each book is its own item AND its own check (set from slot_data; defaults = off).
+-- Keys are the "<AssetIdx>|<Chapter>" the in-game book actor reports.
+M._book_sanity_enabled = false
+M._book_location_map   = {}  -- { ["<asset>|<chapter>"] = AP location id }
+M._book_item_to_book   = {}  -- { ["Book: <series> Vol N"] = { asset, chapter } }
+M._books_unlocked      = {}  -- { ["<asset>|<chapter>"] = true } from received book items
+M._books_correct_seen  = {}  -- de-dupe: books whose correct-placement check already fired
+
 -- AP-supplied per-seed data (set in set_slot_data()).
 M._slot_data = nil
 
@@ -415,6 +427,30 @@ function M.set_slot_data(slot_data)
         for sid, n in pairs(slot_data.bookcase_counts) do
             M._section_bookcase_count[sid] = tonumber(n) or 0
         end
+    end
+
+    -- individual_series_items: each received "Series Unlock: <name>" item unlocks its specific
+    -- series. Map item_name -> series_name (empty table for the grouped default path).
+    M._individual_series_items = (slot_data.individual_series_items == 1)
+    M._series_item_to_series = (type(slot_data.series_item_to_series) == "table")
+        and slot_data.series_item_to_series or {}
+
+    -- BookSanity: per-book items + per-volume checks. book_location_map ("<asset>|<chapter>" ->
+    -- loc id) fires the check when that book is placed correctly; book_item_to_book ("Book: ..."
+    -- -> {asset,chapter}) drives which book un-wards on receiving the item.
+    M._book_sanity_enabled = (slot_data.book_sanity == 1)
+    M._book_location_map = (type(slot_data.book_location_map) == "table")
+        and slot_data.book_location_map or {}
+    M._book_item_to_book = (type(slot_data.book_item_to_book) == "table")
+        and slot_data.book_item_to_book or {}
+    M._books_unlocked = {}
+    M._books_correct_seen = {}
+    if M._book_sanity_enabled then
+        local nloc, nitem = 0, 0
+        for _ in pairs(M._book_location_map) do nloc = nloc + 1 end
+        for _ in pairs(M._book_item_to_book) do nitem = nitem + 1 end
+        log(("[book-sanity] ENABLED: book_location_map=%d book_item_to_book=%d")
+            :format(nloc, nitem))
     end
 
     -- Build section_id → list of row location IDs from row_location_map keys
@@ -786,14 +822,26 @@ function M._recompute_state()
     -- old table or the whole new one, never a half-built one mid-pairs() (which corrupts the Lua heap
     -- across threads -> the rc3 'next'/'compare' errors + UE4SS abort). See _unwarded_snapshot.
 
-    -- Series: series_order[1..N*per_unlock]
+    -- Series: which series are unlocked. Two modes.
     local series_unlocked = {}
-    local series_count = M._received_counts["Progressive Series Unlock"] or 0
-    local per_unlock = M._slot_data.series_per_unlock or 5
-    local series_order = M._slot_data.series_order or {}
-    local total_series = math.min(series_count * per_unlock, #series_order)
-    for i = 1, total_series do
-        series_unlocked[series_order[i]] = true
+    if M._individual_series_items then
+        -- Per-series: each received "Series Unlock: <name>" item unlocks its series.
+        local map = M._series_item_to_series or {}
+        for item_name, count in pairs(M._received_counts) do
+            if count and count > 0 then
+                local sname = map[item_name]
+                if sname then series_unlocked[sname] = true end
+            end
+        end
+    else
+        -- Grouped (default): series_order[1..count*per_unlock].
+        local series_count = M._received_counts["Progressive Series Unlock"] or 0
+        local per_unlock = M._slot_data.series_per_unlock or 5
+        local series_order = M._slot_data.series_order or {}
+        local total_series = math.min(series_count * per_unlock, #series_order)
+        for i = 1, total_series do
+            series_unlocked[series_order[i]] = true
+        end
     end
 
     -- Shelf unlocks: per-section open_count = received count of that section's item.
@@ -805,10 +853,30 @@ function M._recompute_state()
         end
     end
 
+    -- BookSanity: which individual books are unlocked (per-book item received). Built into a local
+    -- and swapped atomically below, same thread-safety discipline as series_unlocked.
+    local books_unlocked = {}
+    if M._book_sanity_enabled then
+        local item_to_book = M._book_item_to_book or {}
+        for item_name, count in pairs(M._received_counts) do
+            if count and count > 0 then
+                local ac = item_to_book[item_name]   -- { series_name, chapter }
+                if type(ac) == "table"
+                        and type(ac[1]) == "string" and type(ac[2]) == "number" then
+                    books_unlocked[ac[1] .. "|" .. ac[2]] = true
+                end
+            end
+        end
+        local nb = 0
+        for _ in pairs(books_unlocked) do nb = nb + 1 end
+        log(("[book-sanity] _books_unlocked = %d books"):format(nb))
+    end
+
     -- Publish atomically (single reference assignment each), tables first so the snapshot below is
     -- computed from the fresh state.
     M._series_unlocked = series_unlocked
     M._shelves_open    = shelves_open
+    M._books_unlocked  = books_unlocked
     -- Precompute the read-only unwarded snapshot the game-thread hooks lookup against (no per-call
     -- alloc/iterate on the game thread). only_unward_shelfable_books is constant per session, so one
     -- snapshot in the active gating mode serves every hook. _compute_unwarded_set allocates here on
@@ -1105,6 +1173,12 @@ end
 -- Read by the warding/unward passes and the unlocked-state dump.
 M._books_warded = {}
 
+-- BookSanity per-book pile-hide tracker. Key "aidx|chapter" (one HISM instance = one volume) ->
+-- { hidden=bool, orig=<captured world FTransform table> }. A locked book's pile instance is
+-- teleported to deep Z (piles stay visible as the game's actor<->pile backfill). orig is captured
+-- once at rest for a clean restore on unlock. Cleared on world reload (reset_hism_state).
+M._book_inst_state = {}
+
 -- Drift probe: per case (keyed by GetFullName), the bHidden we last wrote. Compared before
 -- the next write to log [bookcase-drift] if the game's BP tick reverted our flag.
 M._case_last_applied_hidden = {}
@@ -1176,6 +1250,7 @@ function M.reset_hism_state()
     M._fast_stable = 0; M._fast_total = 0; M._fast_prev_case_n = nil   -- reset the button-gate readiness poller
     M._section_sorted_cache = nil   -- old world's case refs; rebuild the cached per-section sort next pass
     M._books_warded = {}
+    M._book_inst_state = {}
     M._unmapped_warded_books = {}
     M._last_applied_series_unlocked = {}
     M._case_last_applied_hidden = {}
@@ -1323,10 +1398,57 @@ function M._apply_books_to_world()
     local mod_actor = FindFirstOf("ModActor_C")
     if not (mod_actor and mod_actor:IsValid()) then mod_actor = nil end
 
-    -- Cache BP_HISM_Manager for UpdateWPO: WPO displaces book vertices via material param,
-    -- hiding at deep Z without touching bHidden (which the game toggles view-dependently).
-    local mgr_for_wpo = FindFirstOf("BP_HISM_Manager_C")
-    if not (mgr_for_wpo and mgr_for_wpo:IsValid()) then mgr_for_wpo = nil end
+    -- BookSanity per-book pile hide: cache the HISM manager's component array. A locked book's pile
+    -- instance is teleported to deep Z below (piles stay visible as the game's actor<->pile backfill).
+    -- Each series' HISM = HISMArray[aidx+1]; the instance at index==Chapter is that volume. nil
+    -- (feature off) unless book_sanity + hidden mode + the diag flag are all on.
+    local hism_arr
+    if M._book_sanity_enabled and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT") then
+        local mgr = FindFirstOf("BP_HISM_Manager_C")
+        if mgr and mgr:IsValid() then pcall(function() hism_arr = mgr.HISMArray end) end
+    end
+    -- Teleport one book's pile INSTANCE. hide=true: capture its rest transform (once) + move it to
+    -- deep Z; hide=false: restore the captured transform. Idempotent via M._book_inst_state, so the
+    -- ~2 actors sharing an instance only teleport it once. All calls are on the game thread (the
+    -- flush chunk) + pcall-guarded.
+    local function _teleport_inst(aidx, chapter, hide)
+        local ikey = aidx .. "|" .. chapter
+        local st = M._book_inst_state[ikey]
+        if hide then
+            if st and st.hidden then return end          -- already hidden
+        elseif not (st and st.hidden) then return end    -- not hidden -> nothing to restore
+        local comp; pcall(function() comp = hism_arr[aidx + 1] end)
+        if not (comp and comp:IsValid()) then return end
+        if hide then
+            -- Capture the instance's current WORLD transform (GetInstanceTransform fills the table).
+            local cap = {}
+            local got = false
+            pcall(function() got = comp:GetInstanceTransform(chapter, cap, true) end)
+            if not (got and cap.Translation) then return end
+            local ox, oy, oz, rx, ry, rz, rw, sx, sy, sz
+            pcall(function()
+                ox, oy, oz = cap.Translation.X, cap.Translation.Y, cap.Translation.Z
+                rx, ry, rz, rw = cap.Rotation.X, cap.Rotation.Y, cap.Rotation.Z, cap.Rotation.W
+                sx, sy, sz = cap.Scale3D.X, cap.Scale3D.Y, cap.Scale3D.Z
+            end)
+            if oz == nil then return end
+            local orig = { Translation = { X = ox, Y = oy, Z = oz },
+                           Rotation = { X = rx, Y = ry, Z = rz, W = rw },
+                           Scale3D = { X = sx, Y = sy, Z = sz } }
+            local deep = { Translation = { X = ox, Y = oy, Z = oz - 1000000.0 },
+                           Rotation = { X = rx, Y = ry, Z = rz, W = rw },
+                           Scale3D = { X = sx, Y = sy, Z = sz } }
+            local wok = pcall(function() comp:UpdateInstanceTransform(chapter, deep, true, true, true) end)
+            if wok then
+                M._book_inst_state[ikey] = { hidden = true, orig = orig }
+                stats.tp_hide = (stats.tp_hide or 0) + 1
+            end
+        else
+            local wok = pcall(function() comp:UpdateInstanceTransform(chapter, st.orig, true, true, true) end)
+            if wok then st.hidden = false; stats.tp_show = (stats.tp_show or 0) + 1 end
+        end
+    end
+
 
     -- Cache any valid BP_BookCase_C as a MoveToBookCase attachment target (it needs a
     -- non-null AttchedActor; any case works).
@@ -1391,6 +1513,20 @@ function M._apply_books_to_world()
         end
         local series_name = M._asset_to_series[asset_idx]
         local should_unward = series_name and unwarded_set[series_name]
+        -- BookSanity: read this book's Chapter once -- used for both the per-book unlock gate here
+        -- and the pile-instance teleport after warding. In book mode no series is unlocked, so the
+        -- per-book gate (its own item arrived) is what reveals a book. Reads the atomic snapshot.
+        local chapter = nil
+        if M._book_sanity_enabled and series_name then
+            pcall(function()
+                local info = book.ItemInfo
+                if info and info:IsValid() then chapter = tonumber(info.Chapter) end
+            end)
+            if not should_unward and chapter ~= nil then
+                local bu = M._books_unlocked
+                if bu and bu[series_name .. "|" .. chapter] then should_unward = true end
+            end
+        end
         local key = book:GetFullName()
         local is_warded = M._books_warded[key] or false
         local ok = pcall(function()
@@ -1418,6 +1554,11 @@ function M._apply_books_to_world()
                 end
             end
         end)
+        -- BookSanity pile hide: teleport this book's pile instance to deep Z when locked (restore on
+        -- unlock). Hides the far/rest form; the actor ward above hides the close/look form. index == Chapter.
+        if hism_arr and chapter ~= nil then
+            _teleport_inst(asset_idx, chapter, not should_unward)
+        end
         if ok then
             if should_unward then stats.unwarded = stats.unwarded + 1
             else stats.warded = stats.warded + 1 end
@@ -1429,6 +1570,10 @@ function M._apply_books_to_world()
     -- Finalizer after the last chunk: diff log, state summary, in-progress/pending bookkeeping.
     local function _finalize_apply()
         M._finalize_apply_books(books, n, stats, series_snap, shelves_snap, last_applied_snap)
+        if (stats.tp_hide or 0) + (stats.tp_show or 0) > 0 then
+            log(("[book-pile] instances teleported: hid=%d restored=%d (tracked=%d)"):format(
+                stats.tp_hide or 0, stats.tp_show or 0, (function() local c = 0; for _ in pairs(M._book_inst_state) do c = c + 1 end; return c end)()))
+        end
         M._flush_in_progress = false
 
         if M._flush_pending then
@@ -1622,7 +1767,23 @@ function M.reconcile_book_actors()
         if b and b:IsValid() then
             local aidx = _book_valid_asset_idx(b)
             local series = aidx ~= nil and M._asset_to_series[aidx] or nil
-            if series and unwarded[series] then
+            -- Reconcile (restore mesh/collision) any book that SHOULD be shown:
+            -- its series is unwarded, OR (book_sanity) its own per-book item
+            -- arrived. Without the per-book arm the distance-swap that hides
+            -- SM_Book_1 on look is never undone for individually-unlocked books.
+            local reconcile_this = series and unwarded[series]
+            if not reconcile_this and series
+                    and M._book_sanity_enabled and M._books_unlocked then
+                local chapter = nil
+                pcall(function()
+                    local info = b.ItemInfo
+                    if info and info:IsValid() then chapter = tonumber(info.Chapter) end
+                end)
+                if chapter ~= nil and M._books_unlocked[series .. "|" .. chapter] then
+                    reconcile_this = true
+                end
+            end
+            if reconcile_this then
                 checked_unwarded = checked_unwarded + 1
                 -- Collision must be ON for an unwarded book.
                 local coll
@@ -2614,6 +2775,64 @@ end
 -- Read the bool VALUES, never #RowStatus (that's the shelf count, not a completion count).
 --   • Uniform case  -> completed shelf i maps to series CorrectBookDataIndex[i].
 --   • Mixed cabinet -> "fully present in home section", capped by # completed shelves.
+--- BookSanity: scan every book actor's "Is Abs Correct" bool (the game's own correct-placement
+--- verdict, the gold-highlight) and fire the per-book location check for newly-correct books.
+--- De-duped via M._books_correct_seen. Runs on the game thread, so it may read actors directly.
+--- Returns the count of new checks sent.
+function M.detect_correct_books()
+    if not M._book_sanity_enabled then return 0 end
+    local blm = M._book_location_map
+    if type(blm) ~= "table" or not next(blm) then return 0 end
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient.send_check) then return 0 end
+
+    local books = FindAllOf("BP_GrabbingBook_C")
+    if not books then return 0 end
+    local n = 0; pcall(function() n = #books end)
+    if n == 0 then return 0 end
+
+    local seen = M._books_correct_seen
+    local sent = 0
+    for i = 1, n do
+        local book = books[i]
+        if book and book:IsValid() then
+            -- nil for uninitialized orphans; 0 is a valid AssetIdx (1A's first).
+            local asset_idx = _book_valid_asset_idx(book)
+            if asset_idx ~= nil then
+                local is_correct = false
+                local chapter = nil
+                pcall(function()
+                    is_correct = (book["Is Abs Correct"] == true)
+                    if is_correct then
+                        local info = book.ItemInfo
+                        if info and info:IsValid() then chapter = tonumber(info.Chapter) end
+                    end
+                end)
+                local series_name = M._asset_to_series[asset_idx]
+                if is_correct and chapter ~= nil and series_name then
+                    local bid = series_name .. "|" .. chapter
+                    if not seen[bid] then
+                        -- Mark seen regardless so a book with no mapped location
+                        -- (e.g. the other floor under a floor goal) isn't rescanned.
+                        seen[bid] = true
+                        local loc_id = tonumber(blm[bid])
+                        if loc_id then
+                            APClient:send_check(loc_id)
+                            sent = sent + 1
+                            log(("[book-correct] %s ch%d -> loc %d"):format(
+                                series_name, chapter, loc_id))
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if sent > 0 then
+        log(("[book-correct] sent %d new book check(s)"):format(sent))
+    end
+    return sent
+end
+
 function M.detect_completed_rows()
     if not M._cases_indexed then return 0 end
     if not M._slot_data then return 0 end

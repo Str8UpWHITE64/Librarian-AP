@@ -56,7 +56,9 @@ class LibrarianItemCategory(IntEnum):
     SHELF       = 3   # Progressive Shelf Unlock: <SectionId>
     MAJOR_SKILL = 4   # 5 Major Magic skills (progressive)
     FILLER      = 6
-    TRAP        = 7   # reserved for v2; unused in v1
+    TRAP        = 7   # reserved; unused
+    SERIES_INDIV = 8  # per-series unlock items (individual_series_items)
+    BOOK        = 9   # per-book items (book_sanity)
 
 
 class LibrarianItemData(NamedTuple):
@@ -130,6 +132,47 @@ _filler_items: list[LibrarianItemData] = [
     LibrarianItemData("Dust of Ages",         404, LibrarianItemCategory.FILLER, ItemClassification.filler),
 ]
 
+# --- Individual series-unlock items (opt-in: individual_series_items) ---
+#
+# One distinct item per series (~400), each unlocking that specific series.
+# progression_skip_balancing, not plain progression: keeps progression priority
+# but stays out of fill's balancing loop, where 400 items x N players is far too
+# slow. Codes 700 + index in data.ALL_SERIES. Always defined so their AP ids
+# exist, but only enter the pool when the option is on (see create_items);
+# ITEM_QUANTITIES omits them.
+def series_unlock_item_name(series_name: str) -> str:
+    return f"Series Unlock: {series_name}"
+
+
+_individual_series_items: list[LibrarianItemData] = [
+    LibrarianItemData(
+        series_unlock_item_name(series_name),
+        700 + idx,
+        LibrarianItemCategory.SERIES_INDIV,
+        ItemClassification.progression_skip_balancing,
+    )
+    for idx, (_sid, series_name, _vols) in enumerate(data.ALL_SERIES)
+]
+
+
+# BookSanity: one item per individual book (volume). Added to the pool only
+# when book_sanity is on (see create_items); ITEM_QUANTITIES omits them. Global
+# order matches data.ALL_BOOKS. Series names are globally unique, so
+# "Book: <series> Vol N" is a unique item name.
+def book_item_name(series_name: str, chapter: int) -> str:
+    return f"Book: {series_name} Vol {chapter + 1}"
+
+
+_book_items: list[LibrarianItemData] = [
+    LibrarianItemData(
+        book_item_name(_series_name, _chapter),
+        2000 + _idx,
+        LibrarianItemCategory.BOOK,
+        ItemClassification.progression_skip_balancing,
+    )
+    for _idx, (_asset_idx, _chapter, _sid, _series_name) in enumerate(data.ALL_BOOKS)
+]
+
 # --- Combined, in stable order for ID assignment ---
 
 _all_items: list[LibrarianItemData] = (
@@ -137,6 +180,8 @@ _all_items: list[LibrarianItemData] = (
     + _shelf_items
     + _major_skill_items
     + _filler_items
+    + _individual_series_items
+    + _book_items
 )
 
 item_dictionary: dict[str, LibrarianItemData] = {it.name: it for it in _all_items}
@@ -152,6 +197,8 @@ item_name_groups: dict[str, set[str]] = {
     "Major Magic":      {it.name for it in _major_skill_items},
     "Skills":           {it.name for it in _major_skill_items},
     "Filler":           {it.name for it in _filler_items},
+    "Series Unlocks (Individual)": {it.name for it in _individual_series_items},
+    "Books":            {it.name for it in _book_items},
 }
 
 
@@ -251,10 +298,12 @@ assert len(_names) == len(set(_names)), "Duplicate item name detected"
 
 # Item ID ranges shouldn't overlap categories
 for cat, lo, hi in [
-    (LibrarianItemCategory.SERIES,      2,   2),
-    (LibrarianItemCategory.SHELF,       100, 199),
-    (LibrarianItemCategory.MAJOR_SKILL, 200, 299),
-    (LibrarianItemCategory.FILLER,      400, 499),
+    (LibrarianItemCategory.SERIES,       2,   2),
+    (LibrarianItemCategory.SHELF,        100, 199),
+    (LibrarianItemCategory.MAJOR_SKILL,  200, 299),
+    (LibrarianItemCategory.FILLER,       400, 499),
+    (LibrarianItemCategory.SERIES_INDIV, 700, 1199),
+    (LibrarianItemCategory.BOOK,         2000, 5099),
 ]:
     for it in _all_items:
         if it.category == cat:

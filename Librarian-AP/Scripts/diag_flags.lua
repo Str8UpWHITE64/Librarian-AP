@@ -55,18 +55,26 @@ return {
 
     -- Proactively RefreshInfo() unwarded books so corruption self-heals as you walk past.
     -- OFF: RefreshInfo on a cached book that's mid-destruction during heavy manipulation = a native
-    -- AV (RC1 crash). Grab-path BOOK_REFRESH_FIX still covers the targeted case. Set true to re-enable.
+    -- AV. Grab-path BOOK_REFRESH_FIX still covers the targeted case. Set true to re-enable.
     BOOK_REFRESH_SWEEP = false,
 
     -- Every 5s, re-assert collision + mesh-visible on unwarded books (heals flag drift). Logs only on a fix.
     BOOK_ACTOR_RECONCILE = true,
 
+    -- BookSanity: hide a locked book by teleporting its pile instance to deep Z (pile stays visible
+    -- as the actor<->pile backfill). Restored on unlock. Off = actor ward alone gates grabbing.
+    BOOK_PILE_TELEPORT = true,
+
     -- Passive invisible-book scanner. OFF: too noisy without a camera-FOV filter (see known_bugs.txt).
     BOOK_INVIS_SCAN = false,
 
-    -- Single-thread mode -- the rc5 crash cure. Drives AP client create + poll() + item-apply AND all
-    -- warding on ONE thread (the BP_LibrarianCharacter pawn tick) instead of the async LoopAsync, so the
-    -- DLL + apply + warding + hooks share one Lua executor -- no cross-thread lua_State corruption (the
-    -- rc4 heap-corruption crash). OFF = legacy async poll (the pre-rc5 path). Shipping ON.
+    -- Single-thread mode. Drives AP client create + poll() + item-apply AND all warding on ONE thread
+    -- (the BP_LibrarianCharacter pawn tick) instead of the async LoopAsync, so DLL + apply + warding +
+    -- hooks share one Lua executor -- no cross-thread lua_State heap corruption. OFF = legacy async poll.
     POLL_ON_GAME_THREAD = true,
+
+    -- DEV ONLY. true -> main.lua loads AP/probe.lua and its diagnostic keybinds. Ships OFF. Missing
+    -- flags default ON here, so main.lua gates on the RAW value == true (not diag_on). Strip this flag
+    -- + AP/probe.lua + the main.lua require before release.
+    PROBE_MODE = true,
 }
