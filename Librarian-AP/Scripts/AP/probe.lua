@@ -862,24 +862,38 @@ local function probe_skill_timers()
         end)
     end
 
-    -- 3. WRITE test on a COOLDOWN array (the useful-item surface, confirmed readable). Set
-    --    'Show Correct Bookcase' cooldown to 3s at every level + read back. Then ACTIVATE that
-    --    skill in-game: if its cooldown is now ~3s, the game reads CoolDownTimePreLevel LIVE and
-    --    a "Progressive Attunement: cooldown" item is fully viable.
-    local sk = FindFirstOf("Skill_ShowCorrentBookCase_C")
-    if sk and sk:IsValid() then
-        local _, before = dump_num_array(sk, "CoolDownTimePreLevel")
-        pcall(function()
-            local arr = sk.CoolDownTimePreLevel
-            for i = 1, safe_len(arr) do arr[i] = 3.0 end
-        end)
-        local _, after = dump_num_array(sk, "CoolDownTimePreLevel")
-        P("[F12] WRITE Skill_ShowCorrentBookCase_C.CoolDownTimePreLevel all -> 3.0")
-        P(("      before = [%s]"):format(before))
-        P(("      after  = [%s]"):format(after))
-        P("      >>> Now ACTIVATE 'Show Correct Bookcase' a few times -- is the cooldown ~3s?")
+    -- 3. Read-only attunement/fatigue diagnostic. Dumps the live tuning state and each skill's
+    --    current cooldown/active arrays -- no faking, so it's safe to press on a real connection.
+    --    Load a seed with Attunement/Fatigue items (or start_inventory) to exercise the real path.
+    local ia = IA()
+    if ia then
+        P(("[F12] gate: gameplay=%s apply_safe=%s attune=%s"):format(
+            tostring(ia._gameplay_active), tostring(ia._apply_safe),
+            tostring(ia._slot_data and ia._slot_data.attunement)))
+        local rc = ia._received_counts or {}
+        local ac = ia._applied_skill_counts or {}
+        local fa = ia._fatigue_active or {}
+        for _, cls in ipairs({
+            { "Sort",          "Skill_SortBook_C",            "Progressive Sort" },
+            { "Shelf Guide",   "Skill_ShowCorrentBookCase_C", "Progressive Shelf Guide" },
+            { "Insight",       "Skill_ShowSameTypeBook_C",    "Progressive Insight" },
+            { "Auto-Shelving", "Skill_AutoShelve_C",          "Progressive Auto-Shelving" },
+            { "Assemble",      "Skill_GrabSameTypeBook_C",    "Progressive Assemble" },
+        }) do
+            local name, klass, prog = cls[1], cls[2], cls[3]
+            P(("[F12] %s: level=%s mastery=%s fatigue=%s left=%ss"):format(
+                name, tostring(ac[prog] or 0), tostring(rc[name .. " Mastery"] or 0),
+                tostring(rc["Fatigue: " .. name] or 0), tostring(math.floor(fa[name] or 0))))
+            local sk = FindFirstOf(klass)
+            if sk and sk:IsValid() then
+                local _, cd = dump_num_array(sk, "CoolDownTimePreLevel")
+                local _, at = dump_num_array(sk, "ActiveTimePreLevel")
+                P(("       CoolDown=[%s]"):format(cd))
+                P(("       Active  =[%s]"):format(at))
+            end
+        end
     else
-        P("Skill_ShowCorrentBookCase_C: not found")
+        P("[F12] ItemApply not available")
     end
     P("=== [F12] done ===")
 end
@@ -1027,6 +1041,37 @@ local function probe_scatter()
     P("=== [F8] done ===")
 end
 
+-- ---- F7: book/bag capacity — hook SetHandingMaxNum to read the live carry max ---------------
+-- The grant (+2/+3) works but touches neither GetBagLevel nor MaxBagItemLevel; the capacity is a
+-- separate value the game pushes to the HUD via LibrarianPlayerInfo:SetHandingMaxNum(newMax) on
+-- every change. Hooking that captures the live max with no field-hunting. If this reads your real
+-- carry number and rises ~+2 on a grant, the client fix = apply grants until the captured max
+-- hits the target, reading it back each grant (idempotent, can't climb past target on reload).
+local _bag_hud_max = nil
+local _bag_hook_ok = nil
+local function _bag_register_hook()
+    if _bag_hook_ok ~= nil then return end
+    _bag_hook_ok = pcall(function()
+        RegisterHook("/Script/Librarian.LibrarianPlayerInfo:SetHandingMaxNum", function(_, maxBookNum)
+            pcall(function() _bag_hud_max = maxBookNum:get() end)
+        end)
+    end)
+    P(("[bag] SetHandingMaxNum hook registered (ok=%s)"):format(tostring(_bag_hook_ok)))
+end
+local function probe_bag_capacity()
+    P("=== [F7] bag capacity (SetHandingMaxNum hook) ===")
+    _bag_register_hook()
+    local player = FindFirstOf("BP_LibrarianCharacter_C")
+    if not player or not player:IsValid() then P("[bag] no player"); return end
+    P(("[bag] BEFORE grant: captured max = %s"):format(tostring(_bag_hud_max)))
+    local ia = IA(); if ia then ia._ap_grant = true end
+    pcall(function() player:UpgradePlayer(1) end)
+    if ia then ia._ap_grant = false end
+    P(("[bag] AFTER grant [+2]: captured max = %s"):format(tostring(_bag_hud_max)))
+    P("      Press F7 a second time -- BEFORE should now equal your real carry max. Report both lines.")
+    P("=== [bag] done ===")
+end
+
 -- ---- keybinds (everything marshaled to the game thread; pcall-wrapped) ---------------------
 RegisterKeyBind(Key.F12, function() P("[F12] pressed"); on_gt(function() pcall(probe_skill_timers) end) end)
 RegisterKeyBind(Key.F10, function() P("[F10] pressed"); on_gt(function() pcall(probe_move_speed) end) end)
@@ -1037,8 +1082,8 @@ RegisterKeyBind(Key.F5, function() P("[F5] pressed"); on_gt(function() pcall(pro
 RegisterKeyBind(Key.F1, function() P("[F1] pressed"); on_gt(function() pcall(probe_hide_toggle) end) end)
 RegisterKeyBind(Key.F2, function() P("[F2] pressed"); on_gt(function() pcall(probe_control_surface) end) end)
 RegisterKeyBind(Key.F3, function() P("[F3] pressed"); on_gt(function() pcall(probe_placement_watch) end) end)
-RegisterKeyBind(Key.F7, function() P("[F7] pressed"); on_gt(function() pcall(probe_correctness_scan) end) end)
+RegisterKeyBind(Key.F7, function() P("[F7] pressed"); on_gt(function() pcall(probe_bag_capacity) end) end)
 
 P("probe harness loaded.")
-P("  BookSanity: F5=book identity  F1=hide book  F3=placement watch  F7=correctness scan  F8=HISM API  F9=teleport instance")
-P("  Filler/traps/items: F12=skill timers(cooldown/active/reach)  F10=move speed  F6=lighting(dim/off)  F8=book swap/un-shelve  F2=control surface")
+P("  BookSanity: F5=book identity  F1=hide book  F3=placement watch  F8=HISM API  F9=teleport instance")
+P("  Filler/traps/items: F12=skill timers(cooldown/active/reach)  F10=move speed  F6=lighting(dim/off)  F7=bag capacity  F2=control surface")
