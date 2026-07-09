@@ -200,6 +200,33 @@ local SKILL_ITEM_TO_ABILITY = {
     ["Progressive Assemble"]      = UPGRADE.GRAB_SAME_TYPE_BOOK,
 }
 
+-- Skill Mastery: once a skill hits its real max level, each "<skill> Mastery" item extends it one
+-- more step along the game's own tuning curve. Below max we never touch the game's per-level
+-- values. name -> the display skill (also the Mastery item prefix), the Progressive item that
+-- levels the real skill, its class, whether it has an active-time array, and the extended
+-- cooldown/active-time values for steps 1..5 past max. (Internally still called "attunement".)
+local ATTUNE_SKILLS = {
+    { name = "Sort",          prog = "Progressive Sort",          cls = "Skill_SortBook_C",            active = false,
+      cd = { 3, 2, 1, 1, 1 } },
+    { name = "Shelf Guide",   prog = "Progressive Shelf Guide",   cls = "Skill_ShowCorrentBookCase_C", active = true,
+      cd = { 4, 3, 2, 2, 1 },      at = { 65, 70, 75, 80, 85 } },
+    { name = "Insight",       prog = "Progressive Insight",       cls = "Skill_ShowSameTypeBook_C",    active = true,
+      cd = { 18, 16, 14, 12, 11 }, at = { 45, 50, 55, 60, 65 } },
+    { name = "Auto-Shelving", prog = "Progressive Auto-Shelving", cls = "Skill_AutoShelve_C",          active = true,
+      cd = { 8, 6, 5, 4, 3 },      at = { 60, 65, 70, 75, 80 } },
+    { name = "Assemble",      prog = "Progressive Assemble",      cls = "Skill_GrabSameTypeBook_C",    active = false,
+      cd = { 8, 6, 4, 3, 3 } },
+}
+
+-- Fatigue traps: one-shot debuffs. For FATIGUE_DURATION seconds the skill recovers at five
+-- times its normal cooldown and stays active for a tenth of its normal time, then snaps back.
+-- The highest fired item index is kept in server data storage, so a clean reconnect or a fresh
+-- session won't replay old traps. A second trap on the same skill while one is running extends
+-- the timer.
+local FATIGUE_DURATION = 120
+local FATIGUE_CD_MULT  = 5.0
+local FATIGUE_AT_MULT  = 0.1
+
 -- ============================================================================
 -- State
 -- ============================================================================
@@ -235,6 +262,21 @@ M._shelves_open      = {}  -- { [section_id] = open_count }
 M._unwarded_snapshot = {}
 -- Count of OnLevelUp events deferred off the game thread; drained by the 3s mod-thread loop.
 M._pending_level_ups = 0
+
+-- Fatigue-trap state. The floor is the highest item index whose trap already fired (read from
+-- server data storage on connect); traps received before it arrives wait in _fatigue_pending.
+-- _fatigue_active maps skill name -> debuff seconds remaining. _fatigue_persist is set by
+-- main.lua and pushes a newly fired index back to storage.
+M._fatigue_floor   = nil
+M._fatigue_pending = {}
+M._fatigue_active  = {}
+M._fatigue_persist = nil
+-- True while the live skill arrays hold attunement/fatigue edits, so a slot that turns the
+-- system off knows to put the game's own values back once instead of leaving them modified.
+M._attune_dirty    = false
+-- The player's live carry max, captured from the game's SetHandingMaxNum (main.lua hook). nil
+-- until the first capture; apply_bag_capacity grants up to its target by reading this back.
+M._bag_live_max    = nil
 
 -- True around AP-driven UpgradePlayer calls so the main.lua hook doesn't echo a check.
 M._ap_grant = false
@@ -389,6 +431,12 @@ function M.set_slot_data(slot_data)
     M._shelves_open       = {}
     M._unwarded_snapshot  = {}
     M._pending_level_ups  = 0
+    -- Fatigue: re-read the fired-floor from server storage each connect and drop traps queued
+    -- against a stale connection; main.lua re-wires the persist hook per connection. Running
+    -- debuffs stay -- a same-slot reconnect doesn't cure fatigue.
+    M._fatigue_floor      = nil
+    M._fatigue_pending    = {}
+    M._fatigue_persist    = nil
     M._pending_skill_grants = {}
     M._applied_skill_counts = {}
     M._sent_row_locations = {}
@@ -1251,6 +1299,10 @@ function M.reset_hism_state()
     M._section_sorted_cache = nil   -- old world's case refs; rebuild the cached per-section sort next pass
     M._books_warded = {}
     M._book_inst_state = {}
+    M._attune_base = {}          -- old world's skill objects are gone; recapture on next pass
+    M._attune_log_state = {}
+    M._attune_dirty = false      -- fresh skill objects hold the game's own values
+    M._bag_live_max = nil        -- capacity reset to the saved <=15; re-bootstrap from the chest checks
     M._unmapped_warded_books = {}
     M._last_applied_series_unlocked = {}
     M._case_last_applied_hidden = {}
@@ -3555,6 +3607,251 @@ function M.resync_skill_state()
         end
     end
     return retried_total
+end
+
+local function _alen(a)
+    local n = 0
+    if a then pcall(function() n = #a end) end
+    return n
+end
+
+-- Fire a fatigue trap if its item index is above the fired-floor, then raise the floor both
+-- locally and in server storage so the same trap can never fire again.
+local function _maybe_fire_fatigue(skill, index)
+    local floor = M._fatigue_floor or -1
+    if index <= floor then
+        log(("[fatigue] %s idx=%d already fired (floor=%d); skipping"):format(skill, index, floor))
+        return
+    end
+    if index > floor then M._fatigue_floor = index end
+    if M._fatigue_persist then pcall(M._fatigue_persist, index) end
+    M._fatigue_active[skill] = (M._fatigue_active[skill] or 0) + FATIGUE_DURATION
+    log(("[fatigue] %s hit for %ds (idx=%d, total %ds)"):format(
+        skill, FATIGUE_DURATION, index, M._fatigue_active[skill]))
+end
+
+--- Called by main.lua when the fired-floor arrives from server storage. Drains any traps that
+--- queued up while the floor was unknown.
+function M.set_fatigue_floor(value)
+    M._fatigue_floor = tonumber(value) or -1
+    log(("[fatigue] fired-floor = %d (%d trap(s) waiting)"):format(
+        M._fatigue_floor, #M._fatigue_pending))
+    local pending = M._fatigue_pending
+    M._fatigue_pending = {}
+    for _, p in ipairs(pending) do _maybe_fire_fatigue(p.skill, p.index) end
+end
+
+--- Called by main.lua for each received "Fatigue: <skill>" item. Held until the fired-floor is
+--- known so a reconnect's item re-dump can't replay old traps.
+function M.on_fatigue_received(skill, index)
+    if M._fatigue_floor == nil then
+        M._fatigue_pending[#M._fatigue_pending + 1] = { skill = skill, index = index }
+        return
+    end
+    _maybe_fire_fatigue(skill, index)
+end
+
+-- Write each captured skill's arrays back to the game's own values. Used when a slot with the
+-- tuning system off inherits arrays a previous slot left modified (mid-gameplay reconnect keeps
+-- the same skill objects, so a world reload won't do it for us).
+function M._restore_attune_base()
+    if not M._attune_base then return end
+    for _, cfg in ipairs(ATTUNE_SKILLS) do
+        local base = M._attune_base[cfg.cls]
+        if base then
+            local so = FindFirstOf(cfg.cls)
+            if so and so:IsValid() then
+                pcall(function()
+                    local cd = so.CoolDownTimePreLevel
+                    for i = 1, math.min(_alen(cd), #base.cd) do cd[i] = base.cd[i] end
+                end)
+                if cfg.active and base.at then
+                    pcall(function()
+                        local at = so.ActiveTimePreLevel
+                        for i = 1, math.min(_alen(at), #base.at) do at[i] = base.at[i] end
+                    end)
+                end
+            end
+        end
+    end
+end
+
+-- Skill-tuning pass: writes Attunement extensions for maxed skills and ticks down any running
+-- Fatigue debuffs (elapsed = seconds since the last pass, i.e. the caller's loop interval, so
+-- debuff time only burns during gameplay). Below the real max we write back the game's own
+-- values -- normal progression is untouched. A fatigued skill is debuffed at ANY level.
+-- Re-runs every maintenance pass so it survives level-ups and reloads.
+function M.apply_attunement(elapsed)
+    if not (M._gameplay_active and M._apply_safe and M._slot_data) then return end
+    local enabled = (tonumber(M._slot_data.attunement) or 0) ~= 0
+
+    -- Tick debuffs down every pass, even on a slot with the system off, so switching away can't
+    -- freeze one mid-effect.
+    for skill, left in pairs(M._fatigue_active) do
+        local remaining = left - (tonumber(elapsed) or 0)
+        if remaining > 0 then
+            M._fatigue_active[skill] = remaining
+        else
+            M._fatigue_active[skill] = nil
+            log(("[fatigue] %s recovered"):format(skill))
+        end
+    end
+
+    if not enabled then
+        -- A slot without the tuning system carries no debuffs; if a prior slot left the arrays
+        -- modified, put the game's values back once, then there's nothing more to maintain.
+        M._fatigue_active = {}
+        if M._attune_dirty then
+            M._restore_attune_base()
+            M._attune_dirty = false
+            M._attune_log_state = {}
+        end
+        return
+    end
+
+    M._attune_base = M._attune_base or {}
+    M._attune_log_state = M._attune_log_state or {}
+    local any_mod = false
+    for _, cfg in ipairs(ATTUNE_SKILLS) do
+        local so = FindFirstOf(cfg.cls)
+        if so and so:IsValid() then
+            local fatigued = (M._fatigue_active[cfg.name] or 0) > 0
+            -- Capture the game's default arrays once. Skip while fatigued so a mod hot-reload
+            -- mid-debuff can't record the multiplied values as "base" -- wait for it to recover.
+            local base = M._attune_base[cfg.cls]
+            if not base and not fatigued then
+                base = { cd = {}, at = {} }
+                pcall(function()
+                    local a = so.CoolDownTimePreLevel
+                    for i = 1, _alen(a) do base.cd[i] = tonumber(a[i]) end
+                end)
+                if cfg.active then
+                    pcall(function()
+                        local a = so.ActiveTimePreLevel
+                        for i = 1, _alen(a) do base.at[i] = tonumber(a[i]) end
+                    end)
+                end
+                M._attune_base[cfg.cls] = base
+            end
+            local max_level = base and #base.cd or 0
+            if max_level > 0 then
+                local real_level = M._applied_skill_counts[cfg.prog] or 0
+                local steps = M._received_counts[cfg.name .. " Mastery"] or 0
+                if steps > #cfg.cd then steps = #cfg.cd end
+                if real_level < max_level then steps = 0 end
+                if steps > 0 or fatigued then any_mod = true end
+                -- The game reads the current level's entry, so attunement only needs the top
+                -- slot; fatigue multiplies every level so it bites wherever the player is.
+                pcall(function()
+                    local cd = so.CoolDownTimePreLevel
+                    for i = 1, math.min(_alen(cd), max_level) do
+                        local v = base.cd[i]
+                        if steps > 0 and i == max_level then v = cfg.cd[steps] end
+                        if fatigued then v = base.cd[i] * FATIGUE_CD_MULT end
+                        cd[i] = v
+                    end
+                end)
+                if cfg.active then
+                    pcall(function()
+                        local at = so.ActiveTimePreLevel
+                        for i = 1, math.min(_alen(at), #base.at) do
+                            local v = base.at[i]
+                            if steps > 0 and cfg.at and i == #base.at then v = cfg.at[steps] end
+                            if fatigued then v = math.max(1.0, base.at[i] * FATIGUE_AT_MULT) end
+                            at[i] = v
+                        end
+                    end)
+                end
+                -- Log once per state change, not per pass.
+                local state = ("%d|%s"):format(steps, fatigued and "F" or "-")
+                if M._attune_log_state[cfg.name] ~= state then
+                    M._attune_log_state[cfg.name] = state
+                    if steps > 0 or fatigued then
+                        log(("[attune] %s: level=%d/%d steps=%d fatigued=%s"):format(
+                            cfg.name, real_level, max_level, steps, tostring(fatigued)))
+                    end
+                end
+            end
+        end
+    end
+    M._attune_dirty = any_mod
+end
+
+-- Book capacity: the two bag grants add +2 (UpgradeBag) and +3 (UpgradeBag2) to the carry max.
+-- The game saves capacity only up to 15, so the surplus is rebuilt each load -- but rather than
+-- guess how much was restored, apply_bag_capacity reads the LIVE max (captured from the game's
+-- SetHandingMaxNum via a main.lua hook) and grants up to the target. "value" is the grant's +N;
+-- ability 1 (+2) is used for the fill, ability 2 (+3) only to land an odd remainder exactly.
+local BAG_ITEMS = {
+    { item = "+2 Book Capacity", value = 2 },
+    { item = "+3 Book Capacity", value = 3 },
+}
+
+-- True if the player has checked that chest's location -- this session, or per the server's
+-- authoritative checked set after a reconnect. Both chests grabbed => carry capacity is 15.
+local function _bag_chest_grabbed(loc)
+    local ap = package.loaded["AP/APClient"]
+    if not ap then return false end
+    if ap._sent_checks and ap._sent_checks[loc] then return true end
+    local checked
+    pcall(function()
+        if ap._client and ap._client.get_checked_locations then
+            checked = ap._client:get_checked_locations()
+        end
+    end)
+    local hit = false
+    if checked then
+        pcall(function()
+            for _, l in ipairs(checked) do if tonumber(l) == loc then hit = true; break end end
+        end)
+    end
+    return hit
+end
+
+-- Grant book capacity up to what the player's "+N Book Capacity" items (and grabbed chests) call
+-- for. Reads the live carry max and grants up to target -- idempotent: on reload capacity restores
+-- to <=15, we read that and fill the rest; a mid-session chest grab shrinks the gap, never
+-- overshoots. Grabbing a chest (its AP check) adds that chest's +N on top of the items.
+function M.apply_bag_capacity()
+    if not (M._gameplay_active and M._apply_safe and M._slot_data) then return end
+    if (tonumber(M._slot_data.bag_capacity) or 0) == 0 then return end
+    -- Bootstrap the live max: SetHandingMaxNum only fires on a CHANGE, so on a plain load we have no
+    -- value. Capacity is 15 iff both chests were grabbed (the only route there), so if both chest
+    -- checks are done, seed 15 -- the fill's first grant fires the hook and the real value takes over.
+    -- If a chest is still un-grabbed, leave capacity alone so the game keeps spawning it.
+    if M._bag_live_max == nil then
+        -- KNOWN: these chest ids are duplicated in main.lua (AP_LOC_CHEST_*) and Locations.py --
+        -- AP ids are frozen so they won't drift on their own, but keep the three in sync by hand.
+        if _bag_chest_grabbed(1910622) and _bag_chest_grabbed(1910623) then
+            M._bag_live_max = 15
+            log("[bag] bootstrapped live=15 (both chests grabbed)")
+        else
+            return
+        end
+    end
+    local player = FindFirstOf("BP_LibrarianCharacter_C")
+    if not player or not player:IsValid() then return end
+    local target = 15   -- base 10 + both chests (Azure +2, Golden +3)
+    for _, cfg in ipairs(BAG_ITEMS) do
+        target = target + cfg.value * (M._received_counts[cfg.item] or 0)
+    end
+    -- Fill up to target. The hook updates M._bag_live_max synchronously after each grant, so we
+    -- read it back and stop the instant it reaches target (only ever adding).
+    local guard = 0
+    while (M._bag_live_max or 0) < target and guard < 60 do
+        local gap = target - M._bag_live_max
+        local ability = (gap == 3) and 2 or 1   -- +2 normally; +3 to land an odd gap of 3 exactly
+        local prev = M._bag_live_max
+        M._ap_grant = true
+        pcall(function() player:UpgradePlayer(ability) end)
+        M._ap_grant = false
+        guard = guard + 1
+        if (M._bag_live_max or 0) <= prev then break end   -- grant didn't take; stop
+    end
+    if M._bag_logged_target ~= target then
+        M._bag_logged_target = target
+        log(("[bag] target=%d live=%s"):format(target, tostring(M._bag_live_max)))
+    end
 end
 
 -- ============================================================================

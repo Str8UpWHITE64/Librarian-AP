@@ -81,6 +81,27 @@ _MAJOR_MAGIC_NAMES = frozenset((
 _SERIES_ITEM_PREFIX = "Series Unlock: "
 
 
+def _buffs_traps_quantities(magic_counts: dict) -> dict:
+    """{item_name: qty} for the buff/trap items every mode adds: Skill Mastery (useful), Fatigue
+    (trap), and Book Capacity (useful). Mastery for a skill only if magic_counts already holds
+    enough Progressive copies to reach that skill's max -- the magic cap can leave one short, and
+    Mastery is dead weight below max. Fatigue (bites at any level) and the bag items always go in."""
+    q: dict = {}
+    for name, prog, ability in (
+        ("Sort",          "Progressive Sort",          data.UpgradeAbility.SORT_BOOKS),
+        ("Shelf Guide",   "Progressive Shelf Guide",   data.UpgradeAbility.SHOW_MATCHING_SHELF),
+        ("Insight",       "Progressive Insight",       data.UpgradeAbility.SHOW_SAME_TYPE_BOOK),
+        ("Auto-Shelving", "Progressive Auto-Shelving", data.UpgradeAbility.AUTO_SHELVE),
+        ("Assemble",      "Progressive Assemble",      data.UpgradeAbility.GRAB_SAME_TYPE_BOOK),
+    ):
+        if magic_counts.get(prog, 0) >= data.SKILL_MAX_LEVELS[ability]:
+            q[f"{name} Mastery"] = 5
+        q[f"Fatigue: {name}"] = 2
+    q["+2 Book Capacity"] = 8
+    q["+3 Book Capacity"] = 3
+    return q
+
+
 def _librarian_carry_state(source: CollectionState, ret: CollectionState) -> CollectionState:
     """CollectionState.copy() rebuilds a fresh state and drops __dict__ extras,
     so a sweep-copy would lose our per-state stamp caches and the incremental
@@ -740,6 +761,13 @@ class LibrarianWorld(World):
                 quantities[drop_skill] -= 1
                 removed += 1
 
+        # Buffs + traps go in every mode's pool, replacing filler (fewer boring items scatter to
+        # other players); per-skill Mastery gating lives in the helper. In individual mode the
+        # deep-lock treats them like filler (non-advancement) and may pre-place some locally --
+        # fine, the player still gets them. BookSanity injects its own copy in _create_items_book.
+        for _bt_name, _bt_qty in _buffs_traps_quantities(quantities).items():
+            quantities[_bt_name] = _bt_qty
+
         # Pool-overshoot guard. Triggers on combinations like
         # series_per_unlock=2 + starting_count near max + custom goal with
         # low row_count (drops level-up + milestone locations from target
@@ -1195,6 +1223,12 @@ class LibrarianWorld(World):
         for name, qty in magic_q.items():
             for _ in range(qty):
                 pool_items.append(self.create_item(name))
+
+        # Buffs + traps, same as the other modes (replaces filler). Mastery gated on the capped
+        # magic counts above.
+        for bt_name, bt_qty in _buffs_traps_quantities(magic_q).items():
+            for _ in range(bt_qty):
+                pool_items.append(self.create_item(bt_name))
 
         filler_needed = target - len(pool_items)
         if filler_needed < 0:
@@ -2063,6 +2097,12 @@ class LibrarianWorld(World):
             # Lua tracks correctly-completed rows and fires each threshold.
             "row_completion_thresholds": (
                 list(ROW_COMPLETION_THRESHOLDS) if self._keep_row_completions() else []),
+            # Turns on the client skill-tuning system: Mastery items extend a maxed skill along
+            # the game's curve, Fatigue traps hit a skill with a timed debuff. All modes.
+            "attunement": 1,
+            # Turns on the client book-capacity system: "+2/+3 Book Capacity" items re-apply the
+            # game's bag grants each load (capacity resets past 15). All modes.
+            "bag_capacity": 1,
             # Locked-series book appearance, from the BookVisibility option.
             # "hidden" (default) = invisible + non-grabbable; "stacks" =
             # visible-but-non-grabbable (collision off, walk through). The Lua

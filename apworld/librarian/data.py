@@ -827,8 +827,8 @@ SECTIONS: tuple[Section, ...] = (
 class UpgradeAbility:
     """Integer constants matching EUpgradeAbility in the game."""
     JUMP = 0                  # Minor — Crimson Octagon chest
-    UPGRADE_BAG = 1           # Minor — Azure Star chest  (delta +3 in MaxBagItemLevel)
-    UPGRADE_BAG_2 = 2         # Minor — Golden Diamond chest (delta +2)
+    UPGRADE_BAG = 1           # Minor — Azure Star chest  (+2 book capacity)
+    UPGRADE_BAG_2 = 2         # Minor — Golden Diamond chest (+3 book capacity)
     SHOW_MATCHING_SHELF = 3   # Major — Shelf Guide
     JOGGING = 4               # Minor — Emerald Club chest
     SORT_BOOKS = 5            # Major — Sort

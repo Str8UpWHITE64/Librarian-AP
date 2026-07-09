@@ -99,6 +99,8 @@ function APClientWrapper.new(uuid, game_name, server)
     end
     function wrapped:Say(text)                           safe_call("Say", text) end
     function wrapped:Bounce(data, games, slots, tags)    safe_call("Bounce", data, games, slots, tags) end
+    function wrapped:Get(keys)                           safe_call("Get", keys) end
+    function wrapped:Set(key, dflt, want_reply, ops)     safe_call("Set", key, dflt, want_reply, ops) end
 
     function wrapped:get_player_alias(slot)              return safe_call("get_player_alias", slot) end
     function wrapped:get_player_game(slot)               return safe_call("get_player_game", slot) end

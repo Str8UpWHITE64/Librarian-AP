@@ -1633,6 +1633,11 @@ local function start_gameplay_loops()
         -- Skill resync: if save-side level lags received item count (a dropped UpgradePlayer),
         -- retry the missing applies. Never over-grants past received counts.
         pcall(function() IA.resync_skill_state() end)
+        -- Attunement extensions for maxed skills, plus the countdown on running Fatigue
+        -- debuffs (arg = this loop's interval, seconds).
+        pcall(function() IA.apply_attunement(3) end)
+        -- Book capacity: re-apply the bag-grant surplus (capacity resets past 15 each load).
+        pcall(function() IA.apply_bag_capacity() end)
         return false
     end)
 
@@ -1845,6 +1850,15 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:UpgradePlayer", function(self
             loc, idx, ability_name(idx)))
         ap_send_check(loc)
     end
+end)
+
+-- Book capacity: the game pushes the live carry max to the HUD via SetHandingMaxNum on every
+-- change (bag upgrade, reload, item pickup). Capture it so ItemApply.apply_bag_capacity reads the
+-- real capacity and grants up to its target instead of guessing what the save restored.
+RegisterHook("/Script/Librarian.LibrarianPlayerInfo:SetHandingMaxNum", function(_, maxBookNum)
+    local IA = package.loaded["AP/ItemApply"]
+    if not IA then return end
+    pcall(function() IA._bag_live_max = maxBookNum:get() end)
 end)
 
 RegisterHook("/Script/Librarian.LibrarianCharacter:UpgradePlayerBP", function(self, ability, levelNum)
@@ -2342,6 +2356,12 @@ APClient.on_item = function(it, item_name)
 
     if item_name then
         ItemApply.apply_item(item_name)
+        -- Fatigue traps are one-shot, keyed on the item's server index so a reconnect
+        -- re-dump can't replay them. Everything else re-derives from counts and doesn't care.
+        local fatigue_skill = item_name:match("^Fatigue: (.+)$")
+        if fatigue_skill then
+            ItemApply.on_fatigue_received(fatigue_skill, tonumber(it.index) or -1)
+        end
     end
 end
 
@@ -2473,6 +2493,18 @@ APClient.on_slot_connected = function(slot_data)
 
     -- Hand slot data to ItemApply; it will flush any queued items.
     ItemApply.set_slot_data(slot_data)
+
+    -- Fatigue traps fire once ever. The highest fired index lives in server storage under a
+    -- per-slot key (created at -1 on first connect); read it back and route into ItemApply,
+    -- which holds received traps until the floor lands. New traps raise the floor via storage_max.
+    if (tonumber(slot_data.attunement) or 0) ~= 0 then
+        local fatigue_key = ("librarian_fatigue_fired_%d"):format(APClient.slot_number or 0)
+        ItemApply._fatigue_persist = function(idx) APClient:storage_max(fatigue_key, idx) end
+        APClient.on_storage = function(k, v)
+            if k == fatigue_key then ItemApply.set_fatigue_floor(v) end
+        end
+        APClient:storage_read(fatigue_key, -1)
+    end
 
     -- Let the starting-item dump flow during pre-apply: items update derived state but their
     -- per-item flush is suppressed (ItemApply.apply_item), so the settle loop wards once with final

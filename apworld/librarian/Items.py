@@ -55,8 +55,9 @@ class LibrarianItemCategory(IntEnum):
     SERIES      = 2   # Progressive Series Unlock (5 series each)
     SHELF       = 3   # Progressive Shelf Unlock: <SectionId>
     MAJOR_SKILL = 4   # 5 Major Magic skills (progressive)
+    USEFUL      = 5   # Attunement: extend a maxed skill's cooldown / active-time
     FILLER      = 6
-    TRAP        = 7   # reserved; unused
+    TRAP        = 7   # Fatigue: a timed debuff on a skill
     SERIES_INDIV = 8  # per-series unlock items (individual_series_items)
     BOOK        = 9   # per-book items (book_sanity)
 
@@ -173,12 +174,45 @@ _book_items: list[LibrarianItemData] = [
     for _idx, (_asset_idx, _chapter, _sid, _series_name) in enumerate(data.ALL_BOOKS)
 ]
 
+# --- Skill Mastery (useful) + Fatigue (trap) ---
+#
+# Mastery: pushes a skill one step past its real max along the game's tuning curve (lower cooldown,
+# longer active-time). A useful item, not more Progressive copies -- those are load-bearing level-up
+# gates. Fatigue: a one-shot ~2-min debuff (slow recovery, short active-time) that bites at any
+# level. Client-side only; names must match the client's ATTUNE_SKILLS ("<skill> Mastery" /
+# "Fatigue: <skill>").
+_ATTUNE_SKILLS = ("Sort", "Shelf Guide", "Insight", "Auto-Shelving", "Assemble")
+
+_attunement_items: list[LibrarianItemData] = [
+    LibrarianItemData(f"{name} Mastery", 300 + i,
+                      LibrarianItemCategory.USEFUL, ItemClassification.useful)
+    for i, name in enumerate(_ATTUNE_SKILLS)
+]
+
+# Book capacity: the game's two bag upgrades as useful items. "+2" = UpgradeBag (Azure Star),
+# "+3" = UpgradeBag2 (Golden Diamond). The client applies these via the bag grant, gated on the
+# matching chest check, and re-applies each load (the game only saves capacity up to its 15 cap).
+_bag_items: list[LibrarianItemData] = [
+    LibrarianItemData("+2 Book Capacity", 305, LibrarianItemCategory.USEFUL, ItemClassification.useful),
+    LibrarianItemData("+3 Book Capacity", 306, LibrarianItemCategory.USEFUL, ItemClassification.useful),
+]
+
+_fatigue_items: list[LibrarianItemData] = [
+    LibrarianItemData(f"Fatigue: {name}", 307 + i,
+                      LibrarianItemCategory.TRAP, ItemClassification.trap)
+    for i, name in enumerate(_ATTUNE_SKILLS)
+]
+
+
 # --- Combined, in stable order for ID assignment ---
 
 _all_items: list[LibrarianItemData] = (
     _series_items
     + _shelf_items
     + _major_skill_items
+    + _attunement_items
+    + _bag_items
+    + _fatigue_items
     + _filler_items
     + _individual_series_items
     + _book_items
@@ -199,6 +233,9 @@ item_name_groups: dict[str, set[str]] = {
     "Filler":           {it.name for it in _filler_items},
     "Series Unlocks (Individual)": {it.name for it in _individual_series_items},
     "Books":            {it.name for it in _book_items},
+    "Skill Mastery":    {it.name for it in _attunement_items},
+    "Book Capacity":    {it.name for it in _bag_items},
+    "Traps":            {it.name for it in _fatigue_items},
 }
 
 
@@ -301,6 +338,8 @@ for cat, lo, hi in [
     (LibrarianItemCategory.SERIES,       2,   2),
     (LibrarianItemCategory.SHELF,        100, 199),
     (LibrarianItemCategory.MAJOR_SKILL,  200, 299),
+    (LibrarianItemCategory.USEFUL,       300, 306),
+    (LibrarianItemCategory.TRAP,         307, 311),
     (LibrarianItemCategory.FILLER,       400, 499),
     (LibrarianItemCategory.SERIES_INDIV, 700, 1199),
     (LibrarianItemCategory.BOOK,         2000, 5099),
