@@ -1183,7 +1183,7 @@ end
 -- WBP_Title.Text_Version (bottom-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
-local MOD_VERSION = "1.1.0"
+local MOD_VERSION = "1.2.0-beta1"
 local TESTED_GAME_VERSIONS = { "1.0.8", "1.0.9", "1.0.11" }
 
 local function get_game_version()
