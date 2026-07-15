@@ -200,23 +200,33 @@ local SKILL_ITEM_TO_ABILITY = {
     ["Progressive Assemble"]      = UPGRADE.GRAB_SAME_TYPE_BOOK,
 }
 
--- Skill Mastery: once a skill hits its real max level, each "<skill> Mastery" item extends it one
--- more step along the game's own tuning curve. Below max we never touch the game's per-level
--- values. name -> the display skill (also the Mastery item prefix), the Progressive item that
--- levels the real skill, its class, whether it has an active-time array, and the extended
--- cooldown/active-time values for steps 1..5 past max. (Internally still called "attunement".)
+-- Skill Mastery: a "<name> Mastery" item is interchangeable with a Progressive level -- both raise
+-- the same skill, so 1 Mastery + 1 Progressive = level 2. Levels 1..max are native (UpgradePlayer);
+-- each level past max instead retunes the top cd/at slot, steps 1..#cd. `max` must match the game's
+-- *PreLevel array length: too low and the past-max curve never engages, too high and UpgradePlayer
+-- no-ops past the cap and desyncs the applied counter. (Internally still called "attunement".)
 local ATTUNE_SKILLS = {
-    { name = "Sort",          prog = "Progressive Sort",          cls = "Skill_SortBook_C",            active = false,
+    { name = "Sort",          prog = "Progressive Sort",          cls = "Skill_SortBook_C",            max = 5,  active = false,
       cd = { 3, 2, 1, 1, 1 } },
-    { name = "Shelf Guide",   prog = "Progressive Shelf Guide",   cls = "Skill_ShowCorrentBookCase_C", active = true,
+    { name = "Shelf Guide",   prog = "Progressive Shelf Guide",   cls = "Skill_ShowCorrentBookCase_C", max = 10, active = true,
       cd = { 4, 3, 2, 2, 1 },      at = { 65, 70, 75, 80, 85 } },
-    { name = "Insight",       prog = "Progressive Insight",       cls = "Skill_ShowSameTypeBook_C",    active = true,
+    { name = "Insight",       prog = "Progressive Insight",       cls = "Skill_ShowSameTypeBook_C",    max = 10, active = true,
       cd = { 18, 16, 14, 12, 11 }, at = { 45, 50, 55, 60, 65 } },
-    { name = "Auto-Shelving", prog = "Progressive Auto-Shelving", cls = "Skill_AutoShelve_C",          active = true,
+    { name = "Auto-Shelving", prog = "Progressive Auto-Shelving", cls = "Skill_AutoShelve_C",          max = 10, active = true,
       cd = { 8, 6, 5, 4, 3 },      at = { 60, 65, 70, 75, 80 } },
-    { name = "Assemble",      prog = "Progressive Assemble",      cls = "Skill_GrabSameTypeBook_C",    active = false,
+    { name = "Assemble",      prog = "Progressive Assemble",      cls = "Skill_GrabSameTypeBook_C",    max = 10, active = false,
       cd = { 8, 6, 4, 3, 3 } },
 }
+
+-- Progressive item -> { mastery = item name, max = native max }; Mastery item -> Progressive.
+-- The "<name> Mastery" concat must match the names Items.py builds from its own _ATTUNE_SKILLS --
+-- a mismatch is silent: the Mastery routes nowhere and the item no-ops.
+local SKILL_INTERCHANGE = {}
+local MASTERY_TO_PROG = {}
+for _, _cfg in ipairs(ATTUNE_SKILLS) do
+    SKILL_INTERCHANGE[_cfg.prog] = { mastery = _cfg.name .. " Mastery", max = _cfg.max }
+    MASTERY_TO_PROG[_cfg.name .. " Mastery"] = _cfg.prog
+end
 
 -- Fatigue traps: one-shot debuffs. For FATIGUE_DURATION seconds the skill recovers at five
 -- times its normal cooldown and stays active for a tenth of its normal time, then snaps back.
@@ -419,6 +429,11 @@ end
 --- state. AP re-sends all items on (re)connect, so reset _received_counts to avoid double-counts.
 function M.set_slot_data(slot_data)
     M._slot_data = slot_data
+    -- Same-slot MID-GAMEPLAY reconnect. Clearing _applied_skill_counts would zero the
+    -- `applied >= target` guard, so AP's reconnect item re-dump re-issues UpgradePlayer against
+    -- skills already at level -> over-level. Re-seeding from the save can't cover it: the seed runs
+    -- only on the apply-safe false->true edge, and SkillData reads 0 between save events.
+    local midgame_reconnect = M._gameplay_active and M._apply_safe
     -- BookVisibility option. true = HIDE warded books (default); false = "stacks" = visible
     -- but non-grabbable. The three hide paths gate on this so stacks keeps only collision-off.
     -- "~= stacks" defaults any missing/unknown value to the safe hide.
@@ -438,7 +453,9 @@ function M.set_slot_data(slot_data)
     M._fatigue_pending    = {}
     M._fatigue_persist    = nil
     M._pending_skill_grants = {}
-    M._applied_skill_counts = {}
+    if not midgame_reconnect then
+        M._applied_skill_counts = {}
+    end
     M._sent_row_locations = {}
     M._sent_row_completions = {}
     M._sent_section_completions = {}
@@ -692,6 +709,10 @@ function M.apply_item(name)
     -- Skill items: grant immediately (no slot_data / asset_data dependency).
     if SKILL_ITEM_TO_ABILITY[name] then
         M._apply_skill(name)
+    elseif MASTERY_TO_PROG[name] then
+        -- Mastery is interchangeable with a level: drive the matching skill's native level up
+        -- toward the new combined count now, rather than waiting for the periodic resync.
+        M._apply_skill(MASTERY_TO_PROG[name])
     end
 
     -- Section / Series / Shelf items: affect derived state. Require slot_data.
@@ -2831,6 +2852,7 @@ end
 --- verdict, the gold-highlight) and fire the per-book location check for newly-correct books.
 --- De-duped via M._books_correct_seen. Runs on the game thread, so it may read actors directly.
 --- Returns the count of new checks sent.
+local DCB_CHUNK = 500   -- books per pass; ~3000 books wrap in ~6 passes of the 3s loop
 function M.detect_correct_books()
     if not M._book_sanity_enabled then return 0 end
     local blm = M._book_location_map
@@ -2838,14 +2860,28 @@ function M.detect_correct_books()
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient.send_check) then return 0 end
 
-    local books = FindAllOf("BP_GrabbingBook_C")
-    if not books then return 0 end
-    local n = 0; pcall(function() n = #books end)
-    if n == 0 then return 0 end
+    -- CHUNKED scan: FindAllOf over ~3000 book actors plus a string-keyed book["Is Abs Correct"] read
+    -- on each stalls the frame at the 3s cadence. BookSanity loads every book up front (no mid-play
+    -- streaming), so snapshot the list once and walk a slice per pass; actors freed under the
+    -- snapshot are caught by the IsValid() below. The re-snap at the wrap is the only thing that
+    -- refreshes the list after a world reload.
+    local books = M._dcb_books
+    local cursor = M._dcb_cursor or 0
+    if not books or cursor >= (M._dcb_n or 0) then
+        books = FindAllOf("BP_GrabbingBook_C")
+        if not books then M._dcb_books = nil; return 0 end
+        local cnt = 0; pcall(function() cnt = #books end)
+        M._dcb_books = books
+        M._dcb_n = cnt
+        cursor = 0
+    end
+    local n = M._dcb_n or 0
+    if n == 0 then M._dcb_books = nil; return 0 end
 
     local seen = M._books_correct_seen
     local sent = 0
-    for i = 1, n do
+    local stop = math.min(cursor + DCB_CHUNK, n)
+    for i = cursor + 1, stop do
         local book = books[i]
         if book and book:IsValid() then
             -- nil for uninitialized orphans; 0 is a valid AssetIdx (1A's first).
@@ -2879,6 +2915,7 @@ function M.detect_correct_books()
             end
         end
     end
+    M._dcb_cursor = stop
     if sent > 0 then
         log(("[book-correct] sent %d new book check(s)"):format(sent))
     end
@@ -3558,10 +3595,15 @@ function M._apply_skill(name)
 
     -- Counter-based skip: only bump if applied < received. The counter is seeded from save
     -- at apply-safe, so the reconnect re-dump doesn't double-bump skills already at level.
-    local target  = M._received_counts[name] or 0
+    -- Interchange: Progressive AND Mastery both level the skill. Drive the native level toward the
+    -- combined count, capped at the native max so UpgradePlayer never no-ops past the cap (which
+    -- would run the applied counter past the save-capped level and desync on reconnect).
+    local xc      = SKILL_INTERCHANGE[name]
+    local mastery = (xc and (M._received_counts[xc.mastery] or 0)) or 0
+    local native_max = (xc and xc.max) or (M._received_counts[name] or 0)
+    local target  = math.min((M._received_counts[name] or 0) + mastery, native_max)
     local applied = M._applied_skill_counts[name] or 0
     if applied >= target then
-        log(("Skill %s already applied %d/%d — skipping bump"):format(name, applied, target))
         return
     end
 
@@ -3594,11 +3636,15 @@ function M.resync_skill_state()
 
     local retried_total = 0
     for item_name, ability_idx in pairs(SKILL_ITEM_TO_ABILITY) do
-        local target = M._received_counts[item_name] or 0
+        -- Combined Progressive + Mastery target (capped at native max), matching _apply_skill.
+        local xc = SKILL_INTERCHANGE[item_name]
+        local mastery = (xc and (M._received_counts[xc.mastery] or 0)) or 0
+        local native_max = (xc and xc.max) or (M._received_counts[item_name] or 0)
+        local target = math.min((M._received_counts[item_name] or 0) + mastery, native_max)
         local applied = M._applied_skill_counts[item_name] or 0
         if target > applied then
             local missing = target - applied
-            log(("[skill-resync] %s (ability=%d): applied=%d received=%d → re-applying %d"):format(
+            log(("[skill-resync] %s (ability=%d): applied=%d target=%d → re-applying %d"):format(
                 item_name, ability_idx, applied, target, missing))
             for _ = 1, missing do
                 M._apply_skill(item_name)
@@ -3736,7 +3782,13 @@ function M.apply_attunement(elapsed)
             local max_level = base and #base.cd or 0
             if max_level > 0 then
                 local real_level = M._applied_skill_counts[cfg.prog] or 0
-                local steps = M._received_counts[cfg.name .. " Mastery"] or 0
+                -- Interchange: steps past the native max = (Progressive + Mastery) - max_level.
+                -- Native levels are driven by _apply_skill/resync; here we only retune the top
+                -- cooldown/active slot for each level beyond max (curve steps 1..#cd).
+                local total = (M._received_counts[cfg.prog] or 0)
+                    + (M._received_counts[cfg.name .. " Mastery"] or 0)
+                local steps = total - max_level
+                if steps < 0 then steps = 0 end
                 if steps > #cfg.cd then steps = #cfg.cd end
                 if real_level < max_level then steps = 0 end
                 if steps > 0 or fatigued then any_mod = true end
@@ -3970,6 +4022,134 @@ function M.dump_unmapped_books()
         log(("  [%s] '%s' aidx=%d @ (%.0f, %.0f, %.0f) [%s]"):format(
             ud.section or "?", ud.series or "?", ud.asset_idx or 0,
             ud.x or 0, ud.y or 0, ud.z or 0, unlocked))
+    end
+end
+
+-- ============================================================================
+-- Re-hide sweep for BookSanity pile instances
+-- ============================================================================
+-- Insight ("Show Same Type Book") drags a hidden pile instance back up to its rest position. The
+-- warding flush is state-change-driven and its teleport is idempotent on _book_inst_state.hidden,
+-- so it never re-teleports a drifted instance -- the book stays visible (still un-grabbable; the
+-- actor ward is untouched) until a reload. Only instances we hid (st.hidden) are swept, reusing
+-- the stored orig: re-capturing here would take the drifted pose as the rest transform.
+-- ============================================================================
+local RESWEEP_CHUNK   = 500
+local RESWEEP_DEEP_DZ = 1000000.0   -- must match _teleport_inst's hide offset
+
+-- Cached manager -> HISMArray (per-series HISMs); FindFirstOf every pass is not free. The manager
+-- is per-world, so a reload leaves the cache dangling: revalidate per call, never prime once.
+local function _hism_arr()
+    local mgr = M._hism_mgr
+    if not (mgr and mgr:IsValid()) then
+        mgr = FindFirstOf("BP_HISM_Manager_C")
+        M._hism_mgr = (mgr and mgr:IsValid()) and mgr or nil
+    end
+    if not M._hism_mgr then return nil end
+    local arr
+    pcall(function() arr = M._hism_mgr.HISMArray end)
+    return arr
+end
+
+-- Insight-aware re-hide, run from the 3s game-thread loop. Insight ("Show Same Type Book") keeps
+-- pushing the revealed piles back up while it is showing, so a re-hide issued then is overwritten:
+-- only the >=0 -> -1 edge sticks. GetShowingSameTypeIdx is the gate -- it returns the shown
+-- asset-idx while the skill is up, -1 when idle. IsSkillActivated reads unlocked-ness, not firing.
+function M.resweep_book_piles()
+    if not (M._book_sanity_enabled and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT")) then return end
+    if not (M._gameplay_active and M._apply_safe) then return end
+    local hism_arr = _hism_arr()
+    if not hism_arr then return end
+
+    -- The shown idx is an asset-idx -- the same key space as the <aidx> half of ikey -- so recording
+    -- it here is what lets the just_ended pass match the drifted piles by series.
+    local showing = false
+    do
+        local player = FindFirstOf("BP_LibrarianCharacter_C")
+        if player and player:IsValid() then
+            local sidx
+            pcall(function() sidx = player:GetShowingSameTypeIdx() end)
+            if type(sidx) == "number" and sidx >= 0 then
+                showing = true
+                M._insight_shown = M._insight_shown or {}
+                M._insight_shown[sidx] = true
+            end
+        end
+    end
+    local just_ended = (M._insight_showing_prev == true) and (not showing)
+    M._insight_showing_prev = showing
+    if showing then return end   -- don't fight the active skill; wait for it to stop
+
+    -- Re-hide one instance that drifted back out of the deep-Z well. Deep Z is re-derived from the
+    -- stored orig, never re-captured: most calls land on a still-deep pile, and taking that as orig
+    -- would sink the well another RESWEEP_DEEP_DZ and restore unlocked books to deep Z.
+    local function _recheck(ikey)
+        local st = M._book_inst_state[ikey]
+        if not (st and st.hidden and st.orig and st.orig.Translation) then return 0 end
+        local aidx, chapter = ikey:match("^(%-?%d+)|(%-?%d+)$")
+        aidx = tonumber(aidx); chapter = tonumber(chapter)
+        if not (aidx and chapter) then return 0 end
+        local comp; pcall(function() comp = hism_arr[aidx + 1] end)
+        if not (comp and comp:IsValid()) then return 0 end
+        local cur = {}
+        local got = false
+        pcall(function() got = comp:GetInstanceTransform(chapter, cur, true) end)
+        local oz = st.orig.Translation.Z
+        local cz = got and cur.Translation and cur.Translation.Z
+        if not (oz and cz) then return 0 end
+        if cz <= (oz - RESWEEP_DEEP_DZ) + (RESWEEP_DEEP_DZ * 0.5) then return 0 end
+        local deep = {
+            Translation = { X = st.orig.Translation.X, Y = st.orig.Translation.Y, Z = oz - RESWEEP_DEEP_DZ },
+            Rotation = st.orig.Rotation, Scale3D = st.orig.Scale3D }
+        if pcall(function() comp:UpdateInstanceTransform(chapter, deep, true, true, true) end) then
+            return 1
+        end
+        return 0
+    end
+
+    if just_ended then
+        -- Insight only lifts the piles of the type(s) it showed, so drift is confined to those
+        -- asset-idxs. That filter is what makes this pass safe to run unchunked -- it leaves ~a
+        -- dozen instances, where every hidden pile would be ~3000 transform reads in one tick.
+        local shown = M._insight_shown or {}
+        M._insight_shown = nil
+        local fixed = 0
+        for ikey in pairs(M._book_inst_state) do
+            local a = ikey:match("^(%-?%d+)|")
+            if a and shown[tonumber(a)] then fixed = fixed + _recheck(ikey) end
+        end
+        if fixed > 0 then
+            log(("[book-pile] re-hid %d instance(s) as Insight ended"):format(fixed))
+        end
+        return
+    end
+
+    -- Backstop for drift NOT from Insight: a rolling cursor probes RESWEEP_CHUNK per pass. Drift
+    -- comes per-series in bursts, so a hit means the rest is likely drifted too -- catch the whole
+    -- list now, skipping the range the probe just covered.
+    local list = M._resweep_list
+    local idx = M._resweep_idx or 0
+    if not list or idx >= #list then
+        list = {}
+        for ikey, st in pairs(M._book_inst_state) do
+            if st.hidden and st.orig then list[#list + 1] = ikey end
+        end
+        M._resweep_list = list
+        idx = 0
+    end
+    local fixed = 0
+    local stop = math.min(idx + RESWEEP_CHUNK, #list)
+    for i = idx + 1, stop do fixed = fixed + _recheck(list[i]) end
+    if fixed > 0 then
+        for i = 1, #list do
+            if i <= idx or i > stop then fixed = fixed + _recheck(list[i]) end
+        end
+        M._resweep_idx = #list
+    else
+        M._resweep_idx = stop
+    end
+    if fixed > 0 then
+        log(("[book-pile] re-hid %d drifted instance(s)"):format(fixed))
     end
 end
 

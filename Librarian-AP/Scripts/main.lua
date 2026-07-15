@@ -1638,6 +1638,10 @@ local function start_gameplay_loops()
         pcall(function() IA.apply_attunement(3) end)
         -- Book capacity: re-apply the bag-grant surplus (capacity resets past 15 each load).
         pcall(function() IA.apply_bag_capacity() end)
+        -- BookSanity: re-hide any pile instances Insight dragged back into view. Must run from here
+        -- and not the SetActorVisible hook -- a re-hide issued inside the hook is overwritten while
+        -- the skill is still showing. No-op unless book_sanity + hidden mode.
+        pcall(function() IA.resweep_book_piles() end)
         return false
     end)
 
