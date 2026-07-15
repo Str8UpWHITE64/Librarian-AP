@@ -1,8 +1,8 @@
 """
 Librarian: Tidy Up the Arcane Library -- Archipelago options.
 
-Options match yaml keys by name, so the order here is cosmetic: goal ->
-progression shape -> visibility / quality-of-life -> niche.
+Options match yaml keys by name, so the order here drives the template layout:
+goal -> unlock shape -> starting amounts -> visibility / quality-of-life -> niche.
 """
 
 from dataclasses import dataclass
@@ -16,7 +16,12 @@ class Goal(Choice):
     full    -- Complete the whole library, both floors (default).
     floor_1 -- Complete Floor 1 only (1A-1N); Floor 2 leaves the pool.
     floor_2 -- Complete Floor 2 only (2A-2Q); Floor 1 leaves the pool.
-    custom  -- Win after custom_goal_row_count rows; the full pool stays checkable."""
+    custom  -- Win after custom_goal_row_count rows; the full pool stays checkable.
+               Only for the progressive_unlocks mode (not individual_series_unlocks
+               or booksanity).
+
+    For booksanity, a floor goal (floor_1 / floor_2) is recommended: the full goal
+    has ~3072 book items and takes noticeably longer to generate."""
     display_name = "Goal"
 
     option_full = 0
@@ -28,16 +33,43 @@ class Goal(Choice):
 
 class CustomGoalRowCount(Range):
     """Rows needed to win when goal = custom. Ignored for every other goal.
-    Accepts 'random', 'random-low', 'random-high' in your yaml."""
+
+    Only applies to the progressive_unlocks unlock mode -- goal = custom is not
+    supported with individual_series_unlocks or booksanity. Accepts 'random',
+    'random-low', 'random-high' in your yaml."""
     display_name = "Custom Goal Row Count"
     range_start = 1
     range_end = 400
     default = 200
 
 
+class UnlockMode(Choice):
+    """Choose how book series are unlocked.
+
+    progressive_unlocks (default) -- series unlock in fungible groups: each
+        Progressive Series Unlock item reveals series_per_unlock series, and
+        bookcases unlock progressively. The classic, most compact item pool.
+    individual_series_unlocks -- every one of the ~400 series is its own unlock
+        item. More granular and a larger pool; every bookcase starts open.
+    booksanity -- every individual book (~3072) is its own item AND its own check,
+        the most granular option. Every bookcase starts open. A floor goal is
+        recommended (the full goal is slow to generate at this size)."""
+    display_name = "Unlock Mode"
+
+    option_progressive_unlocks = 0
+    option_individual_series_unlocks = 1
+    option_booksanity = 2
+    default = 0
+
+
 class StartingSeriesCount(Range):
     """How many series you begin with unlocked. Always includes at least one whose
-    row is on the starting bookcase, so your first check is available right away."""
+    row is on the starting bookcase, so your first check is available right away.
+
+    progressive_unlocks / individual_series_unlocks: that many series.
+    booksanity: that many series' worth of random books -- each count rolls a series
+    size (3, 5, or 10 volumes), so e.g. 5 starts you with roughly 15-50 random
+    individual books (not whole series)."""
     display_name = "Starting Series Count"
     range_start = 5
     range_end = 25
@@ -47,32 +79,14 @@ class StartingSeriesCount(Range):
 class SeriesPerUnlock(Range):
     """How many series each Progressive Series Unlock reveals. Lower means more
     unlocks with smaller impact; higher means fewer, bigger ones. (Below 3 makes a
-    long unlock chain that's hard to place in tight seeds, so 3 is the minimum.)"""
+    long unlock chain that's hard to place in tight seeds, so 3 is the minimum.)
+
+    Only applies to the progressive_unlocks mode; ignored for
+    individual_series_unlocks and booksanity."""
     display_name = "Series Per Unlock"
     range_start = 3
     range_end = 10
     default = 5
-
-
-class IndividualSeriesItems(Toggle):
-    """Make each series its own item instead of grouped Progressive Series Unlocks.
-
-    Off (default): series unlock in groups of series_per_unlock.
-    On: each of the ~400 series is its own "Series Unlock: <series>" item -- more
-    granular, larger pool. Every bookcase starts open. Not supported with goal = custom."""
-    display_name = "Individual Series Items"
-    default = 0
-
-
-class BookSanity(Toggle):
-    """Make every individual book its own item and its own check (~3072 of each).
-
-    Off (default): checks are per shelf-row (a whole series).
-    On: each "Book: <series> Vol N" item unlocks that book, and placing it on the
-    correct shelf is its own check. Every bookcase starts open. Can't be combined
-    with individual_series_items. Not supported with goal = custom."""
-    display_name = "BookSanity"
-    default = 0
 
 
 class BookVisibility(Choice):
@@ -113,10 +127,9 @@ class OnlyUnwardShelfableBooks(Toggle):
 class LibrarianOptions(PerGameCommonOptions):
     goal: Goal
     custom_goal_row_count: CustomGoalRowCount
+    unlock_mode: UnlockMode
     starting_series_count: StartingSeriesCount
     series_per_unlock: SeriesPerUnlock
-    individual_series_items: IndividualSeriesItems
-    book_sanity: BookSanity
     book_visibility: BookVisibility
     local_filler: LocalFiller
     only_unward_shelfable_books: OnlyUnwardShelfableBooks

@@ -27,7 +27,7 @@ import math
 
 from BaseClasses import MultiWorld, Region, Tutorial, ItemClassification, CollectionState
 from worlds.AutoWorld import World, WebWorld
-from worlds.generic.Rules import set_rule, add_rule
+from worlds.generic.Rules import set_rule, add_rule, add_item_rule
 from Fill import fill_restrictive, FillError, sweep_from_pool
 
 from . import data
@@ -51,7 +51,6 @@ from .Locations import (
     section_completion_name,
     levelup_name,
     chest_open_name,
-    MILESTONE_THRESHOLDS,
     ROW_COMPLETION_THRESHOLDS,
     BOOK_COMPLETION_THRESHOLDS,
     _book_name,
@@ -61,7 +60,6 @@ from .Locations import (
     _floor_locations,
     _levelup_locations,
     _chest_locations,
-    _milestone_locations,
     _book_completion_locations,
     _goal_locations,
 )
@@ -70,8 +68,9 @@ from .Options import LibrarianOptions
 # Item names used as constants below (avoids typos)
 ITEM_PROG_SERIES  = "Progressive Series Unlock"
 
-# The 5 Major Magic item names (gate the level-up locations). Kept as a set so
-# collect/remove can bump the magic stamp that major_magic_total caches on.
+# The 5 Major Magic item names. Used by create_items/_create_items_book to size
+# and cap the Major Magic pool; they no longer gate any location (feasible_rows
+# never modelled magic).
 _MAJOR_MAGIC_NAMES = frozenset((
     "Progressive Sort", "Progressive Shelf Guide", "Progressive Insight",
     "Progressive Auto-Shelving", "Progressive Assemble",
@@ -81,25 +80,29 @@ _MAJOR_MAGIC_NAMES = frozenset((
 _SERIES_ITEM_PREFIX = "Series Unlock: "
 
 
-def _buffs_traps_quantities(magic_counts: dict) -> dict:
+def _buffs_traps_quantities() -> dict:
     """{item_name: qty} for the buff/trap items every mode adds: Skill Mastery (useful), Fatigue
-    (trap), and Book Capacity (useful). Mastery for a skill only if magic_counts already holds
-    enough Progressive copies to reach that skill's max -- the magic cap can leave one short, and
-    Mastery is dead weight below max. Fatigue (bites at any level) and the bag items always go in."""
+    (trap), and Book Capacity (useful). Every skill gets its full 5-item Mastery set -- the pool now
+    keeps all Major Magic so each skill maxes, and the client treats Mastery as extra skill levels
+    past the native max. Fatigue (bites at any level) and the bag items always go in too."""
     q: dict = {}
-    for name, prog, ability in (
-        ("Sort",          "Progressive Sort",          data.UpgradeAbility.SORT_BOOKS),
-        ("Shelf Guide",   "Progressive Shelf Guide",   data.UpgradeAbility.SHOW_MATCHING_SHELF),
-        ("Insight",       "Progressive Insight",       data.UpgradeAbility.SHOW_SAME_TYPE_BOOK),
-        ("Auto-Shelving", "Progressive Auto-Shelving", data.UpgradeAbility.AUTO_SHELVE),
-        ("Assemble",      "Progressive Assemble",      data.UpgradeAbility.GRAB_SAME_TYPE_BOOK),
-    ):
-        if magic_counts.get(prog, 0) >= data.SKILL_MAX_LEVELS[ability]:
-            q[f"{name} Mastery"] = 5
+    for name in ("Sort", "Shelf Guide", "Insight", "Auto-Shelving", "Assemble"):
+        q[f"{name} Mastery"] = 5
         q[f"Fatigue: {name}"] = 2
     q["+2 Book Capacity"] = 8
     q["+3 Book Capacity"] = 3
     return q
+
+
+# Full-goal invariant: the goal requires mm >= levels_kept (= MAX_PLAYER_LEVEL at
+# the full goal), so the five Major Magic skills must be able to supply that many
+# levels between them. These are independent data tables; pin the invariant here
+# so a future edit that lowers a skill max or grows XP_CURVE fails loudly at world
+# load instead of silently making the full goal unwinnable.
+assert (sum(data.SKILL_MAX_LEVELS[a] for a in data.MAJOR_MAGIC_ABILITIES)
+        >= data.MAX_PLAYER_LEVEL), (
+    "Major Magic levels < MAX_PLAYER_LEVEL: the full goal would demand more "
+    "magic than the pool can supply.")
 
 
 def _librarian_carry_state(source: CollectionState, ret: CollectionState) -> CollectionState:
@@ -230,13 +233,16 @@ class LibrarianWorld(World):
         self.starting_section = ""
         self.starting_section_b: str | None = None
         self.starting_series = []
+        self.starting_book_names = []  # booksanity: random books precollected at start
         self.series_req = {}
         self.shelf_req = {}
         # Per-state cache/counter keys, precomputed so the collect/remove hot
         # path never re-formats them.
         self._stamp_key = f"_librarian_stamp_{player}"
-        self._mmstamp_key = f"_librarian_mmstamp_{player}"
         self._bookcount_key = f"_librarian_bookcount_{player}"
+        # individual mode: O(1) count of held series items (== feasible_rows, since
+        # all shelves are precollected so has(shelf) is always true).
+        self._seriescount_key = f"_librarian_seriescount_{player}"
         self._is_book_sanity = False  # set in generate_early
 
     # Sections in the active goal scope. Floor goals filter the pool to
@@ -298,7 +304,18 @@ class LibrarianWorld(World):
         pt = self._ut_passthrough()
         if pt and "book_sanity" in pt:
             return bool(pt["book_sanity"])
-        return bool(self.options.book_sanity.value)
+        return (self.options.unlock_mode.value
+                == self.options.unlock_mode.option_booksanity)
+
+    @property
+    def individual(self) -> bool:
+        """True when unlock_mode == individual_series_unlocks (each series its own
+        item). UT-aware: reads the passthrough int fill_slot_data emits."""
+        pt = self._ut_passthrough()
+        if pt and "individual_series_items" in pt:
+            return bool(pt["individual_series_items"])
+        return (self.options.unlock_mode.value
+                == self.options.unlock_mode.option_individual_series_unlocks)
 
     @property
     def active_books(self) -> list[tuple[int, int, str, str]]:
@@ -313,14 +330,16 @@ class LibrarianWorld(World):
         book-completion filter, analogous to max_reachable_rows)."""
         return sum(s.volume_count for s in self.active_sections)
 
-    @property
-    def starting_books(self) -> list[str]:
-        """Book ITEM names precollected at start (book_sanity): every book of
-        the guaranteed starting series, so sphere 0 has reachable book
-        locations without needing any AP item first."""
-        ss = set(self.starting_series)
-        return [book_item_name(name, ch)
-                for (_ai, ch, _sid, name) in self.active_books if name in ss]
+    def _levels_kept(self, max_reachable: int) -> int:
+        """How many player levels are reachable given `max_reachable` rows/books
+        (how many XP_CURVE thresholds fit). Single source of truth for BOTH the
+        Major Magic pool size (create_items) and the goal's magic requirement
+        (set_rules), so they cannot drift -- pass rows for grouped/individual and
+        books for book_sanity. At the full goal this is MAX_PLAYER_LEVEL (45), so
+        all magic is kept and required; it self-limits for floor/custom goals."""
+        return sum(1 for idx in range(data.MAX_PLAYER_LEVEL)
+                   if data.XP_CURVE[idx] <= max_reachable)
+
 
     # ------------------------------------------------------------------
     # Universal Tracker integration
@@ -378,6 +397,7 @@ class LibrarianWorld(World):
                 name: math.ceil((i + 1) / per_unlock)
                 for i, name in enumerate(self.series_order)
             }
+            self.starting_book_names = list(pt.get("starting_books", []))
             return
 
         # Use active_sections (filtered by goal) so floor goals stay
@@ -461,6 +481,21 @@ class LibrarianWorld(World):
             for i, name in enumerate(self.series_order)
         }
 
+        # 6. BookSanity: precollect a random set of INDIVIDUAL books. The count is
+        # the sum of starting_series_count rolled series sizes (3/5/10 each), so
+        # e.g. 5 -> 15-50 random books. Independent of starting_series (the
+        # whole-series concept the other modes use); every bookcase is open, so any
+        # held book is a reachable sphere-0 check. Rolled last so it doesn't shift
+        # the earlier per-seed RNG. Sent in slot_data for UT reconstruction.
+        self.starting_book_names = []
+        if self.book_sanity:
+            n_books = sum(rng.choice((3, 5, 10))
+                          for _ in range(self.options.starting_series_count.value))
+            all_books = [book_item_name(name, ch)
+                         for (_ai, ch, _sid, name) in self.active_books]
+            rng.shuffle(all_books)
+            self.starting_book_names = all_books[:min(n_books, len(all_books))]
+
     def _keep_row_completions(self) -> bool:
         """Whether to create the 72 'Complete N Rows' checks this seed.
 
@@ -468,7 +503,7 @@ class LibrarianWorld(World):
         (grouped mode, series_per_unlock <= 3). Every looser config generates fine
         without them, so we drop all 72 (fewer filler items) except for the P<=3
         deep-chain opt-in. book_sanity never creates them regardless."""
-        if self.book_sanity or bool(self.options.individual_series_items.value):
+        if self.book_sanity or self.individual:
             return False
         return self.options.series_per_unlock.value <= 3
 
@@ -529,13 +564,6 @@ class LibrarianWorld(World):
             if data.XP_CURVE[idx] <= max_rows
         ]
 
-        # Book-placement milestones dropped — closure-based "in logic" leakage
-        # marked high thresholds reachable too early, and default-mode warding
-        # made them swap-exploitable. Replaced 1:1 by row-completion thresholds
-        # (see Locations.py). MILESTONE_THRESHOLDS stays exported in case we
-        # re-add later.
-        active_milestone_locs: list = []
-
         # Row-completion count milestones: each fires when the player has
         # correctly completed N total rows. Filter by max_rows the same
         # way level-ups do — a milestone of "Complete 300 Rows" is
@@ -548,8 +576,7 @@ class LibrarianWorld(World):
         # Library-attached: floor completions, level-ups, chest openings,
         # milestones, row-completion milestones.
         for category in (active_floor_locs, active_levelup_locs,
-                         _chest_locations, active_milestone_locs,
-                         active_row_completion_locs):
+                         _chest_locations, active_row_completion_locs):
             for loc_data in category:
                 loc = LibrarianLocation(
                     self.player, loc_data.name,
@@ -620,10 +647,6 @@ class LibrarianWorld(World):
 
     def create_items(self) -> None:
         if self.book_sanity:
-            if bool(self.options.individual_series_items.value):
-                raise ValueError(
-                    "Librarian: enable book_sanity OR individual_series_items, "
-                    "not both -- book_sanity already makes every book its own item.")
             self._create_items_book()
             return
 
@@ -648,11 +671,11 @@ class LibrarianWorld(World):
         starting_count = self.options.starting_series_count.value
         starting_unlock_count = math.ceil(starting_count / per_unlock)
 
-        # opt-in: every series is its own item instead of grouped unlocks.
-        individual = bool(self.options.individual_series_items.value)
+        # unlock_mode == individual_series_unlocks: every series is its own item.
+        individual = self.individual
         if individual and self.options.goal.value == self.options.goal.option_custom:
             raise ValueError(
-                "Librarian: individual_series_items does not yet support "
+                "Librarian: unlock_mode individual_series_unlocks does not support "
                 "goal: custom (v1.2.0). Use goal: full, floor_1, or floor_2."
             )
 
@@ -664,8 +687,9 @@ class LibrarianWorld(World):
             # the shared cross-player fill of the series stays flat instead of
             # swap-storming on the shelf co-requirement (its `has(shelf, n)` term
             # flips false mid-fill as shared shelf copies get placed elsewhere).
-            # It also frees the shelf slots into filler, so the deep-lock fills
-            # the count-gated locations with filler, keeping ~all series shared.
+            # It also frees the shelf slots into filler; the count-gated locations
+            # are kept off the progression fill by an item-rule ban (set_rules) and
+            # back-filled with filler + useful, so ~all series circulate cross-world.
             for _name, _qty in ITEM_QUANTITIES.items():
                 if _name.startswith("Progressive Shelf Unlock ("):
                     _sid = _name[len("Progressive Shelf Unlock ("):-1]
@@ -727,26 +751,20 @@ class LibrarianWorld(World):
             if name in quantities:
                 quantities[name] = max(0, quantities[name] - count)
 
-        # Major Magic cap: each player needs at most (levels_kept - 1)
-        # Major Magic items to reach their highest reachable level. Extras
-        # are redundant progression-classified items — AP still has to
-        # place them, and in multi-player seeds with mixed goals (floor /
-        # low-custom configs that drop level-ups) they starve the cross-
-        # world progression pool and trigger "Not enough locations for
-        # progression items" fill failures.
-        #
-        # Shrink the pool by the excess; filler fills the freed slots
-        # below to keep per-player |items| == |locations|.
+        # Major Magic: keep one copy per reachable level (levels_kept). At the
+        # full goal that is all 45, so every skill reaches its max and every
+        # skill's Mastery is earnable; the goal requires mm >= levels_kept
+        # (set_rules) so no copy is redundant progression weight. levels_kept
+        # self-limits for floor/custom goals, and the excess-drop below trims
+        # the pool down to it; filler fills the freed slots to keep per-player
+        # |items| == |locations|.
         major_magic_names = (
             "Progressive Sort", "Progressive Shelf Guide",
             "Progressive Insight", "Progressive Auto-Shelving",
             "Progressive Assemble",
         )
-        levels_kept = sum(
-            1 for idx in range(data.MAX_PLAYER_LEVEL)
-            if data.XP_CURVE[idx] <= self.max_reachable_rows
-        )
-        max_major_magic_needed = max(0, levels_kept - 1)
+        levels_kept = self._levels_kept(self.max_reachable_rows)
+        max_major_magic_needed = levels_kept
         total_major_magic = sum(quantities.get(n, 0) for n in major_magic_names)
         excess_magic = total_major_magic - max_major_magic_needed
         if excess_magic > 0:
@@ -762,10 +780,10 @@ class LibrarianWorld(World):
                 removed += 1
 
         # Buffs + traps go in every mode's pool, replacing filler (fewer boring items scatter to
-        # other players); per-skill Mastery gating lives in the helper. In individual mode the
-        # deep-lock treats them like filler (non-advancement) and may pre-place some locally --
-        # fine, the player still gets them. BookSanity injects its own copy in _create_items_book.
-        for _bt_name, _bt_qty in _buffs_traps_quantities(quantities).items():
+        # other players); per-skill Mastery gating lives in the helper. In individual/book mode
+        # these useful/trap items back-fill the count-gated locations (kept off the progression
+        # fill by the item-rule ban). BookSanity injects its own copy in _create_items_book.
+        for _bt_name, _bt_qty in _buffs_traps_quantities().items():
             quantities[_bt_name] = _bt_qty
 
         # Pool-overshoot guard. Triggers on combinations like
@@ -794,11 +812,23 @@ class LibrarianWorld(World):
                       f"(~{extra_series} extra series unlocked at start) "
                       f"so all skills can stay in the pool.")
             if excess > 0:
+                # Still over (or nothing to lift -- individual mode has no Progressive Series
+                # Unlock). Magic + Mastery + Fatigue + bag items are all useful/trap now (optional),
+                # so drop the surplus from them to fit the smaller goal; magic first (most numerous).
+                for name in (list(major_magic_names)
+                             + list(_buffs_traps_quantities().keys())):
+                    if excess <= 0:
+                        break
+                    take = min(quantities.get(name, 0), excess)
+                    if take:
+                        quantities[name] -= take
+                        excess -= take
+            if excess > 0:
                 raise ValueError(
                     f"Pool overshoots target locations ({target}) by {excess} "
-                    f"even after lifting all in-pool Series Unlocks to "
-                    f"starting inventory. This config is fundamentally "
-                    f"impossible — use a less restrictive goal."
+                    f"even after lifting Series Unlocks and dropping optional "
+                    f"buffs. This config is fundamentally impossible — use a "
+                    f"less restrictive goal."
                 )
 
         pool_items: list[LibrarianItem] = []
@@ -817,9 +847,10 @@ class LibrarianWorld(World):
         self.multiworld.itempool.extend(pool_items)
 
     # Deep (count-gated) location categories: each is reachable only once many
-    # distinct series are held, so leaving them in the shared cross-player fill
-    # makes it swap-storm. pre_fill pre-places them locally so the shared fill
-    # only ever routes into shallow depth-2 rows.
+    # distinct series are held. Leaving them as progression targets in the shared
+    # cross-player fill makes it swap-storm, so individual mode forbids advancement
+    # items on them via _ban_advancement_on_deep (set_rules); AP then back-fills
+    # them with filler + useful items and progression routes only into shallow rows.
     _DEEP_CATEGORIES = frozenset((
         LibrarianLocationCategory.LEVEL_UP,
         LibrarianLocationCategory.ROW_COMPLETION,
@@ -828,160 +859,31 @@ class LibrarianWorld(World):
     ))
 
     def pre_fill(self) -> None:
-        """Take the deep count-gated locations out of the cross-player fill by
-        pre-placing them locally, in dependency order, with a safe item set --
-        keeping shelf + most series in the shared multiworld.
+        """Keep this world's filler in-world before the cross-player fill.
 
-        Individual series items are a 1:1 item->row shape, which is cheap on its
-        own. The cost is the ~150 fillable count-gated locations -- level-ups
-        (feasible_rows>=XP AND magic), 'Complete N Rows' (feasible_rows>=N),
-        section/floor completions -- each reachable only in a late fill sphere,
-        where the shared fill swap-storms. We can't delete them (the series need
-        the location count), so we pre-fill only them, locally.
-
-        Safe item set, placed by category so nothing self-locks:
-          * ROW_COMPLETION (any-N-series gates) host the locked series, in
-            ascending-N order so each is reachable without itself; the deepest
-            (N >= |series|-1) can't host a series and take filler.
-          * LEVEL_UP host magic -- each level grants the magic that opens the
-            next; the top level takes filler.
-          * SECTION/FLOOR host filler only. section_done needs a specific
-            section's series, not any N, so a series here could self-lock on its
-            own section; magic here would starve the level-up cascade.
-        Shelf unlocks are never locked (they stay shared/early so rows stay
-        reachable), so most series stay in the shared multiworld.
-
-        Once the deep locations are pre-filled they leave the unfilled set, so
-        AP's cross-player fill only routes into shallow rows/chests. A final
-        sweep asserts every locked deep location is genuinely reachable, turning
-        any model error into a loud FillError rather than a silent bad seed.
-        """
-        if self.book_sanity:
-            self._pre_fill_book()
-            self._place_local_filler()
-            return
-        if not bool(self.options.individual_series_items.value):
-            self._place_local_filler()
-            return
-
-        mw = self.multiworld
-        p = self.player
-        cat_of = lambda loc: location_dictionary[loc.name].category
-
-        deep_locs = [loc for loc in mw.get_unfilled_locations(p)
-                     if loc.name in location_dictionary
-                     and cat_of(loc) in self._DEEP_CATEGORIES]
-        if not deep_locs:
-            return
-
-        # Partition this player's pool: magic, series, filler. (Shelf unlocks are
-        # progression but deliberately excluded from the safe set.)
-        my_pool = [it for it in mw.itempool if it.player == p]
-        magic = [it for it in my_pool if it.name in _MAJOR_MAGIC_NAMES]
-        series_items = [it for it in my_pool
-                        if it.name.startswith(_SERIES_ITEM_PREFIX) and it.advancement]
-        filler = [it for it in my_pool if not it.advancement]
-
-        n_deep = len(deep_locs)
-        # Use all magic, then as much filler as possible, then the remainder in
-        # series. The series remainder = the "must-deep" progression that will
-        # not fit the shallow slots; minimizing it maximizes series sharing.
-        n_filler_use = min(len(filler), max(0, n_deep - len(magic)))
-        n_series_use = n_deep - len(magic) - n_filler_use
-        magic_use = list(magic)
-        if n_series_use < 0:  # more magic than deep locs (only in tiny configs)
-            magic_use = magic[:n_deep]
-            n_filler_use = 0
-            n_series_use = 0
-        if n_series_use > len(series_items):
-            raise FillError(
-                f"[Librarian] deep-lock: need {n_series_use} series for "
-                f"{n_deep} deep locations, only {len(series_items)} available.")
-        magic_q = list(magic_use)
-        filler_q = list(filler[:n_filler_use])
-        series_q = list(series_items[:n_series_use])
-
-        safe_ids = {id(it) for it in (magic_q + filler_q + series_q)}
-        mw.itempool[:] = [it for it in mw.itempool if id(it) not in safe_ids]
-
-        # base_state now has all shelf + all SHARED series collected (the safe
-        # items were just removed from the pool), so it provides the feasible_rows
-        # floor the cascade climbs from.
-        base_state = mw.get_all_state(False)
-
-        active_by_id = {s.id: s for s in self.active_sections}
-        series_cap = len(self.series_order) - 1  # a series can't gate a loc needing all
-
-        def thresholds(loc):
-            """(feasible_rows needed, major_magic needed) modelled for sort/guard."""
-            cat = cat_of(loc)
-            if cat == LibrarianLocationCategory.ROW_COMPLETION:
-                return (int(loc.name.split()[1]), 0)
-            if cat == LibrarianLocationCategory.LEVEL_UP:
-                n = int(loc.name.split()[2])
-                return (data.XP_CURVE[n - 1], max(0, n - 1))
-            if cat == LibrarianLocationCategory.SECTION:
-                sec = active_by_id.get(loc.name.split(":", 1)[1].strip().split()[0])
-                return (len(sec.series) if sec else 0, 0)
-            if cat == LibrarianLocationCategory.FLOOR:
-                fn = int(loc.name.split()[1])
-                return (sum(len(s.series) for s in self.active_sections
-                            if s.floor == fn), 0)
-            return (0, 0)
-
-        thr = {id(loc): thresholds(loc) for loc in deep_locs}
-        # ascending threshold; on ties place ROW_COMPLETION first (they carry the
-        # series that lift feasible_rows for everything above them).
-        tie = lambda loc: 0 if cat_of(loc) == LibrarianLocationCategory.ROW_COMPLETION else 1
-        deep_sorted = sorted(deep_locs, key=lambda l: (thr[id(l)][0], tie(l), thr[id(l)][1]))
-
-        # Walk locations shallow->deep, tracking the model's feasible_rows / magic
-        # exactly as the eventual sweep will see them, and lock the class of item
-        # each category needs.
-        feasible = self._pre_fill_feasible_rows(base_state)
-        held_mm = 0
-        for loc in deep_sorted:
-            need_rows, need_mm = thr[id(loc)]
-            if feasible < need_rows or held_mm < need_mm:
-                raise FillError(
-                    f"[Librarian] deep-lock: '{loc.name}' needs feasible>="
-                    f"{need_rows}/mm>={need_mm}, model at {feasible}/{held_mm}. "
-                    f"safe set under-provisioned.")
-            cat = cat_of(loc)
-            if (cat == LibrarianLocationCategory.ROW_COMPLETION
-                    and series_q and need_rows < series_cap):
-                item = series_q.pop(); feasible += 1
-            elif cat == LibrarianLocationCategory.LEVEL_UP and magic_q:
-                item = magic_q.pop(); held_mm += 1
-            elif filler_q:
-                item = filler_q.pop()
-            elif magic_q:
-                item = magic_q.pop(); held_mm += 1
-            elif series_q and need_rows < series_cap:
-                item = series_q.pop(); feasible += 1
-            else:
-                raise FillError(
-                    f"[Librarian] deep-lock: no legal item for '{loc.name}' "
-                    f"(need_rows={need_rows}).")
-            loc.place_locked_item(item)
-
-        # Every safe item must have landed.
-        leftover = len(series_q) + len(magic_q) + len(filler_q)
-        if leftover:
-            raise FillError(
-                f"[Librarian] deep-lock: {leftover} safe items unplaced.")
-
-        # Safety net: prove every locked deep location is actually reachable
-        # (the model above is exact, but a data/rule drift would silently break
-        # winnability -- turn that into a loud failure instead).
-        verify = sweep_from_pool(base_state, [], mw.get_filled_locations(p))
-        for loc in deep_sorted:
-            if not loc.can_reach(verify):
-                raise FillError(
-                    f"[Librarian] deep-lock verification failed: '{loc.name}' "
-                    f"holding '{loc.item.name}' is unreachable.")
-
+        The deep count-gated locations (level-ups, row/book completions, section
+        and floor completions) are routed out of AP's swap-prone progression fill
+        by an item-rule ban applied in set_rules for individual/book modes
+        (_ban_advancement_on_deep). AP's remaining_fill then back-fills them with
+        filler + useful items, so progression only ever routes into the shallow
+        depth-1 rows/books; grouped keeps them as ordinary progression targets.
+        pre_fill's only remaining job is the local-filler pass."""
         self._place_local_filler()
+
+    def _ban_advancement_on_deep(self, deep_categories) -> None:
+        """Forbid advancement items on this player's deep count-gated locations so
+        AP's progression fill skips them natively: Location.can_fill checks
+        item_rule before (and short-circuits) the access rule, so a series/book
+        item is rejected here without ever evaluating feasible_rows and no
+        swap-storm forms. The locations stay DEFAULT, so AP's remaining_fill still
+        fills them with filler + useful items (magic can land on level-ups). This
+        replaces the old hand-rolled deep-lock pre_fill."""
+        p = self.player
+        ban = lambda item: not item.advancement
+        for loc in self.multiworld.get_unfilled_locations(p):
+            data = location_dictionary.get(loc.name)
+            if data is not None and data.category in deep_categories:
+                add_item_rule(loc, ban)
 
     def _place_local_filler(self) -> None:
         """local_filler (default on): keep our filler in our own world by
@@ -1030,144 +932,14 @@ class LibrarianWorld(World):
             mw.itempool.remove(filler_items[i])
             placeable[i].place_locked_item(filler_items[i])
 
-    # Deep count-gated categories for the BookSanity deep-lock.
+    # Deep count-gated categories banned from advancement in book_sanity (see
+    # _ban_advancement_on_deep).
     _DEEP_CATEGORIES_BOOK = frozenset((
         LibrarianLocationCategory.LEVEL_UP,
         LibrarianLocationCategory.BOOK_COMPLETION,
         LibrarianLocationCategory.SECTION,
         LibrarianLocationCategory.FLOOR,
     ))
-
-    def _pre_fill_book(self) -> None:
-        """BookSanity deep-lock: pre-place the count-gated locations (level-ups,
-        'Complete N Books', section/floor completions) locally so the shared
-        cross-player fill only routes into the depth-1 book locations. With all
-        shelves precollected there is ample filler, so these take magic (->
-        level-ups) + filler and no books -- every book stays in the shared
-        multiworld. Books only backfill if filler is short."""
-        mw = self.multiworld
-        p = self.player
-        cat_of = lambda loc: location_dictionary[loc.name].category
-
-        deep_locs = [loc for loc in mw.get_unfilled_locations(p)
-                     if loc.name in location_dictionary
-                     and cat_of(loc) in self._DEEP_CATEGORIES_BOOK]
-        if not deep_locs:
-            return
-
-        my_pool = [it for it in mw.itempool if it.player == p]
-        magic = [it for it in my_pool if it.name in _MAJOR_MAGIC_NAMES]
-        book_items = [it for it in my_pool
-                      if it.name.startswith("Book: ") and it.advancement]
-        filler = [it for it in my_pool if not it.advancement]
-
-        n_deep = len(deep_locs)
-        n_filler_use = min(len(filler), max(0, n_deep - len(magic)))
-        n_book_use = n_deep - len(magic) - n_filler_use
-        magic_use = list(magic)
-        if n_book_use < 0:
-            magic_use = magic[:n_deep]
-            n_filler_use = 0
-            n_book_use = 0
-        if n_book_use > len(book_items):
-            raise FillError(
-                f"[Librarian] book deep-lock: need {n_book_use} books for "
-                f"{n_deep} deep locations, only {len(book_items)} available.")
-        magic_q = list(magic_use)
-        filler_q = list(filler[:n_filler_use])
-        book_q = list(book_items[:n_book_use])
-
-        safe_ids = {id(it) for it in (magic_q + filler_q + book_q)}
-        mw.itempool[:] = [it for it in mw.itempool if id(it) not in safe_ids]
-
-        base_state = mw.get_all_state(False)
-        active_by_id = {s.id: s for s in self.active_sections}
-        total_books = sum(s.volume_count for s in self.active_sections)
-        book_cap = total_books - 1  # a book can't gate a loc needing all books
-
-        def thresholds(loc):
-            cat = cat_of(loc)
-            if cat == LibrarianLocationCategory.BOOK_COMPLETION:
-                return (int(loc.name.split()[1]), 0)
-            if cat == LibrarianLocationCategory.LEVEL_UP:
-                n = int(loc.name.split()[2])
-                return (data.XP_CURVE[n - 1], max(0, n - 1))
-            if cat == LibrarianLocationCategory.SECTION:
-                sec = active_by_id.get(loc.name.split(":", 1)[1].strip().split()[0])
-                return (sec.volume_count if sec else 0, 0)
-            if cat == LibrarianLocationCategory.FLOOR:
-                fn = int(loc.name.split()[1])
-                return (sum(s.volume_count for s in self.active_sections
-                            if s.floor == fn), 0)
-            return (0, 0)
-
-        thr = {id(loc): thresholds(loc) for loc in deep_locs}
-        tie = lambda loc: (0 if cat_of(loc) == LibrarianLocationCategory.BOOK_COMPLETION
-                           else 1)
-        deep_sorted = sorted(deep_locs,
-                             key=lambda l: (thr[id(l)][0], tie(l), thr[id(l)][1]))
-
-        feasible = self._pre_fill_feasible_books(base_state)
-        held_mm = 0
-        for loc in deep_sorted:
-            need, need_mm = thr[id(loc)]
-            if feasible < need or held_mm < need_mm:
-                raise FillError(
-                    f"[Librarian] book deep-lock: '{loc.name}' needs feasible>="
-                    f"{need}/mm>={need_mm}, model at {feasible}/{held_mm}.")
-            cat = cat_of(loc)
-            if (cat == LibrarianLocationCategory.BOOK_COMPLETION
-                    and book_q and need < book_cap):
-                item = book_q.pop(); feasible += 1
-            elif cat == LibrarianLocationCategory.LEVEL_UP and magic_q:
-                item = magic_q.pop(); held_mm += 1
-            elif filler_q:
-                item = filler_q.pop()
-            elif magic_q:
-                item = magic_q.pop(); held_mm += 1
-            elif book_q and need < book_cap:
-                item = book_q.pop(); feasible += 1
-            else:
-                raise FillError(
-                    f"[Librarian] book deep-lock: no legal item for '{loc.name}'.")
-            loc.place_locked_item(item)
-
-        leftover = len(magic_q) + len(filler_q) + len(book_q)
-        if leftover:
-            raise FillError(
-                f"[Librarian] book deep-lock: {leftover} safe items unplaced.")
-
-        verify = sweep_from_pool(base_state, [], mw.get_filled_locations(p))
-        for loc in deep_sorted:
-            if not loc.can_reach(verify):
-                raise FillError(
-                    f"[Librarian] book deep-lock verification failed: "
-                    f"'{loc.name}' holding '{loc.item.name}' is unreachable.")
-
-    def _pre_fill_feasible_books(self, state) -> int:
-        """Number of distinct book items THIS player holds (all placeable, since
-        every shelf is precollected). Used by the book deep-lock model."""
-        p = self.player
-        prog = state.prog_items[p]
-        total = 0
-        for iname, cnt in prog.items():
-            if cnt >= 1 and iname.startswith("Book: "):
-                total += 1
-        return total
-
-    def _pre_fill_feasible_rows(self, state) -> int:
-        """feasible_rows for THIS player read directly off a state (used only by
-        pre_fill's model; mirrors _set_rules_individual.feasible_rows)."""
-        p = self.player
-        prog = state.prog_items[p]
-        total = 0
-        for sec in self.active_sections:
-            held_shelf = prog.get(shelf_unlock_name(sec.id), 0)
-            for ser in sec.series:
-                if (prog.get(series_unlock_item_name(ser.name), 0) >= 1
-                        and held_shelf >= self.shelf_req[(sec.id, ser.name)]):
-                    total += 1
-        return total
 
     def _create_items_book(self) -> None:
         """BookSanity item pool: every book is its own item. Every bookcase is
@@ -1179,6 +951,11 @@ class LibrarianWorld(World):
             raise ValueError(
                 "Librarian: book_sanity does not support goal: custom (v1.2.0). "
                 "Use goal: full, floor_1, or floor_2.")
+        if self.options.goal.value == self.options.goal.option_full:
+            print("[Librarian] BookSanity + full goal (~3072 book checks): "
+                  "generation's spoiler-playthrough step is quadratic in item "
+                  "count and will be slow. A floor goal (floor_1/floor_2) "
+                  "generates several times faster with ~1500 checks.")
 
         target = sum(len(r.locations) for r in mw.regions
                      if r.player == self.player) - 1
@@ -1191,7 +968,7 @@ class LibrarianWorld(World):
                 sid = name[len("Progressive Shelf Unlock ("):-1]
                 if sid in active_ids:
                     precollect_names.extend([name] * qty)
-        starting_book_names = self.starting_books
+        starting_book_names = self.starting_book_names
         precollect_names.extend(starting_book_names)
         for name in precollect_names:
             mw.push_precollected(self.create_item(name))
@@ -1208,10 +985,10 @@ class LibrarianWorld(World):
                 continue
             pool_items.append(self.create_item(n))
 
-        # Major Magic, capped to (levels_kept - 1) like the row path.
-        levels_kept = sum(1 for idx in range(data.MAX_PLAYER_LEVEL)
-                          if data.XP_CURVE[idx] <= self.max_reachable_books)
-        max_major_magic = max(0, levels_kept - 1)
+        # Major Magic: keep one per reachable level (levels_kept), like the row
+        # path; the goal requires mm >= levels_kept so none is redundant.
+        levels_kept = self._levels_kept(self.max_reachable_books)
+        max_major_magic = levels_kept
         magic_q = {n: ITEM_QUANTITIES.get(n, 0) for n in _MAJOR_MAGIC_NAMES}
         excess = sum(magic_q.values()) - max_major_magic
         while excess > 0:
@@ -1226,15 +1003,31 @@ class LibrarianWorld(World):
 
         # Buffs + traps, same as the other modes (replaces filler). Mastery gated on the capped
         # magic counts above.
-        for bt_name, bt_qty in _buffs_traps_quantities(magic_q).items():
+        for bt_name, bt_qty in _buffs_traps_quantities().items():
             for _ in range(bt_qty):
                 pool_items.append(self.create_item(bt_name))
 
         filler_needed = target - len(pool_items)
         if filler_needed < 0:
-            raise ValueError(
-                f"Librarian: book_sanity pool overshoots target by "
-                f"{-filler_needed} (target={target}, pool={len(pool_items)}).")
+            # Overshoot relief (mirrors the row path): drop surplus optional items
+            # -- Major Magic, then buffs/traps -- all non-book, non-progression, so
+            # dropping them never affects winnability. Book items are never dropped.
+            drop_set = set(_MAJOR_MAGIC_NAMES) | set(_buffs_traps_quantities().keys())
+            excess = -filler_needed
+            kept: list[LibrarianItem] = []
+            for it in reversed(pool_items):
+                if excess > 0 and it.name in drop_set:
+                    excess -= 1
+                    continue
+                kept.append(it)
+            pool_items = list(reversed(kept))
+            filler_needed = target - len(pool_items)
+            if filler_needed < 0:
+                raise ValueError(
+                    f"Librarian: book_sanity pool overshoots target by "
+                    f"{-filler_needed} even after dropping optional buffs "
+                    f"(target={target}, pool={len(pool_items)}). Use a less "
+                    f"restrictive goal.")
         for i in range(filler_needed):
             f = _filler_items[i % len(_filler_items)]
             pool_items.append(self.create_item(f.name))
@@ -1274,15 +1067,12 @@ class LibrarianWorld(World):
                 if name.startswith("Book: "):
                     bk = self._bookcount_key
                     sd[bk] = sd.get(bk, 0) + 1
-                elif name in _MAJOR_MAGIC_NAMES:
-                    mk = self._mmstamp_key
-                    sd[mk] = sd.get(mk, 0) + 1
             else:
                 sk = self._stamp_key
                 sd[sk] = sd.get(sk, 0) + 1
-                if name in _MAJOR_MAGIC_NAMES:
-                    mk = self._mmstamp_key
-                    sd[mk] = sd.get(mk, 0) + 1
+                if name.startswith(_SERIES_ITEM_PREFIX):
+                    sc = self._seriescount_key
+                    sd[sc] = sd.get(sc, 0) + 1
         return changed
 
     def remove(self, state, item, *args, **kwargs) -> bool:
@@ -1294,15 +1084,12 @@ class LibrarianWorld(World):
                 if name.startswith("Book: "):
                     bk = self._bookcount_key
                     sd[bk] = sd.get(bk, 0) - 1
-                elif name in _MAJOR_MAGIC_NAMES:
-                    mk = self._mmstamp_key
-                    sd[mk] = sd.get(mk, 0) + 1
             else:
                 sk = self._stamp_key
                 sd[sk] = sd.get(sk, 0) + 1
-                if name in _MAJOR_MAGIC_NAMES:
-                    mk = self._mmstamp_key
-                    sd[mk] = sd.get(mk, 0) + 1
+                if name.startswith(_SERIES_ITEM_PREFIX):
+                    sc = self._seriescount_key
+                    sd[sc] = sd.get(sc, 0) - 1
         return changed
 
     # ------------------------------------------------------------------
@@ -1326,35 +1113,19 @@ class LibrarianWorld(World):
 
         shelf_names = {sec.id: shelf_unlock_name(sec.id) for sec in active_sections}
 
-        # item_name -> (shelf_unlock_name, shelf_req) for every active series.
-        series_item_info: dict[str, tuple[str, int]] = {}
-        for sec in active_sections:
-            sname = shelf_names[sec.id]
-            for ser in sec.series:
-                series_item_info[series_unlock_item_name(ser.name)] = (
-                    sname, shelf_req[(sec.id, ser.name)])
-
-        # Cache keyed on the per-state mutation stamp (bumped in collect/remove).
-        # Many rules call this against the same state per fill sweep; the stamp
-        # check is O(1), so we do the O(held) compute once per state.
+        # Per-state mutation stamp (bumped in collect/remove); used by section_done's
+        # cache below.
         stamp_key = f"_librarian_stamp_{p}"
-        cache_key = f"_librarian_feasible_indiv_{p}"
+
+        # feasible_rows = number of distinct series items this player holds. Every
+        # bookcase is precollected (create_items), so has(shelf, shelf_req) is always
+        # true and a row is finishable iff its series item is held. Maintained as an
+        # O(1) incremental counter in collect/remove (carried across copy() by
+        # _librarian_carry_state), exactly like book_sanity's feasible_books.
+        seriescount_key = self._seriescount_key
 
         def feasible_rows(state) -> int:
-            stamp = state.__dict__.get(stamp_key, 0)
-            cached = state.__dict__.get(cache_key)
-            if cached is not None and cached[0] == stamp:
-                return cached[1]
-            prog = state.prog_items[p]
-            total = 0
-            for item_name, count in prog.items():
-                info = series_item_info.get(item_name)
-                if info is not None and count >= 1:
-                    shelf_name, shelf_req_n = info
-                    if prog.get(shelf_name, 0) >= shelf_req_n:
-                        total += 1
-            state.__dict__[cache_key] = (stamp, total)
-            return total
+            return state.__dict__.get(seriescount_key, 0)
 
         # Precompute per-section requirements (shelf name, bookcase count, and the
         # series item names) so section_done does no string-formatting per call.
@@ -1391,22 +1162,6 @@ class LibrarianWorld(World):
             memo[sec.id] = r
             return r
 
-        # Cached on the magic-specific stamp (bumped only when a Major Magic item
-        # is collected/removed). Magic changes rarely relative to series/shelf, so
-        # this cache survives long stretches of a fill sweep -- unlike the general
-        # stamp. The level-up rule (a hotspot) calls this.
-        mm_stamp_key = f"_librarian_mmstamp_{p}"
-        mm_cache_key = f"_librarian_mmtotal_{p}"
-
-        def major_magic_total(state) -> int:
-            stamp = state.__dict__.get(mm_stamp_key, 0)
-            cached = state.__dict__.get(mm_cache_key)
-            if cached is not None and cached[0] == stamp:
-                return cached[1]
-            total = sum(state.count(n, p) for n in _MAJOR_MAGIC_NAMES)
-            state.__dict__[mm_cache_key] = (stamp, total)
-            return total
-
         # Section region access + per-row + section-completion rules.
         for section in active_sections:
             entrance = mw.get_entrance(f"Open Section {section.id}", p)
@@ -1415,17 +1170,14 @@ class LibrarianWorld(World):
                 state.has(sname, p, 1)
             )
 
-            sec_shelf_name = shelf_names[section.id]
             for series in section.series:
-                shelf_n = shelf_req[(section.id, series.name)]
                 item_name = series_unlock_item_name(series.name)
 
-                def make_row_rule(sname, sn, iname):
-                    return lambda state: (
-                        state.has(sname, p, sn) and state.has(iname, p, 1)
-                    )
+                # Shelves all precollected -> has(shelf) always true; gate on series only.
+                def make_row_rule(iname):
+                    return lambda state: state.prog_items[p][iname] >= 1
                 row_loc = mw.get_location(f"Shelf: {section.id} - {series.name}", p)
-                row_loc.access_rule = make_row_rule(sec_shelf_name, shelf_n, item_name)
+                row_loc.access_rule = make_row_rule(item_name)
 
             sec_loc = mw.get_location(section_completion_name(section.id), p)
             sec_loc.access_rule = (
@@ -1454,11 +1206,9 @@ class LibrarianWorld(World):
             if data.XP_CURVE[level_n - 1] > max_rows:
                 continue  # location was not created
             rows_needed = data.XP_CURVE[level_n - 1]
-            major_magic_needed = max(0, level_n - 1)
             loc = mw.get_location(f"Reached Level {level_n}", p)
             loc.access_rule = (
-                lambda state, n=rows_needed, mm=major_magic_needed:
-                feasible_rows(state) >= n and major_magic_total(state) >= mm
+                lambda state, n=rows_needed: feasible_rows(state) >= n
             )
 
         # Row-completion milestones (only created for the deep-chain opt-in).
@@ -1480,6 +1230,8 @@ class LibrarianWorld(World):
         goal.access_rule = (
             lambda state, n=total_active_rows: feasible_rows(state) >= n
         )
+
+        self._ban_advancement_on_deep(self._DEEP_CATEGORIES)
 
         mw.completion_condition[p] = lambda state: state.has(VICTORY_ITEM_NAME, p)
 
@@ -1509,8 +1261,6 @@ class LibrarianWorld(World):
         stamp_key = f"_librarian_stamp_{p}"
         fb_cache_key = f"_librarian_feasible_books_{p}"
         secdone_key = f"_librarian_secdone_book_{p}"
-        mm_stamp_key = f"_librarian_mmstamp_{p}"
-        mm_cache_key = f"_librarian_mmtotal_book_{p}"
 
         # feasible_books = the incremental book counter maintained in
         # collect/remove (carried across copy() by _librarian_carry_state). O(1)
@@ -1531,15 +1281,6 @@ class LibrarianWorld(World):
                     return False
             return True
 
-        def major_magic_total(state) -> int:
-            stamp = state.__dict__.get(mm_stamp_key, 0)
-            cached = state.__dict__.get(mm_cache_key)
-            if cached is not None and cached[0] == stamp:
-                return cached[1]
-            total = sum(state.count(n, p) for n in _MAJOR_MAGIC_NAMES)
-            state.__dict__[mm_cache_key] = (stamp, total)
-            return total
-
         # Per-book locations (depth-1) + section completions. The rule inlines
         # has() (state.prog_items[p][n] >= 1); this lambda is evaluated a huge
         # number of times per fill, so skipping the method call is a real win.
@@ -1549,7 +1290,7 @@ class LibrarianWorld(World):
                     iname = book_item_name(ser.name, ch)
                     loc = mw.get_location(_book_name(sec.id, ser.name, ch), p)
                     loc.access_rule = (
-                        lambda state, n=iname: state.prog_items[p].get(n, 0) >= 1)
+                        lambda state, n=iname: state.prog_items[p][n] >= 1)
             sec_loc = mw.get_location(section_completion_name(sec.id), p)
             sec_loc.access_rule = (
                 lambda state, sid=sec.id: section_done_book(state, sid))
@@ -1577,8 +1318,8 @@ class LibrarianWorld(World):
                 continue
             loc = mw.get_location(f"Reached Level {level_n}", p)
             loc.access_rule = (
-                lambda state, n=data.XP_CURVE[level_n - 1], mm=max(0, level_n - 1):
-                feasible_books(state) >= n and major_magic_total(state) >= mm)
+                lambda state, n=data.XP_CURVE[level_n - 1]:
+                feasible_books(state) >= n)
 
         for thresh in BOOK_COMPLETION_THRESHOLDS:
             if thresh > max_books:
@@ -1590,6 +1331,7 @@ class LibrarianWorld(World):
         goal = mw.get_location(GOAL_LOCATION_NAME, p)
         goal.access_rule = (
             lambda state, n=total_active_books: feasible_books(state) >= n)
+        self._ban_advancement_on_deep(self._DEEP_CATEGORIES_BOOK)
         mw.completion_condition[p] = lambda state: state.has(VICTORY_ITEM_NAME, p)
 
     def set_rules(self) -> None:
@@ -1598,7 +1340,7 @@ class LibrarianWorld(World):
         if self.book_sanity:
             self._set_rules_book()
             return
-        if bool(self.options.individual_series_items.value):
+        if self.individual:
             self._set_rules_individual()
             return
         mw = self.multiworld
@@ -1735,74 +1477,6 @@ class LibrarianWorld(World):
             state.__dict__[cache_attr] = (marker, total)
             return total
 
-        # Milestone helpers. Milestones fire on cumulative books PLACED;
-        # any book on any shelf counts — correct placement isn't required.
-        # Threshold is reachable once the player has enough unlocked-series
-        # books to pick up AND enough open shelf capacity to drop them.
-        # Both totals are cumulative and monotonic. Precompute lookup
-        # arrays so each rule call is O(active_sections) rather than O(series).
-        only_shelfable = bool(self.options.only_unward_shelfable_books.value)
-        series_volumes_by_name = {
-            ser.name: ser.volumes
-            for sec in data.SECTIONS for ser in sec.series
-        }
-        # cumulative_books_unlocked[k] = total volumes in series_order[:k]
-        cumulative_books_unlocked: list[int] = [0]
-        for name in self.series_order:
-            cumulative_books_unlocked.append(
-                cumulative_books_unlocked[-1]
-                + series_volumes_by_name.get(name, 0)
-            )
-        # section_cumulative_slots[sid][n] = total shelf-slot capacity of
-        # the first n bookcases of section sid. Capacity per bookcase is the
-        # sum of volumes of the series that live on it (via shelf_req).
-        section_cumulative_slots: dict[str, list[int]] = {}
-        for sec in active_sections:
-            per_bookcase_volumes: dict[int, int] = {}
-            for ser in sec.series:
-                bc_idx = shelf_req[(sec.id, ser.name)]
-                per_bookcase_volumes[bc_idx] = (
-                    per_bookcase_volumes.get(bc_idx, 0) + ser.volumes
-                )
-            cumulative: list[int] = [0]
-            for bc_idx in sorted(per_bookcase_volumes):
-                cumulative.append(cumulative[-1] + per_bookcase_volumes[bc_idx])
-            section_cumulative_slots[sec.id] = cumulative
-
-        # Hoist len(...)-1 sentinels out of the per-call hot path so each
-        # rule invocation just compares ints rather than calling len() and
-        # subtracting on every iteration.
-        _books_unlocked_max_idx = len(cumulative_books_unlocked) - 1
-        _books_unlocked_max = cumulative_books_unlocked[-1]
-        # Pre-extract (table, max_idx, max_value) tuples per section so
-        # the hot-path loop in shelf_slots_open only does dict lookup once
-        # and reuses the precomputed per-section bounds.
-        section_slots_table = {
-            sec.id: (
-                section_cumulative_slots[sec.id],
-                len(section_cumulative_slots[sec.id]) - 1,
-                section_cumulative_slots[sec.id][-1],
-            )
-            for sec in active_sections
-        }
-
-        def books_unlocked(state) -> int:
-            n_series = state.count(ITEM_PROG_SERIES, p) * per_unlock
-            if n_series >= _books_unlocked_max_idx:
-                return _books_unlocked_max
-            return cumulative_books_unlocked[n_series]
-
-        def shelf_slots_open(state) -> int:
-            total = 0
-            for sec in active_sections:
-                n = state.count(shelf_names[sec.id], p)
-                table, max_idx, max_val = section_slots_table[sec.id]
-                if n >= max_idx:
-                    total += max_val
-                else:
-                    total += table[n]
-            return total
-
         # Section region access — gated by ≥1 Progressive Shelf Unlock for X.
         # Capture the precomputed shelf-unlock name string in the lambda
         # closure so the rule doesn't re-format the section id every call.
@@ -1860,35 +1534,22 @@ class LibrarianWorld(World):
         # is tracked as a location check, but no AP prereq is needed (the
         # in-game key chain gates which chests are reachable when).
 
-        # Level-up access rules — only for level-up locations that were
-        # actually created (create_regions drops ones beyond max_reachable_rows).
-        # • feasible_rows(state) >= XP_CURVE[N-1]: player can finish that
-        #   many rows (per-series shelf+series check).
-        # • Major Magic total >= N-1: each post-level-1 level requires
-        #   one Major Magic. Sum five state.count calls directly rather
-        #   than count_group("Major Magic", p) — count_group walks the
-        #   full item list per call, a hot-path cost during fill sweeps.
-        major_magic_names = ("Progressive Sort", "Progressive Shelf Guide",
-                             "Progressive Insight", "Progressive Auto-Shelving",
-                             "Progressive Assemble")
-        def major_magic_total(state) -> int:
-            return sum(state.count(n, p) for n in major_magic_names)
+        # Level-up access rules — only for level-up locations that were actually
+        # created (create_regions drops ones beyond max_reachable_rows). Gate is
+        # feasible_rows(state) >= XP_CURVE[N-1]; magic never gates a level-up
+        # (feasible_rows never modelled magic).
         max_rows = self.max_reachable_rows
         for level_n in range(1, data.MAX_PLAYER_LEVEL + 1):
             if data.XP_CURVE[level_n - 1] > max_rows:
                 continue  # location was not created
             rows_needed = data.XP_CURVE[level_n - 1]
-            major_magic_needed = max(0, level_n - 1)
             loc = mw.get_location(f"Reached Level {level_n}", p)
             loc.access_rule = (
-                lambda state, n=rows_needed, mm=major_magic_needed:
-                feasible_rows(state) >= n
-                and major_magic_total(state) >= mm
+                lambda state, n=rows_needed: feasible_rows(state) >= n
             )
 
-        # Book-placement milestones were dropped (see create_regions). No
-        # access_rule loop needed here; if any are ever re-added,
-        # books_unlocked + shelf_slots_open are still defined above as helpers.
+        # Book-placement milestones were dropped (see create_regions); no
+        # access_rule loop needed here.
 
         # Row-completion milestones. Each fires when the player has
         # correctly completed N total rows. Reachable when feasible_rows
@@ -1917,7 +1578,8 @@ class LibrarianWorld(World):
         if goal_value == self.options.goal.option_custom:
             # Custom-row goal is reachable once feasible_rows >= threshold.
             threshold = self.options.custom_goal_row_count.value
-            goal.access_rule = lambda state, n=threshold: feasible_rows(state) >= n
+            goal.access_rule = (
+                lambda state, n=threshold: feasible_rows(state) >= n)
         else:
             # full / floor_1 / floor_2 all require every active section
             # to be cleared. For floor goals, active_sections is already
@@ -2051,16 +1713,21 @@ class LibrarianWorld(World):
             "starting_section": self.starting_section,
             "starting_section_b": self.starting_section_b,
             "starting_series": self.starting_series,
+            # booksanity: the individual books precollected at start (random subset;
+            # count = sum of starting_series_count rolled 3/5/10 sizes). Empty for
+            # other modes. Emitted so Universal Tracker can reconstruct the seed.
+            "starting_books": self.starting_book_names,
             "starting_series_count": self.options.starting_series_count.value,
             "series_per_unlock": self.options.series_per_unlock.value,
             "series_order": self.series_order,
-            # opt-in. When 1, each series is its own item and the Lua client
-            # resolves an unlocked series from series_item_to_series instead of
-            # the series_order prefix. Empty map when off.
-            "individual_series_items": int(self.options.individual_series_items.value),
+            # Derived from unlock_mode for the Lua client (unchanged contract).
+            # When 1, each series is its own item and the client resolves an
+            # unlocked series from series_item_to_series instead of the
+            # series_order prefix. Empty map when off.
+            "individual_series_items": int(self.individual),
             "series_item_to_series": (
                 {series_unlock_item_name(s): s for s in self.series_order}
-                if self.options.individual_series_items.value else {}
+                if self.individual else {}
             ),
             "shelf_order": self.shelf_order,
             # Per-section bookcase counts. Sizes the per-section shelf-
