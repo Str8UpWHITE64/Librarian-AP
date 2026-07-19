@@ -259,8 +259,8 @@ one is loaded — your other saves are never touched.
 > **Requires game 1.0.12+, and a run started under this version of the mod.**
 > Runs from an earlier release are **not compatible** — their save is not
 > brought across, and continuing one after updating is neither supported nor
-> tested. Start the seed fresh. Your seed and YAML don't need regenerating;
-> it's the in-game world you restart, not the seed.
+> tested. Generate a new seed and start it fresh on this version of the mod
+> and apworld.
 
 The game keeps saves in numbered slots. Each AP run claims one free slot
 in the **20–30** range and treats it as the run's own — it is told to you
@@ -277,10 +277,29 @@ them.
 - **Don't save over slots 20–30.** This is the one action that can
   genuinely lose a run: saving a different world into the run's slot
   overwrites it, and the mod cannot get it back.
-- **Don't delete slots 20–30** while the run is still going.
+- **Be careful when deleting saves.** Deleting an AP save is not
+  recoverable, so make sure you are deleting the correct ones.
 - **You don't need to save manually at all.** The mod writes the run's
   slot after every save the game makes, on a timer, and when you quit or
   return to the title. Quitting from the pause menu is safe.
+
+### If you run out of slots
+
+Eleven runs can be in progress at once (20–30). Once they're all taken, a
+new run can't claim one, and the mod will say so and ask you to free a
+slot and reconnect — so it's worth clearing finished runs before starting
+a twelfth.
+
+Deleting a finished run's slot is how you make room. To work out which is
+which, the load menu shows each slot's date, play time and row count, and
+the exact seed-to-slot mapping lives in:
+
+```
+%LOCALAPPDATA%\Librarian\Saved\LibrarianAP_slots.txt
+```
+
+If you're not sure a slot is finished, leave it — deleting the wrong one
+cannot be undone.
 
 ### Why the mod is strict about this
 

@@ -12,12 +12,11 @@ system cannot work with at all — Continue stays dead and no slot can be claime
 title screen rather than failing quietly. **Stay on 1.1.0 if you are on an older game build.**
 
 **Runs in progress on 1.1.0 are not compatible.** Updating the mod and continuing an existing run is not
-supported — the old save is not imported into the slot system, and that path is untested. Start the seed
-fresh. Existing seeds and YAML are fine to reuse; it's the in-game world that has to be restarted.
+supported — the old save is not imported into the slot system, and that path is untested. Generate a new
+seed and start it fresh on this version.
 
-**Install both files.** All the behaviour changes are client-side, but the apworld carries a matching
-version stamp, so grab `librarian.apworld` alongside the game bundle. Nothing about generation, item IDs
-or location IDs changed.
+**Install both files.** Take the mod and `librarian.apworld` together, and generate against the new
+apworld — a run should be started on a matched pair rather than carried across from the old one.
 
 **Crash fix — one Lua executor, for real this time**
 - UE4SS runs the mod's Lua with no VM lock, so any timer callback executing on its background thread
@@ -36,8 +35,9 @@ or location IDs changed.
   longer writes. Fixed.
 - AP runs no longer share save slots with your vanilla saves. Each run claims its own slot in the 20–30
   range, tells you which one, and loads it for you when you reconnect.
-- **Leave slots 20–30 alone.** Don't load, overwrite or delete them by hand — the mod handles saving for
-  you, and saving a different world over the run's slot is the one action that can lose it. See
+- **Leave slots 20–30 alone.** Don't load or save over them by hand — the mod handles saving for you, and
+  saving a different world over the run's slot is the one action that can lose it. Be careful when deleting
+  saves: deleting an AP save is not recoverable, so make sure you are deleting the correct ones. See
   [How saving works](README.md#how-saving-works).
 - The mod checks that the loaded world is actually your run's save before it does anything. If you load
   the wrong save, it says so on screen and **sends no checks and hides no books** until the right one is
