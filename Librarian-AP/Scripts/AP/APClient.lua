@@ -119,6 +119,17 @@ function Client:connect()
         log("Already connected to slot")
         return
     end
+    -- Drop the previous run's check state before anything from the new one arrives. Connecting to a
+    -- second seed in the same process would otherwise send seed A's queued locations into seed B,
+    -- and A's sent set would suppress B's checks at the same location IDs.
+    --
+    -- Here rather than in the slot-connected handler on purpose: the server's checked_locations
+    -- arrive as part of the same Connected exchange, and clearing inside that handler can land after
+    -- they have already been recorded. _sent_checks is the cross-session truth for how far this slot
+    -- has progressed (_compute_sent_level_baseline reads it), so wiping it there would reset the
+    -- level floor to zero and re-issue skill upgrades the player already has.
+    self._outgoing_checks = {}
+    self._sent_checks = {}
     self._deferred_init = true
     log("Connecting...")
 end
