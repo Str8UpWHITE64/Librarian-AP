@@ -38,6 +38,8 @@ M.stored_fp    = nil       -- layout hash recorded at this run's last save
 M.fp_checked   = false     -- layout compared for the current world already
 M.autoload_done = false    -- this run's save was already auto-loaded this session
 M.mirror_pending = nil     -- a save happened; copy the world into our slot
+M.mirroring    = false     -- a mirror write is in flight; ignore its own hook echo
+M.disabled     = false     -- player chose vanilla; passive until the next connect
 
 --- A fresh run is the one case identity is established by causation rather than
 --- evidence: the player started this world from New Game while connected, so it
@@ -422,6 +424,7 @@ end
 --- override is a deliberate escape hatch, but never for a contradiction --
 --- that is evidence of the wrong world, not missing evidence.
 function M.may_send_checks()
+    if M.disabled then return false end
     if M.verdict == M.VERIFIED then return true end
     if M.override and M.verdict ~= M.REJECTED then return true end
     return false
@@ -439,6 +442,13 @@ end
 --- claim_target: set only while claiming a new slot, where the slot must be
 --- empty rather than ours.
 function M.can_force_save(claim_target)
+    -- Writing this run's slot only makes sense while the run is live. A stale
+    -- slot + verdict left over from an earlier connection would otherwise let
+    -- the mirror keep writing after a disconnect, or during vanilla play.
+    if M.disabled then return false, "mod passive (vanilla)" end
+    local AC = package.loaded["AP/APClient"]
+    if not (AC and AC._slot_connected) then return false, "not connected" end
+
     local IA = package.loaded["AP/ItemApply"]
     if not IA then return false, "ItemApply unavailable" end
     if not IA._gameplay_active then return false, "not in gameplay" end
@@ -481,6 +491,10 @@ function M.reset()
     M.pending_fresh, M.title_preapply = false, false
     M.stored_fp, M.fp_checked, M.autoload_done = nil, false, false
     M.mirror_pending = nil
+    -- Cleared here on purpose: a connection re-arms the mod even if the player
+    -- had chosen vanilla earlier in the session. The vanilla path sets this
+    -- again immediately after calling reset.
+    M.disabled = false
 end
 
 return M

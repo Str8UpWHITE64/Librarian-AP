@@ -1228,6 +1228,9 @@ end
 local function enter_vanilla_mode()
     if _vanilla_mode then return end
     _vanilla_mode = true
+    -- Vanilla means fully passive: no slot claiming, no mirroring, no checks.
+    local SIv = package.loaded["AP/SaveIdentity"]
+    if SIv then SIv.reset(); SIv.disabled = true end
     log("[menu] Close clicked — VANILLA mode latched; mod passive until relaunch")
     if _G._librarian_menu and _G._librarian_menu.hide then
         pcall(function() _G._librarian_menu.hide() end)
@@ -1365,6 +1368,7 @@ local register_bp_hooks_once  -- forward declaration; defined below
 -- watcher below catches that path too. activate_gameplay is idempotent, so both can converge.
 local m01_load_count = 0
 local _gameplay_loops_started = false
+local _mirror_ticks = nil     -- tick counter for the periodic slot mirror
 local _reject_nag = nil       -- tick counter for the repeated wrong-save warning
 local _pre_apply_settle_state = nil  -- {empty_ticks, reapplies_done} during pre-apply settle
 local _reconnect_settle_state = nil  -- {last_item_tick, quiet_ticks, total_ticks} during mid-game reconnect
@@ -1705,6 +1709,42 @@ local function start_gameplay_loops()
             if sent > 0 then
                 log(("[book-sanity] shelving → %d check(s) sent"):format(sent))
             end
+        end
+        return false
+    end)
+
+    -- Keep this run's slot current: after each save the game makes, and on a
+    -- timer as well, since a BookSanity session can run for hours without the
+    -- game autosaving at all.
+    gt_loop("slot_mirror", 2000, function()
+        local IA = package.loaded["AP/ItemApply"]
+        local SI = package.loaded["AP/SaveIdentity"]
+        if not (IA and SI) then return false end
+        if not (IA._gameplay_active or IA._allow_pre_apply) then return true end
+
+        _mirror_ticks = (_mirror_ticks or 0) + 1
+        if _mirror_ticks % 60 == 0 then SI.mirror_pending = "timer" end   -- ~2 min
+        if not SI.mirror_pending then return false end
+
+        local ok, why = SI.can_force_save()
+        if not ok then
+            -- Usually just "mid-save" or "not settled"; keep the request.
+            if _mirror_ticks % 15 == 0 then
+                log(("[save-id] mirror waiting: %s"):format(tostring(why)))
+            end
+            return false
+        end
+
+        local which = SI.mirror_pending
+        SI.mirror_pending = nil
+        local gi = find_game_instance()
+        if not gi then return false end
+        SI.mirroring = true
+        local wrote = pcall(function() gi:SaveGameData(SI.slot, false) end)
+        SI.mirroring = false
+        if wrote then
+            log(("[save-id] mirrored to slot %d on %s (layout=%s)")
+                :format(SI.slot, tostring(which), tostring(SI.record_layout())))
         end
         return false
     end)
@@ -2210,13 +2250,19 @@ end
 ---
 --- Deferred rather than done here: this fires ~1s BEFORE the game writes, so
 --- saving now would race it. The mirror step below waits for that write to land.
+--- The game saves into its own slots, so without mirroring this run's slot falls
+--- behind whatever was played since the last manual save there -- and then stops
+--- matching the recorded layout, which reads as the wrong save.
+---
+--- Only requests the copy: this fires shortly BEFORE the game writes, so saving
+--- here would race it. The mirror step waits for that write to land.
 local function record_layout_on_save(which)
     local SI = package.loaded["AP/SaveIdentity"]
     if not (SI and SI.slot and SI.verdict == SI.VERIFIED) then return end
-    local fp, sample = SI.record_layout()
-    if fp then
-        log(("[save-id] layout recorded on %s (hash=%d loose=%d)"):format(which, fp, sample or 0))
-    end
+    -- Our own mirror writes come back through this same hook, and treating one
+    -- as a fresh save request makes the mirror re-trigger itself forever.
+    if SI.mirroring then return end
+    SI.mirror_pending = which or "save"
 end
 
 
@@ -2259,6 +2305,51 @@ end)
 
 RegisterHook("/Script/Librarian.SaveSubsystem:StartSaveProgress", function()
     record_layout_on_save("autosave")
+end)
+
+--- Write into this run's slot immediately, on the calling thread.
+--- Only for the way out: the deferred mirror waits for the game's own write to
+--- land, which never happens once the process is leaving, so quitting has to
+--- write before the game proceeds.
+local function mirror_now(which)
+    local SI = package.loaded["AP/SaveIdentity"]
+    if not (SI and SI.slot) or SI.mirroring then return end
+    local ok, why = SI.can_force_save()
+    if not ok then
+        log(("[save-id] quit mirror skipped (%s): %s"):format(tostring(which), tostring(why)))
+        return
+    end
+    local gi = find_game_instance()
+    if not gi then return end
+    SI.mirroring = true
+    local wrote = pcall(function() gi:SaveGameData(SI.slot, false) end)
+    SI.mirroring = false
+    if wrote then
+        SI.mirror_pending = nil
+        log(("[save-id] mirrored to slot %d on %s (layout=%s)")
+            :format(SI.slot, tostring(which), tostring(SI.record_layout())))
+    end
+end
+
+-- Quit and back-to-title end the session and are hookable BEFORE they run, which
+-- is the only reason a save can still land. Registration waits for the widget to
+-- exist and is attempted once -- retrying RegisterHook against a class that is
+-- not resident is not free.
+local _pause_hooks_tried = false
+local PAUSE_BP = "/Game/Librarian/UI/Title/WBP_PauseMenu.WBP_PauseMenu_C:"
+gt_loop("pause_hooks", 5000, function()
+    if _pause_hooks_tried then return true end
+    local menu = FindFirstOf("WBP_PauseMenu_C")
+    if not (menu and menu:IsValid()) then return false end
+    _pause_hooks_tried = true
+    local n = 0
+    for _, fn in ipairs({ "OnQuitGame", "OnBackToTitleMenu", "OnBackToTitileScreen" }) do
+        if pcall(function()
+            RegisterHook(PAUSE_BP .. fn, function() mirror_now("quit: " .. fn) end)
+        end) then n = n + 1 end
+    end
+    log(("[save-id] quit hooks registered (%d/3)"):format(n))
+    return true
 end)
 
 -- /Script/Librarian.LibrarianGameInstanceBase:LoadGameDataBP() (BP override)
@@ -2951,6 +3042,10 @@ APClient.on_disconnected = function()
     local IA = package.loaded["AP/ItemApply"]
     if IA and IA.clear_pre_apply then IA.clear_pre_apply() end
     _pre_apply_settle_state = nil
+    -- Drop the run's slot and verdict. Leaving them set would let the mirror
+    -- keep writing to that slot after the run has ended.
+    local SId = package.loaded["AP/SaveIdentity"]
+    if SId then SId.reset() end
     -- Disconnected: both gameplay buttons return to disabled-by-default.
     gt_defer(50, _title_refresh)
     HUD.set_status("AP: disconnected — F4 for menu, F12 to reconnect", HUD.COL_STATUS_BAD)
