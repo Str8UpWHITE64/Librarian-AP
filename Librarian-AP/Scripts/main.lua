@@ -1208,7 +1208,12 @@ end
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
 local MOD_VERSION = "1.1.1"
-local TESTED_GAME_VERSIONS = { "1.0.8", "1.0.9", "1.0.11", "1.0.12", "1.0.13" }
+local TESTED_GAME_VERSIONS = { "1.0.12", "1.0.13" }
+
+-- Hard floor, not a preference. Below this the game keeps saves as one flat file, so the slot the
+-- run claims cannot exist, the save-existence test can never return true (leaving Continue dead),
+-- and the load menu the auto-load drives is not in the build at all.
+local MIN_GAME_VERSION = { 1, 0, 12 }
 
 local function get_game_version()
     local gi = find_game_instance()
@@ -1226,10 +1231,28 @@ local function is_tested_version(v)
     return false
 end
 
+--- True when the game is older than the save system needs. Unknown/unparseable reads as
+--- supported: refusing on a version we could not measure would be worse than the warning.
+local function is_below_min_version(v)
+    if not v or v == "" then return false end
+    local parts = {}
+    for n in tostring(v):gmatch("%d+") do parts[#parts + 1] = tonumber(n) end
+    if #parts == 0 then return false end
+    for i = 1, 3 do
+        local got, want = parts[i] or 0, MIN_GAME_VERSION[i]
+        if got ~= want then return got < want end
+    end
+    return false
+end
+
 local function compose_title_status_text()
     local game_v = get_game_version() or "?"
-    local tested = is_tested_version(game_v)
-    local game_part = "Game v" .. game_v .. (tested and "" or " (UNTESTED)")
+    local game_part
+    if is_below_min_version(game_v) then
+        game_part = "Game v" .. game_v .. " (TOO OLD)"
+    else
+        game_part = "Game v" .. game_v .. (is_tested_version(game_v) and "" or " (UNTESTED)")
+    end
 
     local APClient = package.loaded["AP/APClient"]
     local IA = package.loaded["AP/ItemApply"]
@@ -2361,14 +2384,24 @@ local function notify_version_compat()
     if _compat_notified then return end
     _compat_notified = true
     local game_v = get_game_version() or "?"
-    local msg
-    if is_tested_version(game_v) then
+    local msg, secs
+    if is_below_min_version(game_v) then
+        -- Not a "may have issues": on these builds the save system cannot work at all, and the
+        -- symptom (Continue permanently disabled) looks like the mod is broken rather than the
+        -- pairing being wrong. Say which way to go and hold it on screen longer.
+        msg = ("LibAP v%s — Game v%s is TOO OLD. Update the game to %d.%d.%d or newer, or use LibAP 1.1.0.")
+            :format(MOD_VERSION, game_v, MIN_GAME_VERSION[1], MIN_GAME_VERSION[2], MIN_GAME_VERSION[3])
+        secs = 30.0
+    elseif is_tested_version(game_v) then
         msg = ("LibAP v%s — Game v%s (verified compatible)"):format(MOD_VERSION, game_v)
+        secs = 12.0
     else
         msg = ("LibAP v%s — Game v%s UNTESTED, may have issues"):format(MOD_VERSION, game_v)
+        secs = 12.0
     end
+    log(msg)
     local HUD = package.loaded["AP/HUD"]
-    if HUD and HUD.notify then HUD.notify(msg, 12.0) end
+    if HUD and HUD.notify then HUD.notify(msg, secs) end
 end
 
 -- Title-refresh bodies. All three touch widgets and read the save system, so they run on the

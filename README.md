@@ -12,7 +12,14 @@ open up new series and bookcases.
 
 ## Requirements
 
-- **Librarian: Tidy Up the Arcane Library!** https://store.steampowered.com/app/4197610/Librarian_Tidy_Up_the_Arcane_Library/
+- **Librarian: Tidy Up the Arcane Library!** — **game build 1.0.12 or newer.**
+  https://store.steampowered.com/app/4197610/Librarian_Tidy_Up_the_Arcane_Library/
+
+  1.0.12 moved saves into numbered slots, and this mod's save handling is
+  built on them. On older builds it cannot work — Continue stays disabled
+  and no save slot can be claimed — so the title screen marks the game
+  **TOO OLD** rather than failing quietly. If you're on an older build,
+  use **Librarian-AP 1.1.0** instead.
 - **Archipelago** 0.6.x or newer on the server side.
 - **UE4SS (experimental build)**. The stable UE4SS release isn't new
   enough; an experimental build is required. A known-good copy is
@@ -248,6 +255,12 @@ one is loaded — your other saves are never touched.
 ## How saving works
 
 **Short version: leave save slots 20–30 alone. The mod handles saving.**
+
+> **Requires game 1.0.12+, and a run started under 1.1.1.** The slot is claimed
+> when you press **New Game** while connected, so a world carried over from
+> 1.1.0 has no slot recorded and never gets one — it will still play and still
+> send checks, but it won't be auto-loaded or saved for you. Start the seed
+> fresh to get the managed slot. Your seed and YAML don't need regenerating.
 
 The game keeps saves in numbered slots. Each AP run claims one free slot
 in the **20–30** range and treats it as the run's own — it is told to you

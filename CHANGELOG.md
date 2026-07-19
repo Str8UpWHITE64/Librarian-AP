@@ -7,9 +7,17 @@ Versions are git tags on `master` (e.g. `1.1.0-beta1`). Newest first.
 Maintenance release on the 1.1.0 line: the long-standing intermittent crash is fixed, and the mod works
 again on game builds **1.0.12** and **1.0.13**, which changed how the game saves.
 
+**Requires game 1.0.12 or newer.** Older builds keep saves as a single flat file, which the new save
+system cannot work with at all — Continue stays dead and no slot can be claimed. The mod says so on the
+title screen rather than failing quietly. **Stay on 1.1.0 if you are on an older game build.**
+
+**Start a fresh run.** 1.1.1 does not adopt a world from 1.1.0: the run's slot is claimed when you press
+New Game while connected, so an older world has no slot recorded and never gets one. Existing seeds and
+YAML are fine to reuse — it's the in-game world that has to be restarted.
+
 **Install both files.** All the behaviour changes are client-side, but the apworld carries a matching
-version stamp, so grab `librarian.apworld` alongside the game bundle. Seeds already generated with the
-1.1.0 apworld keep working — nothing about generation, item IDs or location IDs changed.
+version stamp, so grab `librarian.apworld` alongside the game bundle. Nothing about generation, item IDs
+or location IDs changed.
 
 **Crash fix — one Lua executor, for real this time**
 - UE4SS runs the mod's Lua with no VM lock, so any timer callback executing on its background thread
