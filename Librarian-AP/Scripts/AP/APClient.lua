@@ -451,10 +451,25 @@ end
 -- ---------------------------------------------------------------
 
 --- Queue a location check. De-duped against already-sent locations.
+--- Single chokepoint for every check the mod sends, which is why the identity
+--- gate lives here rather than in each detector -- there are several, and one
+--- missed path is a false check in someone else's multiworld.
+--- Dropped rather than queued: a check derived from the wrong world must not be
+--- held and flushed later if the right save is loaded afterwards.
 function Client:send_check(location_id)
     location_id = tonumber(location_id)
     if not location_id then return end
     if self._sent_checks[location_id] then return end
+
+    local SI = package.loaded["AP/SaveIdentity"]
+    if SI and not SI.may_send_checks() then
+        if not self._id_block_logged then
+            self._id_block_logged = true
+            log(("Checks held: %s"):format(SI.reason or "save identity not confirmed"))
+        end
+        return
+    end
+    self._id_block_logged = nil
     self._outgoing_checks[#self._outgoing_checks + 1] = location_id
     if self.on_check_sent then pcall(self.on_check_sent, location_id) end
 end
