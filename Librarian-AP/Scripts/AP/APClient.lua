@@ -58,6 +58,7 @@ local Client = {
     _outgoing_checks = {},
     _outgoing_say = {},
     _outgoing_status = nil,
+    _outgoing_storage = {},
 
     -- Already-sent location IDs so we don't double-send
     _sent_checks = {},
@@ -75,6 +76,7 @@ local Client = {
     on_disconnected = nil,        -- function()
     on_slot_refused = nil,        -- function(reason_str)
     on_check_sent = nil,          -- function(loc_id) — fires when a check is queued
+    on_storage = nil,             -- function(key, value) — data-storage read replies
 }
 
 local LOG_PREFIX = "[LibrarianAP]"
@@ -117,6 +119,17 @@ function Client:connect()
         log("Already connected to slot")
         return
     end
+    -- Drop the previous run's check state before anything from the new one arrives. Connecting to a
+    -- second seed in the same process would otherwise send seed A's queued locations into seed B,
+    -- and A's sent set would suppress B's checks at the same location IDs.
+    --
+    -- Here rather than in the slot-connected handler on purpose: the server's checked_locations
+    -- arrive as part of the same Connected exchange, and clearing inside that handler can land after
+    -- they have already been recorded. _sent_checks is the cross-session truth for how far this slot
+    -- has progressed (_compute_sent_level_baseline reads it), so wiping it there would reset the
+    -- level floor to zero and re-issue skill upgrades the player already has.
+    self._outgoing_checks = {}
+    self._sent_checks = {}
     self._deferred_init = true
     log("Connecting...")
 end
@@ -235,6 +248,15 @@ function Client:_register_handlers()
         -- Reset caches; we'll repopulate from this connection's data.
         self._scout_cache = {}
         self._player_alias_cache = {}
+        -- Fresh connection: drop item-tracking and data-storage state from any prior slot/socket.
+        -- The server re-dumps received items on connect, so the applied-index high-water mark must
+        -- reset or the re-dump is skipped; clearing the queue and on_storage stops a stranded item
+        -- or stale key from a prior slot leaking into this one. The check sets are cleared in
+        -- connect() instead -- see there.
+        self._applied_index = -1
+        self._pending_items = {}
+        self._outgoing_storage = {}
+        self.on_storage = nil
         if self.on_slot_connected then pcall(self.on_slot_connected, self.slot_data) end
         -- Fire scouts for all our missing locations so on_check_sent can
         -- name what we're sending. Batched (25 per tick × 200ms delay) so
@@ -262,6 +284,18 @@ function Client:_register_handlers()
             log("[server] " .. tostring(text))
             if self.on_message then pcall(self.on_message, tostring(text)) end
         end
+    end)
+    -- Data-storage replies. Retrieved answers a Get; set_reply answers a Set with
+    -- want_reply. Both funnel into on_storage(key, value) so callers see one path.
+    c:set_retrieved_handler(function(data)
+        if type(data) ~= "table" then return end
+        for k, v in pairs(data) do
+            if self.on_storage then pcall(self.on_storage, k, v) end
+        end
+    end)
+    c:set_set_reply_handler(function(reply)
+        if type(reply) ~= "table" then return end
+        if self.on_storage then pcall(self.on_storage, reply.key, reply.value) end
     end)
     c:set_data_package_changed_handler(function(_)
         log("Data package updated")
@@ -440,6 +474,32 @@ function Client:set_in_game(state)
     end
 end
 
+--- Read a server data-storage key, creating it at `default` if missing.
+--- The value returns through on_storage(key, value), always concrete since
+--- create-if-missing guarantees the key exists by reply time.
+function Client:storage_read(key, default)
+    self._outgoing_storage[#self._outgoing_storage + 1] =
+        { key = key, dflt = default, reply = true,
+          ops = { { operation = "default", value = 0 } } }
+end
+
+--- Raise a server data-storage key to `value` if that's higher than what's stored.
+--- Fire-and-forget; no reply.
+function Client:storage_max(key, value)
+    self._outgoing_storage[#self._outgoing_storage + 1] =
+        { key = key, dflt = value, reply = false,
+          ops = { { operation = "max", value = value } } }
+end
+
+--- Overwrite a server data-storage key. Fire-and-forget; no reply.
+--- Unlike storage_max this is unconditional, so it suits a value that can
+--- legitimately change to something lower (the claimed save slot).
+function Client:storage_write(key, value)
+    self._outgoing_storage[#self._outgoing_storage + 1] =
+        { key = key, dflt = value, reply = false,
+          ops = { { operation = "replace", value = value } } }
+end
+
 function Client:say(text)
     self._outgoing_say[#self._outgoing_say + 1] = tostring(text)
 end
@@ -464,6 +524,13 @@ function Client:_process_outgoing()
             log(("Sending %d location checks: %s"):format(#new_checks, table.concat(new_checks, ", ")))
             self._client:LocationChecks(new_checks)
         end
+    end
+
+    if #self._outgoing_storage > 0 then
+        for _, s in ipairs(self._outgoing_storage) do
+            self._client:Set(s.key, s.dflt, s.reply, s.ops)
+        end
+        self._outgoing_storage = {}
     end
 
     if #self._outgoing_say > 0 then
