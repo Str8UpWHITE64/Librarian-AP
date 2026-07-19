@@ -210,12 +210,21 @@ or host it locally.
    automatically. Type your server (e.g. `archipelago.gg:38281`), slot
    name, and password (leave blank if none), then click **Connect**.
    You can also press **F4** any time to toggle the menu.
-3. Wait for `AP: World ready — click Continue` to appear (about 10–20
-   seconds while the mod wards locked books behind the menu). The
-   Continue / Start Game buttons stay disabled until then.
-4. Click **Continue** (or **Start Game** if this is a fresh slot) and
-   play normally. As you complete shelves, the mod sends location
-   checks to Archipelago; received items unlock more series and shelves.
+3. What happens next depends on whether this seed has been played before:
+   - **First time on this seed** — only **New Game** is available. Click
+     it. Once the world has settled the mod claims a save slot for the
+     run and tells you which one, e.g.
+     `AP: this run is saved to slot 22 — load that slot to continue it.`
+   - **Returning to a seed** — the mod knows which slot is yours and
+     loads it for you. The load menu flashes open on its own; that's
+     expected, and it means the mod is picking your slot.
+4. Play normally. As you complete shelves, the mod sends location checks
+   to Archipelago; received items unlock more series and shelves.
+
+The mod verifies that the loaded world really is this run's save before
+it does anything. If you load the wrong save while connected, it says so
+on screen and sends **no** checks and hides **no** books until the right
+one is loaded — your other saves are never touched.
 
 ### Tips
 
@@ -224,14 +233,65 @@ or host it locally.
   so the menu prefills with your last-used values on the next launch.
   You can also pre-populate this JSON if you'd rather not type fields
   each time.
-- Your AP progress is saved in a per-seed save slot named
-  `Sav_AP_<seed>_<slot>.sav`, separate from your normal save. The
-  original `Sav.sav` is left alone.
+- Your AP progress lives in its own numbered save slot, separate from
+  your normal saves. See [How saving works](#how-saving-works) — please
+  read it, since the one thing that can lose a run is saving over that
+  slot by hand.
 - **F12** is a direct-connect shortcut that bypasses the menu and uses
   whatever's currently in `ap_config.json`. Useful for quick reconnects.
 - If you ever see visual artifacts (e.g., a book showing in an
   unexpected place), going to the title screen and clicking Continue
   again will force a clean world reload.
+
+---
+
+## How saving works
+
+**Short version: leave save slots 20–30 alone. The mod handles saving.**
+
+The game keeps saves in numbered slots. Each AP run claims one free slot
+in the **20–30** range and treats it as the run's own — it is told to you
+on screen the first time, and the mod loads it for you whenever you
+reconnect to that seed. Slots 1–19 are yours and the mod never touches
+them.
+
+### Rules for the AP slot
+
+- **Don't load slots 20–30 from the load menu yourself.** The mod loads
+  the right one when you connect. Loading one by hand while connected to
+  a different seed makes the mod refuse to send checks until you go back
+  to the correct save.
+- **Don't save over slots 20–30.** This is the one action that can
+  genuinely lose a run: saving a different world into the run's slot
+  overwrites it, and the mod cannot get it back.
+- **Don't delete slots 20–30** while the run is still going.
+- **You don't need to save manually at all.** The mod writes the run's
+  slot after every save the game makes, on a timer, and when you quit or
+  return to the title. Quitting from the pause menu is safe.
+
+### Why the mod is strict about this
+
+An Archipelago run reports your progress to a shared multiworld, and a
+false report can't be taken back — it can hand other players items they
+haven't earned and break the seed for everyone in it. So before the mod
+sends anything, it checks that the world you have loaded is genuinely
+this run's save. Until that check passes it stays completely passive: no
+checks sent, no books hidden, nothing written.
+
+That means a wrong save is harmless — you'll get an on-screen warning and
+can simply load the right one. It also means the mod would rather do
+nothing than guess.
+
+### If something looks wrong
+
+- **"this save does not match your run"** — you have the wrong save
+  loaded. Return to the title and reconnect; the mod will load the right
+  slot.
+- **The slot the mod recorded is gone** — the mod says so rather than
+  silently starting over. If you deleted it, the run's progress on the
+  server is still intact, but the game-side world is not recoverable.
+- **Which slot is mine?** It's named on screen when claimed, and in the
+  UE4SS log as `[save-id] claimed slot N for this run`.
 
 ---
 

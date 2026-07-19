@@ -1,6 +1,6 @@
 # Changelog
 
-Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
+Versions are git tags on `master` (e.g. `1.1.0-beta1`). Newest first.
 
 ## 1.1.1 — 2026-07-19
 
@@ -25,6 +25,9 @@ again on game builds **1.0.12** and **1.0.13**, which changed how the game saves
   longer writes. Fixed.
 - AP runs no longer share save slots with your vanilla saves. Each run claims its own slot in the 20–30
   range, tells you which one, and loads it for you when you reconnect.
+- **Leave slots 20–30 alone.** Don't load, overwrite or delete them by hand — the mod handles saving for
+  you, and saving a different world over the run's slot is the one action that can lose it. See
+  [How saving works](README.md#how-saving-works).
 - The mod checks that the loaded world is actually your run's save before it does anything. If you load
   the wrong save, it says so on screen and **sends no checks and hides no books** until the right one is
   loaded — so a vanilla save is left completely untouched.
