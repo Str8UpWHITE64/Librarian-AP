@@ -2,6 +2,43 @@
 
 Versions are git tags on `v1.1.0-rewrite` (e.g. `1.1.0-beta1`). Newest first.
 
+## 1.1.1 — 2026-07-19
+
+Maintenance release on the 1.1.0 line: the long-standing intermittent crash is fixed, and the mod works
+again on game builds **1.0.12** and **1.0.13**, which changed how the game saves. Client-side only — the
+1.1.0 apworld is unchanged, so **there is no need to regenerate or redistribute it**.
+
+**Crash fix — one Lua executor, for real this time**
+- UE4SS runs the mod's Lua with no VM lock, so any timer callback executing on its background thread
+  shares one `lua_State` with the game thread and corrupts its heap. The process then died wherever the
+  damage was next touched, which is why the crashes moved around and looked random.
+- 1.1.0 already routed most work onto the game thread, but a dozen timers stayed on the background
+  thread and kept entering the VM several times a second for the whole session. The reliable trigger was
+  connecting: a 50 ms timer refreshed the title buttons — walking actors, probing the save system and
+  writing UI — while the starting-item dump hammered the VM from the game thread.
+- All of it now runs on the game thread, including the F4/F12 keybinds, which fire on a third thread of
+  their own. The only background timer left is the one that starts the client before a player pawn
+  exists, and it switches itself off permanently once the game thread takes over.
+
+**Game 1.0.12 / 1.0.13 — saves moved into numbered slots**
+- Continue was disabled for every player on these builds: the mod tested for a save file the game no
+  longer writes. Fixed.
+- AP runs no longer share save slots with your vanilla saves. Each run claims its own slot in the 20–30
+  range, tells you which one, and loads it for you when you reconnect.
+- The mod checks that the loaded world is actually your run's save before it does anything. If you load
+  the wrong save, it says so on screen and **sends no checks and hides no books** until the right one is
+  loaded — so a vanilla save is left completely untouched.
+- Your run's slot is kept current automatically: after each save the game makes, on a timer, and when you
+  quit or return to the title.
+- Connecting no longer forces a level reload. It reloaded an identical world and blocked the way to New
+  Game.
+
+**Also fixed**
+- Connecting to a second seed without restarting the game could send the first seed's queued checks into
+  it, and the first seed's already-sent list could suppress checks in the second. Check state is now
+  dropped when a new connection starts.
+- Title-button gating never actually worked — it wrote to the button's event name rather than the button.
+
 ## 1.1.0 — 2026-07-06
 
 First stable release of the 1.1.0 line, promoting `1.1.0-rc5` after a zero-crash field cycle. The shipping Lua is
