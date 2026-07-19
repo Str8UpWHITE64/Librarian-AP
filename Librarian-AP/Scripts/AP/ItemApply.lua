@@ -1453,6 +1453,12 @@ function M._apply_books_to_world()
     local _book_run_chunk
     local function _book_process_one_chunk()
         local chunk_end = math.min(cursor + BOOK_APPLY_CHUNK_SIZE - 1, n)
+        -- The flush spans ~100 frames and logs nothing until the finalizer, so a crash inside it
+        -- would otherwise leave no cursor. Every 10th chunk only: trace.mark flushes to disk, and
+        -- one synchronous write per frame would perturb the window it is meant to describe.
+        if (cursor % (BOOK_APPLY_CHUNK_SIZE * 10)) < BOOK_APPLY_CHUNK_SIZE or chunk_end >= n then
+            trace.mark("l1-chunk", nil, ("cur=%d/%d"):format(cursor, n))
+        end
         for i = cursor, chunk_end do
             _apply_one_book(books[i])
         end

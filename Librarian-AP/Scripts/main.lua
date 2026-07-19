@@ -52,6 +52,10 @@ _G._librarian_trace = trace   -- reachable from hook callbacks if ever needed
 -- loops are gated off and their work moves to the pawn-tick master scheduler (Stage 2 single-thread fix).
 local POLL_GT = diag_on("POLL_ON_GAME_THREAD")
 
+-- Published for modules that need the single-thread decision but do not read diag_flags
+-- themselves (AP/HUD.lua). Set before any require below, so it is live by the time they load.
+_G._librarian_poll_gt = POLL_GT
+
 -- Stage-2 single-thread scheduler. When POLL_GT, periodic work that used to run on the async LoopAsync
 -- thread is registered here and driven by the game-thread pawn tick (the ReceiveTick master scheduler)
 -- at each step's own interval, via a DeltaSeconds accumulator. When off, gt_loop just starts a normal
@@ -59,6 +63,8 @@ local POLL_GT = diag_on("POLL_ON_GAME_THREAD")
 local _gt_steps = {}          -- name -> { fn, interval, accum, stopped }
 local _gt_step_order = {}
 local _gt_pending_activate = nil  -- reason string set by a title-button hook; consumed on the game thread by the scheduler
+local _gt_pending_f12 = false     -- F12/F4 fire on the UE4SS input thread; the binds set a
+local _gt_pending_f4  = false     -- boolean and the master tick runs the actual work
 local _l3_resume = nil            -- L3 (book-pile HISM) chunk resume; the master scheduler advances it one chunk/frame
 local _l3c_ep, _l3c_mgr, _l3c_mat, _l3c_ready   -- L3 setup scan cache (per world epoch): HISM mgr / mask material / ready flag
 local _gt_last_epoch = -1         -- last world epoch the scheduler saw; a bump means the captured warding arrays are freed
@@ -72,14 +78,55 @@ local function gt_loop(name, interval_ms, fn)
 end
 local function gt_run_steps(dt_ms)
     for i = 1, #_gt_step_order do
-        local st = _gt_steps[_gt_step_order[i]]
+        local name = _gt_step_order[i]
+        local st = _gt_steps[name]
         if st and not st.stopped then
             st.accum = st.accum + dt_ms
             if st.accum >= st.interval then
                 st.accum = 0
                 local ok, res = pcall(st.fn)
-                if ok and res == true then st.stopped = true end
+                if ok then
+                    if res == true then st.stopped = true end
+                else
+                    -- A silently dropped step looks exactly like one that ran clean.
+                    log(("[gt-step] %s error: %s"):format(tostring(name), tostring(res)))
+                end
             end
+        end
+    end
+end
+
+-- Deferred one-shot work, run on the game thread once `delay_ms` of tick time has elapsed.
+--
+-- This replaces marshalling from the async thread. Marshalling looked safe -- the body ran on the
+-- game thread -- but the ExecuteInGameThread CALL still happens off-thread, and crash stacks that
+-- run engine-tick -> UE4SS -> Lua with NO ProcessEvent frame between them are exactly that queue
+-- executing a body. Handing the work to the master tick keeps the async thread out of it entirely.
+--
+-- Nothing here needs to beat the pawn tick: it starts at the first M01 load, seconds before the
+-- title is interactive. Anything queued earlier just runs on the first tick.
+local _gt_deferred = {}
+local _gt_clock_ms = 0
+local function gt_defer(delay_ms, fn)
+    if not POLL_GT then
+        LoopAsync(delay_ms, function() fn() return true end)
+        return
+    end
+    if delay_ms < 1 then delay_ms = 1 end   -- 0 would be due in the same pass it was queued
+    _gt_deferred[#_gt_deferred + 1] = { due = _gt_clock_ms + delay_ms, fn = fn }
+end
+
+local function gt_run_deferred(dt_ms)
+    _gt_clock_ms = _gt_clock_ms + dt_ms   -- advance even when idle, or a later due-time reads stale
+    local i = 1
+    while i <= #_gt_deferred do
+        local d = _gt_deferred[i]
+        if _gt_clock_ms >= d.due then
+            table.remove(_gt_deferred, i)
+            local ok, err = pcall(d.fn)
+            if not ok then log(("[gt-defer] error: %s"):format(tostring(err))) end
+        else
+            i = i + 1
         end
     end
 end
@@ -351,31 +398,9 @@ local function _bh_grab_check(b, tag)
         log(("[book-hook] %s-MESH series=%s actorZ=%s meshZ=%s cpd=%s mesh=%s"):format(
             tostring(tag), tostring(series), tostring(actorz), tostring(meshz), tostring(cpd), tostring(meshname)))
     end
-    -- Deferred render-truth: WasRecentlyRendered at grab-start is unreliable (actor was pile form
-    -- a moment earlier). Re-check ~0.6s later; still-shown-but-not-drawn = genuinely invisible.
-    -- One-shot; logs the render-pass fields no flag exposes.
-    if unwarded_here == true then
-        local b_ref, series_ref = b, series
-        LoopAsync(600, function()
-            if b_ref and b_ref:IsValid() then
-                local ar, hid2 = nil, nil
-                pcall(function() ar = b_ref:WasRecentlyRendered(0.5) end)
-                pcall(function() hid2 = b_ref.bHidden end)
-                if ar == false and hid2 == false then
-                    local sm2; pcall(function() sm2 = b_ref.SM_Book_1 end)
-                    local v2, rmp2, mn2 = nil, nil, "?"
-                    if sm2 and sm2:IsValid() then
-                        pcall(function() v2 = sm2:IsVisible() end)
-                        pcall(function() rmp2 = sm2.bRenderInMainPass end)
-                        pcall(function() local msh = sm2.StaticMesh; if msh and msh:IsValid() then mn2 = msh:GetFullName() end end)
-                    end
-                    log(("[book-hook] *** INVISIBLE-CONFIRMED *** series=%s bHidden=%s smIsVisible=%s renderInMainPass=%s mesh=%s (held ~0.6s, actor NOT drawn)"):format(
-                        tostring(series_ref), tostring(hid2), tostring(v2), tostring(rmp2), tostring(mn2)))
-                end
-            end
-            return true   -- one-shot
-        end)
-    end
+    -- The deferred render-truth re-check that used to sit here is gone: it held an actor reference
+    -- across a 600ms async delay and then read the actor off-thread, which is the shared-heap access
+    -- the single-thread rule exists to remove. The fields it logged are diagnostics only.
     if diag_on("BOOK_EVENT_GRABFIX") and unwarded_here == true then
         local did = {}
         if bhidden == true then
@@ -1543,7 +1568,12 @@ local function start_gameplay_loops()
             return true
         end
         if not IA._apply_safe then return false end
-        pcall(try_register_book_hooks)   -- register the book hooks (one-shot, game thread)
+        -- Not during a flush: registering the book hooks installs SetActorVisible / SetBookInfo /
+        -- CanBeGrab callbacks that _apply_one_book's own visibility and collision writes would then
+        -- re-enter, nesting Lua inside the flush. It missed this window by timing rather than design.
+        if not IA._flush_in_progress then
+            pcall(try_register_book_hooks)   -- register the book hooks (one-shot, game thread)
+        end
         pcall(bh_report_periodic)        -- ~30s [book-hook] count report
         pcall(function() IA.refresh_index_if_changed() end)   -- catch lazy-spawned bookcases
         pcall(function() IA._apply_bookcases_to_world() end)  -- Layer 2 bookcase ward
@@ -1677,6 +1707,15 @@ local function deactivate_gameplay(reason)
     -- second Continue skips set_apply_safe(true) and books never re-ward ("books visible, cases hidden").
     _gameplay_loops_started = false
 end
+
+-- HUD notification drain, on the game thread. Lives here rather than in AP/HUD.lua because
+-- _gt_step_order is order-sensitive for warding and must stay auditable in one file; module-scope
+-- steps always register before the start_gameplay_loops ones, so this cannot perturb that order.
+if POLL_GT then gt_loop("hud_drain", 300, function()
+    local H = package.loaded["AP/HUD"]
+    if H and H._drain_one then H._drain_one() end
+    return false
+end) end   -- with the flag off, AP/HUD.lua keeps its own async drain; registering both halves DRAIN_MS
 
 -- SelectedLevel watcher (handles "Continue" path where no LoadMap fires).
 -- BP_LibrarianGameInstance_C.SelectedLevel is -1 at title and >= 0 once the
@@ -1993,16 +2032,28 @@ local function notify_version_compat()
     if HUD and HUD.notify then HUD.notify(msg, 12.0) end
 end
 
+-- Title-refresh bodies. All three touch widgets and read the save system, so they run on the
+-- game thread via gt_defer.
+local function _title_refresh()
+    update_title_buttons()
+    update_title_status_text()
+end
+
+local function _title_refresh_compat()
+    update_title_buttons()
+    update_title_status_text()
+    notify_version_compat()
+end
+
+local function _title_status_only()
+    update_title_status_text()
+end
+
 local function on_title_construct(self)
     log(">> [WBP_Title] Construct")
     -- Defer so the widget's own Construct (button bindings, styles) runs first, then apply gating
     -- state + the Text_Version status line.
-    LoopAsync(50, function()
-        update_title_buttons()
-        update_title_status_text()
-        notify_version_compat()
-        return true
-    end)
+    gt_defer(50, _title_refresh_compat)
 end
 
 -- Stage-2 master game-thread scheduler body. Runs in main.lua scope (sees all module locals) and is
@@ -2014,6 +2065,23 @@ _G._librarian_gt_master_tick = function(dt_ms)
     if not (c and c._poll_on_game_thread) then return end
     c._gt_tick_count = (c._gt_tick_count or 0) + 1
     pcall(function() c:_tick_once() end)                 -- create + poll + outgoing + item-apply
+    -- Both reached at runtime, not through the file-locals: `APClient` and `menu_toggle` are
+    -- declared further down the file, so a closure built here would only see nil globals.
+    if _gt_pending_f12 then                              -- F12 pressed on the input thread
+        _gt_pending_f12 = false
+        if not c._slot_connected then
+            log("[F12] connecting to AP...")
+            pcall(function() c:connect() end)
+        else
+            log("[F12] already connected")
+        end
+    end
+    if _gt_pending_f4 then                               -- F4 pressed on the input thread
+        _gt_pending_f4 = false
+        log("[F4] toggle connection menu")
+        local m = _G._librarian_menu
+        if m and m.toggle then pcall(m.toggle) end
+    end
     if _gt_pending_activate then                         -- title-button activation, on the game thread
         local reason = _gt_pending_activate; _gt_pending_activate = nil
         pcall(function() activate_gameplay(reason) end)
@@ -2043,9 +2111,17 @@ _G._librarian_gt_master_tick = function(dt_ms)
             pcall(function() IA.flush_apply() end)
         end
     end
+    gt_run_deferred(dt_ms)                                   -- one-shot deferred work (title/HUD refreshes)
     gt_run_steps(dt_ms)                                      -- apply-gate / settle / warding / sync / etc.
     if (c._gt_tick_count % 600) == 0 then
-        log(("[gt-tick] master driver (fires=%d, steps=%d)"):format(c._gt_tick_count, #_gt_step_order))
+        -- Name the registered steps, not just the count: a bare number says little when a dozen
+        -- registrations exist. Printing the array contents next to the key count of _gt_steps makes
+        -- damage visible -- array N with keys N-1 is a stray array entry that never registered.
+        local names, keyn = {}, 0
+        for i = 1, #_gt_step_order do names[i] = tostring(_gt_step_order[i]) end
+        for _ in pairs(_gt_steps) do keyn = keyn + 1 end
+        log(("[gt-tick] master driver (ticks=%d, steps=%d, keys=%d) order=[%s]"):format(
+            c._gt_tick_count, #_gt_step_order, keyn, table.concat(names, ",")))
     end
 end
 
@@ -2252,9 +2328,10 @@ local HUD = require("AP/HUD")
 trace.init({ version = MOD_VERSION, flags = diag_flags_str() })
 trace.mark("boot")
 
--- Crash-ledger heartbeat: a flushed 1 Hz marker so the crash_trace.log tail shows whether the
--- crash was synchronous-in-op (unmatched BEG) or idle (several "hb" lines after the last END).
-LoopAsync(1000, function() trace.mark("hb"); return false end)
+-- The 1 Hz crash-ledger heartbeat that used to run here is gone. It did string.format, os.date, a
+-- shared ring write and flushed I/O on the async thread every second for the whole session, racing
+-- trace.init's own close/reopen. The BEG/END markers already distinguish a synchronous-in-op crash
+-- from an idle one.
 
 -- Lifecycle state machine, driven by the lc_event(...) calls below. Observational only: logs
 -- [lifecycle] transitions, gates nothing yet. pcall'd require so it can't break mod loading.
@@ -2385,11 +2462,11 @@ APClient.on_slot_connected = function(slot_data)
     -- Force a fresh world reload now SaveGameName points at the AP slot -- the boot world used
     -- default 'Sav', so without this the books/HISM stay stale ("default orientation until you look").
     -- Only when still at title (a mid-gameplay reconnect would be disruptive). Defer 200ms to settle.
-    LoopAsync(200, function()
+    gt_defer(200, function()
         local IA = package.loaded["AP/ItemApply"]
         if IA and IA._gameplay_active then
             log("[AP][save] mid-gameplay reconnect — skipping forced level reload")
-            return true
+            return
         end
         local statics = StaticFindObject("/Script/Engine.Default__GameplayStatics")
         local gi = find_game_instance()
@@ -2408,16 +2485,12 @@ APClient.on_slot_connected = function(slot_data)
         else
             log("[AP][save] OpenLevel skipped — GameplayStatics or GameInstance missing")
         end
-        return true  -- one-shot
     end)
 
-    -- Update title-screen buttons + Text_Version line. Done via async tick
-    -- so the redirected SaveGameName is the one we read.
-    LoopAsync(50, function()
-        update_title_buttons()
-        update_title_status_text()
-        return true
-    end)
+    -- Update title-screen buttons + Text_Version line. Deferred onto the game thread: this used to
+    -- be a raw 50ms async timer, and it was the proven crash ignition -- FindAllOf, save-existence
+    -- probes and UMG writes off-thread, landing inside the item dump's unyielding game-thread burst.
+    gt_defer(50, _title_refresh)
 
     -- HUD: status line + clear stale log entries from prior connect.
     HUD.set_status(("AP: connected as %s (slot #%s)"):format(
@@ -2468,11 +2541,7 @@ APClient.on_disconnected = function()
     if IA and IA.clear_pre_apply then IA.clear_pre_apply() end
     _pre_apply_settle_state = nil
     -- Disconnected: both gameplay buttons return to disabled-by-default.
-    LoopAsync(50, function()
-        update_title_buttons()
-        update_title_status_text()
-        return true
-    end)
+    gt_defer(50, _title_refresh)
     HUD.set_status("AP: disconnected — F4 for menu, F12 to reconnect", HUD.COL_STATUS_BAD)
     -- Connect menu: re-show + status. Repopulate fields from current
     -- APClient values so the player can edit and retry.
@@ -2486,10 +2555,7 @@ end
 APClient.on_slot_refused = function(reason)
     log("[AP] slot refused: " .. tostring(reason))
     HUD.set_status("AP: slot refused — " .. tostring(reason), HUD.COL_STATUS_BAD)
-    LoopAsync(50, function()
-        update_title_status_text()
-        return true
-    end)
+    gt_defer(50, _title_status_only)
     -- Connect menu: leave open (already up from the Connect click) and
     -- surface the refusal reason. Don't call show() — if the user closed
     -- it between click and refused, respect that.
@@ -2510,24 +2576,23 @@ if APClient._poll_on_game_thread then
 end
 
 -- Initial HUD status. Wait briefly so the world exists for PrintString's WorldContextObject.
-LoopAsync(2000, function()
+-- On the game thread: set_status enqueues into the same _notif_queue the HUD drain now reads
+-- from the game thread, and a cross-thread write to that table is the rc3 crash class.
+local function _initial_hud_status()
+    -- The delay is tick time now, so this can land after a fast connect; don't overwrite it.
+    if APClient._slot_connected then return end
     HUD.set_status(
         ("AP: not connected (server=%s, slot=%s) — F4 for menu, F12 to connect"):format(
             tostring(APClient.server or "?"),
             tostring(APClient.slot or "?")),
         HUD.COL_STATUS_WARN)
-    return true  -- one-shot
-end)
+end
+gt_defer(2000, _initial_hud_status)
 
 -- F12: connect to Archipelago (or trigger a reconnect if the socket dropped).
-RegisterKeyBind(Key.F12, function()
-    if not APClient._slot_connected then
-        log("[F12] connecting to AP...")
-        APClient:connect()
-    else
-        log("[F12] already connected")
-    end
-end)
+-- UE4SS dispatches keybinds on the input thread, so the bind only sets a flag; the master tick
+-- does the work. Entering the VM from a third thread is the same corruption as the async timers.
+RegisterKeyBind(Key.F12, function() _gt_pending_f12 = true end)
 
 log("Press F12 to connect to Archipelago.")
 
@@ -2627,103 +2692,14 @@ _G._librarian_menu = {
     enter_vanilla = enter_vanilla_mode,
 }
 
-RegisterKeyBind(Key.F4, function()
-    log("[F4] toggle connection menu")
-    menu_toggle()
-end)
-
--- TEMP probe (F6): does any HISM PerInstanceCustomData float encode the book's AssetIdx/series?
--- If so we could hide warded books per-instance. Press F6 with the pile visible. Remove once answered.
-local function probe_customdata()
-    log("[cd-probe] === START ===")
-    local mgr = FindFirstOf("BP_HISM_Manager_C")
-    if not (mgr and mgr:IsValid()) then log("[cd-probe] no BP_HISM_Manager_C (load a save first)"); return end
-    local arr; pcall(function() arr = mgr.HISMArray end)
-    local hn = 0; if arr then pcall(function() hn = #arr end) end
-    if hn == 0 then log("[cd-probe] HISMArray empty"); return end
-
-    -- Ground truth: distinct AssetIdx values from book actors.
-    local books = FindAllOf("BP_GrabbingBook_C")
-    local bn = 0; if books then pcall(function() bn = #books end) end
-    local aset, acount, amin, amax = {}, 0, math.huge, -math.huge
-    for i = 1, bn do
-        local b = books[i]
-        if b and b:IsValid() then
-            local ai
-            pcall(function() local info = b.ItemInfo; if info and info:IsValid() then ai = info.AssetIdx end end)
-            if ai and ai >= 0 then
-                if not aset[ai] then aset[ai] = true; acount = acount + 1 end
-                if ai < amin then amin = ai end
-                if ai > amax then amax = ai end
-            end
-        end
-    end
-    log(("[cd-probe] %d book actors, %d distinct AssetIdx (range %s..%s)"):format(
-        bn, acount, tostring(amin), tostring(amax)))
-
-    -- Custom floats per instance = len(PerInstanceSMCustomData) / numInstances.
-    local NUM = 0
-    for hi = 1, hn do
-        local h; pcall(function() h = arr[hi] end)
-        if h and h:IsValid() then
-            local sn = 0; pcall(function() sn = #h.PerInstanceSMData end)
-            local cl = 0; pcall(function() cl = #h.PerInstanceSMCustomData end)
-            if sn > 0 and cl > 0 then NUM = math.floor(cl / sn); break end
-        end
-    end
-    if NUM == 0 then log("[cd-probe] no PerInstanceSMCustomData found"); return end
-    log(("[cd-probe] %d custom floats per instance"):format(NUM))
-
-    local dist, mn, mx, intlike, inA = {}, {}, {}, {}, {}
-    for k = 0, NUM-1 do dist[k]={}; mn[k]=math.huge; mx[k]=-math.huge; intlike[k]=true; inA[k]=0 end
-    local sampled, raw = 0, 0
-    local step = math.max(1, math.floor(hn / 80))   -- ~80 HISMs spread across the pile
-    for hi = 1, hn, step do
-        local h; pcall(function() h = arr[hi] end)
-        if h and h:IsValid() then
-            local sn = 0; pcall(function() sn = #h.PerInstanceSMData end)
-            local cd; pcall(function() cd = h.PerInstanceSMCustomData end)
-            if cd and sn > 0 then
-                for j = 0, sn-1 do
-                    local row = {}
-                    for k = 0, NUM-1 do
-                        local v = 0; pcall(function() v = cd[j*NUM + k + 1] end)
-                        v = tonumber(v) or 0
-                        row[k] = v
-                        dist[k][math.floor(v*100+0.5)/100] = true
-                        if v < mn[k] then mn[k]=v end
-                        if v > mx[k] then mx[k]=v end
-                        if math.abs(v - math.floor(v+0.5)) > 0.01 then intlike[k]=false end
-                        if aset[math.floor(v+0.5)] then inA[k]=inA[k]+1 end
-                    end
-                    sampled = sampled + 1
-                    if raw < 6 then
-                        raw = raw + 1
-                        local p = {}; for k=0,NUM-1 do p[#p+1]=string.format("%.2f", row[k]) end
-                        log(("[cd-probe] raw hi=%d j=%d: [%s]"):format(hi, j, table.concat(p, ",")))
-                    end
-                end
-            end
-        end
-    end
-    log(("[cd-probe] sampled %d instances"):format(sampled))
-    for k = 0, NUM-1 do
-        local dc = 0; for _ in pairs(dist[k]) do dc = dc + 1 end
-        log(("[cd-probe] cd[%2d] distinct=%-4d min=%-9.2f max=%-9.2f int=%-5s in_assetidx=%d/%d"):format(
-            k, dc, mn[k], mx[k], tostring(intlike[k]), inA[k], sampled))
-    end
-    log(("[cd-probe] === END (winner = a float with int=true, distinct~%d, in_assetidx~%d) ==="):format(acount, sampled))
-end
-
-RegisterKeyBind(Key.F6, function()
-    log("[F6] running custom-data probe")
-    pcall(probe_customdata)
-end)
+-- Input thread again: set the flag, let the master tick construct the widget. See the F12 bind.
+RegisterKeyBind(Key.F4, function() _gt_pending_f4 = true end)
 
 -- Poll for ModActor on startup and show the menu once. Subsequent shows
 -- are user-driven via F4 — auto-show on disconnect is handled in the
--- on_disconnected handler.
-LoopAsync(500, function()
+-- on_disconnected handler. On the game-thread scheduler: the body does
+-- FindFirstOf plus UMG construction, which must not run off-thread.
+gt_loop("menu_show", 500, function()
     if _menu_initial_shown then return true end
     if APClient._slot_connected then
         _menu_initial_shown = true

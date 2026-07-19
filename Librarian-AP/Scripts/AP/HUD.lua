@@ -117,13 +117,17 @@ end
 
 local MAX_RETRIES = 10   -- 10 × 300ms = 3s of retry budget before dropping
 
-LoopAsync(DRAIN_MS, function()
-    if #_notif_queue == 0 then return false end
+-- Drain one queued notification. emit_notification walks actors (FindFirstOf /
+-- StaticFindObject), converts strings to FText and drives a Blueprint that builds a UMG
+-- widget -- all game-thread-only work, and _notif_queue is written from the game thread
+-- too. Built once at load; the async timer below does nothing but hand it over.
+local function drain_one()
+    if #_notif_queue == 0 then return end
     local entry = _notif_queue[1]
     local ok, reason = emit_notification(entry.text, entry.duration)
     if ok or reason == "fatal" then
         table.remove(_notif_queue, 1)
-        return false
+        return
     end
     -- Transient failure (likely mid-LoadMap). Bump retry count; drop after
     -- MAX_RETRIES so a broken entry can't block the whole queue forever.
@@ -133,8 +137,17 @@ LoopAsync(DRAIN_MS, function()
             MAX_RETRIES, tostring(entry.text)))
         table.remove(_notif_queue, 1)
     end
-    return false
-end)
+end
+
+M._drain_one = drain_one
+
+-- Single-thread mode drives this from main.lua's game-thread step scheduler (gt_loop "hud_drain"),
+-- so nothing about notifications touches the async thread -- not even the queue-length check, which
+-- would be an off-thread read of a table the game thread inserts into. The pawn tick is alive from
+-- the first M01 load, well before connect, so the drain loses nothing by waiting for it.
+if not _G._librarian_poll_gt then
+    LoopAsync(DRAIN_MS, function() drain_one() return false end)
+end
 
 function M.set_status(text, color)
     M._status_text  = text or ""

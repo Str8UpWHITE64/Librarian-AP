@@ -140,23 +140,43 @@ end
 Client._gt_tick_count = 0
 Client._poll_on_game_thread = false
 
+-- THE ONE INTENTIONAL ASYNC RESIDUAL. Every other LoopAsync in the mod either runs only when
+-- POLL_ON_GAME_THREAD is off, or does nothing at all. This loop cannot move: it bootstraps the AP
+-- client during the window before any pawn exists, which is the one situation a game-thread step
+-- could never cover. Its async-side work is a few table reads -- no UObject access, no allocation,
+-- no I/O. Do not add work here; if you need more, do it inside gt_bootstrap_tick.
+--
+-- Once the pawn tick has been seen advancing it LATCHES OFF for good. "Is the tick advancing right
+-- now" is not a usable test: a pause menu, a cutscene, an unpossessed pawn or a single long frame
+-- (warding_maint can hitch for seconds) all stop the tick without the pawn being gone, and the
+-- watchdog would then marshal every 500ms from the async thread -- exactly the cross-thread entry
+-- this whole change exists to remove.
 function Client:_start_async_loop()
     local self_ref = self
     local async_last_seen = -1
+    local gt_confirmed_live = false
+    -- Built once, not per fire: allocating this closure on the async thread would be exactly the
+    -- kind of shared-heap work this whole loop exists to avoid.
+    local gt_bootstrap_tick = function()
+        local ok, e = pcall(function() self_ref:_tick_once() end)
+        if not ok then log("game-thread tick error: " .. tostring(e)) end
+    end
     LoopAsync(500, function()
         if not self_ref.enabled then return false end
 
         if self_ref._poll_on_game_thread then
-            -- The game-thread pawn tick owns create+poll+apply. Only cover the window where it is NOT
-            -- firing yet (pre-connect title / LoadMap gap, no pawn): marshal ONE tick onto the game
-            -- thread via ExecuteInGameThread, so the DLL is still only ever touched from the game thread.
+            -- The game-thread pawn tick owns create+poll+apply. Only cover the window before it has
+            -- ever fired: marshal ONE tick via ExecuteInGameThread, so the DLL is still only ever
+            -- touched from the game thread.
             local tc = self_ref._gt_tick_count or 0
-            if tc ~= async_last_seen then async_last_seen = tc; return false end   -- pawn tick alive -> idle
+            if tc ~= async_last_seen then
+                async_last_seen = tc
+                gt_confirmed_live = true
+                return false
+            end
+            if gt_confirmed_live then return false end   -- latched: the pawn tick owns it from here
             if type(ExecuteInGameThread) == "function" then
-                ExecuteInGameThread(function()
-                    local ok, e = pcall(function() self_ref:_tick_once() end)
-                    if not ok then log("game-thread tick error: " .. tostring(e)) end
-                end)
+                ExecuteInGameThread(gt_bootstrap_tick)
             end
             return false
         end
@@ -383,7 +403,10 @@ function Client:_apply_pending_items()
                 idx, item_id, tostring(name or "?"),
                 tostring(it.player), tostring(it.location)))
             if self.on_item then
-                pcall(self.on_item, it, name)
+                -- Surfaced, not swallowed: a dropped error here is indistinguishable from a
+                -- clean apply, which hid a real fault for several debugging rounds.
+                local ok, err = pcall(self.on_item, it, name)
+                if not ok then log("on_item error: " .. tostring(err)) end
             end
         end
     end
