@@ -1245,7 +1245,7 @@ end
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
 local MOD_VERSION = "1.2.0-beta1"
-local TESTED_GAME_VERSIONS = { "1.0.8", "1.0.9", "1.0.11" }
+local TESTED_GAME_VERSIONS = { "1.0.8", "1.0.9", "1.0.11", "1.0.12", "1.0.13" }
 
 local function get_game_version()
     local gi = find_game_instance()
@@ -2103,15 +2103,23 @@ RegisterLoadMapPostHook(function(Engine, World)
         -- so the incoming one is judged on its own -- otherwise verifying the
         -- run's own save would go on vouching for whatever is loaded next.
         local SIw = package.loaded["AP/SaveIdentity"]
+        -- Read before the reset: it is what says whether this world's checks were
+        -- being held, and reset_world clears it.
+        local left_unverified = (not SIw) or SIw.verdict ~= SIw.VERIFIED
         if SIw then SIw.reset_world() end
 
-        -- Book detection dedupes on what it has already seen, and marks a book
-        -- seen whether or not its check actually sent. Held checks in a world we
-        -- then leave would otherwise be lost for good: the book stays flagged and
-        -- is never re-examined in the world where it does count.
+        -- Every detector dedupes on what it has already seen, and marks a
+        -- location seen whether or not its check actually sent. Held checks in a
+        -- world we then leave would otherwise be lost for good: the location
+        -- stays flagged and is never re-examined where it does count. Rows,
+        -- sections, floors and milestones have the same shape as books here.
         if IA then
             IA._books_correct_seen = {}
             IA._dcb_books, IA._dcb_cursor = nil, 0
+            if left_unverified and IA.clear_check_dedupe then
+                log("[save-id] leaving an unverified world → re-arming check detection")
+                pcall(IA.clear_check_dedupe)
+            end
         end
 
         -- Layer-3 state is per-world (fresh HISMs start visible; the series cache is tied to the

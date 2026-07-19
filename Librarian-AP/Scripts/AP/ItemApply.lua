@@ -617,6 +617,26 @@ function M.clear_pre_apply()
     M._pre_apply_complete = false
 end
 
+--- Forget which checks the detectors believe they have already handled.
+---
+--- They mark a location handled at the moment they decide to fire it, not when
+--- it reaches the server, so anything the identity gate refused to send is
+--- flagged and never looked at again. Leaving a world whose checks were held
+--- would lose them for good; clearing here lets the next world re-derive them.
+--- Re-firing is free: send_check still dedupes against what the server has
+--- already recorded.
+---
+--- The book-sanity dedupe is cleared alongside this at the same call site.
+function M.clear_check_dedupe()
+    M._sent_row_locations = {}
+    M._sent_row_completions = {}
+    M._sent_section_completions = {}
+    M._sent_floor_completions = {}
+    M._milestones_sent = {}
+    M._baseline_sync_done = false
+    M._level_baseline_done = false
+end
+
 --- Called by main.lua's LoadMap hook. Toggles whether we're in gameplay. World apply does
 --- NOT happen here — the LoadMap retry loop drives set_apply_safe + flush_apply later.
 function M.set_gameplay_active(state)
