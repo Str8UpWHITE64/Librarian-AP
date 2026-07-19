@@ -5,8 +5,11 @@ Versions are git tags on `master` (e.g. `1.1.0-beta1`). Newest first.
 ## 1.1.1 — 2026-07-19
 
 Maintenance release on the 1.1.0 line: the long-standing intermittent crash is fixed, and the mod works
-again on game builds **1.0.12** and **1.0.13**, which changed how the game saves. Client-side only — the
-1.1.0 apworld is unchanged, so **there is no need to regenerate or redistribute it**.
+again on game builds **1.0.12** and **1.0.13**, which changed how the game saves.
+
+**Install both files.** All the behaviour changes are client-side, but the apworld carries a matching
+version stamp, so grab `librarian.apworld` alongside the game bundle. Seeds already generated with the
+1.1.0 apworld keep working — nothing about generation, item IDs or location IDs changed.
 
 **Crash fix — one Lua executor, for real this time**
 - UE4SS runs the mod's Lua with no VM lock, so any timer callback executing on its background thread
