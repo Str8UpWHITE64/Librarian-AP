@@ -76,5 +76,5 @@ return {
     -- DEV ONLY. true -> main.lua loads AP/probe.lua and its diagnostic keybinds. Ships OFF. Missing
     -- flags default ON here, so main.lua gates on the RAW value == true (not diag_on). Strip this flag
     -- + AP/probe.lua + the main.lua require before release.
-    PROBE_MODE = true,
+    PROBE_MODE = false,
 }

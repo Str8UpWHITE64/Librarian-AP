@@ -1671,6 +1671,12 @@ function M._apply_books_to_world()
     local _book_run_chunk
     local function _book_process_one_chunk()
         local chunk_end = math.min(cursor + BOOK_APPLY_CHUNK_SIZE - 1, n)
+        -- The flush spans ~100 frames and logs nothing until the finalizer, so a crash inside it
+        -- would otherwise leave no cursor. Every 10th chunk only: trace.mark flushes to disk, and
+        -- one synchronous write per frame would perturb the window it is meant to describe.
+        if (cursor % (BOOK_APPLY_CHUNK_SIZE * 10)) < BOOK_APPLY_CHUNK_SIZE or chunk_end >= n then
+            trace.mark("l1-chunk", nil, ("cur=%d/%d"):format(cursor, n))
+        end
         for i = cursor, chunk_end do
             _apply_one_book(books[i])
         end
@@ -2853,6 +2859,13 @@ end
 --- De-duped via M._books_correct_seen. Runs on the game thread, so it may read actors directly.
 --- Returns the count of new checks sent.
 local DCB_CHUNK = 500   -- books per pass; ~3000 books wrap in ~6 passes of the 3s loop
+
+--- Ask the next scan to cover every book instead of one chunk. Called when the
+--- game reports a book was shelved, so the check fires promptly rather than
+--- whenever the rolling cursor happens to reach it.
+function M.request_full_book_scan()
+    M._dcb_full_scan = true
+end
 function M.detect_correct_books()
     if not M._book_sanity_enabled then return 0 end
     local blm = M._book_location_map
@@ -2865,8 +2878,18 @@ function M.detect_correct_books()
     -- streaming), so snapshot the list once and walk a slice per pass; actors freed under the
     -- snapshot are caught by the IsValid() below. The re-snap at the wrap is the only thing that
     -- refreshes the list after a world reload.
+    -- A book was just shelved, so scan the whole set now instead of waiting for
+    -- the rolling cursor to reach it. Chunking exists to keep the periodic sweep
+    -- off the frame budget; an insert is a discrete player action, so paying for
+    -- one full pass there is both rare and exactly when the check is expected.
+    local full = M._dcb_full_scan
+    M._dcb_full_scan = false
+
     local books = M._dcb_books
     local cursor = M._dcb_cursor or 0
+    if full then
+        books, cursor = nil, 0   -- force a re-snapshot and start from the top
+    end
     if not books or cursor >= (M._dcb_n or 0) then
         books = FindAllOf("BP_GrabbingBook_C")
         if not books then M._dcb_books = nil; return 0 end
@@ -2880,7 +2903,7 @@ function M.detect_correct_books()
 
     local seen = M._books_correct_seen
     local sent = 0
-    local stop = math.min(cursor + DCB_CHUNK, n)
+    local stop = full and n or math.min(cursor + DCB_CHUNK, n)
     for i = cursor + 1, stop do
         local book = books[i]
         if book and book:IsValid() then

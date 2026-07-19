@@ -1072,7 +1072,1175 @@ local function probe_bag_capacity()
     P("=== [bag] done ===")
 end
 
+-- ---- F11: save-system schema -----------------------------------------------------------------
+-- The game's manual save/load system numbers its slots and renamed the save file Sav -> GameData.
+-- Our per-seed isolation rewrites GameInstance.SaveGameName, so the redirect only holds if that
+-- property still names the file. This dumps what the redirect now lands in: whether SaveGameName
+-- still exists and takes a write, the live save object's schema (which PlayerExtraData carries
+-- SkillData), the SaveSubsystem surface, and every Save-named class the build exposes.
+-- The live slot names come from the [AP][save-probe] hooks in main.lua (UE4SS.log), plus the
+-- async hook below -- an async save path would leave those existing hooks silent.
+
+-- Walk a UStruct's properties, then its supers. depth bounds the super walk (UObject has a lot);
+-- filter is a lowercase substring, nil = every property.
+local function dump_props(strct, label, depth, filter)
+    P(("--- %s ---"):format(label))
+    if not (strct and strct:IsValid()) then P("  (not found)"); return end
+    local ok = pcall(function()
+        local cls, guard = strct, 0
+        while cls and cls:IsValid() and guard < (depth or 12) do
+            guard = guard + 1
+            local cn = "?"; pcall(function() cn = cls:GetFName():ToString() end)
+            P(("  [%s]"):format(cn))
+            cls:ForEachProperty(function(Prop)
+                local pn, pt = "?", "?"
+                pcall(function() pn = Prop:GetFName():ToString() end)
+                pcall(function() pt = Prop:GetClass():GetFName():ToString() end)
+                if (not filter) or pn:lower():find(filter, 1, true) then
+                    P(("    %-34s %s"):format(pn, pt))
+                end
+            end)
+            local super; pcall(function() super = cls:GetSuperStruct() end)
+            cls = super
+        end
+    end)
+    if not ok then P("  (property dump failed)") end
+end
+
+-- UFunctions on a class. Not every UE4SS build exposes ForEachFunction; absence is not a finding.
+local function dump_funcs(cls, label, filter)
+    P(("--- %s ---"):format(label))
+    if not (cls and cls:IsValid()) then P("  (not found)"); return end
+    local n = 0
+    local ok = pcall(function()
+        cls:ForEachFunction(function(Fn)
+            local fn = "?"; pcall(function() fn = Fn:GetFName():ToString() end)
+            if (not filter) or fn:lower():find(filter, 1, true) then P("    " .. fn); n = n + 1 end
+        end)
+    end)
+    if not ok then P("  (ForEachFunction unavailable in this UE4SS build)")
+    else P(("  (%d function(s))"):format(n)) end
+end
+
+local function find_class(path)
+    local c; pcall(function() c = StaticFindObject(path) end)
+    if c and c:IsValid() then return c end
+    return nil
+end
+
+-- A UFunction's own properties ARE its parameters (ReturnParm flagged among them). GetSaveDataPath
+-- is the candidate redirect point, so its exact signature decides whether we can rewrite the path.
+local function dump_signature(fnpath, label)
+    P(("--- signature: %s ---"):format(label))
+    local fn = find_class(fnpath)
+    if not fn then P("  (function object not found)"); return end
+    local ok = pcall(function()
+        fn:ForEachProperty(function(Prop)
+            local pn, pt = "?", "?"
+            pcall(function() pn = Prop:GetFName():ToString() end)
+            pcall(function() pt = Prop:GetClass():GetFName():ToString() end)
+            local ret = ""
+            pcall(function() if Prop:IsA(0) then ret = "" end end)
+            P(("    %-26s %s%s"):format(pn, pt, ret))
+        end)
+    end)
+    if not ok then P("  (signature dump failed)") end
+end
+
+-- SLOT TRACKER.
+-- The native save/load path is unreachable (it calls GetSaveDataPath directly in C++), so the mod
+-- cannot force which slot loads. But the BP menu DOES dispatch GetSaveDataPath for the slot the
+-- player is acting on, so we can OBSERVE it -- enough to bind seed<->slot and refuse checks when a
+-- foreign save is loaded. This proves the observation is reliable: every slot-bearing call, tagged.
+-- Post-hook arg order is empirical, NOT declaration order: arg1=ReturnValue(path), then
+-- mapIdx, slotIdx, pathType, AutoSave.
+local function argval(a)
+    local v = "?"
+    pcall(function()
+        local g = a:get()
+        v = (type(g) == "userdata") and tostring(g:ToString()) or tostring(g)
+    end)
+    return v
+end
+
+M_last_slot = nil   -- global on purpose: readable from the UE4SS console for spot checks
+
+local _path_hook_ok = nil
+local function register_path_hook()
+    if _path_hook_ok ~= nil then return end
+    _path_hook_ok = pcall(function()
+        RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:GetSaveDataPath",
+            function() end,
+            function(self, ...)
+                local a = { ... }
+                local path, mapIdx, slotIdx, pathType, auto =
+                    argval(a[1]), argval(a[2]), argval(a[3]), argval(a[4]), argval(a[5])
+                M_last_slot = slotIdx
+                P(("[slot] GetSaveDataPath -> '%s'  mapIdx=%s slotIdx=%s pathType=%s autoSave=%s")
+                    :format(path, mapIdx, slotIdx, pathType, auto))
+            end)
+    end)
+    P(("[slot] GetSaveDataPath hook registered=%s"):format(tostring(_path_hook_ok)))
+
+    -- SaveGameData(saveSlotNum, isAutoSave) -- 2 params on this build (was 1). This is the one
+    -- write-side call we can still see, and the only candidate for forcing a slot.
+    local ok2 = pcall(function()
+        RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:SaveGameData", function(self, slot, auto)
+            P(("[slot] SaveGameData(saveSlotNum=%s, isAutoSave=%s)"):format(argval(slot), argval(auto)))
+        end)
+    end)
+    P(("[slot] SaveGameData hook registered=%s"):format(tostring(ok2)))
+
+    -- LoadGameData(levelIdx, loadSlotNum, isAutoSave) -- 3 params now (was 1). Has never fired;
+    -- logging all three confirms whether that stays true rather than assuming it.
+    local ok3 = pcall(function()
+        RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:LoadGameData", function(self, lvl, slot, auto)
+            P(("[slot] LoadGameData(levelIdx=%s, loadSlotNum=%s, isAutoSave=%s)  <-- FIRED")
+                :format(argval(lvl), argval(slot), argval(auto)))
+        end)
+    end)
+    P(("[slot] LoadGameData hook registered=%s"):format(tostring(ok3)))
+end
+
+-- The slot path is built from the map + slot number (Map01/Save01/GameData.sav), and the write
+-- never reaches GameplayStatics:SaveGameToSlot -- so the remaining candidates are the async
+-- variant or a memory//custom serializer. Hook them at LOAD, not from the keybind: a hook
+-- registered only when the probe runs can't observe the save that already happened.
+local _save_hooks_ok = nil
+local function register_save_write_hooks()
+    if _save_hooks_ok ~= nil then return end
+    local function slot_of(p)
+        local v = "?"
+        pcall(function() v = p:get():ToString() end)
+        return tostring(v)
+    end
+    _save_hooks_ok = true
+    for _, sig in ipairs({
+        { "/Script/Engine.GameplayStatics:AsyncSaveGameToSlot", "AsyncSaveGameToSlot" },
+        { "/Script/Engine.GameplayStatics:SaveGameToMemory",    "SaveGameToMemory" },
+        { "/Script/Engine.GameplayStatics:LoadGameFromMemory",  "LoadGameFromMemory" },
+        { "/Script/Engine.GameplayStatics:DeleteGameInSlot",    "DeleteGameInSlot" },
+    }) do
+        local ok = pcall(function()
+            RegisterHook(sig[1], function(_, a, b)
+                -- AsyncSaveGameToSlot(SaveGameObject, SlotName, UserIndex): slot is the 2nd param.
+                -- The memory variants take no slot; log the call itself, which is the finding.
+                P(("[save] %s slot='%s'"):format(sig[2], slot_of(b) ~= "?" and slot_of(b) or slot_of(a)))
+            end)
+        end)
+        P(("[save] hook %-22s registered=%s"):format(sig[2], tostring(ok)))
+    end
+    -- AUTOSAVE ATTRIBUTION. Manual saves fire SaveGameData(slot, isAutoSave) and give us the slot
+    -- outright; autosaves fire only StartSaveProgress, which carries no parameters. The two are
+    -- disjoint -- verified across a full session, every autosave write had StartSaveProgress ~1s
+    -- before it and no SaveGameData, and vice versa -- so together they cover every save.
+    -- The slot comes from ScanAutoSaveSlots(): sample it at the hook (still the PREVIOUS newest)
+    -- and again after the write lands, and the value that changed names the slot just written.
+    -- State is captured at the hook, since that is what gets serialized a moment later.
+    local ok = pcall(function()
+        RegisterHook("/Script/Librarian.SaveSubsystem:StartSaveProgress", function()
+            local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
+            local before, rows, books = "?", "?", "?"
+            if gi and gi:IsValid() then
+                pcall(function()
+                    local a = gi:ScanAutoSaveSlots()
+                    if type(a) == "table" then before = tostring(a.NewestSlot) end
+                end)
+                pcall(function()
+                    local sg = gi.GameSaveData
+                    if sg and sg:IsValid() then
+                        rows = tostring(sg.GameProgressData.CurrentFinishedRowNum)
+                        books = tostring(sg.GameProgressData.InsertedBookNum)
+                    end
+                end)
+            end
+            P(("[autosave] StartSaveProgress -- newestAuto BEFORE=%s | state rows=%s books=%s")
+                :format(before, rows, books))
+            -- Re-sample once the write has landed; marshal back to the game thread to read UObjects.
+            LoopAsync(2500, function()
+                on_gt(function()
+                    local gi2 = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
+                    if not (gi2 and gi2:IsValid()) then return end
+                    local after = "?"
+                    pcall(function()
+                        local a = gi2:ScanAutoSaveSlots()
+                        if type(a) == "table" then after = tostring(a.NewestSlot) end
+                    end)
+                    P(("[autosave] ...after write: newestAuto=%s  (%s)"):format(
+                        after, (after ~= before) and ("wrote AutoSave" .. after) or "UNCHANGED -- attribution failed"))
+                end)
+                return true
+            end)
+        end)
+    end)
+    P(("[save] hook %-22s registered=%s"):format("StartSaveProgress+attrib", tostring(ok)))
+    local ok2 = pcall(function()
+        RegisterHook("/Script/Librarian.SaveSubsystem:CheckAbleSave", function()
+            P("[save] SaveSubsystem.CheckAbleSave")
+        end)
+    end)
+    P(("[save] hook %-22s registered=%s"):format("CheckAbleSave", tostring(ok2)))
+end
+
+-- WHAT IS LOADED RIGHT NOW. The single line that answers "did the load land on the slot we asked
+-- for" -- the schema dump lists property NAMES, which is useless for telling two saves apart.
+-- Also reports the game's own idea of the newest slot, since that is what Continue resolves to.
+local function report_live_state(tag)
+    local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
+    if not (gi and gi:IsValid()) then P(("[live] %s: no GameInstance"):format(tag)); return end
+    local rows, books = "?", "?"
+    pcall(function()
+        local sg = gi.GameSaveData
+        if sg and sg:IsValid() then
+            rows  = tostring(sg.GameProgressData.CurrentFinishedRowNum)
+            books = tostring(sg.GameProgressData.InsertedBookNum)
+        end
+    end)
+    local newest, autonewest = "?", "?"
+    pcall(function()
+        local n = gi:GetNewestSaveSlot()
+        if type(n) == "table" then
+            newest = ("slot=%s auto=%s"):format(tostring(n.SlotNum), tostring(n.AutoSave))
+        end
+    end)
+    pcall(function()
+        local a = gi:ScanAutoSaveSlots()
+        if type(a) == "table" then autonewest = tostring(a.NewestSlot) end
+    end)
+    P(("[live] %s: rows=%s books=%s | newest=%s | newestAuto=%s")
+        :format(tag, rows, books, newest, autonewest))
+end
+
+local function probe_save_system()
+    P("=== save-system schema ===")
+    report_live_state("on Ctrl+F9")
+    register_save_write_hooks()
+
+    local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
+    if not (gi and gi:IsValid()) then P("[save] no GameInstance -- load a save, or press Ctrl+F9 in-game"); return end
+    P(("[save] GameInstance class = %s"):format(class_name(gi)))
+
+    local ver = "<none>"
+    pcall(function() ver = gi:GetProjectVersion():ToString() end)
+    P(("[save] GetProjectVersion = %s"):format(tostring(ver)))
+
+    -- Does the redirect target still exist, and does a write take? The write is restored
+    -- immediately: a stray SaveGameName would point the next real save at a file of our invention.
+    -- Only run it once the CURRENT name is known to be a string -- restoring a nil would strand the
+    -- probe value. Whole probe is on the game thread, so no save can land inside the window.
+    local slot_now
+    pcall(function() slot_now = gi.SaveGameName:ToString() end)
+    local have_slot = (type(slot_now) == "string")
+    P(("[save] SaveGameName readable=%s value='%s'"):format(tostring(have_slot), tostring(slot_now)))
+    if not have_slot then
+        P("[save] !! SaveGameName is gone or unreadable -- the per-seed redirect cannot work as built")
+    else
+        local probe_val, readback = "Sav_AP_probe_readback", nil
+        local wrote = pcall(function() gi.SaveGameName = probe_val end)
+        pcall(function() readback = gi.SaveGameName:ToString() end)
+        local restored
+        pcall(function() gi.SaveGameName = slot_now end)
+        pcall(function() restored = gi.SaveGameName:ToString() end)
+        P(("[save] write test: wrote=%s readback='%s' sticks=%s"):format(
+            tostring(wrote), tostring(readback), tostring(readback == probe_val)))
+        if restored == slot_now then
+            P(("[save] restored to '%s'"):format(tostring(restored)))
+        else
+            P(("[save] !! RESTORE FAILED: SaveGameName is now '%s', expected '%s' -- do NOT save; "
+               .. "restart the game before playing"):format(tostring(restored), tostring(slot_now)))
+        end
+    end
+
+    local sg
+    pcall(function() sg = gi.GameSaveData end)
+    local got_schema = false
+    if sg and sg:IsValid() then
+        P(("[save] GameSaveData class = %s"):format(class_name(sg)))
+        local scls; pcall(function() scls = sg:GetClass() end)
+        dump_props(scls, "GameSaveData schema (which PlayerExtraData holds SkillData?)", 3, nil)
+        got_schema = true
+    else
+        P("[save] GameSaveData is nil/invalid -- schema pending; retrying on later triggers")
+    end
+
+    -- Every property on the LIVE GameInstance class, unfiltered, including the Blueprint subclass.
+    -- The native loader takes its slot from somewhere; a name filter, or dumping only the C++ base,
+    -- would hide it. Values too -- the name alone cannot say which slot is currently selected.
+    local live_cls; pcall(function() live_cls = gi:GetClass() end)
+    P("--- LIVE GameInstance: all properties + values (hunting the slot the loader reads) ---")
+    local shown_any = false
+    pcall(function()
+        local cls, guard = live_cls, 0
+        while cls and cls:IsValid() and guard < 4 do
+            guard = guard + 1
+            local cn = "?"; pcall(function() cn = cls:GetFName():ToString() end)
+            P(("  [%s]"):format(cn))
+            cls:ForEachProperty(function(Prop)
+                local pn, pt = "?", "?"
+                pcall(function() pn = Prop:GetFName():ToString() end)
+                pcall(function() pt = Prop:GetClass():GetFName():ToString() end)
+                -- Only scalars carry a readable slot; skip arrays/maps/objects to keep this short.
+                if pt == "IntProperty" or pt == "BoolProperty" or pt == "StrProperty"
+                        or pt == "NameProperty" or pt == "ByteProperty" or pt == "EnumProperty" then
+                    local v = "?"
+                    pcall(function()
+                        local raw = gi[pn]
+                        v = (type(raw) == "userdata") and tostring(raw:ToString()) or tostring(raw)
+                    end)
+                    P(("    %-32s %-14s = %s"):format(pn, pt, v))
+                    shown_any = true
+                end
+            end)
+            local super; pcall(function() super = cls:GetSuperStruct() end)
+            cls = super
+        end
+    end)
+    if not shown_any then P("  (no scalar properties readable)") end
+
+    -- Same for the subsystem that drives saving.
+    local ss = FindFirstOf("SaveSubsystem")
+    if ss and ss:IsValid() then
+        P("--- LIVE SaveSubsystem: scalar properties ---")
+        pcall(function()
+            local c; pcall(function() c = ss:GetClass() end)
+            if c and c:IsValid() then
+                c:ForEachProperty(function(Prop)
+                    local pn, pt = "?", "?"
+                    pcall(function() pn = Prop:GetFName():ToString() end)
+                    pcall(function() pt = Prop:GetClass():GetFName():ToString() end)
+                    local v = "?"
+                    pcall(function() v = tostring(ss[pn]) end)
+                    P(("    %-32s %-14s = %s"):format(pn, pt, v))
+                end)
+            end
+        end)
+    end
+    dump_funcs(find_class("/Script/Librarian.LibrarianGameInstanceBase"),
+        "GameInstance save/load functions", "ave")
+    dump_funcs(find_class("/Script/Librarian.LibrarianGameInstanceBase"),
+        "GameInstance load functions", "oad")
+
+    -- Slot budget: a per-seed slot scheme has to fit inside these.
+    local mx, mxa = "?", "?"
+    pcall(function() mx = tostring(gi.MaxSaveSlots) end)
+    pcall(function() mxa = tostring(gi.MaxAutoSaveSlots) end)
+    P(("[save] MaxSaveSlots=%s MaxAutoSaveSlots=%s"):format(mx, mxa))
+
+    -- The path builder and the slot helpers -- the redirect surface.
+    local GIB = "/Script/Librarian.LibrarianGameInstanceBase:"
+    dump_signature(GIB .. "GetSaveDataPath", "GetSaveDataPath")
+    dump_signature(GIB .. "SaveGameData", "SaveGameData")
+    dump_signature(GIB .. "LoadGameData", "LoadGameData")
+    dump_signature(GIB .. "GetNewestSaveSlot", "GetNewestSaveSlot")
+    dump_signature(GIB .. "ScanAutoSaveSlots", "ScanAutoSaveSlots")
+
+
+    local subsys = FindFirstOf("SaveSubsystem")
+    P(("[save] SaveSubsystem instance = %s"):format(subsys and class_name(subsys) or "<not found>"))
+    dump_props(find_class("/Script/Librarian.SaveSubsystem"), "SaveSubsystem properties", 1, nil)
+    dump_funcs(find_class("/Script/Librarian.SaveSubsystem"), "SaveSubsystem functions", nil)
+
+    -- LibrarianSlotSaveGame is the slot metadata the load menu lists (MetaData: RowMaxNum,
+    -- BookMaxNum, SaveTime, PlayTime) -- a per-seed slot has to carry one or it stays invisible.
+    dump_props(find_class("/Script/Librarian.LibrarianSlotSaveGame"), "LibrarianSlotSaveGame", 2, nil)
+    dump_props(find_class("/Script/Librarian.LibrarianSaveMetadata"), "LibrarianSaveMetadata", 2, nil)
+
+    -- Live USaveGame objects: names the classes actually in use, including any the manual save
+    -- system added that we have no path for.
+    P("--- live USaveGame instances ---")
+    local found = 0
+    for _, short in ipairs({ "LibrarianSaveGame", "LibrarianSlotSaveGame", "SystemSaveGame", "SaveGame" }) do
+        local objs; pcall(function() objs = FindAllOf(short) end)
+        local n = safe_len(objs)
+        if n > 0 then
+            found = found + n
+            P(("  FindAllOf(%q): %d"):format(short, n))
+            for i = 1, math.min(n, 8) do
+                local o = objs[i]
+                if o and o:IsValid() then P(("    %s  =  %s"):format(class_name(o), full_name(o))) end
+            end
+        end
+    end
+    if found == 0 then P("  (none live)") end
+
+    P(("=== save-system schema done (schema captured=%s) -- send probe.log ==="):format(tostring(got_schema)))
+    return got_schema
+end
+
+-- Auto-dump: the schema read needs a loaded GameSaveData, which only exists once a save is in.
+-- Firing off the game's own save/load means the dump lands at exactly the right moment and needs
+-- no keypress -- F11 never reached UE4SS, so a keybind alone is not a reliable trigger. Once per
+-- session; these hooks are on the game thread already, so the body runs inline.
+-- Latch only once the schema is actually captured: DoesSaveGameExist also fires at the title,
+-- where GameSaveData is nil, and latching there would spend the one-shot before a save is in.
+-- ATTEMPT_CAP keeps a title-screen menu (which probes every slot) from dumping on a loop.
+local _auto_dumped, _auto_attempts = false, 0
+local ATTEMPT_CAP = 8
+local function auto_dump_on(sig, label)
+    local ok = pcall(function()
+        RegisterHook(sig, function()
+            if _auto_dumped or _auto_attempts >= ATTEMPT_CAP then return end
+            _auto_attempts = _auto_attempts + 1
+            P(("[save] auto-dump triggered by %s (attempt %d/%d)"):format(label, _auto_attempts, ATTEMPT_CAP))
+            local ok2, got = pcall(probe_save_system)
+            if ok2 and got then
+                _auto_dumped = true
+                P("[save] schema captured -- auto-dump latched, no further attempts")
+            elseif _auto_attempts >= ATTEMPT_CAP then
+                P("[save] attempt cap reached without a loaded save -- use Ctrl+F9 in-game to re-dump")
+            end
+        end)
+    end)
+    P(("[save] auto-dump hook %-28s registered=%s"):format(label, tostring(ok)))
+end
+
+register_save_write_hooks()
+register_path_hook()
+
+-- Auto-report after EVERY level load. A world rebuild destroys whatever ran before it, so a probe
+-- that asks the player to press a key after the load screen is asking them to do the measurement by
+-- hand -- and the interesting number (did the rebuilt world keep the slot we chose?) is gone by then.
+-- Delay lets GameSaveData settle, then marshal back to the game thread for the UObject reads.
+pcall(function()
+    RegisterLoadMapPostHook(function()
+        LoopAsync(2500, function()
+            on_gt(function() pcall(report_live_state, "after level load") end)
+            return true   -- one-shot
+        end)
+    end)
+end)
+-- StartSaveProgress is the one confirmed to fire on this build: loading a save calls neither
+-- GI.LoadGameData nor LoadGameFromSlot (the subsystem reads natively, below UFunction dispatch),
+-- so a load-side trigger never lands. The rest stay as cheap extra chances to catch the dump.
+auto_dump_on("/Script/Librarian.SaveSubsystem:StartSaveProgress", "SaveSubsystem.StartSaveProgress")
+auto_dump_on("/Script/Librarian.SaveSubsystem:CheckAbleSave", "SaveSubsystem.CheckAbleSave")
+auto_dump_on("/Script/Librarian.LibrarianGameInstanceBase:SaveGameData", "GI.SaveGameData")
+auto_dump_on("/Script/Librarian.LibrarianGameInstanceBase:LoadGameData", "GI.LoadGameData")
+auto_dump_on("/Script/Librarian.LibrarianGameInstanceBase:LoadGameDataBP", "GI.LoadGameDataBP")
+-- DoesSaveGameExist is how the menu enumerates slots (Map01/<Slot>/SlotData), so it fires on any
+-- visit to the load screen -- a trigger that needs no save at all.
+auto_dump_on("/Script/Engine.GameplayStatics:DoesSaveGameExist", "DoesSaveGameExist")
+
+-- ---- CAN WE DRIVE THE SAVE SYSTEM? -----------------------------------------------------------
+-- Hooking the native save path fails (it calls GetSaveDataPath below UFunction dispatch), but
+-- CALLING a UFunction is a different mechanism and the mod already does it elsewhere
+-- (UpgradePlayer, ScatterBooks, UpdateInstanceTransform). If SaveGameData/LoadGameData are
+-- callable, the mod can FORCE the right slot instead of only detecting the wrong one -- which
+-- decides whether isolation can be automatic or has to be a warning.
+--
+-- Ctrl+F10 = save-side only, and deliberately writes to an EMPTY high slot so nothing existing is
+-- touched (additive; delete Map01/Save<N> to undo). Load-side is NOT bound: driving a load discards
+-- unsaved progress, so it stays manual until the save side is proven.
+local PROBE_WRITE_SLOT = 20   -- well clear of hand-made saves; MaxSaveSlots=30
+
+local function probe_drive_save()
+    P("=== [Ctrl+F10] can the mod DRIVE the save system? ===")
+    local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
+    if not (gi and gi:IsValid()) then P("[drive] no GameInstance -- run this in-game"); return end
+
+    local ver = "?"; pcall(function() ver = gi:GetProjectVersion():ToString() end)
+    P(("[drive] game v%s  target slot=%d (expected EMPTY)"):format(tostring(ver), PROBE_WRITE_SLOT))
+
+    -- Confirm the target is empty first, so a pass/fail can't be confused with clobbering a save.
+    local exists = "?"
+    pcall(function()
+        local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+        if gs then exists = tostring(gs:DoesSaveGameExist(
+            ("Map01/Save%02d/SlotData"):format(PROBE_WRITE_SLOT), 0)) end
+    end)
+    P(("[drive] DoesSaveGameExist(Map01/Save%02d/SlotData) = %s (want false)")
+        :format(PROBE_WRITE_SLOT, exists))
+
+    -- SaveGameData(saveSlotNum, isAutoSave). If this returns ok and the slot dir appears, the mod
+    -- can place a save in a chosen slot.
+    local ok, err = pcall(function() gi:SaveGameData(PROBE_WRITE_SLOT, false) end)
+    P(("[drive] SaveGameData(%d, false) ok=%s%s"):format(
+        PROBE_WRITE_SLOT, tostring(ok), ok and "" or (" err=" .. tostring(err))))
+
+    -- GetNewestSaveSlot / ScanAutoSaveSlots return structs -- if these carry slot identity they
+    -- close the autosave hole, since autosave WRITES are invisible to every hook.
+    -- They come back as Lua tables here, not userdata, so walk them generically.
+    local function show(v, depth)
+        depth = depth or 0
+        if type(v) == "table" then
+            if depth > 2 then return "{...}" end
+            local parts = {}
+            for k, sub in pairs(v) do
+                parts[#parts + 1] = ("%s=%s"):format(tostring(k), show(sub, depth + 1))
+            end
+            table.sort(parts)
+            return "{" .. table.concat(parts, ", ") .. "}"
+        end
+        if type(v) == "userdata" then
+            local parts = {}
+            for _, f in ipairs({ "SlotIndex", "MapIndex", "SaveType", "PlayTime",
+                                "CompleteRowNum", "RowMaxNum", "InsertedBookNum", "BookMaxNum" }) do
+                local got; pcall(function() got = v[f] end)
+                if got ~= nil then parts[#parts + 1] = ("%s=%s"):format(f, tostring(got)) end
+            end
+            return (#parts > 0) and ("<" .. table.concat(parts, " ") .. ">") or tostring(v)
+        end
+        return tostring(v)
+    end
+    for _, fn in ipairs({ "GetNewestSaveSlot", "ScanAutoSaveSlots" }) do
+        local okc, res = pcall(function() return gi[fn](gi) end)
+        P(("[drive] %s() ok=%s -> %s"):format(fn, tostring(okc), show(res)))
+    end
+
+    P(("[drive] NOW CHECK: did Map01/Save%02d/ appear on disk? That is the real answer."):format(
+        PROBE_WRITE_SLOT))
+    P("=== [Ctrl+F10] done ===")
+end
+
+-- Ctrl+F8: can the mod DRIVE A LOAD? This is the piece that decides whether per-seed isolation can
+-- be automatic (mod puts the player in the right slot) or has to be a prompt. Targets the slot the
+-- save-side test wrote, so it only ever loads OUR OWN probe save -- never one of the player's.
+-- Disruptive by nature: a load discards unsaved progress, hence its own keybind and its own warning.
+local function probe_drive_load()
+    P("=== [Ctrl+F8] can the mod DRIVE a load? ===")
+    local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
+    if not (gi and gi:IsValid()) then P("[drive] no GameInstance"); return end
+
+    local exists = "?"
+    pcall(function()
+        local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+        if gs then exists = tostring(gs:DoesSaveGameExist(
+            ("Map01/Save%02d/SlotData"):format(PROBE_WRITE_SLOT), 0)) end
+    end)
+    P(("[drive] target Map01/Save%02d exists=%s (run Ctrl+F10 first if false)")
+        :format(PROBE_WRITE_SLOT, exists))
+    if exists ~= "true" then P("[drive] aborting -- nothing to load"); return end
+
+    -- Live state before, so the log shows whether the load actually swapped the world.
+    local before = "?"
+    pcall(function()
+        local sg = gi.GameSaveData
+        if sg and sg:IsValid() then
+            before = ("rows=%s books=%s"):format(
+                tostring(sg.GameProgressData.CurrentFinishedRowNum),
+                tostring(sg.GameProgressData.InsertedBookNum))
+        end
+    end)
+    P(("[drive] BEFORE load: %s"):format(before))
+
+    -- LoadGameData(levelIdx, loadSlotNum, isAutoSave) -> bool. mapIdx was 1 in every observed
+    -- GetSaveDataPath call, so levelIdx=1 is the matching guess for Map01.
+    local ok, res = pcall(function() return gi:LoadGameData(1, PROBE_WRITE_SLOT, false) end)
+    P(("[drive] LoadGameData(1, %d, false) ok=%s -> %s"):format(
+        PROBE_WRITE_SLOT, tostring(ok), tostring(res)))
+
+    local after = "?"
+    pcall(function()
+        local sg = gi.GameSaveData
+        if sg and sg:IsValid() then
+            after = ("rows=%s books=%s"):format(
+                tostring(sg.GameProgressData.CurrentFinishedRowNum),
+                tostring(sg.GameProgressData.InsertedBookNum))
+        end
+    end)
+    P(("[drive] AFTER load: %s   (changed=%s)"):format(after, tostring(before ~= after)))
+    P("[drive] ok=true alone is NOT proof -- the real test is whether the WORLD changed on screen.")
+    P("=== [Ctrl+F8] done ===")
+end
+
+-- Ctrl+F7: the FULL load -- pick the slot, then rebuild the world.
+-- LoadGameData alone deserializes onto the running world and leaves it visually corrupt (flashing
+-- books, duplicates on the ground) because the actors are never rebuilt. The game's own Load Game
+-- button does a full LoadMap of PL_M01, and the mod's connect path already forces the same thing
+-- via OpenLevel. So the candidate sequence is LoadGameData (choose the save) THEN OpenLevel
+-- (rebuild from it) -- which is the pre-1.0.12 flow with the dead SaveGameName write swapped out.
+--
+-- The open question this answers: does the rebuilt world reflect the slot WE chose, or does the
+-- native path re-read whatever slot the game considers current and discard our choice?
+local function probe_drive_full_load()
+    P("=== [Ctrl+F7] full load: LoadGameData + OpenLevel ===")
+    local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
+    if not (gi and gi:IsValid()) then P("[drive] no GameInstance"); return end
+
+    local function progress()
+        local s = "?"
+        pcall(function()
+            local sg = gi.GameSaveData
+            if sg and sg:IsValid() then
+                s = ("rows=%s books=%s"):format(
+                    tostring(sg.GameProgressData.CurrentFinishedRowNum),
+                    tostring(sg.GameProgressData.InsertedBookNum))
+            end
+        end)
+        return s
+    end
+
+    P(("[drive] BEFORE: %s"):format(progress()))
+    local okl, res = pcall(function() return gi:LoadGameData(1, PROBE_WRITE_SLOT, false) end)
+    P(("[drive] LoadGameData(1, %d, false) ok=%s -> %s   now: %s"):format(
+        PROBE_WRITE_SLOT, tostring(okl), tostring(res), progress()))
+
+    local statics = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    if not (statics and statics:IsValid()) then P("[drive] no GameplayStatics -- cannot OpenLevel"); return end
+    P("[drive] OpenLevel(PL_M01) -- world rebuild; expect a load screen")
+    local oko, err = pcall(function() statics:OpenLevel(gi, FName("PL_M01"), true, "") end)
+    P(("[drive] OpenLevel ok=%s%s"):format(tostring(oko), oko and "" or (" err=" .. tostring(err))))
+    P("[drive] The [live] line after the load screen reports whether the slot stuck.")
+    P("=== [Ctrl+F7] done ===")
+end
+
+-- ---- Ctrl+F6: world fingerprint (does the random book scatter identify a playthrough?) --------
+-- The game stores no seed -- checked GameInstance, GameMode, GameManager and the save structs --
+-- so the per-game randomness lives directly in each book's saved Transform. That makes the LAYOUT
+-- itself the identity: a different new game scatters books differently, and a save carries its
+-- scatter with it. If this holds, a foreign save can be rejected on content rather than on which
+-- slot it happens to occupy -- which is what slot numbers cannot do, since a player can overwrite
+-- the AP slot with any save at all.
+--
+-- Keyed by book identity (aidx|chapter) and sorted, so the hash does not depend on actor iteration
+-- order, which varies run to run. Positions rounded to whole units to absorb float jitter.
+-- Hash EVERY book, not a sample. Sampling the lowest-numbered books after an id-sort was the first
+-- attempt and it produced a constant hash across three separate new games: the spots are fixed and
+-- only the ASSIGNMENT of book->spot is randomized, so a subset chosen by id can easily be one the
+-- game fills identically every run. Whole-set is also just correct — partial coverage cannot prove
+-- two worlds match.
+local function world_fingerprint(verbose)
+    local books = FindAllOf("BP_GrabbingBook_C")
+    if not books then return nil, 0, "no books (load a save first)" end
+    local n = safe_len(books)
+    if n == 0 then return nil, 0, "0 books loaded" end
+
+    local entries, no_pos, no_info, at_origin = {}, 0, 0, 0
+    local distinct_pos, distinct_aidx = {}, {}
+    local correct_entries, scattered_entries, n_correct, n_attached = {}, {}, 0, 0
+    local min_z, n_deep = math.huge, 0
+    for i = 1, math.min(n, 8000) do
+        local book = books[i]
+        local info = book_info(book)
+        if not info then
+            no_info = no_info + 1
+        else
+            local aidx, chap
+            pcall(function() aidx = info.AssetIdx end)
+            pcall(function() chap = info.Chapter end)
+            if aidx ~= nil and chap ~= nil then
+                local x, y, z
+                pcall(function()
+                    local loc = book:K2_GetActorLocation()
+                    x, y, z = loc.X, loc.Y, loc.Z
+                end)
+                -- "Is Abs Correct" is the WRONG split for identity. The game saves shelved books
+                -- via FBookCaseSaveData, which stores no transform at all -- their position is
+                -- rebuilt from (case, slot) geometry that is identical in every playthrough. That
+                -- is true of a MIS-shelved book too: it sits on a fixed slot and carries just as
+                -- little per-run identity as a correct one. So the predicate that matters is
+                -- shelved-vs-loose, not correct-vs-incorrect. Only loose books persist a real
+                -- FTransform, i.e. the randomized scatter.
+                local correct, attached = false, false
+                pcall(function() correct = book["Is Abs Correct"] and true or false end)
+                pcall(function()
+                    local parent = book:GetAttachParentActor()
+                    attached = (parent and parent:IsValid()) and true or false
+                end)
+                if x then
+                    local px, py, pz = math.floor(x + 0.5), math.floor(y + 0.5), math.floor(z + 0.5)
+                    -- Skip actors parked at the origin. During a level transition the incoming
+                    -- world's books exist but are not placed yet, and they all read 0,0,0 -- a
+                    -- measurement taken then sees ~2x the real actor count and hashes garbage.
+                    if px == 0 and py == 0 and pz == 0 then
+                        at_origin = at_origin + 1
+                    else
+                        if pz < min_z then min_z = pz end
+                        if pz < -500000 then n_deep = n_deep + 1 end
+                        local pos = ("%d,%d,%d"):format(px, py, pz)
+                        distinct_pos[pos] = true
+                        distinct_aidx[aidx] = true
+                        -- Key by POSITION, value the book in it: the spots are fixed and only the
+                        -- occupant is randomized, so position-major is the part that varies.
+                        local e = ("%s=%d|%d"):format(pos, aidx, chap)
+                        entries[#entries + 1] = e
+                        -- Split by the game's own correct-placement verdict. A correctly shelved
+                        -- book has been moved to where the PUZZLE says it goes, which is the same
+                        -- destination in every playthrough -- so it carries no per-run identity and
+                        -- would inflate the similarity between two unrelated late-game saves.
+                        -- Only the still-misplaced books hold the randomized assignment.
+                        if correct then n_correct = n_correct + 1 end
+                        if attached then n_attached = n_attached + 1 end
+                        -- AssetIdx 0 (Monsterology) is the one series the game never randomizes,
+                        -- so it agrees for free between ANY two worlds -- excluding it keeps those
+                        -- 10 books from manufacturing fake agreements.
+                        if attached or aidx == 0 then
+                            correct_entries[#correct_entries + 1] = e
+                        else
+                            scattered_entries[#scattered_entries + 1] = e
+                        end
+                    end
+                else
+                    no_pos = no_pos + 1
+                end
+            else
+                no_info = no_info + 1
+            end
+        end
+    end
+    if #entries == 0 then return nil, 0, "no readable book positions" end
+    table.sort(entries)
+
+    local function djb2(list)
+        local h = 5381
+        for i = 1, #list do
+            local s = list[i]
+            for c = 1, #s do
+                h = (h * 33 + s:byte(c)) % 4294967296
+            end
+        end
+        return h
+    end
+    local h = djb2(entries)
+    table.sort(scattered_entries)
+    local h_scattered = djb2(scattered_entries)
+    -- Shelved books hashed separately. A series may sit on ANY same-size shelf within its own
+    -- bookcase (volumes in order), so the arrangement is real variation -- but it is chosen by the
+    -- PLAYER, not rolled per run. Useless for telling two arbitrary saves apart (a methodical
+    -- player repeats their own habits), yet ideal for matching a save against OUR OWN record of
+    -- this run, where the choices being compared are the ones we watched them make.
+    table.sort(correct_entries)
+    local h_shelved = djb2(correct_entries)
+
+    if verbose then
+        local dp, da = 0, 0
+        for _ in pairs(distinct_pos) do dp = dp + 1 end
+        for _ in pairs(distinct_aidx) do da = da + 1 end
+        P(("[fp]   actors=%d hashed=%d at_origin=%d no_pos=%d no_info=%d | distinct positions=%d distinct asset-idx=%d")
+            :format(n, #entries, at_origin, no_pos, no_info, dp, da))
+        if at_origin > 0 then
+            P(("[fp]   WARNING: %d unplaced book(s) skipped -- world still streaming; re-press once settled")
+                :format(at_origin))
+        end
+        P(("[fp]   shelved(attached)=%d  is-abs-correct=%d  LOOSE=%d  (%.1f%% shelved)")
+            :format(n_attached, n_correct, #scattered_entries,
+                    (#entries > 0) and (n_attached / #entries * 100) or 0))
+        P(("[fp]   LOOSE-only fingerprint=%d  <- the only part that identifies a run"):format(h_scattered))
+        P(("[fp]   SHELVED-only fingerprint=%d  <- shelf arrangement (player-chosen, still matchable)")
+            :format(h_shelved))
+        P(("[fp]   verification headroom: %d loose books (need >=16 to bootstrap)"):format(#scattered_entries))
+        -- BookSanity moves HISM PILE INSTANCES to deep Z to hide locked books; it never moves the
+        -- ACTORS (no SetActorLocation anywhere in the mod). The fingerprint reads actor positions
+        -- for exactly that reason. If actors ever start getting teleported, the scatter signal
+        -- silently becomes a record of our own hiding rather than of the save -- so flag it loudly
+        -- instead of letting it pass as a legitimate layout change.
+        if n_deep > 0 then
+            P(("[fp]   !! %d book ACTOR(s) below Z=-500000 (min=%d) -- actors are being moved; the "
+               .. "scatter fingerprint is NOT trustworthy in this state"):format(n_deep, min_z))
+        end
+        P("[fp]   sample entries (position=book):")
+        for i = 1, math.min(3, #entries) do P(("[fp]     %s"):format(entries[i])) end
+        if #correct_entries > 0 then
+            P(("[fp]     [shelved]   %s"):format(correct_entries[1]))
+        end
+        if #scattered_entries > 0 then
+            P(("[fp]     [scattered] %s"):format(scattered_entries[1]))
+        end
+    end
+    return h, #entries, nil, h_scattered, n_correct, #scattered_entries
+end
+
+local _fp_last, _fp_last_scat = nil, nil
+local function probe_world_fingerprint()
+    P("=== [Ctrl+F6] world fingerprint ===")
+    local fp, used, err, fp_scat, n_corr, n_scat = world_fingerprint(true)
+    if not fp then P(("[fp] unavailable: %s"):format(tostring(err))); return end
+    local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
+    local rows, books_n = "?", "?"
+    if gi and gi:IsValid() then
+        pcall(function()
+            local sg = gi.GameSaveData
+            if sg and sg:IsValid() then
+                rows = tostring(sg.GameProgressData.CurrentFinishedRowNum)
+                books_n = tostring(sg.GameProgressData.InsertedBookNum)
+            end
+        end)
+    end
+    P(("[fp] fingerprint=%d  (from %d books)  rows=%s books=%s"):format(fp, used, rows, books_n))
+
+    -- IMPOSSIBILITY CHECK. Locked series are warded, so a legitimate AP save can only ever contain
+    -- books shelved from series this run actually granted. A shelved series we never unlocked is a
+    -- contradiction, not a coincidence -- and unlike the scatter, this evidence GROWS as the player
+    -- progresses, covering exactly the late game where loose books run out.
+    local ia2 = IA()
+    local unlocked = ia2 and ia2._series_unlocked
+    local a2s2 = (ia2 and ia2._asset_to_series) or {}
+    if type(unlocked) == "table" and next(unlocked) then
+        local shelved_series, impossible, n_unlocked = {}, {}, 0
+        for _ in pairs(unlocked) do n_unlocked = n_unlocked + 1 end
+        local bl = FindAllOf("BP_GrabbingBook_C")
+        for i = 1, math.min(safe_len(bl), 8000) do
+            local b = bl[i]
+            local info = book_info(b)
+            if info then
+                local aidx, att
+                pcall(function() aidx = info.AssetIdx end)
+                pcall(function()
+                    local p2 = b:GetAttachParentActor(); att = (p2 and p2:IsValid()) and true or false
+                end)
+                if att and aidx ~= nil then
+                    local sname = a2s2[aidx]
+                    if sname then
+                        shelved_series[sname] = true
+                        if not unlocked[sname] then impossible[sname] = true end
+                    end
+                end
+            end
+        end
+        local n_shelved, n_bad, first_bad = 0, 0, nil
+        for _ in pairs(shelved_series) do n_shelved = n_shelved + 1 end
+        for sname in pairs(impossible) do n_bad = n_bad + 1; first_bad = first_bad or sname end
+        P(("[fp]   POSSIBILITY: %d series shelved, %d granted by AP, %d IMPOSSIBLE")
+            :format(n_shelved, n_unlocked, n_bad))
+        if n_bad > 0 then
+            P(("[fp]   !! foreign save indicator -- e.g. %q is shelved but was never unlocked")
+                :format(tostring(first_bad)))
+        end
+    else
+        P("[fp]   POSSIBILITY: skipped (not connected to AP, or no series unlocked yet)")
+    end
+
+    -- Control: "Monsterology: An Introduction to Forbidden Beast" is the one series the game does
+    -- NOT move between new games. Its position must stay constant while everything else varies --
+    -- if it moves too, position reads are unreliable; if NOTHING moves, the scatter is not per-game.
+    local ia = IA()
+    local a2s = (ia and ia._asset_to_series) or {}
+    local ctrl_aidx = nil
+    for aidx, sname in pairs(a2s) do
+        if type(sname) == "string" and sname:find("Monsterology", 1, true)
+                and sname:find("Forbidden", 1, true) then
+            ctrl_aidx = aidx; break
+        end
+    end
+    if ctrl_aidx then
+        -- Report by CHAPTER, lowest first. Actor iteration order varies per run, so printing "the
+        -- first three found" compared chapter 0/1/2 against chapter 9/8/7 last time -- different
+        -- books, so the control proved nothing. Keyed by chapter it is comparable run to run.
+        local books2 = FindAllOf("BP_GrabbingBook_C")
+        local by_chapter = {}
+        for i = 1, math.min(safe_len(books2), 8000) do
+            local b = books2[i]
+            local info = book_info(b)
+            local aidx
+            if info then pcall(function() aidx = info.AssetIdx end) end
+            if aidx == ctrl_aidx then
+                local chap, x, y, z
+                pcall(function() chap = info.Chapter end)
+                pcall(function()
+                    local loc = b:K2_GetActorLocation(); x, y, z = loc.X, loc.Y, loc.Z
+                end)
+                if chap and x and not (x == 0 and y == 0 and z == 0) then
+                    by_chapter[chap] = ("%d,%d,%d"):format(
+                        math.floor(x + 0.5), math.floor(y + 0.5), math.floor(z + 0.5))
+                end
+            end
+        end
+        local chaps = {}
+        for c in pairs(by_chapter) do chaps[#chaps + 1] = c end
+        table.sort(chaps)
+        if #chaps == 0 then
+            P(("[fp]   CONTROL Monsterology aidx=%d: no placed actors"):format(ctrl_aidx))
+        else
+            for i = 1, math.min(3, #chaps) do
+                P(("[fp]   CONTROL Monsterology aidx=%d chapter=%d @ %s"):format(
+                    ctrl_aidx, chaps[i], by_chapter[chaps[i]]))
+            end
+        end
+    else
+        P("[fp]   CONTROL Monsterology: series not in _asset_to_series (connect to AP to populate)")
+    end
+    if _fp_last ~= nil then
+        P(("[fp] previous=%d -> %s | previous scattered=%s -> %s"):format(
+            _fp_last, (fp == _fp_last) and "SAME" or "DIFFERENT",
+            tostring(_fp_last_scat),
+            (fp_scat == _fp_last_scat) and "SAME" or "DIFFERENT"))
+    end
+    _fp_last, _fp_last_scat = fp, fp_scat
+    P("=== [Ctrl+F6] done ===")
+end
+
+-- ---- save/load MENU tracing (1.0.12+ slot picker) --------------------------------------------
+-- Driving LoadGameData directly failed: the native loader rebuilds the world from its own notion of
+-- the current slot and discards ours. But the menu's own load path obviously works, so hook it and
+-- watch the real sequence instead of guessing at it. Whatever OnLoadSave does between the click and
+-- the level load is the part we are missing.
+-- UpdateSlotInfo is also the relabel point: it populates each row and carries the slot index.
+-- Registration must be DEFERRED and RETRIED. A BP-path hook fails silently (registered=false) if the
+-- Blueprint class is not loaded yet, and probe.lua runs long before the title UI exists -- which is
+-- why an earlier attempt reported false for every hook. main.lua has the same problem and solves it
+-- with register_bp_hooks_once, driven from the LoadMap post-hook. Retry until they take.
+local _menu_hooks_ok = nil
+local function register_menu_hooks()
+    if _menu_hooks_ok then return true end
+
+    local function slotinfo(p)
+        local s = "?"
+        pcall(function()
+            local v = p:get()
+            s = ("slot=%s auto=%s"):format(tostring(v.SlotNum), tostring(v.AutoSave))
+        end)
+        return s
+    end
+
+    -- The menu actions. Order of arrival across a real load is the finding.
+    for _, sig in ipairs({
+        { "/Game/Librarian/UI/Save/WBP_SaveMenu.WBP_SaveMenu_C:OnLoadSave",  "OnLoadSave" },
+        { "/Game/Librarian/UI/Save/WBP_SaveMenu.WBP_SaveMenu_C:OnSaveGame",  "OnSaveGame" },
+        { "/Game/Librarian/UI/Save/WBP_SaveMenu.WBP_SaveMenu_C:OnDeleteSave","OnDeleteSave" },
+        { "/Game/Librarian/UI/Save/WBP_SaveMenu.WBP_SaveMenu_C:RefreshSlotList", "RefreshSlotList" },
+    }) do
+        local ok = pcall(function()
+            RegisterHook(sig[1], function(self)
+                local mode, ls = "?", "?"
+                pcall(function() mode = tostring(self:get().SaveLoadMode) end)
+                pcall(function()
+                    local v = self:get().LoadSlotInfo
+                    ls = ("slot=%s auto=%s"):format(tostring(v.SlotNum), tostring(v.AutoSave))
+                end)
+                P(("[menu] %s  mode=%s LoadSlotInfo=%s"):format(sig[2], mode, ls))
+            end)
+        end)
+        P(("[menu] hook %-16s registered=%s"):format(sig[2], tostring(ok)))
+    end
+
+    -- Which slot the player clicked, with the auto flag -- the exact pair identity needs.
+    local ok2 = pcall(function()
+        RegisterHook("/Game/Librarian/UI/Save/WBP_SaveMenu.WBP_SaveMenu_C:SaveSlotPressed",
+            function(self, widget, slot)
+                P(("[menu] SaveSlotPressed  %s"):format(slotinfo(slot)))
+            end)
+    end)
+    P(("[menu] hook %-16s registered=%s"):format("SaveSlotPressed", tostring(ok2)))
+
+    -- Row population, and the relabel point. Must hook the BP path: the parent-class hook
+    -- (/Script/Librarian.SaveSlotWidget:UpdateSlotInfo) registers but NEVER fires, because the BP
+    -- subclass redeclares it and dispatch goes there instead.
+    local ok3 = pcall(function()
+        RegisterHook("/Game/Librarian/UI/Save/WBP_SaveSlot.WBP_SaveSlot_C:UpdateSlotInfo", function(self, slotIdx, _save)
+            local idx, cur = "?", "?"
+            pcall(function() idx = tostring(slotIdx:get()) end)
+            pcall(function()
+                local c = self:get().CurrentSlotIdx
+                cur = ("slot=%s auto=%s"):format(tostring(c.SlotNum), tostring(c.AutoSave))
+            end)
+            P(("[menu] UpdateSlotInfo slotIdx=%s CurrentSlotIdx=%s  <- relabel point"):format(idx, cur))
+        end)
+    end)
+    P(("[menu] hook %-16s registered=%s"):format("UpdateSlotInfo", tostring(ok3)))
+    -- ok2/ok3 are the BP-path hooks: if the Blueprint class is resident they all take together,
+    -- so they are a sufficient signal that the retry can stop.
+    _menu_hooks_ok = (ok2 and ok3) or false
+    return _menu_hooks_ok
+end
+
+-- Ctrl+F1: fully automated load -- open the menu the way a click does, then drive it.
+-- Ctrl+F2 only worked once the player had opened the Load window by hand, so something the open
+-- performs is a prerequisite. Two candidates, both handled here: SaveLoadMode must be LoadMode
+-- (the working capture showed mode=1, and a menu that was never opened may still be in SaveMode),
+-- and RefreshSlotList must have populated the slot widgets.
+-- Pressing the title's Load button is the faithful way to get all of it, since that is exactly what
+-- the player does; the menu is then driven on a later tick, once it has constructed.
+local TITLE_LOAD_BTN =
+    "BndEvt__WBP_Title_Button_Load_K2Node_ComponentBoundEvent_2_OnButtonPressedEvent__DelegateSignature"
+
+local function _drive_menu_load(slot)
+    local menu = FindFirstOf("WBP_SaveMenu_C")
+    if not (menu and menu:IsValid()) then P("[auto] menu still absent"); return false end
+    local mode = "?"
+    pcall(function() mode = tostring(menu.SaveLoadMode) end)
+    P(("[auto] menu found, SaveLoadMode=%s (1=Load)"):format(mode))
+    pcall(function() menu.SaveLoadMode = 1 end)
+    pcall(function() menu:RefreshSlotList() end)
+    local set_ok = pcall(function()
+        local ls = menu.LoadSlotInfo
+        ls.SlotNum = slot
+        ls.AutoSave = false
+    end)
+    P(("[auto] set LoadSlotInfo slot=%d ok=%s"):format(slot, tostring(set_ok)))
+    local ok, err = pcall(function() menu:OnLoadSave() end)
+    P(("[auto] OnLoadSave() ok=%s%s"):format(tostring(ok), ok and "" or (" err=" .. tostring(err))))
+    return ok
+end
+
+local function probe_auto_load()
+    P("=== [Ctrl+F1] automated load (open menu, then drive it) ===")
+    local title = FindFirstOf("WBP_Title_C")
+    if not (title and title:IsValid()) then
+        P("[auto] no WBP_Title_C -- run this at the title screen")
+        return
+    end
+    local opened = pcall(function() title[TITLE_LOAD_BTN](title) end)
+    P(("[auto] pressed title Load button ok=%s"):format(tostring(opened)))
+    -- Give the menu a beat to construct and populate before driving it.
+    LoopAsync(1200, function()
+        on_gt(function() pcall(_drive_menu_load, PROBE_WRITE_SLOT) end)
+        return true
+    end)
+    P("=== [Ctrl+F1] issued -- watch for the load screen ===")
+end
+
+-- Ctrl+F2: force a LOAD by driving the menu's own path.
+-- Calling LoadGameData directly failed -- the native loader rebuilt the world from its own slot and
+-- discarded ours. But the menu's click path works, and the trace shows what it actually does:
+--     SaveSlotPressed(slot=20, auto=false)   ->   OnLoadSave()  with LoadSlotInfo = that slot
+-- So OnLoadSave reads LoadSlotInfo rather than taking an argument. Set it, then call OnLoadSave,
+-- and the game should take exactly the path a click takes.
+-- WBP_SaveMenu_C lives inside TitleUMG's widget tree, so it exists even with the menu closed.
+local function probe_force_load()
+    P("=== [Ctrl+F2] force load via the menu's own path ===")
+    local menu = FindFirstOf("WBP_SaveMenu_C")
+    if not (menu and menu:IsValid()) then
+        P("[force] no WBP_SaveMenu_C -- open the save/load menu once so the widget exists")
+        return
+    end
+    P(("[force] menu = %s"):format(full_name(menu)))
+
+    local function show_ls(tag)
+        pcall(function()
+            local ls = menu.LoadSlotInfo
+            P(("[force] %s LoadSlotInfo slot=%s auto=%s"):format(
+                tag, tostring(ls.SlotNum), tostring(ls.AutoSave)))
+        end)
+    end
+    show_ls("BEFORE")
+
+    -- In-place member assignment first: UE4SS exposes struct properties as live references, so
+    -- writing members is more reliable than replacing the whole struct with a table.
+    local set_ok = pcall(function()
+        local ls = menu.LoadSlotInfo
+        ls.SlotNum = PROBE_WRITE_SLOT
+        ls.AutoSave = false
+    end)
+    if not set_ok then
+        set_ok = pcall(function()
+            menu.LoadSlotInfo = { SlotNum = PROBE_WRITE_SLOT, AutoSave = false }
+        end)
+        P(("[force] in-place set failed; whole-struct assign ok=%s"):format(tostring(set_ok)))
+    end
+    show_ls("AFTER-SET")
+    if not set_ok then P("[force] could not set LoadSlotInfo -- aborting"); return end
+
+    local ok, err = pcall(function() menu:OnLoadSave() end)
+    P(("[force] OnLoadSave() ok=%s%s"):format(tostring(ok), ok and "" or (" err=" .. tostring(err))))
+    P(("[force] expect a load screen; the [live] line should report slot %d's contents")
+        :format(PROBE_WRITE_SLOT))
+    P("=== [Ctrl+F2] done ===")
+end
+
+-- Ctrl+F3: find the save menu's real Blueprint path.
+-- The parent-class hooks (SaveLoadMenu:RefreshSlotList, SaveSlotWidget:UpdateSlotInfo) register but
+-- never fire: the BP subclass redeclares them, so dispatch goes to the BP version and the parent
+-- hook is bypassed -- the same thing already documented for OnLevelUp in main.lua. Hooking needs the
+-- BP asset path, which cannot be read off the header dump, so read it from a live instance instead.
+-- Run with the Load/Save menu OPEN.
+local function probe_find_menu_path()
+    P("=== [Ctrl+F3] locate the save-menu Blueprint ===")
+    for _, cls in ipairs({ "WBP_SaveMenu_C", "WBP_SaveSlot_C", "SaveLoadMenu", "SaveSlotWidget",
+                           "WBP_PauseMenu_C", "PauseMenu" }) do
+        local objs; pcall(function() objs = FindAllOf(cls) end)
+        local n = safe_len(objs)
+        P(("[path] FindAllOf(%q) -> %d"):format(cls, n))
+        for i = 1, math.min(n, 3) do
+            local o = objs[i]
+            if o and o:IsValid() then
+                P(("[path]   obj   %s"):format(full_name(o)))
+                -- The class's own full name is what a RegisterHook path is built from.
+                pcall(function()
+                    local c = o:GetClass()
+                    if c and c:IsValid() then
+                        P(("[path]   CLASS %s"):format(c:GetFullName()))
+                    end
+                end)
+            end
+        end
+    end
+    P("[path] hook path = the CLASS line's object path + ':' + FunctionName")
+    P("=== [Ctrl+F3] done ===")
+end
+
+-- Ctrl+F5: can we start a New Game ourselves? WBP_Title:StartGame() is a callable UFunction, and
+-- calling BP functions by reflection is the same mechanism that made SaveGameData work where the
+-- hook-based approach did not. DESTRUCTIVE-ish: starts a new game, so unsaved progress is lost.
+local function probe_force_new_game()
+    P("=== [Ctrl+F5] force New Game via WBP_Title:StartGame() ===")
+    local title = FindFirstOf("WBP_Title_C")
+    if not (title and title:IsValid()) then
+        P("[force] no WBP_Title_C live -- run this at the title screen")
+        return
+    end
+    P(("[force] title widget = %s"):format(full_name(title)))
+    local ok, err = pcall(function() title:StartGame() end)
+    P(("[force] StartGame() ok=%s%s"):format(tostring(ok), ok and "" or (" err=" .. tostring(err))))
+    P("[force] watch for a load screen; the [live] line after it reports what loaded")
+    P("=== [Ctrl+F5] done ===")
+end
+
+-- Retry until the widget Blueprints are loaded. They come up with the title UI, well after this
+-- script runs; without the retry every hook silently reports registered=false and the menu looks
+-- like it never fires.
+do
+    local tries = 0
+    LoopAsync(2000, function()
+        tries = tries + 1
+        local done = false
+        on_gt(function() done = register_menu_hooks() end)
+        if done then P(("[menu] hooks registered after %d attempt(s)"):format(tries)); return true end
+        if tries >= 30 then P("[menu] giving up after 30 attempts -- open the save menu, then reload the mod"); return true end
+        return false
+    end)
+end
+
 -- ---- keybinds (everything marshaled to the game thread; pcall-wrapped) ---------------------
+-- Ctrl+F9 for a manual re-dump. Plain F11 is registered too but the game or shell appears to eat
+-- it -- the bind takes and the callback never fires -- so it is a fallback, not the trigger.
+P(("[save] Key.F11=%s Key.F9=%s ModifierKey=%s"):format(
+    tostring(Key and Key.F11), tostring(Key and Key.F9), tostring(ModifierKey ~= nil)))
+pcall(function()
+    RegisterKeyBind(Key.F9, { ModifierKey.CONTROL }, function()
+        P("[Ctrl+F9] pressed"); on_gt(function() pcall(probe_save_system) end)
+    end)
+end)
+pcall(function()
+    RegisterKeyBind(Key.F10, { ModifierKey.CONTROL }, function()
+        P("[Ctrl+F10] pressed"); on_gt(function() pcall(probe_drive_save) end)
+    end)
+end)
+pcall(function()
+    RegisterKeyBind(Key.F8, { ModifierKey.CONTROL }, function()
+        P("[Ctrl+F8] pressed"); on_gt(function() pcall(probe_drive_load) end)
+    end)
+end)
+pcall(function()
+    RegisterKeyBind(Key.F7, { ModifierKey.CONTROL }, function()
+        P("[Ctrl+F7] pressed"); on_gt(function() pcall(probe_drive_full_load) end)
+    end)
+end)
+pcall(function()
+    RegisterKeyBind(Key.F6, { ModifierKey.CONTROL }, function()
+        P("[Ctrl+F6] pressed"); on_gt(function() pcall(probe_world_fingerprint) end)
+    end)
+end)
+pcall(function()
+    RegisterKeyBind(Key.F5, { ModifierKey.CONTROL }, function()
+        P("[Ctrl+F5] pressed"); on_gt(function() pcall(probe_force_new_game) end)
+    end)
+end)
+pcall(function()
+    RegisterKeyBind(Key.F3, { ModifierKey.CONTROL }, function()
+        P("[Ctrl+F3] pressed"); on_gt(function() pcall(probe_find_menu_path) end)
+    end)
+end)
+pcall(function()
+    RegisterKeyBind(Key.F2, { ModifierKey.CONTROL }, function()
+        P("[Ctrl+F2] pressed"); on_gt(function() pcall(probe_force_load) end)
+    end)
+end)
+pcall(function()
+    RegisterKeyBind(Key.F1, { ModifierKey.CONTROL }, function()
+        P("[Ctrl+F1] pressed"); on_gt(function() pcall(probe_auto_load) end)
+    end)
+end)
+RegisterKeyBind(Key.F11, function() P("[F11] pressed"); on_gt(function() pcall(probe_save_system) end) end)
 RegisterKeyBind(Key.F12, function() P("[F12] pressed"); on_gt(function() pcall(probe_skill_timers) end) end)
 RegisterKeyBind(Key.F10, function() P("[F10] pressed"); on_gt(function() pcall(probe_move_speed) end) end)
 RegisterKeyBind(Key.F6,  function() P("[F6] pressed");  on_gt(function() pcall(probe_lights) end) end)
@@ -1087,3 +2255,4 @@ RegisterKeyBind(Key.F7, function() P("[F7] pressed"); on_gt(function() pcall(pro
 P("probe harness loaded.")
 P("  BookSanity: F5=book identity  F1=hide book  F3=placement watch  F8=HISM API  F9=teleport instance")
 P("  Filler/traps/items: F12=skill timers(cooldown/active/reach)  F10=move speed  F6=lighting(dim/off)  F7=bag capacity  F2=control surface")
+P("  Save system: auto-dumps on first save/load; Ctrl+F9 = re-dump; Ctrl+F10 = drive-save (writes empty slot 20); Ctrl+F8 = load-only (corrupts world); Ctrl+F7 = FULL load; Ctrl+F6 = world fingerprint; Ctrl+F5 = force New Game; Ctrl+F3 = find save-menu BP path; Ctrl+F2 = force load slot 20; Ctrl+F1 = AUTOMATED load (opens menu itself) (SaveGameName, save object, SaveSubsystem, save classes)")

@@ -52,6 +52,10 @@ _G._librarian_trace = trace   -- reachable from hook callbacks if ever needed
 -- loops are gated off and their work moves to the pawn-tick master scheduler (Stage 2 single-thread fix).
 local POLL_GT = diag_on("POLL_ON_GAME_THREAD")
 
+-- Published for modules that need the single-thread decision but do not read diag_flags
+-- themselves (AP/HUD.lua). Set before any require below, so it is live by the time they load.
+_G._librarian_poll_gt = POLL_GT
+
 -- Stage-2 single-thread scheduler. When POLL_GT, periodic work that used to run on the async LoopAsync
 -- thread is registered here and driven by the game-thread pawn tick (the ReceiveTick master scheduler)
 -- at each step's own interval, via a DeltaSeconds accumulator. When off, gt_loop just starts a normal
@@ -59,6 +63,8 @@ local POLL_GT = diag_on("POLL_ON_GAME_THREAD")
 local _gt_steps = {}          -- name -> { fn, interval, accum, stopped }
 local _gt_step_order = {}
 local _gt_pending_activate = nil  -- reason string set by a title-button hook; consumed on the game thread by the scheduler
+local _gt_pending_f12 = false     -- F12/F4 fire on the UE4SS input thread; the binds set a
+local _gt_pending_f4  = false     -- boolean and the master tick runs the actual work
 local _l3_resume = nil            -- L3 (book-pile HISM) chunk resume; the master scheduler advances it one chunk/frame
 local _l3c_ep, _l3c_mgr, _l3c_mat, _l3c_ready   -- L3 setup scan cache (per world epoch): HISM mgr / mask material / ready flag
 local _gt_last_epoch = -1         -- last world epoch the scheduler saw; a bump means the captured warding arrays are freed
@@ -72,14 +78,61 @@ local function gt_loop(name, interval_ms, fn)
 end
 local function gt_run_steps(dt_ms)
     for i = 1, #_gt_step_order do
-        local st = _gt_steps[_gt_step_order[i]]
+        local name = _gt_step_order[i]
+        local st = _gt_steps[name]
         if st and not st.stopped then
             st.accum = st.accum + dt_ms
             if st.accum >= st.interval then
                 st.accum = 0
                 local ok, res = pcall(st.fn)
-                if ok and res == true then st.stopped = true end
+                if ok then
+                    if res == true then st.stopped = true end
+                else
+                    -- A silently dropped step looks exactly like one that ran clean.
+                    log(("[gt-step] %s error: %s"):format(tostring(name), tostring(res)))
+                end
             end
+        end
+    end
+end
+
+-- Deferred one-shot work, run on the game thread once `delay_ms` of tick time has elapsed.
+--
+-- This replaces marshalling from the async thread. Marshalling looked safe -- the body ran on the
+-- game thread -- but the ExecuteInGameThread CALL still happens off-thread, and crash stacks that
+-- run engine-tick -> UE4SS -> Lua with NO ProcessEvent frame between them are exactly that queue
+-- executing a body. Handing the work to the master tick keeps the async thread out of it entirely.
+--
+-- Nothing here needs to beat the pawn tick: it starts at the first M01 load, seconds before the
+-- title is interactive. Anything queued earlier just runs on the first tick.
+local _gt_deferred = {}
+local _gt_clock_ms = 0
+local function gt_defer(delay_ms, fn)
+    if not POLL_GT then
+        LoopAsync(delay_ms, function() fn() return true end)
+        return
+    end
+    if delay_ms < 1 then delay_ms = 1 end   -- 0 would be due in the same pass it was queued
+    _gt_deferred[#_gt_deferred + 1] = { due = _gt_clock_ms + delay_ms, fn = fn }
+end
+-- Run fn on the game thread. Under POLL_GT every caller is already there, so marshalling would
+-- only push the work onto UE4SS's deferred queue for no benefit.
+local function gt_run_now(fn)
+    if POLL_GT then return fn() end
+    if type(ExecuteInGameThread) == "function" then ExecuteInGameThread(fn) else fn() end
+end
+
+local function gt_run_deferred(dt_ms)
+    _gt_clock_ms = _gt_clock_ms + dt_ms   -- advance even when idle, or a later due-time reads stale
+    local i = 1
+    while i <= #_gt_deferred do
+        local d = _gt_deferred[i]
+        if _gt_clock_ms >= d.due then
+            table.remove(_gt_deferred, i)
+            local ok, err = pcall(d.fn)
+            if not ok then log(("[gt-defer] error: %s"):format(tostring(err))) end
+        else
+            i = i + 1
         end
     end
 end
@@ -367,31 +420,9 @@ local function _bh_grab_check(b, tag)
         log(("[book-hook] %s-MESH series=%s actorZ=%s meshZ=%s cpd=%s mesh=%s"):format(
             tostring(tag), tostring(series), tostring(actorz), tostring(meshz), tostring(cpd), tostring(meshname)))
     end
-    -- Deferred render-truth: WasRecentlyRendered at grab-start is unreliable (actor was pile form
-    -- a moment earlier). Re-check ~0.6s later; still-shown-but-not-drawn = genuinely invisible.
-    -- One-shot; logs the render-pass fields no flag exposes.
-    if unwarded_here == true then
-        local b_ref, series_ref = b, series
-        LoopAsync(600, function()
-            if b_ref and b_ref:IsValid() then
-                local ar, hid2 = nil, nil
-                pcall(function() ar = b_ref:WasRecentlyRendered(0.5) end)
-                pcall(function() hid2 = b_ref.bHidden end)
-                if ar == false and hid2 == false then
-                    local sm2; pcall(function() sm2 = b_ref.SM_Book_1 end)
-                    local v2, rmp2, mn2 = nil, nil, "?"
-                    if sm2 and sm2:IsValid() then
-                        pcall(function() v2 = sm2:IsVisible() end)
-                        pcall(function() rmp2 = sm2.bRenderInMainPass end)
-                        pcall(function() local msh = sm2.StaticMesh; if msh and msh:IsValid() then mn2 = msh:GetFullName() end end)
-                    end
-                    log(("[book-hook] *** INVISIBLE-CONFIRMED *** series=%s bHidden=%s smIsVisible=%s renderInMainPass=%s mesh=%s (held ~0.6s, actor NOT drawn)"):format(
-                        tostring(series_ref), tostring(hid2), tostring(v2), tostring(rmp2), tostring(mn2)))
-                end
-            end
-            return true   -- one-shot
-        end)
-    end
+    -- The deferred render-truth probe that used to sit here is gone: it held a book-actor
+    -- reference across a 0.6s async delay and then read it off-thread, so it both entered the VM
+    -- on the async thread and could deref an actor freed in the meantime.
     if diag_on("BOOK_EVENT_GRABFIX") and unwarded_here == true then
         local did = {}
         if bhidden == true then
@@ -438,6 +469,10 @@ local function try_register_book_hooks()
     if _book_hooks_attempted then return end
     if not diag_on("BOOK_EVENT_HOOKS") then return end
     _book_hooks_attempted = true
+    -- Marshalled deliberately, even under POLL_GT: the only caller is the warding_maint step, which
+    -- runs inside the ReceiveTick hook, and RegisterHook would then mutate UE4SS's hook table from
+    -- inside a ProcessEvent dispatch of that same table (UE4SS #1180). Marshalling FROM the game
+    -- thread is heap-safe -- it takes no cross-thread reference -- and defers this out of dispatch.
     ExecuteInGameThread(function()
         local function reg(fn, cb, cb_post)
             local ok, err
@@ -1086,14 +1121,14 @@ end
 --   - Start Game enabled iff that save does NOT exist (fresh AP run).
 -- Other title buttons are left alone.
 
-local function ap_save_exists(slot_name)
-    if not slot_name or slot_name == "" then return false end
-    local appdata = os.getenv("LOCALAPPDATA")
-    if not appdata or appdata == "" then return false end
-    local path = appdata .. "\\Librarian\\Saved\\SaveGames\\" .. slot_name .. ".sav"
-    local f = io.open(path, "rb")
-    if f then f:close(); return true end
-    return false
+-- The game moved saves into numbered slot directories, so the old flat
+-- SaveGames/<name>.sav test always failed -- which disabled Continue for every
+-- player, connected or not. Ask the game instead of guessing at a path.
+-- Reached via package.loaded: this runs above the module requires.
+local function ap_save_exists()
+    local SI = package.loaded["AP/SaveIdentity"]
+    if not SI then return false end
+    return SI.any_save_exists()
 end
 
 local function find_title_widget()
@@ -1108,8 +1143,15 @@ local function find_title_widget()
     return nil
 end
 
-local function set_button_enabled(btn, enabled)
-    if not btn then return end
+--- Name it, so a missing property is reported rather than swallowed: a typo'd
+--- widget property reads as nil and the write vanishes, which looks exactly
+--- like the gating working.
+local function set_button_enabled(btn, enabled, name)
+    if not btn then
+        log(("[title-buttons] %s not found on the widget — gating had no effect")
+            :format(tostring(name or "?")))
+        return
+    end
     local valid = false
     pcall(function() valid = btn:IsValid() end)
     if not valid then return end
@@ -1136,24 +1178,35 @@ local function update_title_buttons()
         -- (_pre_apply_complete) AND the bookcases finished streaming + warding (_ward_settled). Entering
         -- before the shelves are warded shows an un-warded world for a beat; gating the buttons on both
         -- means the player only enters a world that's already warded (lights then come on right after).
-        local not_ready = IA and IA._allow_pre_apply and (not IA._pre_apply_complete or not IA._ward_settled)
+        -- Only hold the buttons for warding when we are actually warding the
+        -- title-behind world. On a fresh run that world is about to be thrown
+        -- away by New Game, so waiting for it just delays the player.
+        local SIg = package.loaded["AP/SaveIdentity"]
+        local warding_title = SIg and SIg.title_preapply
+        local not_ready = warding_title and IA and IA._allow_pre_apply
+            and (not IA._pre_apply_complete or not IA._ward_settled)
         if not_ready then
             log(("[title-buttons] connected; not ready (pre_apply=%s ward_settled=%s) → buttons disabled"):format(
                 tostring(IA and IA._pre_apply_complete), tostring(IA and IA._ward_settled)))
         else
-            local current_slot = read_save_slot()
-            local has_save = ap_save_exists(current_slot)
-            enable_continue = has_save
-            enable_start = not has_save
-            log(("[title-buttons] connected; slot='%s' save_exists=%s → continue=%s start=%s"):format(
-                tostring(current_slot), tostring(has_save),
+            -- Ask about THIS RUN's save, not saves in general: the player's
+            -- vanilla saves say nothing about whether this seed has been
+            -- started. No claimed slot means a fresh run, so New Game is the
+            -- only way forward and Continue would land in someone else's world.
+            local SI = package.loaded["AP/SaveIdentity"]
+            local run_slot = SI and SI.slot
+            local has_run_save = run_slot and (SI.slot_exists(run_slot, false) == true) or false
+            enable_continue = has_run_save
+            enable_start = not has_run_save
+            log(("[title-buttons] connected; run_slot=%s exists=%s → continue=%s start=%s"):format(
+                tostring(run_slot), tostring(has_run_save),
                 tostring(enable_continue), tostring(enable_start)))
         end
     elseif _vanilla_mode then
         -- Vanilla (Close clicked): restore base-game button behavior -- Continue if
         -- the player's (non-AP) save exists, New Game always. Mod stays passive.
         local vanilla_slot = read_save_slot()
-        enable_continue = ap_save_exists(vanilla_slot)
+        enable_continue = ap_save_exists()
         enable_start = true
         log(("[title-buttons] vanilla — continue=%s start=true (slot='%s')"):format(
             tostring(enable_continue), tostring(vanilla_slot)))
@@ -1161,8 +1214,13 @@ local function update_title_buttons()
         log("[title-buttons] not connected; both gameplay buttons disabled")
     end
 
-    pcall(function() set_button_enabled(widget.Button_LoadGame, enable_continue) end)
-    pcall(function() set_button_enabled(widget.Button_StartGame, enable_start) end)
+    -- Property names, not delegate names: the Continue button's bound event is
+    -- called Button_LoadGame but the widget property is Button_Continue, so
+    -- writing the delegate name silently did nothing. Button_Load is the slot
+    -- picker, which reaches any save and so has to follow Continue.
+    pcall(function() set_button_enabled(widget.Button_Continue, enable_continue, "Button_Continue") end)
+    pcall(function() set_button_enabled(widget.Button_Load, enable_continue, "Button_Load") end)
+    pcall(function() set_button_enabled(widget.Button_StartGame, enable_start, "Button_StartGame") end)
 end
 
 -- Latch Vanilla mode. Called from the BroadcastCloseRequest hook via the global
@@ -1306,12 +1364,52 @@ local register_bp_hooks_once  -- forward declaration; defined below
 -- M01 load = gameplay. Continue reuses the title's M01 (no 2nd load), so the SelectedLevel
 -- watcher below catches that path too. activate_gameplay is idempotent, so both can converge.
 local m01_load_count = 0
--- Set just before our forced OpenLevel(PL_M01) on connect; cleared by the next M01 LoadMap.
--- Tells the handler NOT to count that load as gameplay (user is still at the title).
-local _suppress_next_m01_load_count = false
 local _gameplay_loops_started = false
+local _reject_nag = nil       -- tick counter for the repeated wrong-save warning
 local _pre_apply_settle_state = nil  -- {empty_ticks, reapplies_done} during pre-apply settle
 local _reconnect_settle_state = nil  -- {last_item_tick, quiet_ticks, total_ticks} during mid-game reconnect
+
+--- Warding is held until the world is known to be this run's. Beyond saving the
+--- work, warding a foreign save would hide the player's own books in their own
+--- game.
+local function ward_allowed()
+    local SI = package.loaded["AP/SaveIdentity"]
+    return (not SI) or SI.may_ward()
+end
+
+--- Decide whether the loaded world belongs to this run, before anything is
+--- warded and before any check can be sent. Runs on every entry path.
+local function identity_evaluate(why)
+    local SI = package.loaded["AP/SaveIdentity"]
+    if not SI then return end
+    local before = SI.verdict
+    local v = SI.evaluate()
+    if SI.last_counts then
+        log(("[save-id] %s: %s -> %s (%s)"):format(why, tostring(before), tostring(v), SI.last_counts))
+    end
+    if v ~= before then
+        log(("[save-id] %s -> %s%s"):format(why, tostring(v), SI.reason and (": " .. SI.reason) or ""))
+        if v == SI.VERIFIED then
+            -- Warding was held pending this answer, so run it now that the world
+            -- is known to be ours. Without this the hold would never lift for a
+            -- returning run, whose verdict lands after the world is already up.
+            local IA2 = package.loaded["AP/ItemApply"]
+            if IA2 and IA2._gameplay_active and IA2._apply_safe then
+                log("[save-id] verified → applying warding")
+                pcall(function() IA2.flush_apply() end)
+            end
+        end
+        if v == SI.REJECTED then
+            pcall(function()
+                local H = package.loaded["AP/HUD"]
+                if H then
+                    H.notify(("AP: this save does not match your run - checks paused. %s")
+                        :format(SI.reason or ""), 30.0)
+                end
+            end)
+        end
+    end
+end
 
 local function start_gameplay_loops()
     if _gameplay_loops_started then return end
@@ -1402,8 +1500,11 @@ local function start_gameplay_loops()
                 local IA = package.loaded["AP/ItemApply"]
                 if IA and IA.set_apply_safe then
                     pcall(function() IA.set_apply_safe(true) end)
+                    identity_evaluate("apply-gate give-up")
                     lc_event("on_world_ready")
-                    if IA._gameplay_active then pcall(function() IA.flush_apply() end) end
+                    if IA._gameplay_active and ward_allowed() then
+                        pcall(function() IA.flush_apply() end)
+                    end
                 end
                 return true
             end
@@ -1420,9 +1521,10 @@ local function start_gameplay_loops()
             log(("LoadMap apply-gate PASSED (books=%d distinct=%d ticks=%d) → set_apply_safe (flush deferred to settle loop)")
                 :format(n, distinct, apply_attempts))
             pcall(function() IA.set_apply_safe(true) end)
+            identity_evaluate("apply-gate pass")
             lc_event("on_world_ready")  -- world populated → CONNECTING→PRE_APPLY
             -- Pre-apply path defers flush to the settle loop below; gameplay-active flushes now.
-            if IA._gameplay_active then
+            if IA._gameplay_active and ward_allowed() then
                 pcall(function() IA.flush_apply() end)
             end
         end
@@ -1468,7 +1570,7 @@ local function start_gameplay_loops()
             if s.quiet_ticks >= 2 or s.total_ticks >= 10 then
                 log(("[pre-apply] items quiet (%d items applied, %d ticks waited); firing single flush_apply"):format(
                     cur, s.total_ticks))
-                pcall(function() IA.flush_apply() end)
+                if ward_allowed() then pcall(function() IA.flush_apply() end) end
                 s.phase = "draining"
                 s.quiet_ticks = 0
             end
@@ -1568,7 +1670,13 @@ local function start_gameplay_loops()
             return true
         end
         if not IA._apply_safe then return false end
-        pcall(try_register_book_hooks)   -- register the book hooks (one-shot, game thread)
+        -- Not during a flush: registering the book hooks installs SetActorVisible / SetBookInfo /
+        -- CanBeGrab callbacks that _apply_one_book's own visibility and collision writes would then
+        -- re-enter, nesting Lua inside the flush. It missed this window by timing last run rather
+        -- than by design.
+        if not IA._flush_in_progress then
+            pcall(try_register_book_hooks)   -- register the book hooks (one-shot, game thread)
+        end
         pcall(bh_report_periodic)        -- ~30s [book-hook] count report
         pcall(function() IA.refresh_index_if_changed() end)   -- catch lazy-spawned bookcases
         pcall(function() IA._apply_bookcases_to_world() end)  -- Layer 2 bookcase ward
@@ -1584,9 +1692,53 @@ local function start_gameplay_loops()
     -- Periodic milestone / level sync (3s). Book-placement milestones key off InsertedBookNum,
     -- which grows without finishing rows; the FinishRow hook would miss those until the next row.
     -- Level-ups are event-driven (OnLevelUp), so this poll is mostly milestones.
+    -- Runs the scan a shelving event asked for. Separate from the 3s sync pass
+    -- so the check lands about as fast as the player expects; costs a flag test
+    -- per tick when nothing is pending.
+    gt_loop("book_scan", 500, function()
+        local IA = package.loaded["AP/ItemApply"]
+        if not IA then return false end
+        if not (IA._gameplay_active or IA._allow_pre_apply) then return true end
+        if IA._dcb_full_scan and IA._apply_safe and not IA._flush_in_progress then
+            local sent = 0
+            pcall(function() sent = IA.detect_correct_books() or 0 end)
+            if sent > 0 then
+                log(("[book-sanity] shelving → %d check(s) sent"):format(sent))
+            end
+        end
+        return false
+    end)
+
     gt_loop("sync", 3000, function()
         local IA = package.loaded["AP/ItemApply"]
         if not IA then return false end
+
+        -- A world with nothing shelved yet gives the identity test nothing to
+        -- judge, so it stays undecided and checks stay held. Retry while that
+        -- is the case; the first correctly shelved book settles it.
+        local SI = package.loaded["AP/SaveIdentity"]
+        if SI and SI.verdict == SI.UNKNOWN and IA._apply_safe and IA._gameplay_active then
+            identity_evaluate("progress made")
+        end
+
+        -- Keep saying it. A rejected save means everything the player does goes
+        -- unreported, so a single notification they happened to miss is worse
+        -- than none -- they would play on believing it counted.
+        if SI and SI.verdict == SI.REJECTED and IA._gameplay_active then
+            _reject_nag = (_reject_nag or 0) + 1
+            if _reject_nag % 7 == 1 then   -- ~every 21s on the 3s loop
+                pcall(function()
+                    local H = package.loaded["AP/HUD"]
+                    if H then
+                        H.notify(("AP: WRONG SAVE - checks are paused. %s")
+                            :format(SI.reason or "load this run's save (slot "
+                                .. tostring(SI.slot) .. ")"), 20.0)
+                    end
+                end)
+            end
+        elseif _reject_nag then
+            _reject_nag = nil
+        end
         -- Stop only when fully out of gameplay/pre-apply (returning true ENDS the loop). Don't
         -- early-exit on _gameplay_active alone -- that kills the loop before gameplay starts.
         if not (IA._gameplay_active or IA._allow_pre_apply) then
@@ -1720,6 +1872,131 @@ end
 -- player has picked a save. We poll once per second and activate/deactivate
 -- on transitions.
 local _prev_selected_level = -1
+-- Load this run's save automatically once we know which slot it is.
+--
+-- The slot cannot be handed to the loader directly: LoadGameData is discarded by
+-- the world rebuild, and there is no slot variable to set. What does work is the
+-- path a player takes -- open the load menu, point it at a slot, confirm -- so
+-- that is driven here. The menu flashing open is intentional; it shows the
+-- player something is happening rather than the game appearing to hang.
+--
+-- Staged rather than done in one pass because the menu needs a moment to build
+-- its slot widgets after the button press.
+local TITLE_LOAD_BTN =
+    "BndEvt__WBP_Title_Button_Load_K2Node_ComponentBoundEvent_2_OnButtonPressedEvent__DelegateSignature"
+local _autoload_stage = nil   -- nil | "opening"
+
+-- HUD notification drain, on the game thread. Lives here rather than in AP/HUD.lua because
+-- _gt_step_order is order-sensitive for warding and must stay auditable in one file; module-scope
+-- steps always register before the start_gameplay_loops ones, so this cannot perturb that order.
+if POLL_GT then gt_loop("hud_drain", 300, function()
+    local H = package.loaded["AP/HUD"]
+    if H and H._drain_one then H._drain_one() end
+    return false
+end) end   -- with the flag off, AP/HUD.lua keeps its own async drain; registering both halves DRAIN_MS
+
+gt_loop("autoload", 500, function()
+    local SI = package.loaded["AP/SaveIdentity"]
+    local IA = package.loaded["AP/ItemApply"]
+    local AC = package.loaded["AP/APClient"]
+    if not (SI and IA and AC) then return false end
+
+    -- Only from the title, only once, and only for a slot that is really there.
+    if SI.autoload_done or IA._gameplay_active then return false end
+    if not (AC._slot_connected and SI.slot) then return false end
+    if SI.slot_exists(SI.slot, false) ~= true then return false end
+
+    if _autoload_stage == nil then
+        local title = FindFirstOf("WBP_Title_C")
+        if not (title and title:IsValid()) then return false end
+        local ok = pcall(function() title[TITLE_LOAD_BTN](title) end)
+        log(("[save-id] auto-load: opening the load menu for slot %d (ok=%s)")
+            :format(SI.slot, tostring(ok)))
+        _autoload_stage = ok and "opening" or nil
+        return false
+    end
+
+    if _autoload_stage == "opening" then
+        local menu = FindFirstOf("WBP_SaveMenu_C")
+        if not (menu and menu:IsValid()) then return false end   -- still building
+        -- The menu reads its target from LoadSlotInfo; OnLoadSave takes no
+        -- argument. SaveLoadMode has to say Load, or a never-opened menu can
+        -- still be in Save mode.
+        pcall(function() menu.SaveLoadMode = 1 end)
+        pcall(function() menu:RefreshSlotList() end)
+        local set = pcall(function()
+            local ls = menu.LoadSlotInfo
+            ls.SlotNum = SI.slot
+            ls.AutoSave = false
+        end)
+        local ok = set and pcall(function() menu:OnLoadSave() end)
+        log(("[save-id] auto-load: loading slot %d (set=%s load=%s)")
+            :format(SI.slot, tostring(set), tostring(ok)))
+        SI.autoload_done = true
+        _autoload_stage = nil
+        return false
+    end
+
+    return false
+end)
+
+-- Claim a save slot for a fresh run. Module scope, not inside the gameplay
+-- loops, because it has to survive the New Game world transition. Waits for the
+-- first ward pass to drain so the claimed save contains a fully applied world,
+-- and never picks a slot it could not confirm empty.
+gt_loop("claim_slot", 1000, function()
+    -- Reached via package.loaded: this runs above the module requires.
+    local SI = package.loaded["AP/SaveIdentity"]
+    if not (SI and SI.pending_fresh) then return false end
+
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._gameplay_active and IA._apply_safe) then return false end
+    -- Same drain predicate the pre-apply settle uses: warding finished writing.
+    if IA._flush_in_progress then return false end
+    if IA._pump_idle and not IA._pump_idle() then return false end
+
+    local slot = SI.first_free_slot()
+    if not slot then
+        SI.pending_fresh = false
+        log(("[save-id] no free slot in %d-%d — cannot claim"):format(SI.SLOT_MIN, SI.SLOT_MAX))
+        pcall(function()
+            local H = package.loaded["AP/HUD"]
+            if H then H.notify(("AP: no free save slot in %d-%d. Free one and reconnect.")
+                :format(SI.SLOT_MIN, SI.SLOT_MAX), 30.0) end
+        end)
+        return false
+    end
+
+    -- Verified by causation: we watched this world start from New Game.
+    SI.mark_fresh_verified()
+    local ok_gate, why = SI.can_force_save(slot)
+    if not ok_gate then
+        log(("[save-id] claim held off: %s"):format(tostring(why)))
+        return false
+    end
+
+    local gi = find_game_instance()
+    if not gi then return false end
+    local wrote = pcall(function() gi:SaveGameData(slot, false) end)
+    if not wrote then
+        log("[save-id] SaveGameData failed — will retry")
+        return false
+    end
+
+    SI.pending_fresh = false
+    SI.slot, SI.slot_source = slot, "claimed"
+    SI.write_local(SI.seed, SI.ap_slot, slot)
+    local AC = package.loaded["AP/APClient"]
+    if AC and SI.storage_key then pcall(function() AC:storage_write(SI.storage_key, slot) end) end
+    local fp = SI.record_layout()
+    log(("[save-id] claimed slot %d for this run (layout=%s)"):format(slot, tostring(fp)))
+    pcall(function()
+        local H = package.loaded["AP/HUD"]
+        if H then H.notify(("AP: this run is saved to slot %d — load that slot to continue it."):format(slot), 30.0) end
+    end)
+    return false
+end)
+
 gt_loop("selected_level", 1000, function()
     local gi = FindFirstOf("BP_LibrarianGameInstance_C")
     if not gi or not gi:IsValid() then return false end
@@ -1765,14 +2042,7 @@ RegisterLoadMapPostHook(function(Engine, World)
     -- the reliable signal is the 2nd+ M01 LoadMap; SelectedLevel >= 0 is a secondary positive.
     local in_gameplay = false
     if lvlname:find("PL_M01", 1, true) then
-        -- Our forced OpenLevel (on connect) leaves the user at the title -- don't count it toward
-        -- the gameplay threshold; the HideTitleMenu hook activates gameplay when they click Continue.
-        local is_our_forced_reload = _suppress_next_m01_load_count or false
-        _suppress_next_m01_load_count = false
-
-        if not is_our_forced_reload then
-            m01_load_count = m01_load_count + 1
-        end
+        m01_load_count = m01_load_count + 1
         local gi = FindFirstOf("BP_LibrarianGameInstance_C")
         local selected = -1
         if gi and gi:IsValid() then
@@ -1788,6 +2058,21 @@ RegisterLoadMapPostHook(function(Engine, World)
         -- Fresh world -> reset HISM mapping state (captured transforms refer to the old world).
         local IA = package.loaded["AP/ItemApply"]
         if IA and IA.reset_hism_state then IA.reset_hism_state() end
+
+        -- The identity verdict describes the world that just went away. Clear it
+        -- so the incoming one is judged on its own -- otherwise verifying the
+        -- run's own save would go on vouching for whatever is loaded next.
+        local SIw = package.loaded["AP/SaveIdentity"]
+        if SIw then SIw.reset_world() end
+
+        -- Book detection dedupes on what it has already seen, and marks a book
+        -- seen whether or not its check actually sent. Held checks in a world we
+        -- then leave would otherwise be lost for good: the book stays flagged and
+        -- is never re-examined in the world where it does count.
+        if IA then
+            IA._books_correct_seen = {}
+            IA._dcb_books, IA._dcb_cursor = nil, 0
+        end
 
         -- Layer-3 state is per-world (fresh HISMs start visible; the series cache is tied to the
         -- old world's actors). Clear it so this world re-snapshots and re-hides from scratch.
@@ -1815,11 +2100,9 @@ RegisterLoadMapPostHook(function(Engine, World)
     if in_gameplay then
         activate_gameplay("LoadMap → in_gameplay")
     else
-        -- Post-connect title path: the OpenLevel triggered by connect
-        -- brings us here with the M01 world fresh-loaded but the player
-        -- still at the title menu. Kick off the apply-gate retry loop so
-        -- warding runs while the player waits — Continue / Start stay
-        -- disabled (see update_title_buttons) until _pre_apply_complete.
+        -- Title path: an M01 load with the player still at the menu. Kick off
+        -- the apply-gate retry loop so warding runs while they wait; Continue /
+        -- Start stay disabled until _pre_apply_complete.
         local IA = package.loaded["AP/ItemApply"]
         if IA and IA._allow_pre_apply and lvlname:find("PL_M01", 1, true) then
             log("LoadMap (post-connect title) → start pre-apply loops")
@@ -1859,6 +2142,33 @@ end)
 -- Book capacity: the game pushes the live carry max to the HUD via SetHandingMaxNum on every
 -- change (bag upgrade, reload, item pickup). Capture it so ItemApply.apply_bag_capacity reads the
 -- real capacity and grants up to its target instead of guessing what the save restored.
+-- Shelving a book is the moment its check becomes due. Without an event the
+-- rolling scan can take ~20s to reach it, which reads as the mod not working.
+-- Two sources because either alone could be missed: the HUD counter update and
+-- the game manager's own insert call.
+--- Shelving a book is when its check becomes due, but the counters that report
+--- it also move while the world streams and the connect item dump runs -- and a
+--- full actor walk there reads half-built books, which is a native access
+--- violation pcall cannot catch.
+---
+--- So this only ASKS for a full scan; the periodic pass runs it from the game
+--- thread at a moment already known to be safe. Latency drops from a full
+--- ~20s cursor wrap to one tick, without adding a scan on an unsafe path.
+local function on_book_shelved(which)
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._book_sanity_enabled) then return end
+    if not (IA._gameplay_active and IA._apply_safe) then return end
+    IA.request_full_book_scan()
+end
+
+RegisterHook("/Script/Librarian.LibrarianPlayerInfo:SetCurrentBookNum", function(_, n)
+    on_book_shelved("shelved-count changed")
+end)
+
+RegisterHook("/Script/Librarian.GameManager:BookInserted", function()
+    on_book_shelved("book inserted")
+end)
+
 RegisterHook("/Script/Librarian.LibrarianPlayerInfo:SetHandingMaxNum", function(_, maxBookNum)
     local IA = package.loaded["AP/ItemApply"]
     if not IA then return end
@@ -1889,6 +2199,27 @@ local function fstring_to_str(p)
     return tostring(s or "<?>")
 end
 
+-- Record the world layout whenever the game saves. A save captures the world at
+-- that instant, so this is what a later load of that slot must reproduce.
+-- Autosaves fire StartSaveProgress and no SaveGameData; manual saves the
+-- reverse, so both are needed to catch every save.
+--- The game's own saves go to its own slots, so without mirroring, this run's
+--- slot falls behind whatever the player did since they last saved there by
+--- hand -- and then no longer matches the layout we recorded, which reads as the
+--- wrong save. Every save the game makes is therefore mirrored into our slot.
+---
+--- Deferred rather than done here: this fires ~1s BEFORE the game writes, so
+--- saving now would race it. The mirror step below waits for that write to land.
+local function record_layout_on_save(which)
+    local SI = package.loaded["AP/SaveIdentity"]
+    if not (SI and SI.slot and SI.verdict == SI.VERIFIED) then return end
+    local fp, sample = SI.record_layout()
+    if fp then
+        log(("[save-id] layout recorded on %s (hash=%d loose=%d)"):format(which, fp, sample or 0))
+    end
+end
+
+
 -- /Script/Engine.GameplayStatics:SaveGameToSlot(SaveGameObject, SlotName, UserIndex)
 RegisterHook("/Script/Engine.GameplayStatics:SaveGameToSlot", function(self, _save, slot_param, _user)
     log(("[AP][save-probe] GameplayStatics.SaveGameToSlot SlotName='%s'"):format(fstring_to_str(slot_param)))
@@ -1908,8 +2239,8 @@ end)
 RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:SaveGameData", function(self, slot_num_param)
     local n = "?"
     pcall(function() n = tostring(slot_num_param:get()) end)
-    log(("[AP][save-probe] GI.SaveGameData(slot=%s) — current SaveGameName='%s'")
-        :format(n, tostring(read_save_slot())))
+    log(("[AP][save-probe] GI.SaveGameData(slot=%s)"):format(n))
+    record_layout_on_save("manual save")
     -- After save, InsertedBookNum is fresh -> re-run the progress sync so book milestones catch
     -- up (safety net if a BP-hook counter missed an event).
     -- Post-save resync used to call IA.sync_progress_state() here, but SaveGameData fires on the GAME
@@ -1924,6 +2255,10 @@ RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:LoadGameData", functio
     pcall(function() n = tostring(slot_num_param:get()) end)
     log(("[AP][save-probe] GI.LoadGameData(slot=%s) — current SaveGameName='%s'")
         :format(n, tostring(read_save_slot())))
+end)
+
+RegisterHook("/Script/Librarian.SaveSubsystem:StartSaveProgress", function()
+    record_layout_on_save("autosave")
 end)
 
 -- /Script/Librarian.LibrarianGameInstanceBase:LoadGameDataBP() (BP override)
@@ -1979,8 +2314,9 @@ local function on_title_load_game_pressed(self)
     log(("    SaveGameName='%s'  GameSaveData: %s"):format(
         tostring(read_save_slot()), snapshot_save_data()))
 
-    -- Do NOT reload the save here (gi:LoadGameData): the world is already AP-loaded from the
-    -- connect-time OpenLevel, and a reload re-applies bag-skill increments past the bag cap.
+    -- Do NOT reload the save here (gi:LoadGameData): Continue resumes the world
+    -- already loaded behind the title, and a reload re-applies bag-skill
+    -- increments past the bag cap.
 
     -- Force gameplay activation next tick in case LoadMap never fires. Delay so the widget's own
     -- handler (level transition / UI hide) runs first.
@@ -1999,6 +2335,14 @@ end
 
 local function on_title_start_game_pressed(self)
     log(">> [WBP_Title] StartGame button pressed")
+    -- A connected New Game is the run's own world by construction, so the slot
+    -- claim is armed here and completes once the world has settled.
+    local AC = package.loaded["AP/APClient"]
+    local SI = package.loaded["AP/SaveIdentity"]
+    if AC and AC._slot_connected and SI and not SI.slot then
+        SI.pending_fresh = true
+        log("[save-id] fresh run armed — will claim a slot once the world settles")
+    end
 end
 
 local function on_title_hide_menu(self)
@@ -2039,16 +2383,28 @@ local function notify_version_compat()
     if HUD and HUD.notify then HUD.notify(msg, 12.0) end
 end
 
+-- Title-refresh bodies. All three touch widgets and read the save system, so they run on the
+-- game thread via gt_defer.
+local function _title_refresh()
+    update_title_buttons()
+    update_title_status_text()
+end
+
+local function _title_refresh_compat()
+    update_title_buttons()
+    update_title_status_text()
+    notify_version_compat()
+end
+
+local function _title_status_only()
+    update_title_status_text()
+end
+
 local function on_title_construct(self)
     log(">> [WBP_Title] Construct")
     -- Defer so the widget's own Construct (button bindings, styles) runs first, then apply gating
     -- state + the Text_Version status line.
-    LoopAsync(50, function()
-        update_title_buttons()
-        update_title_status_text()
-        notify_version_compat()
-        return true
-    end)
+    gt_defer(50, _title_refresh_compat)
 end
 
 -- Stage-2 master game-thread scheduler body. Runs in main.lua scope (sees all module locals) and is
@@ -2060,6 +2416,23 @@ _G._librarian_gt_master_tick = function(dt_ms)
     if not (c and c._poll_on_game_thread) then return end
     c._gt_tick_count = (c._gt_tick_count or 0) + 1
     pcall(function() c:_tick_once() end)                 -- create + poll + outgoing + item-apply
+    -- Both reached at runtime, not through the file-locals: `APClient` and `menu_toggle` are
+    -- declared further down the file, so a closure built here would only see nil globals.
+    if _gt_pending_f12 then                              -- F12 pressed on the input thread
+        _gt_pending_f12 = false
+        if not c._slot_connected then
+            log("[F12] connecting to AP...")
+            pcall(function() c:connect() end)
+        else
+            log("[F12] already connected")
+        end
+    end
+    if _gt_pending_f4 then                               -- F4 pressed on the input thread
+        _gt_pending_f4 = false
+        log("[F4] toggle connection menu")
+        local m = _G._librarian_menu
+        if m and m.toggle then pcall(m.toggle) end
+    end
     if _gt_pending_activate then                         -- title-button activation, on the game thread
         local reason = _gt_pending_activate; _gt_pending_activate = nil
         pcall(function() activate_gameplay(reason) end)
@@ -2089,9 +2462,18 @@ _G._librarian_gt_master_tick = function(dt_ms)
             pcall(function() IA.flush_apply() end)
         end
     end
+    gt_run_deferred(dt_ms)                                   -- one-shot deferred work (title/HUD refreshes)
     gt_run_steps(dt_ms)                                      -- apply-gate / settle / warding / sync / etc.
     if (c._gt_tick_count % 600) == 0 then
-        log(("[gt-tick] master driver (fires=%d, steps=%d)"):format(c._gt_tick_count, #_gt_step_order))
+        -- Name the registered steps, not just the count: thirteen registrations exist (five at
+        -- module scope, eight in start_gameplay_loops), so a bare number says little. Printing the
+        -- array contents next to the key count of _gt_steps makes damage visible -- array N with
+        -- keys N-1 is a stray array entry that never registered.
+        local names, keyn = {}, 0
+        for i = 1, #_gt_step_order do names[i] = tostring(_gt_step_order[i]) end
+        for _ in pairs(_gt_steps) do keyn = keyn + 1 end
+        log(("[gt-tick] master driver (ticks=%d, steps=%d, keys=%d) order=[%s]"):format(
+            c._gt_tick_count, #_gt_step_order, keyn, table.concat(names, ",")))
     end
 end
 
@@ -2292,15 +2674,17 @@ local APClient = require("AP/APClient")
 local ItemApply = require("AP/ItemApply")
 local APConfig = require("AP/APConfig")
 local HUD = require("AP/HUD")
+local SaveIdentity = require("AP/SaveIdentity")
 
 -- Open the crash breadcrumb ledger now, before any world mutation can fire. Re-opened
 -- with the seed on slot connect (header then carries it for triage). See AP/trace.lua.
 trace.init({ version = MOD_VERSION, flags = diag_flags_str() })
 trace.mark("boot")
 
--- Crash-ledger heartbeat: a flushed 1 Hz marker so the crash_trace.log tail shows whether the
--- crash was synchronous-in-op (unmatched BEG) or idle (several "hb" lines after the last END).
-LoopAsync(1000, function() trace.mark("hb"); return false end)
+-- No crash-ledger heartbeat. It ran string.format + os.date + a shared ring write + flushed file
+-- I/O on the async thread every second, and raced trace.init's own close/reopen on the game
+-- thread. Its forensic value was marginal: trace.init truncates the ledger on slot connect
+-- anyway, so the heartbeat never survived to describe a connect-time crash.
 
 -- Lifecycle state machine, driven by the lc_event(...) calls below. Observational only: logs
 -- [lifecycle] transitions, gates nothing yet. pcall'd require so it can't break mod loading.
@@ -2434,42 +2818,16 @@ APClient.on_slot_connected = function(slot_data)
     local ap_slot_name = ("Sav_AP_%s_%s"):format(seed, sanitize_slot(slot_num))
     set_save_slot(ap_slot_name)
 
-    -- Force a fresh world reload now SaveGameName points at the AP slot -- the boot world used
-    -- default 'Sav', so without this the books/HISM stay stale ("default orientation until you look").
-    -- Only when still at title (a mid-gameplay reconnect would be disruptive). Defer 200ms to settle.
-    LoopAsync(200, function()
-        local IA = package.loaded["AP/ItemApply"]
-        if IA and IA._gameplay_active then
-            log("[AP][save] mid-gameplay reconnect — skipping forced level reload")
-            return true
-        end
-        local statics = StaticFindObject("/Script/Engine.Default__GameplayStatics")
-        local gi = find_game_instance()
-        if statics and statics:IsValid() and gi then
-            log("[AP][save] forcing OpenLevel(PL_M01) — fresh world with AP save")
-            -- Signal the LoadMap hook to not count this load (we're
-            -- staying at title; user will click Continue normally).
-            _suppress_next_m01_load_count = true
-            local ok, err = pcall(function()
-                statics:OpenLevel(gi, FName("PL_M01"), true, "")
-            end)
-            if not ok then
-                log(("[AP][save] OpenLevel FAILED: %s"):format(tostring(err)))
-                _suppress_next_m01_load_count = false
-            end
-        else
-            log("[AP][save] OpenLevel skipped — GameplayStatics or GameInstance missing")
-        end
-        return true  -- one-shot
-    end)
+    -- No forced world reload on connect. It existed to make the title-behind
+    -- world pick up the redirected save file, but nothing reads SaveGameName
+    -- any more, so it reloaded an identical world -- costing a load screen and
+    -- leaving the player unable to reach New Game.
 
-    -- Update title-screen buttons + Text_Version line. Done via async tick
-    -- so the redirected SaveGameName is the one we read.
-    LoopAsync(50, function()
-        update_title_buttons()
-        update_title_status_text()
-        return true
-    end)
+    -- Update title-screen buttons + Text_Version line. Deferred a tick so the redirected
+    -- SaveGameName is the one we read. Marshalled to the game thread: this fires ~58ms after
+    -- connect, i.e. inside the item-apply burst, and it walks actors (FindAllOf), reads the save
+    -- system (DoesSaveGameExist) and writes UMG -- none of which may run off-thread.
+    gt_defer(50, _title_refresh)
 
     -- HUD: status line + clear stale log entries from prior connect.
     HUD.set_status(("AP: connected as %s (slot #%s)"):format(
@@ -2498,17 +2856,79 @@ APClient.on_slot_connected = function(slot_data)
     -- Hand slot data to ItemApply; it will flush any queued items.
     ItemApply.set_slot_data(slot_data)
 
+    -- Pre-apply is decided once the run's slot record comes back, not here:
+    -- warding the title-behind world only pays off if that world might be this
+    -- run's save. A mid-gameplay reconnect keeps its existing loops.
+
     -- Fatigue traps fire once ever. The highest fired index lives in server storage under a
     -- per-slot key (created at -1 on first connect); read it back and route into ItemApply,
     -- which holds received traps until the floor lands. New traps raise the floor via storage_max.
+    -- on_storage is a single function slot, cleared on every connect, so every
+    -- reader has to share one dispatch table -- a second bare assignment would
+    -- silently drop whichever handler lost the race.
+    local storage_handlers = {}
+    APClient.on_storage = function(k, v)
+        local h = storage_handlers[k]
+        if h then pcall(h, v) end
+    end
+
     if (tonumber(slot_data.attunement) or 0) ~= 0 then
         local fatigue_key = ("librarian_fatigue_fired_%d"):format(APClient.slot_number or 0)
         ItemApply._fatigue_persist = function(idx) APClient:storage_max(fatigue_key, idx) end
-        APClient.on_storage = function(k, v)
-            if k == fatigue_key then ItemApply.set_fatigue_floor(v) end
-        end
+        storage_handlers[fatigue_key] = function(v) ItemApply.set_fatigue_floor(v) end
         APClient:storage_read(fatigue_key, -1)
     end
+
+    -- Which save slot this run owns. The server copy is authoritative (it
+    -- survives a reinstall and cannot be forged by copying local files); the
+    -- local file is the fallback and is also what lets the title screen know
+    -- the slot before any connection exists.
+    SaveIdentity.reset()
+    local ap_slot = APClient.slot_number or 0
+    local slot_key = ("librarian_save_slot_%d"):format(ap_slot)
+    SaveIdentity.storage_key = slot_key
+    SaveIdentity.seed = seed
+    SaveIdentity.ap_slot = ap_slot
+
+    local from_local = SaveIdentity.read_local(seed, ap_slot)
+    if from_local then
+        SaveIdentity.slot, SaveIdentity.slot_source = from_local, "local"
+    end
+
+    storage_handlers[slot_key] = function(v)
+        local n = tonumber(v)
+        -- The server seeds this key to -1 when absent, which means "never claimed".
+        if n and n >= SaveIdentity.SLOT_MIN and n <= SaveIdentity.SLOT_MAX then
+            SaveIdentity.slot, SaveIdentity.slot_source = n, "server"
+            if n ~= from_local then SaveIdentity.write_local(seed, ap_slot, n) end
+            log(("[save-id] server says slot %d%s"):format(
+                n, SaveIdentity.slot_exists(n, false) and "" or " (MISSING on disk)"))
+        else
+            log(("[save-id] no slot recorded on server (local=%s) -- fresh run"):format(
+                tostring(from_local)))
+        end
+        log("[save-id] " .. SaveIdentity.describe())
+
+        -- Only a returning run has a world worth warding before the player
+        -- enters it. A fresh run goes straight to New Game, which rebuilds the
+        -- world anyway, so warding the title-behind one would only make the
+        -- player wait for work that is about to be discarded.
+        local returning = SaveIdentity.slot
+            and (SaveIdentity.slot_exists(SaveIdentity.slot, false) == true)
+        if returning and not ItemApply._gameplay_active then
+            SaveIdentity.title_preapply = true
+            log(("[save-id] returning run (slot %d) → pre-apply the title world")
+                :format(SaveIdentity.slot))
+            start_gameplay_loops()
+        elseif not returning then
+            log("[save-id] fresh run → no title warding; New Game only")
+        end
+
+        -- The reply is asynchronous and decides which buttons make sense, so
+        -- re-run the gating now that the run's slot is known.
+        pcall(function() update_title_buttons() end)
+    end
+    APClient:storage_read(slot_key, -1)
 
     -- Let the starting-item dump flow during pre-apply: items update derived state but their
     -- per-item flush is suppressed (ItemApply.apply_item), so the settle loop wards once with final
@@ -2532,11 +2952,7 @@ APClient.on_disconnected = function()
     if IA and IA.clear_pre_apply then IA.clear_pre_apply() end
     _pre_apply_settle_state = nil
     -- Disconnected: both gameplay buttons return to disabled-by-default.
-    LoopAsync(50, function()
-        update_title_buttons()
-        update_title_status_text()
-        return true
-    end)
+    gt_defer(50, _title_refresh)
     HUD.set_status("AP: disconnected — F4 for menu, F12 to reconnect", HUD.COL_STATUS_BAD)
     -- Connect menu: re-show + status. Repopulate fields from current
     -- APClient values so the player can edit and retry.
@@ -2550,10 +2966,7 @@ end
 APClient.on_slot_refused = function(reason)
     log("[AP] slot refused: " .. tostring(reason))
     HUD.set_status("AP: slot refused — " .. tostring(reason), HUD.COL_STATUS_BAD)
-    LoopAsync(50, function()
-        update_title_status_text()
-        return true
-    end)
+    gt_defer(50, _title_status_only)
     -- Connect menu: leave open (already up from the Connect click) and
     -- surface the refusal reason. Don't call show() — if the user closed
     -- it between click and refused, respect that.
@@ -2574,24 +2987,23 @@ if APClient._poll_on_game_thread then
 end
 
 -- Initial HUD status. Wait briefly so the world exists for PrintString's WorldContextObject.
-LoopAsync(2000, function()
+-- On the game thread: set_status enqueues into the same _notif_queue the HUD drain now reads
+-- from the game thread, and a cross-thread write to that table is the rc3 crash class.
+local function _initial_hud_status()
+    -- The delay is tick time now, so this can land after a fast connect; don't overwrite it.
+    if APClient._slot_connected then return end
     HUD.set_status(
         ("AP: not connected (server=%s, slot=%s) — F4 for menu, F12 to connect"):format(
             tostring(APClient.server or "?"),
             tostring(APClient.slot or "?")),
         HUD.COL_STATUS_WARN)
-    return true  -- one-shot
-end)
+end
+gt_defer(2000, _initial_hud_status)
 
 -- F12: connect to Archipelago (or trigger a reconnect if the socket dropped).
-RegisterKeyBind(Key.F12, function()
-    if not APClient._slot_connected then
-        log("[F12] connecting to AP...")
-        APClient:connect()
-    else
-        log("[F12] already connected")
-    end
-end)
+-- Keybind callbacks fire on the UE4SS input thread, so the handler only sets a scalar; the master
+-- tick does the work on the game thread. Same discipline probe.lua already applies to its binds.
+RegisterKeyBind(Key.F12, function() _gt_pending_f12 = true end)
 
 log("Press F12 to connect to Archipelago.")
 
@@ -2691,10 +3103,9 @@ _G._librarian_menu = {
     enter_vanilla = enter_vanilla_mode,
 }
 
-RegisterKeyBind(Key.F4, function()
-    log("[F4] toggle connection menu")
-    menu_toggle()
-end)
+-- Input thread: set a scalar only. menu_toggle walks actors and builds a UMG widget, none of which
+-- may run off the game thread. Drained by the master tick.
+RegisterKeyBind(Key.F4, function() _gt_pending_f4 = true end)
 
 -- DEV: feasibility probe harness (AP/probe.lua). Loads only when diag PROBE_MODE is EXPLICITLY
 -- true -- diag_on() defaults missing flags to ON, so gate on the raw table value to keep the
@@ -2711,7 +3122,9 @@ end
 -- Poll for ModActor on startup and show the menu once. Subsequent shows
 -- are user-driven via F4 — auto-show on disconnect is handled in the
 -- on_disconnected handler.
-LoopAsync(500, function()
+-- On the game thread: it walks actors (FindFirstOf), reads GetFullName and constructs the menu
+-- widget. Returning true latches the step off, the same contract gt_loop and LoopAsync share.
+gt_loop("menu_show", 500, function()
     if _menu_initial_shown then return true end
     if APClient._slot_connected then
         _menu_initial_shown = true
