@@ -256,11 +256,11 @@ one is loaded — your other saves are never touched.
 
 **Short version: leave save slots 20–30 alone. The mod handles saving.**
 
-> **Requires game 1.0.12+, and a run started under 1.1.1.** The slot is claimed
-> when you press **New Game** while connected, so a world carried over from
-> 1.1.0 has no slot recorded and never gets one — it will still play and still
-> send checks, but it won't be auto-loaded or saved for you. Start the seed
-> fresh to get the managed slot. Your seed and YAML don't need regenerating.
+> **Requires game 1.0.12+, and a run started under this version of the mod.**
+> Runs from an earlier release are **not compatible** — their save is not
+> brought across, and continuing one after updating is neither supported nor
+> tested. Start the seed fresh. Your seed and YAML don't need regenerating;
+> it's the in-game world you restart, not the seed.
 
 The game keeps saves in numbered slots. Each AP run claims one free slot
 in the **20–30** range and treats it as the run's own — it is told to you

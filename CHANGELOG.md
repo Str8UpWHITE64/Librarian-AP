@@ -11,9 +11,9 @@ again on game builds **1.0.12** and **1.0.13**, which changed how the game saves
 system cannot work with at all — Continue stays dead and no slot can be claimed. The mod says so on the
 title screen rather than failing quietly. **Stay on 1.1.0 if you are on an older game build.**
 
-**Start a fresh run.** 1.1.1 does not adopt a world from 1.1.0: the run's slot is claimed when you press
-New Game while connected, so an older world has no slot recorded and never gets one. Existing seeds and
-YAML are fine to reuse — it's the in-game world that has to be restarted.
+**Runs in progress on 1.1.0 are not compatible.** Updating the mod and continuing an existing run is not
+supported — the old save is not imported into the slot system, and that path is untested. Start the seed
+fresh. Existing seeds and YAML are fine to reuse; it's the in-game world that has to be restarted.
 
 **Install both files.** All the behaviour changes are client-side, but the apworld carries a matching
 version stamp, so grab `librarian.apworld` alongside the game bundle. Nothing about generation, item IDs
