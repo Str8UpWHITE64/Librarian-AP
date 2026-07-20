@@ -4094,6 +4094,30 @@ local function _hism_arr()
     return arr
 end
 
+--- Sink ONE pile instance back down, immediately.
+---
+--- Exists because rewriting the transform the game passes to its own UpdateInstance does not stick:
+--- the hook fires on exactly the right books, but a struct argument written back from Lua is not
+--- what the game goes on to use. So instead of correcting the call, let it land and put the
+--- instance back with the write that is already known to work -- the same one the hide path uses.
+---
+--- Re-derives deep Z from the stored orig and never re-captures: most calls arrive on a pile that
+--- is already down, and taking that pose as the rest pose would sink the well a second time and
+--- strand the book when it unlocks.
+function M.resink_pile(aidx, chapter)
+    if not (M._book_sanity_enabled and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT")) then return false end
+    local st = M._book_inst_state[aidx .. "|" .. chapter]
+    if not (st and st.hidden and st.orig and st.orig.Translation) then return false end
+    local arr = _hism_arr()
+    if not arr then return false end
+    local comp; pcall(function() comp = arr[aidx + 1] end)
+    if not (comp and comp:IsValid()) then return false end
+    local o = st.orig.Translation
+    local deep = { Translation = { X = o.X, Y = o.Y, Z = o.Z - RESWEEP_DEEP_DZ },
+                   Rotation = st.orig.Rotation, Scale3D = st.orig.Scale3D }
+    return pcall(function() comp:UpdateInstanceTransform(chapter, deep, true, true, true) end)
+end
+
 -- Insight-aware re-hide, run from the 3s game-thread loop. Insight ("Show Same Type Book") keeps
 -- pushing the revealed piles back up while it is showing, so a re-hide issued then is overwritten:
 -- only the >=0 -> -1 edge sticks. GetShowingSameTypeIdx is the gate -- it returns the shown
@@ -4119,9 +4143,14 @@ function M.resweep_book_piles()
             end
         end
     end
-    local just_ended = (M._insight_showing_prev == true) and (not showing)
+    -- The skill's own end call is the reliable edge; the poll below is the fallback for when the
+    -- hook is not registered. Polling alone can miss a short skill entirely -- a fatigued Insight
+    -- can finish inside one sample -- and the drift then waits for the rolling backstop instead.
+    local hook_ended = M._insight_ended == true
+    M._insight_ended = false
+    local just_ended = hook_ended or ((M._insight_showing_prev == true) and (not showing))
     M._insight_showing_prev = showing
-    if showing then return end   -- don't fight the active skill; wait for it to stop
+    if showing and not hook_ended then return end   -- don't fight the active skill; wait for it to stop
 
     -- Re-hide one instance that drifted back out of the deep-Z well. Deep Z is re-derived from the
     -- stored orig, never re-captured: most calls land on a still-deep pile, and taking that as orig

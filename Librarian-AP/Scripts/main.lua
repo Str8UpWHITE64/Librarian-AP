@@ -63,8 +63,9 @@ _G._librarian_poll_gt = POLL_GT
 local _gt_steps = {}          -- name -> { fn, interval, accum, stopped }
 local _gt_step_order = {}
 local _gt_pending_activate = nil  -- reason string set by a title-button hook; consumed on the game thread by the scheduler
-local _gt_pending_f12 = false     -- F12/F4 fire on the UE4SS input thread; the binds set a
+local _gt_pending_f12 = false     -- F12/F4/F6 fire on the UE4SS input thread; the binds set a
 local _gt_pending_f4  = false     -- boolean and the master tick runs the actual work
+local _gt_pending_f6  = false     -- dev: fire the Recall Stone once (MAGIC_TEST_RECALL_STONE)
 local _l3_resume = nil            -- L3 (book-pile HISM) chunk resume; the master scheduler advances it one chunk/frame
 local _l3c_ep, _l3c_mgr, _l3c_mat, _l3c_ready   -- L3 setup scan cache (per world epoch): HISM mgr / mask material / ready flag
 local _gt_last_epoch = -1         -- last world epoch the scheduler saw; a bump means the captured warding arrays are freed
@@ -161,6 +162,13 @@ end
 -- ExecuteInGameThread). Each callback re-checks its flag, so a flip = no-op.
 -- ============================================================================
 local BOOK_BP = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingBook.BP_GrabbingBook_C"
+
+-- Book-restore helpers, on one table: the main chunk sits just under Lua's 200-local ceiling and
+-- a table costs one slot however many hang off it. PROBE_MODE attaches dev diagnostics here too.
+--
+-- Declared here rather than beside the functions because the eviction path above calls into it.
+-- A local declared later is not an upvalue for earlier code -- it would resolve to a nil global.
+local _dev = {}
 local _book_hooks_attempted = false
 local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0, enforced = 0, enf_samples = 0,
               revealed = 0, rev_samples = 0, grabbed = 0, grab_samples = 0, grabfix = 0 }
@@ -187,6 +195,38 @@ local function _bh_book_unlocked(book_obj, series)
         if info and info:IsValid() then chapter = tonumber(info.Chapter) end
     end)
     return chapter ~= nil and bu[series .. "|" .. chapter] == true
+end
+
+--- Is this book one the run has NOT earned? The same test the SetActorVisible ENFORCE path makes,
+--- factored out so the magic-skill guards below cannot drift from it.
+---
+--- Returns nil, not false, when the answer cannot be established -- no series, no snapshot yet, a
+--- book mid-spawn. Callers must treat nil as "leave it alone": denying a grab on a book we simply
+--- failed to read would break ordinary play, which is a worse outcome than the leak.
+--- The (asset, chapter) pair identifying a book, in the same key space as _book_inst_state.
+local function _bh_book_key(book_obj)
+    if not book_obj then return nil end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._book_valid_asset_idx) then return nil end
+    local aidx = IA._book_valid_asset_idx(book_obj)
+    if aidx == nil then return nil end
+    local chapter
+    pcall(function()
+        local info = book_obj.ItemInfo
+        if info and info:IsValid() then chapter = tonumber(info.Chapter) end
+    end)
+    if chapter == nil then return nil end
+    return aidx, chapter
+end
+
+local function _bh_book_is_warded(book_obj)
+    if not book_obj then return nil end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._unwarded_snapshot) then return nil end
+    local _, series = _bh_series(book_obj)
+    if not series then return nil end
+    if IA._unwarded_snapshot[series] then return false end
+    return not _bh_book_unlocked(book_obj, series)
 end
 
 local function _bh_sample(tag, book_obj, extra)
@@ -564,11 +604,32 @@ local function try_register_book_hooks()
             local b; pcall(function() b = self:get() end)
             _bh_sample("SetBookInfo", b)
         end)
+        -- CanBeGrab is the game's own "may this be taken" predicate. Answering it is how a warded
+        -- book is refused without moving or touching the actor -- which matters twice over: the
+        -- save-identity fingerprint reads book actor positions, and collision-off only stops the
+        -- paths that trace, not a skill that walks a type registry.
         reg("CanBeGrab", function(self)
             if not diag_on("BOOK_EVENT_HOOKS") then return end
             _bh.canbegrab = _bh.canbegrab + 1
             local b; pcall(function() b = self:get() end)
             _bh_grab_check(b, "CANGRAB")
+        end, function(self, result)
+            if not (diag_on("BOOK_EVENT_HOOKS") and diag_on("MAGIC_WARD_CANBEGRAB")) then return end
+            if not result then return end          -- no return value handed to us; nothing to deny
+            local b; pcall(function() b = self:get() end)
+            if _bh_book_is_warded(b) ~= true then return end   -- nil/false: leave the answer alone
+            -- First denial reports whether the override actually took. Nothing else in this mod
+            -- writes a return value from a post-hook, so the capability itself is unproven and a
+            -- silent no-op would otherwise read as "the skill ignores the predicate".
+            local set_ok = pcall(function() result:set(false) end)
+            _bh.grab_denied = (_bh.grab_denied or 0) + 1
+            if _bh.deny_samples == nil then _bh.deny_samples = 0 end
+            if _bh.deny_samples < 5 then
+                _bh.deny_samples = _bh.deny_samples + 1
+                local _, series = _bh_series(b)
+                log(("[book-hook] CanBeGrab DENY warded series=%s set_ok=%s"):format(
+                    tostring(series), tostring(set_ok)))
+            end
         end)
         -- GRAB-path observe + fix for "pickable book invisible" (which SetActorVisible/REVEAL
         -- never sees). _bh_grab_check runs from BOTH CanBeGrab (above) and GrabFromPlayer.
@@ -582,13 +643,442 @@ local function try_register_book_hooks()
     end)
 end
 
+-- ============================================================
+-- Magic-skill guards: keep the mass-book skills off warded books
+-- ============================================================
+-- Pile instances the game has just re-placed that we still consider hidden, waiting to be put back
+-- down. A queue rather than an immediate write because the correction cannot happen inside the
+-- game's own call: rewriting the transform argument does not stick, and the post-hook that would
+-- run after it never fires for this function. So the pre-hook records, and the master tick -- which
+-- runs later in the same frame -- does the write, using the path the hide already relies on.
+local _magic_resink = {}
+local _magic_resink_n = 0
+
+local function _magic_queue_resink(aidx, chap)
+    local k = aidx .. "|" .. chap
+    if _magic_resink[k] then return end
+    _magic_resink[k] = { aidx = aidx, chap = chap }
+    _magic_resink_n = _magic_resink_n + 1
+end
+
+--- Drained from the master tick. Bounded per pass: Insight re-places a whole series at once, and a
+--- long queue must not turn one frame into a stall.
+local function gt_drain_magic_resink()
+    if _magic_resink_n == 0 then return end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA.resink_pile) then _magic_resink = {}; _magic_resink_n = 0; return end
+    local done = 0
+    for k, e in pairs(_magic_resink) do
+        _magic_resink[k] = nil
+        _magic_resink_n = _magic_resink_n - 1
+        pcall(function() IA.resink_pile(e.aidx, e.chap) end)
+        done = done + 1
+        if done >= 32 then break end
+    end
+end
+
+-- Set by the bag-intake hook when a warded book arrives. Only a hint for the watcher below -- the
+-- watcher does not depend on it, because the whole difficulty here is that the interesting routes
+-- may not dispatch through anything hookable.
+local _magic_bag_dirty = false
+
+-- Books dropped out of the bag that are on their way home. Held only until the game's own return
+-- has had time to run, then re-warded. Actor references are kept across frames here, which is only
+-- safe because every one of these runs on the game thread and each is re-validated at use.
+local _magic_reward_q = {}
+-- Wait for the book to STOP MOVING rather than for a fixed delay. Cancel only interrupts the grab;
+-- the game returns the book to its shelf position afterwards, on its own schedule, and a fixed
+-- timer expired before that happened -- re-warding mid-flight and, worse, re-opening the save gate
+-- while the book still had a journey left to make.
+local MAGIC_STILL_TICKS  = 3      -- consecutive ~stationary samples before it counts as at rest
+local MAGIC_OBSERVE_MAX  = 90     -- keep watching this long; the game's return is late and silent
+local MAGIC_STILL_DIST2  = 25.0   -- squared units; below this counts as not moving
+
+local function _magic_pos(book)
+    local x, y, z
+    pcall(function()
+        local l = book:K2_GetActorLocation()
+        x, y, z = l.X, l.Y, l.Z
+    end)
+    return x, y, z
+end
+
+local function _magic_queue_reward(book, sent_home)
+    local x, y, z = _magic_pos(book)
+    -- Where we asked it to end up, so the log can report whether it obeyed. A book that reports
+    -- "sent home" but comes to rest somewhere else is the failure mode that matters here.
+    --
+    -- Measured against the actor's own SpawnTransform, not the pile instance's stored transform.
+    -- The old target was the pile record, which is a different point: it reported every returned
+    -- book as ~1000 units adrift while the books were in fact sitting where they belonged. An
+    -- off_home number that cannot be trusted is worse than none.
+    local hx, hy, hz
+    pcall(function()
+        local v = book.SpawnTransform and book.SpawnTransform.Translation
+        if v then hx, hy, hz = v.X, v.Y, v.Z end
+    end)
+    _magic_reward_q[#_magic_reward_q + 1] = {
+        book = book, sent_home = sent_home,
+        x0 = x, y0 = y, z0 = z,           -- where it was dropped, for the moved= report
+        hx = hx, hy = hy, hz = hz,        -- where it should end up
+        lx = x, ly = y, lz = z,           -- last sample
+        still = 0, age = 0,
+    }
+end
+
+--- Re-ward the books whose return has had time to complete, and report how far each actually moved.
+--- The distance is the diagnostic that matters: a book that has not moved never went home, and its
+--- position will not be where a reload puts it -- which is the failure that refused a run its own
+--- save. Near-zero movement here means the return call is the wrong one.
+--- Watch an evicted book for as long as the game might still move it.
+---
+--- Coming to rest once is not the end of the story: the game returns books to their shelves on a
+--- delay of its own, well after they have stopped rolling, so a watcher that stopped at the first
+--- stillness declared victory while the real journey was still to come. Each book therefore stays
+--- under observation for the full window, is re-warded whenever it is at rest, and any later
+--- movement re-arms both the re-ward and the save gate.
+local function gt_drain_magic_reward()
+    if #_magic_reward_q == 0 then return end
+    local IA = package.loaded["AP/ItemApply"]
+    local keep = {}
+    for _, e in ipairs(_magic_reward_q) do
+        local b = e.book
+        local alive = false
+        pcall(function() alive = b and b:IsValid() end)
+        if alive then
+            e.age = e.age + 1
+
+            -- The game sets this while it is carrying the book somewhere; trust it over position.
+            local teleporting = false
+            pcall(function() teleporting = b.Teleporting and true or false end)
+
+            local x, y, z = _magic_pos(b)
+            local moved_now = false
+            if x and e.lx then
+                local dx, dy, dz = x - e.lx, y - e.ly, z - e.lz
+                moved_now = (dx*dx + dy*dy + dz*dz) >= MAGIC_STILL_DIST2
+            end
+            e.lx, e.ly, e.lz = x, y, z
+
+            if moved_now or teleporting then
+                e.still = 0
+                if e.warded then
+                    -- It moved after we had already put it away: the return we were waiting for.
+                    e.warded = false
+                    log("[magic] evicted book moved again -- still not home, holding slot writes")
+                end
+            else
+                e.still = e.still + 1
+            end
+
+            if e.still >= MAGIC_STILL_TICKS and not e.warded then
+                e.warded = true
+                local moved = "?"
+                if x and e.x0 then
+                    local dx, dy, dz = x - e.x0, y - e.y0, z - e.z0
+                    moved = ("%.0f"):format(math.sqrt(dx*dx + dy*dy + dz*dz))
+                end
+                pcall(function()
+                    if not IA or IA._book_hide_mode then b:SetActorHiddenInGame(true) end
+                    b:SetActorEnableCollision(false)
+                end)
+                -- The number that decides whether this approach works: how far the book came to
+                -- rest from where we told it to go. Near zero means the teleport home landed and
+                -- the recorded layout will still describe this world after a reload.
+                local off = "?"
+                if x and e.hx then
+                    local dx, dy, dz = x - e.hx, y - e.hy, z - e.hz
+                    off = ("%.0f"):format(math.sqrt(dx*dx + dy*dy + dz*dz))
+                end
+                log(("[magic] re-warded at rest (moved=%s after %ds, sent_home=%s, off_home=%s)")
+                    :format(moved, e.age, tostring(e.sent_home), off))
+            end
+
+            if e.age < MAGIC_OBSERVE_MAX then
+                keep[#keep + 1] = e
+            elseif not e.warded then
+                log("[magic] observation window closed while book was STILL MOVING -- position suspect")
+            end
+        end
+    end
+    _magic_reward_q = keep
+end
+
+--- Hand back any book in the bag the run has not earned.
+---
+--- Eviction rather than refusal because the skill that puts them there dispatches through nothing
+--- we can intercept -- its own functions register cleanly and never fire, so the bag is the first
+--- point the book is observable at all. Runs from the tick, never from inside the intake call: the
+--- game is mid-way through adding the item at that moment, and taking it back underneath itself is
+--- how re-entrancy bugs start.
+---
+--- Re-wards the actor after dropping. The game returns a dropped book to its rest position and
+--- restores its visibility on the way, so without this the book ends up parked in the open.
+local function _magic_evict_bag()
+    if not diag_on("MAGIC_WARD_BAG_EVICT") then return end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._book_sanity_enabled) then return end
+    pcall(function()
+        local pawn = FindFirstOf("BP_LibrarianCharacter_C")
+        if not (pawn and pawn:IsValid()) then return end
+        local bag; pcall(function() bag = pawn.ItemBagComponent end)
+        if not (bag and bag:IsValid()) then return end
+        -- Re-read the bag between every drop. DropGameItem re-packs the array, so references
+        -- collected up front go stale after the first removal -- which is what made this evict one
+        -- book per pass, i.e. one per second, instead of clearing in one go.
+        local guard = 0
+        while guard < 32 do
+            guard = guard + 1
+            local it
+            pcall(function()
+                local items = bag.Items
+                if not items then return end
+                local n = 0; pcall(function() n = #items end)
+                for i = 1, math.min(n, 32) do
+                    local cand = items[i]
+                    if cand and cand:IsValid() and _bh_book_is_warded(cand) == true then
+                        it = cand
+                        return
+                    end
+                end
+            end)
+            if not it then break end
+            local dropped = pcall(function() bag:DropGameItem(it) end)
+            -- Do NOT re-ward here. A warded book has collision off, so dropping one and immediately
+            -- re-warding leaves it hanging in the air exactly where the player stood -- which is how
+            -- the run's recorded book layout stopped matching its own save. Give it collision back,
+            -- ask the game to put it away, and re-ward only once it has arrived.
+            pcall(function() it:SetActorEnableCollision(true) end)
+            pcall(function() it:Cancel() end)
+
+            -- Put it back directly instead of letting it fall. The previous version aimed
+            -- TeleportEffect at the pile instance's stored transform and then waited; its own
+            -- telemetry showed 8 of 9 books coming to rest ~1000 units off. What actually returned
+            -- them was the game's out-of-bounds rescue -- the dropped book fell through the floor,
+            -- left the world, and was caught seconds later, banner and all. That round trip is the
+            -- window in which the layout the save fingerprint reads is in motion.
+            --
+            -- SpawnTransform is the book's own record of where it belongs, and the write holds once
+            -- simulation is off, so there is nothing to fall and nothing to wait for.
+            local home = false
+            if _dev.restore_book_home then
+                home = _dev.restore_book_home(it) and true or false
+            end
+            _magic_queue_reward(it, home)
+            _bh.bag_evicted = (_bh.bag_evicted or 0) + 1
+            if (_bh.evict_samples or 0) < 8 then
+                _bh.evict_samples = (_bh.evict_samples or 0) + 1
+                local _, series = _bh_series(it)
+                log(("[magic] BAG EVICT series=%s dropped=%s"):format(
+                    tostring(series), tostring(dropped)))
+            end
+        end
+    end)
+end
+
+-- Trace budget. These fire from inside a skill's own dispatch, so an unbounded log would both spam
+-- the file and perturb the thing it is measuring.
+local _magic_trace_n = 0
+local function _magic_trace(what, detail)
+    if _magic_trace_n >= 60 then return end
+    _magic_trace_n = _magic_trace_n + 1
+    log(("[magic] %s%s"):format(tostring(what), detail and (" -- " .. tostring(detail)) or ""))
+end
+
+--- Report what is in the player's bag and whether any of it is warded. The whole question about
+--- Assemble is whether a book the run has not earned can end up here: from the bag it can be
+--- shelved, and shelving is what fires row-completion checks.
+local function _magic_bag_report(when)
+    if _magic_trace_n >= 60 then return end
+    local total, warded, example = 0, 0, nil
+    pcall(function()
+        local pawn = FindFirstOf("BP_LibrarianCharacter_C")
+        if not (pawn and pawn:IsValid()) then return end
+        local bag
+        pcall(function() bag = pawn.ItemBagComponent end)
+        if not (bag and bag:IsValid()) then return end
+        local items
+        pcall(function() items = bag.Items end)
+        if not items then return end
+        local n = 0
+        pcall(function() n = #items end)
+        for i = 1, math.min(n, 32) do
+            local it = items[i]
+            if it and it:IsValid() then
+                total = total + 1
+                if _bh_book_is_warded(it) == true then
+                    warded = warded + 1
+                    if not example then
+                        local _, s = _bh_series(it)
+                        example = s
+                    end
+                end
+            end
+        end
+    end)
+    _magic_trace(("bag %s"):format(tostring(when)),
+        ("items=%d warded=%d%s"):format(total, warded,
+            example and (" e.g. " .. tostring(example)) or ""))
+end
+
+-- Two skills reach books by a route the ward does not cover. Assemble collects by book type rather
+-- than by what the player can touch, so collision-off does not stop it; Insight re-shows pile
+-- instances from the game's own rest data, overwriting the deep-Z sink.
+--
+-- Both guards ride the game's own call and correct its argument, the same shape as the
+-- SetActorVisible ENFORCE path -- nothing here moves an actor. That is deliberate: the save-identity
+-- fingerprint reads book actor positions to decide whether a save belongs to the run, so a mod that
+-- relocates actors turns that signal into a record of itself.
+--
+-- Registered separately from the book hooks because these live on the character and the HISM
+-- manager, not on the book, and each class only becomes resident once its actor exists.
+local _magic_hooks_attempted = false
+local HISM_MGR_BP  = "/Game/Librarian/Prop/BP_HISM_Manager.BP_HISM_Manager_C"
+local CHAR_NATIVE  = "/Script/Librarian.LibrarianCharacter"
+local BAG_NATIVE   = "/Script/Librarian.ItemBagComponent"
+-- The book's parent, where the skill-side grab actually lives. BP_GrabbingBook overrides
+-- GrabFromPlayer but NOT GrabFromSkill, so the book path resolves to nothing for that one.
+local ITEM_BP      = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingItem.BP_GrabbingItem_C"
+local ITEM_NATIVE  = "/Script/Librarian.GrabbingItemBase"
+
+local function try_register_magic_hooks()
+    if _magic_hooks_attempted then return end
+    if not diag_on("BOOK_EVENT_HOOKS") then return end
+    -- Both classes must be resident: registering against one that is not is not a harmless no-op.
+    local mgr, char
+    pcall(function() mgr = FindFirstOf("BP_HISM_Manager_C") end)
+    pcall(function() char = FindFirstOf("BP_LibrarianCharacter_C") end)
+    if not (mgr and mgr:IsValid() and char and char:IsValid()) then return end
+    _magic_hooks_attempted = true
+
+    -- Marshalled for the same reason the book hooks are: the caller runs inside ReceiveTick, and
+    -- RegisterHook would mutate UE4SS's hook table from inside a dispatch of that same table.
+    ExecuteInGameThread(function()
+        local function mreg(path, label, pre, post)
+            local ok, err
+            if post then ok, err = pcall(function() RegisterHook(path, pre, post) end)
+            else         ok, err = pcall(function() RegisterHook(path, pre) end) end
+            log(("[magic-hook] register %-22s %s"):format(
+                label, ok and "OK" or ("FAILED: " .. tostring(err))))
+            return ok
+        end
+
+        -- Insight. Correcting the transform the game hands its own UpdateInstance does not stick --
+        -- the hook lands on exactly the right books, but a struct argument written back from Lua is
+        -- not what the game goes on to use. So let the call complete and put the instance straight
+        -- back down afterwards, using the write the hide path already relies on. Post, not pre.
+        mreg(HISM_MGR_BP .. ":UpdateInstance", "UpdateInstance", function(self, info, transform)
+            if not diag_on("BOOK_EVENT_HOOKS") then return end
+            local IA = package.loaded["AP/ItemApply"]
+            if not (IA and IA._book_sanity_enabled and IA._book_inst_state) then return end
+            local aidx, chap
+            pcall(function()
+                local i = info:get()
+                aidx, chap = tonumber(i.AssetIdx), tonumber(i.Chapter)
+            end)
+            if not (aidx and chap) then return end
+            local st = IA._book_inst_state[aidx .. "|" .. chap]
+            if not (st and st.hidden) then return end
+            if not diag_on("MAGIC_WARD_HISM_WRITE") then return end
+            _magic_queue_resink(aidx, chap)
+            if diag_on("MAGIC_LEAK_TRACE") then
+                _magic_trace("queued re-sink", ("aidx=%d chap=%d"):format(aidx, chap))
+            end
+        end)
+
+        -- Assemble. The ability is GrabSameTypeBook, but the character function of that name never
+        -- dispatches -- registered fine, never fired -- so the skill reaches books some other way.
+        -- These are the book-side routes by which a book can be taken or moved; log-only, to find
+        -- which one actually carries it. GrabFromSkill is on the PARENT class: BP_GrabbingBook does
+        -- not override it, so hooking the book path would register against nothing.
+        for _, probe in ipairs({
+            { ITEM_NATIVE .. ":GrabFromSkill",       "GrabFromSkill(native)" },
+            { BOOK_BP .. ":SpawnBehindPlayer",       "SpawnBehindPlayer" },
+            { BOOK_BP .. ":MoveToSpaceArea",         "MoveToSpaceArea" },
+            { BOOK_BP .. ":TeleportEffect",          "TeleportEffect" },
+            { BOOK_BP .. ":MoveToCaseWithSkill",     "MoveToCaseWithSkill" },
+            { BOOK_BP .. ":Cancel",                  "Cancel(BP)" },
+            { BOOK_BP .. ":DetachActor",             "DetachActor" },
+            { BOOK_BP .. ":SetSimulate",             "SetSimulate" },
+            -- Out-of-bounds recovery. This is the behaviour we actually want: the game's popup says
+            -- it puts the book back where it came from, which is exactly the move eviction needs.
+            -- FellOutOfWorld is UE's own below-KillZ hook; the rest are the game's likely handlers.
+            { BOOK_BP .. ":FellOutOfWorld",          "FellOutOfWorld" },
+            { ITEM_NATIVE .. ":FellOutOfWorld",      "FellOutOfWorld(native)" },
+            { BOOK_BP .. ":ReceiveActorBeginOverlap","BeginOverlap" },
+            { BOOK_BP .. ":ReceiveHit",              "ReceiveHit" },
+            { BOOK_BP .. ":MoveToBookCase",          "MoveToBookCase" },
+            { BOOK_BP .. ":BookDonePlace",           "BookDonePlace" },
+            { BOOK_BP .. ":SetBookInfo",             "SetBookInfo" },
+            { BOOK_BP .. ":RefreshInfo",             "RefreshInfo" },
+        }) do
+            local path, label = probe[1], probe[2]
+            mreg(path, label, function(self)
+                if not diag_on("MAGIC_LEAK_TRACE") then return end
+                local b; pcall(function() b = self:get() end)
+                -- Log the warded state rather than filtering on it. Filtering to warded-only made
+                -- silence ambiguous: a route that fired on an unreadable book (state nil) looked
+                -- identical to a route that never fired at all.
+                local _, series = _bh_series(b)
+                _magic_trace(label, ("warded=%s series=%s")
+                    :format(tostring(_bh_book_is_warded(b)), tostring(series)))
+            end)
+        end
+
+        -- Insight's per-book highlight. Sinking the pile was not enough: the skill lights the book
+        -- ACTOR too, and that is the layer the player actually sees -- which is why 24 pile
+        -- re-sinks changed nothing on screen. Answering the toggle with "off" refuses the effect at
+        -- source. A bool argument does write back, unlike the transform struct the pile path needed.
+        mreg(BOOK_BP .. ":ToggleSameTypeEffect", "ToggleSameTypeEffect", function(self, is_on)
+            if not diag_on("BOOK_EVENT_HOOKS") then return end
+            local v; pcall(function() v = is_on:get() end)
+            if v ~= true then return end                     -- turning it off is always fine
+            local b; pcall(function() b = self:get() end)
+            if _bh_book_is_warded(b) ~= true then return end
+            if not diag_on("MAGIC_WARD_SAMETYPE_FX") then return end
+            local set_ok = pcall(function() is_on:set(false) end)
+            _bh.fx_denied = (_bh.fx_denied or 0) + 1
+            if diag_on("MAGIC_LEAK_TRACE") and (_bh.fx_samples or 0) < 5 then
+                _bh.fx_samples = (_bh.fx_samples or 0) + 1
+                local _, series = _bh_series(b)
+                _magic_trace("ToggleSameTypeEffect DENY",
+                    ("series=%s set_ok=%s"):format(tostring(series), tostring(set_ok)))
+            end
+        end)
+
+        -- The bag's own intake. Whatever moves a book -- a skill, a manual grab, anything -- it
+        -- has to arrive here, so this catches the leak without knowing which route carried it.
+        -- That matters because the skill's own functions register fine and never dispatch.
+        mreg(BAG_NATIVE .. ":PickUpGameItem", "PickUpGameItem", function(self, item)
+            if not diag_on("BOOK_EVENT_HOOKS") then return end
+            local b; pcall(function() b = item:get() end)
+            local warded = _bh_book_is_warded(b)
+            if diag_on("MAGIC_LEAK_TRACE") then
+                local _, series = _bh_series(b)
+                _magic_trace("PickUpGameItem", ("warded=%s series=%s")
+                    :format(tostring(warded), tostring(series)))
+            end
+            if warded == true then _magic_bag_dirty = true end
+        end)
+
+        -- Insight ending. Zero-latency edge for the existing resweep, which otherwise waits for the
+        -- 3s poll to notice -- a fatigued Insight can be shorter than that and be missed entirely.
+        mreg(CHAR_NATIVE .. ":HideSameTypeBook", "HideSameTypeBook", function()
+            local IA = package.loaded["AP/ItemApply"]
+            if IA then IA._insight_ended = true end
+            if diag_on("MAGIC_LEAK_TRACE") then _magic_trace("HideSameTypeBook", "insight ended") end
+        end)
+    end)
+end
+
 local _bh_report_tick = 0
 local function bh_report_periodic()
     if not diag_on("BOOK_EVENT_HOOKS") then return end
     _bh_report_tick = _bh_report_tick + 1
     if _bh_report_tick % 6 ~= 0 then return end   -- ~every 30s (6 ticks of the 5s loop)
-    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d Grab=%d (grabfix=%d) refresh-sweep=%d"):format(
-        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab, _bh.grabbed, _bh.grabfix, _bh.rsweep or 0))
+    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d (denied=%d) Grab=%d (grabfix=%d) refresh-sweep=%d | magic: fx-denied=%d bag-evicted=%d"):format(
+        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab, _bh.grab_denied or 0,
+        _bh.grabbed, _bh.grabfix, _bh.rsweep or 0, _bh.fx_denied or 0, _bh.bag_evicted or 0))
 end
 
 -- ============================================================================
@@ -1396,6 +1886,16 @@ local _reject_nag = nil       -- tick counter for the repeated wrong-save warnin
 local _pre_apply_settle_state = nil  -- {empty_ticks, reapplies_done} during pre-apply settle
 local _reconnect_settle_state = nil  -- {last_item_tick, quiet_ticks, total_ticks} during mid-game reconnect
 
+--- Describe a layout record as "hash/sample". The sample count is the number of loose books that
+--- went into the hash, and it is the diagnostic that matters: if it differs between the save and
+--- the next load, no arrangement of books can make the hashes agree.
+
+local function _fp_desc(record_fn)
+    local fp, sample = record_fn()
+    if not fp then return "none" end
+    return ("%d/%s books"):format(fp, tostring(sample or "?"))
+end
+
 --- Warding is held until the world is known to be this run's. Beyond saving the
 --- work, warding a foreign save would hide the player's own books in their own
 --- game.
@@ -1411,6 +1911,13 @@ local function identity_evaluate(why)
     if not SI then return end
     local before = SI.verdict
     local v = SI.evaluate()
+    -- The layout comparison decides accept-or-reject on its own, so its numbers have to be visible.
+    -- Without them a rejection says only "does not match" -- no way to tell a genuinely foreign save
+    -- from our own book count having shifted, which is the difference between working as intended
+    -- and refusing the player's own run.
+    if SI.last_fp then
+        log(("[save-id] %s: %s"):format(why, SI.last_fp))
+    end
     if SI.last_counts then
         log(("[save-id] %s: %s -> %s (%s)"):format(why, tostring(before), tostring(v), SI.last_counts))
     end
@@ -1703,6 +2210,7 @@ local function start_gameplay_loops()
         -- than by design.
         if not IA._flush_in_progress then
             pcall(try_register_book_hooks)   -- register the book hooks (one-shot, game thread)
+            pcall(try_register_magic_hooks)  -- character + HISM-manager hooks (one-shot)
         end
         pcall(bh_report_periodic)        -- ~30s [book-hook] count report
         pcall(function() IA.refresh_index_if_changed() end)   -- catch lazy-spawned bookcases
@@ -1767,7 +2275,7 @@ local function start_gameplay_loops()
         SI.mirroring = false
         if wrote then
             log(("[save-id] mirrored to slot %d on %s (layout=%s)")
-                :format(SI.slot, tostring(which), tostring(SI.record_layout())))
+                :format(SI.slot, tostring(which), _fp_desc(SI.record_layout)))
         end
         return false
     end)
@@ -1783,6 +2291,7 @@ local function start_gameplay_loops()
         if SI and SI.verdict == SI.UNKNOWN and IA._apply_safe and IA._gameplay_active then
             identity_evaluate("progress made")
         end
+
 
         -- Keep saying it. A rejected save means everything the player does goes
         -- unreported, so a single notification they happened to miss is worse
@@ -1957,6 +2466,225 @@ if POLL_GT then gt_loop("hud_drain", 300, function()
     if H and H._drain_one then H._drain_one() end
     return false
 end) end   -- with the flag off, AP/HUD.lua keeps its own async drain; registering both halves DRAIN_MS
+
+-- Does a book the run has not earned ever end up in the bag? Polled rather than hooked on purpose:
+-- the skill's own functions register and never dispatch, so a hook-based answer could be a false
+-- negative. From the bag a book can be shelved, and shelving is what fires row-completion checks --
+-- so this is the question that decides whether the leak is cosmetic or reaches the multiworld.
+-- Reports only on change, so a steady bag costs one array walk a second and says nothing.
+local _magic_bag_last = -1
+
+gt_loop("magic_bag_watch", 1000, function()
+    if not diag_on("MAGIC_LEAK_TRACE") then return false end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._gameplay_active and IA._book_sanity_enabled) then return false end
+    local total, warded, example = 0, 0, nil
+    pcall(function()
+        local pawn = FindFirstOf("BP_LibrarianCharacter_C")
+        if not (pawn and pawn:IsValid()) then return end
+        local bag; pcall(function() bag = pawn.ItemBagComponent end)
+        if not (bag and bag:IsValid()) then return end
+        local items; pcall(function() items = bag.Items end)
+        if not items then return end
+        local n = 0; pcall(function() n = #items end)
+        for i = 1, math.min(n, 32) do
+            local it = items[i]
+            if it and it:IsValid() then
+                total = total + 1
+                if _bh_book_is_warded(it) == true then
+                    warded = warded + 1
+                    if not example then local _, s = _bh_series(it); example = s end
+                end
+            end
+        end
+    end)
+    if warded ~= _magic_bag_last or _magic_bag_dirty then
+        _magic_bag_last = warded
+        _magic_bag_dirty = false
+        log(("[magic] BAG items=%d warded=%d%s"):format(
+            total, warded, example and (" e.g. " .. tostring(example)) or ""))
+    end
+    if warded > 0 then _magic_evict_bag() end
+    gt_drain_magic_reward()
+
+    -- There used to be a settle window here that blocked slot writes while evicted books were in
+    -- the air, because the layout hash was taken from where books currently sat and a book caught
+    -- mid-fall would record positions no reload reproduces. The hash now keys on each book's own
+    -- SpawnTransform, which does not move -- so a save taken mid-flight records exactly what a
+    -- save taken at rest would, and there is nothing left to wait for.
+    return false
+end)
+
+
+
+
+-- Telling live books from the inert copies in the resident test level is done by POSITION -- an
+-- inert copy sits exactly at the world origin, a book in play never does. There is deliberately no
+-- helper here for "the pawn's world", because using one to filter books is wrong and was written
+-- twice: which world holds the live books depends on how the world was entered, and on a loaded
+-- save they are NOT in the pawn's world. The pawn's world is published to _G purely so the load
+-- can be identified in the log.
+
+
+
+--- Move a book's pile instance to match its actor.
+---
+--- The actor is only half a book: at any distance the game draws books as HISM instances (one
+--- component per series, one instance per chapter) and swaps an actor in up close. Moving the actor
+--- alone leaves the book showing where it was taken from until you walk over and look at it.
+---
+--- Warded books must NOT follow the actor home -- their instance is sunk on purpose, and raising it
+--- would put an un-unlocked book back on the shelf in plain sight. Those stay sunk.
+function _dev.restore_book_pile(aidx, chapter, home)
+    if not (aidx and chapter and home and home.Translation) then return false, "no key" end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return false, "no manager" end
+    local arr; pcall(function() arr = mgr.HISMArray end)
+    if not arr then return false, "no HISMArray" end
+    local comp; pcall(function() comp = arr[aidx + 1] end)
+    if not (comp and comp:IsValid()) then return false, "no component" end
+
+    local IA = package.loaded["AP/ItemApply"]
+    local st = IA and IA._book_inst_state and IA._book_inst_state[aidx .. "|" .. chapter]
+
+    if st and st.hidden then
+        -- Same deep offset the hide path uses; a different one here would strand the book.
+        local t = { Translation = { X = home.Translation.X, Y = home.Translation.Y,
+                                    Z = home.Translation.Z - 1000000.0 },
+                    Rotation = home.Rotation, Scale3D = home.Scale3D }
+        local ok = pcall(function() comp:UpdateInstanceTransform(chapter, t, true, true, true) end)
+        -- Deliberately NOT re-aiming st.orig from SpawnTransform. Measured equal, so the write
+        -- would be a no-op; and if they ever diverge, overwriting relocates the book on unlock.
+        return ok, "warded, kept sunk"
+    end
+
+    local ok = pcall(function() comp:UpdateInstanceTransform(chapter, home, true, true, true) end)
+    return ok, ok and "moved" or "write refused"
+end
+
+function _dev.restore_book_home(book)
+    local alive = false
+    pcall(function() alive = book and book:IsValid() end)
+    if not alive then return false end
+
+    local t
+    pcall(function() t = book.SpawnTransform end)
+    if not t then return false end
+
+    -- A plain-table copy as well as the struct: the actor call takes the FTransform as-is, but the
+    -- instance write wants the table form the rest of the pile code uses.
+    local hx, hy, hz
+    local home
+    pcall(function()
+        local p, r, s = t.Translation, t.Rotation, t.Scale3D
+        if not p then return end
+        hx, hy, hz = p.X, p.Y, p.Z
+        home = {
+            Translation = { X = p.X, Y = p.Y, Z = p.Z },
+            Rotation = r and { X = r.X, Y = r.Y, Z = r.Z, W = r.W }
+                         or { X = 0, Y = 0, Z = 0, W = 1 },
+            -- A zero scale would make the instance vanish rather than move, which reads as a
+            -- successful write and an invisible book.
+            Scale3D = (s and s.X and s.X ~= 0) and { X = s.X, Y = s.Y, Z = s.Z }
+                                               or { X = 1, Y = 1, Z = 1 },
+        }
+    end)
+    -- An unfilled FTransform reads as the world origin, and no book belongs there. Writing it
+    -- would pile every such book at 0,0,0 -- far worse than leaving it where it is.
+    if not hx or (hx == 0 and hy == 0 and hz == 0) then return false end
+
+    pcall(function() book:SetSimulate(false) end)
+
+    -- The transform carries rotation and scale as well as position, so the book lands the way it
+    -- was placed rather than at whatever angle it happened to stop rolling at. The out-parameter
+    -- is a concrete FHitResult, which UE4SS can marshal -- unlike the wildcard row struct that
+    -- kills the process; an empty table is enough to receive it.
+    local ok = false
+    pcall(function() ok = book:K2_SetActorTransform(t, false, {}, true) and true or false end)
+    if not ok then
+        -- No out-parameter at all on this one, so it survives a marshalling failure above.
+        pcall(function()
+            local r = book:K2_GetActorRotation()
+            ok = book:K2_TeleportTo(t.Translation, r) and true or false
+        end)
+    end
+
+    -- Second layer. Reported separately because the actor moving without it is exactly the
+    -- half-restored state this is here to fix.
+    local aidx, chap
+    pcall(function()
+        local info = book.ItemInfo
+        if info then aidx = tonumber(info.AssetIdx); chap = tonumber(info.Chapter) end
+    end)
+    local pile_ok, pile_why = _dev.restore_book_pile(aidx, chap, home)
+
+    return ok, hx, hy, hz, pile_ok, pile_why
+end
+
+
+
+
+-- Register the magic hooks from module scope, not from the warding maintenance step.
+--
+-- They used to ride warding_maint, which only starts once the mod is connected and gameplay is
+-- active. That meant loading a save just to look at something registered nothing, and every probe
+-- stayed silent -- which reads identically to "the game never calls these", and produced exactly
+-- that false negative once already. What the hooks observe is a property of the level, not the run.
+gt_loop("magic_hook_reg", 2000, function()
+    if _magic_hooks_attempted then return true end
+    if not diag_on("BOOK_EVENT_HOOKS") then return true end
+    pcall(try_register_magic_hooks)
+    return _magic_hooks_attempted   -- latch off once they are on
+end)
+
+-- Deliberately NOT gated on the mod being connected or the world being apply-safe: the stone is a
+-- fact about the level, not about the run, and gating it on gameplay meant it never ran at all for
+-- someone who just loaded a save to look.
+local _rs_tries = 0
+gt_loop("find_recall_stone", 5000, function()
+    if not diag_on("MAGIC_LEAK_TRACE") then return true end
+    _rs_tries = _rs_tries + 1
+    if _rs_tries > 12 then
+        log("[magic] recall stone: not found after a minute of looking -- giving up")
+        return true
+    end
+
+    -- The stone is BP_G01_Crystal_01 -- "TimeStone" internally, nothing in its class name says
+    -- Recall. Ask for it directly rather than sifting every actor by name.
+    local found = 0
+    pcall(function()
+        local all = FindAllOf("BP_G01_Crystal_01_C")
+        if not all then return end
+        local n = 0
+        pcall(function() n = #all end)
+        for i = 1, n do
+            local a = all[i]
+            if a and a:IsValid() then
+                found = found + 1
+                local nm, actived, ridx = "?", "?", "?"
+                pcall(function() nm = a:GetFullName() end)
+                pcall(function() actived = tostring(a.Actived) end)
+                pcall(function() ridx = tostring(a.RespawnIdx) end)
+                log(("[magic] recall stone PRESENT: Actived=%s RespawnIdx=%s %s")
+                    :format(actived, ridx, nm))
+                -- Which of its entry points actually exist on the instance. The interesting one is
+                -- OnConfirmed_Event: if that is callable we can put every loose book back with one
+                -- call instead of dropping books and waiting to see where they land.
+                for _, fn in ipairs({ "Interact", "OnConfirmed_Event", "OnCanceled_Event",
+                                      "ActiveTimeStone", "OnBookCaseNumChanged_Event" }) do
+                    local present = false
+                    pcall(function() present = type(a[fn]) ~= "nil" end)
+                    log(("    %-28s %s"):format(fn, present and "callable" or "MISSING"))
+                end
+            end
+        end
+    end)
+    if found == 0 then return false end   -- level may still be streaming; try again
+    if diag_on("MAGIC_TEST_RECALL_STONE") then
+        log("[magic] recall-stone test ARMED -- press F6 to fire it")
+    end
+    return true                            -- reported; this answers a yes/no question
+end)
 
 gt_loop("autoload", 500, function()
     local SI = package.loaded["AP/SaveIdentity"]
@@ -2358,7 +3086,7 @@ local function mirror_now(which)
     if wrote then
         SI.mirror_pending = nil
         log(("[save-id] mirrored to slot %d on %s (layout=%s)")
-            :format(SI.slot, tostring(which), tostring(SI.record_layout())))
+            :format(SI.slot, tostring(which), _fp_desc(SI.record_layout)))
     end
 end
 
@@ -2559,6 +3287,21 @@ _G._librarian_gt_master_tick = function(dt_ms)
             log("[F12] already connected")
         end
     end
+    if _gt_pending_f6 then                               -- F6 pressed on the input thread
+        _gt_pending_f6 = false
+        -- Diagnostics live in dev/AP/probe_magic.lua and are attached to _dev only under
+        -- PROBE_MODE, so this does nothing in a normal build.
+        for _, name in ipairs({ "probe_spawn_home", "probe_insight_state", "probe_home_agreement",
+                                "probe_world_split", "probe_spawn_table" }) do
+            if _dev[name] then pcall(_dev[name]) end
+        end
+        if diag_on("MAGIC_TEST_RESTORE_HOME") and _dev.test_restore_home then
+            pcall(_dev.test_restore_home)
+        end
+        if diag_on("MAGIC_TEST_RECALL_STONE") and _dev.test_recall_stone then
+            pcall(_dev.test_recall_stone)
+        end
+    end
     if _gt_pending_f4 then                               -- F4 pressed on the input thread
         _gt_pending_f4 = false
         log("[F4] toggle connection menu")
@@ -2594,6 +3337,7 @@ _G._librarian_gt_master_tick = function(dt_ms)
             pcall(function() IA.flush_apply() end)
         end
     end
+    gt_drain_magic_resink()                                  -- put Insight-revealed piles back down
     gt_run_deferred(dt_ms)                                   -- one-shot deferred work (title/HUD refreshes)
     gt_run_steps(dt_ms)                                      -- apply-gate / settle / warding / sync / etc.
     if (c._gt_tick_count % 600) == 0 then
@@ -3242,6 +3986,12 @@ _G._librarian_menu = {
 -- Input thread: set a scalar only. menu_toggle walks actors and builds a UMG widget, none of which
 -- may run off the game thread. Drained by the master tick.
 RegisterKeyBind(Key.F4, function() _gt_pending_f4 = true end)
+
+-- DEV: fire the Recall Stone once per press. Same discipline as the two above -- the handler sets a
+-- boolean and nothing else, since a key runs on a third thread and reaching into the game from there
+-- is the corruption everything else here was rewritten to avoid.
+-- Inert unless MAGIC_TEST_RECALL_STONE is on, so a stray press cannot rearrange a real run.
+RegisterKeyBind(Key.F6, function() _gt_pending_f6 = true end)
 
 -- DEV: feasibility probe harness (AP/probe.lua). Loads only when diag PROBE_MODE is EXPLICITLY
 -- true -- diag_on() defaults missing flags to ON, so gate on the raw table value to keep the

@@ -65,6 +65,48 @@ return {
     -- as the actor<->pile backfill). Restored on unlock. Off = actor ward alone gates grabbing.
     BOOK_PILE_TELEPORT = true,
 
+    -- Log what the mass-book magic skills actually touch: which books Assemble takes, whether the
+    -- game asks CanBeGrab first, and which pile instances get rewritten while Insight is up. Cheap
+    -- (a few lines per skill use) and it is the only evidence for whether the two guards below are
+    -- hitting the right path. Turn off once the behaviour is settled.
+    MAGIC_LEAK_TRACE = true,
+
+    -- Assemble: answer the game's own grabbable predicate with "no" for a warded book, so the skill
+    -- never takes one. Only bites if the skill consults the predicate -- MAGIC_LEAK_TRACE says
+    -- whether it does. Off = the skill can pull a hidden book into the bag, from where it can be
+    -- shelved and fire a check the run has not earned.
+    MAGIC_WARD_CANBEGRAB = true,
+
+    -- Insight: ride the game's own pile write and sink a warded book's instance back to deep Z, so
+    -- it is never shown rather than re-hidden afterwards. Off = the post-hoc resweep alone, which
+    -- deliberately leaves locked books visible for the whole skill duration.
+    MAGIC_WARD_HISM_WRITE = true,
+
+    -- Insight: refuse the per-book highlight for a warded book by answering its own toggle with
+    -- "off". The pile sink alone was not enough -- the skill also lights the book actor, which is a
+    -- separate layer and the one actually seen.
+    MAGIC_WARD_SAMETYPE_FX = true,
+
+    -- DEV, DESTRUCTIVE. Arms F6 to call the Recall Stone's confirm handler, to learn what it does to
+    -- books -- specifically which per-book call it makes, so that call can be aimed at just the books
+    -- we displaced. It takes no arguments, so it recalls EVERY loose book, not only ours: it
+    -- rearranges the world and will change the recorded book layout. Only ever turn this on for a
+    -- save you are willing to lose. Ships OFF; F6 does nothing while it is off.
+    MAGIC_TEST_RECALL_STONE = false,
+
+
+    -- DEV, WRITES BOOK POSITIONS. Arms F6 to send up to 10 displaced books back to their own
+    -- SpawnTransform -- the first time the mod moves a book on purpose. It moves real books in the
+    -- live save, so it changes the recorded layout; only turn it on for a save you are willing to
+    -- lose. Ships OFF; F6 only reads while it is off.
+    MAGIC_TEST_RESTORE_HOME = false,
+
+    -- Assemble: take back any warded book that reached the bag. Not prevention -- the skill does
+    -- not dispatch through anything hookable, so the bag's own intake is the first place the book
+    -- can be seen at all. Off = a locked book can be carried and shelved, which fires a check the
+    -- run has not earned.
+    MAGIC_WARD_BAG_EVICT = true,
+
     -- Passive invisible-book scanner. OFF: too noisy without a camera-FOV filter (see known_bugs.txt).
     BOOK_INVIS_SCAN = false,
 
