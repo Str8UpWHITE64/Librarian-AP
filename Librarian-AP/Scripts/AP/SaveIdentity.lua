@@ -153,9 +153,19 @@ function M.read_local(seed, ap_slot)
     local found
     pcall(function()
         for line in f:lines() do
-            local k, v, fp = line:match("^(.-)=(%d+),(%d+)$")
+            -- "slot,hNNN" is home-keyed. "slot,NNN" is the older position-keyed hash and is
+            -- discarded, not compared: comparing bases would reject every run already on disk.
+            -- Those re-record a home-keyed hash at their next save.
+            local k, v, fp = line:match("^(.-)=(%d+),h(%d+)$")
+            if not k then
+                local lk, lv = line:match("^(.-)=(%d+),%d+$")
+                if lk then k, v, fp = lk, lv, nil end
+            end
             if not k then k, v = line:match("^(.-)=(%d+)$") end
-            if k == want then found, M.stored_fp = tonumber(v), tonumber(fp) end
+            if k == want then
+                found = tonumber(v)
+                M.stored_fp = fp and tonumber(fp) or nil
+            end
         end
     end)
     pcall(function() f:close() end)
@@ -192,8 +202,10 @@ function M.write_local(seed, ap_slot, slot)
         end)
         pcall(function() f:close() end)
     end
+    -- "h" marks the hash as home-keyed. A future change to the basis needs a new marker: a hash
+    -- whose meaning changed silently is indistinguishable from a save that does not match.
     lines[#lines + 1] = M.stored_fp
-        and ("%s=%d,%d"):format(want, slot, M.stored_fp)
+        and ("%s=%d,h%d"):format(want, slot, M.stored_fp)
         or  ("%s=%d"):format(want, slot)
 
     local out = io.open(p, "w")
@@ -219,64 +231,82 @@ local function granted_sets(IA)
     return series, books
 end
 
---- Fingerprint of the loose-book layout.
+--- Fingerprint of the world's book placement.
 ---
 --- The game stores no seed; the per-run randomness is baked into where each book
---- starts. The SPOTS are fixed across playthroughs and only the occupant varies,
---- so the identifying fact is which book sits in which spot -- hence position as
---- the key, book as the value.
+--- belongs. The SPOTS are fixed across playthroughs and only the occupant varies,
+--- so the identifying fact is which book belongs in which spot -- hence position
+--- as the key, book as the value.
 ---
---- Only loose books count. A shelved book's position is not stored at all; it is
---- rebuilt from which case and shelf it occupies, so it is identical between two
---- unrelated saves and would dilute the comparison. AssetIdx 0 is excluded too --
---- the game never randomises that series, so it agrees between any two worlds.
---- Books parked at the origin are mid-load and not placed yet.
+--- Keyed on SpawnTransform -- each book's own record of where it belongs -- not on
+--- where it currently sits. Live positions changed whenever the player moved a book
+--- or the mod evicted one, which refused runs their own save. Homes are serialized
+--- and survive a quit, so every book counts and the sample never thins out.
+---
+--- AssetIdx 0 is excluded: that series is never randomised, so it agrees between any
+--- two worlds. That exclusion also drops the inert copies in the resident test level,
+--- which carry no ItemInfo and so read as 0.
+---
+--- Do NOT filter these by world. Which world holds the live books depends on how the
+--- world was entered, and on a loaded save they are not the pawn's -- see
+--- reconcile/eviction notes in main.lua.
 ---
 --- Returns: hash, sample_count, unplaced_count
 function M.fingerprint()
+    -- Every nil return records WHY: a fingerprint that silently declines to exist reads exactly
+    -- like one with nothing to say, and that ambiguity cost two wrong diagnoses.
+    M.fp_why = nil
     local books = FindAllOf("BP_GrabbingBook_C")
-    if not books then return nil end
+    if not books then M.fp_why = "FindAllOf returned nothing"; return nil end
     local n = 0
     pcall(function() n = #books end)
-    if n == 0 then return nil end
+    if n == 0 then M.fp_why = "no book actors"; return nil end
 
+    -- Per-rejection tallies, so a zero-entry result says which filter ate everything rather than
+    -- leaving it to be guessed at.
+    local skip_info, skip_a0, skip_noxf = 0, 0, 0
     local entries, unplaced = {}, 0
     for i = 1, math.min(n, 8000) do
         local b = books[i]
         if b and b:IsValid() then
-            local info
-            pcall(function() info = b.ItemInfo end)
-            if info and info:IsValid() then
-                local attached = false
-                pcall(function()
-                    local p = b:GetAttachParentActor()
-                    attached = (p and p:IsValid()) and true or false
-                end)
-                local aidx, chap
-                pcall(function() aidx = info.AssetIdx end)
-                pcall(function() chap = info.Chapter end)
-                if not attached and aidx and aidx ~= 0 and chap then
-                    local x, y, z
-                    pcall(function()
-                        local loc = b:K2_GetActorLocation()
-                        x, y, z = loc.X, loc.Y, loc.Z
-                    end)
-                    if x then
-                        local px = math.floor(x + 0.5)
-                        local py = math.floor(y + 0.5)
-                        local pz = math.floor(z + 0.5)
-                        if px == 0 and py == 0 and pz == 0 then
-                            unplaced = unplaced + 1
-                        else
-                            entries[#entries + 1] =
-                                ("%d,%d,%d=%d|%d"):format(px, py, pz, aidx, chap)
+            do
+                local info
+                pcall(function() info = b.ItemInfo end)
+                if not (info and info:IsValid()) then
+                    skip_info = skip_info + 1
+                else
+                    local aidx, chap
+                    pcall(function() aidx = info.AssetIdx end)
+                    pcall(function() chap = info.Chapter end)
+                    if not (aidx and aidx ~= 0 and chap) then
+                        skip_a0 = skip_a0 + 1
+                    else
+                        local x, y, z
+                        pcall(function()
+                            local v = b.SpawnTransform and b.SpawnTransform.Translation
+                            if v then x, y, z = v.X, v.Y, v.Z end
+                        end)
+                        if not x then skip_noxf = skip_noxf + 1 else
+                            local px = math.floor(x + 0.5)
+                            local py = math.floor(y + 0.5)
+                            local pz = math.floor(z + 0.5)
+                            if px == 0 and py == 0 and pz == 0 then
+                                unplaced = unplaced + 1
+                            else
+                                entries[#entries + 1] =
+                                    ("%d,%d,%d=%d|%d"):format(px, py, pz, aidx, chap)
+                            end
                         end
                     end
                 end
             end
         end
     end
-    if #entries == 0 then return nil end
+    if #entries == 0 then
+        M.fp_why = ("no usable books of %d (no-info=%d aidx0/no-chap=%d no-transform=%d origin=%d)")
+            :format(n, skip_info, skip_a0, skip_noxf, unplaced)
+        return nil
+    end
     table.sort(entries)
 
     local h = 5381
@@ -372,15 +402,18 @@ function M.evaluate()
     local IA = package.loaded["AP/ItemApply"]
     if not IA then return M.verdict end
 
-    -- Layout first, and once per world only. A save records the exact positions
-    -- at that instant, so a freshly loaded world reproduces them bit for bit --
-    -- but they drift as soon as the player shelves anything, which is why this
-    -- runs at load time and is not retried afterwards.
+    -- Layout first, once per world. The hash is over where books BELONG, which nothing in normal
+    -- play changes, so a mismatch is real evidence rather than a stale reading.
     if not M.fp_checked and M.stored_fp then
-        local fp, sample = M.fingerprint()
+        local fp, sample, unplaced = M.fingerprint()
         if fp then
             M.fp_checked = true
-            M.last_fp = ("layout=%d stored=%d sample=%d"):format(fp, M.stored_fp, sample or 0)
+            -- sample is how many books went into the hash. It should be the same number every time
+            -- for a given world; if it moves between a save and the next load, the hash cannot
+            -- match whatever the homes are -- so it is the first thing to check when a run is
+            -- refused its own save.
+            M.last_fp = ("layout=%d stored=%d sample=%d unplaced=%d")
+                :format(fp, M.stored_fp, sample or 0, unplaced or 0)
             if fp == M.stored_fp then
                 M.verdict, M.reason = M.VERIFIED, nil
                 return M.verdict
@@ -460,7 +493,6 @@ function M.can_force_save(claim_target)
     if not IA._gameplay_active then return false, "not in gameplay" end
     if not IA._apply_safe then return false, "world not settled" end
     if M.verdict ~= M.VERIFIED then return false, "identity " .. tostring(M.verdict) end
-
     if claim_target then
         if M.slot_exists(claim_target, false) ~= false then
             return false, "claim target not confirmed empty"

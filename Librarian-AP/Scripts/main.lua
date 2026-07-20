@@ -1889,11 +1889,17 @@ local _reconnect_settle_state = nil  -- {last_item_tick, quiet_ticks, total_tick
 --- Describe a layout record as "hash/sample". The sample count is the number of loose books that
 --- went into the hash, and it is the diagnostic that matters: if it differs between the save and
 --- the next load, no arrangement of books can make the hashes agree.
-
 local function _fp_desc(record_fn)
     local fp, sample = record_fn()
-    if not fp then return "none" end
-    return ("%d/%s books"):format(fp, tostring(sample or "?"))
+    if fp then return ("%d/%s books"):format(fp, tostring(sample or "?")) end
+    -- Re-sampling can legitimately fail here: the quit mirror runs while the world is being torn
+    -- down. That is not a problem as long as a layout was already taken during play -- report the
+    -- one on record rather than implying nothing was saved.
+    local SI = package.loaded["AP/SaveIdentity"]
+    if SI and SI.stored_fp then return ("%d (recorded earlier)"):format(SI.stored_fp) end
+    -- "none" on its own is what made two rounds of this hard to diagnose: it reads as "nothing to
+    -- record" when it actually meant "could not record, and here is why".
+    return ("none (%s)"):format((SI and SI.fp_why) or "no reason recorded")
 end
 
 --- Warding is held until the world is known to be this run's. Beyond saving the
@@ -2292,6 +2298,20 @@ local function start_gameplay_loops()
             identity_evaluate("progress made")
         end
 
+        -- Sample the layout while the world is still alive.
+        --
+        -- The mirror writes on a timer and on quit, and it used to compute the fingerprint at that
+        -- moment. On quit that is too late: the gameplay world is already being torn down, its
+        -- books destroyed, and the only book actors left belong to the resident test level -- so
+        -- the fingerprint described nothing and recorded "none". Homes do not change during play,
+        -- so sampling once per world is both sufficient and cheap; the mirror then just writes
+        -- what is already stored.
+        if SI and SI.verdict == SI.VERIFIED and not SI.stored_fp
+           and IA._apply_safe and IA._gameplay_active and SI.record_layout then
+            local fp, sample = SI.record_layout()
+            log(("[save-id] layout recorded: %s (%s books)")
+                :format(tostring(fp), tostring(sample or (SI.fp_why or "?"))))
+        end
 
         -- Keep saying it. A rejected save means everything the player does goes
         -- unreported, so a single notification they happened to miss is worse
@@ -2473,7 +2493,6 @@ end) end   -- with the flag off, AP/HUD.lua keeps its own async drain; registeri
 -- so this is the question that decides whether the leak is cosmetic or reaches the multiworld.
 -- Reports only on change, so a steady bag costs one array walk a second and says nothing.
 local _magic_bag_last = -1
-
 -- Insight re-ward: keep a locked book's ACTOR hidden while the skill shows its series.
 --
 -- Measured: with the skill up a warded book reads bHidden=false while its pile instance is still
@@ -3461,6 +3480,31 @@ register_bp_hooks_once = function()
                     local d = DeltaSeconds and DeltaSeconds:get()
                     if d and d > 0 then dt = d * 1000 end
                 end)
+                -- Resolve here and keep only plain values: the wrapper `self` yields is valid
+                -- only inside this callback, and stashing the object left every later read
+                -- looking at an invalid handle. The name is refreshed only when the address
+                -- changes, i.e. once per world.
+                local _wok, _werr = pcall(function()
+                    local pawn = self:get()
+                    if not pawn then error("self:get() returned nothing", 0) end
+                    local w = pawn:GetWorld()
+                    if not w then error("pawn:GetWorld() returned nothing", 0) end
+                    if not w:IsValid() then error("pawn world is not valid", 0) end
+                    local a = w:GetAddress()
+                    if not a then error("world GetAddress() returned nothing", 0) end
+                    if a ~= _G._librarian_live_world_addr then
+                        _G._librarian_live_world_addr = a
+                        _G._librarian_live_world_name = w:GetFullName()
+                        log(("[world] live world = %s"):format(tostring(_G._librarian_live_world_name)))
+                    end
+                end)
+                -- Logged once. A silent failure here disables the world filter everywhere it is
+                -- used -- the fingerprint simply stops existing -- with nothing in the log to say
+                -- so, which is exactly how this went unnoticed twice.
+                if not _wok and not _G._librarian_world_err then
+                    _G._librarian_world_err = true
+                    log(("[world] FAILED to resolve live world: %s"):format(tostring(_werr)))
+                end
                 local f = _G._librarian_gt_master_tick
                 if f then f(dt) end
             end)
