@@ -18,6 +18,12 @@
 local M = {}
 
 -- Slots the mod may claim. Low slots are left to the player.
+--
+-- Claiming is occupancy-based (first_free_slot asks the game which slots hold a
+-- save), not a counter, so two mod versions installed on one machine cannot hand
+-- out the same slot. That only holds while this range and slot_data_path stay
+-- identical across versions -- change one and a run claimed by the other version
+-- becomes invisible to this one.
 M.SLOT_MIN, M.SLOT_MAX = 20, 30
 
 -- Verdicts. Only VERIFIED permits sending checks or writing our slot; UNKNOWN
