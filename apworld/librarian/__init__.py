@@ -1702,7 +1702,7 @@ class LibrarianWorld(World):
             # suffix is informational. NOT the AP world version -- that one
             # (archipelago.json:world_version) must be clean semver so AP can parse it
             # for YAML `requires: game:` checks (a suffix there reads as 0.0.0).
-            "version": "1.2.0-beta1",
+            "version": "1.2.0-beta2",
             "goal": goal_value,
             # Row count at which the Lua client should send STATUS_GOAL.
             # Ignored for the "full" goal (the game's EndGame fires it).
