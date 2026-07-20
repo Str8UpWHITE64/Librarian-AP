@@ -2474,6 +2474,91 @@ end) end   -- with the flag off, AP/HUD.lua keeps its own async drain; registeri
 -- Reports only on change, so a steady bag costs one array walk a second and says nothing.
 local _magic_bag_last = -1
 
+-- Insight re-ward: keep a locked book's ACTOR hidden while the skill shows its series.
+--
+-- Measured: with the skill up a warded book reads bHidden=false while its pile instance is still
+-- sunk, so the reveal is the actor and re-sinking piles could never have fixed it.
+--
+-- The book list is walked once per activation and only warded books of that series are kept
+-- (about a dozen); walking all 3072 on a timer would hitch several times per use. `rehid` climbing
+-- with `passes` would mean the skill re-shows continuously -- then hook its call, not poll faster.
+-- Passes to keep guarding after the skill drops. The skill restores visibility on its way out, and
+-- standing down the instant it ends leaves that last reveal uncaught -- seen in testing as a
+-- split-second flash AFTER the effect expired.
+local INSIGHT_GRACE = 15
+
+local _insight = { idx = -1, books = nil, rehid = 0, passes = 0, grace = 0 }
+
+gt_loop("insight_ward", 100, function()
+    if not diag_on("MAGIC_WARD_INSIGHT_ACTOR") then return end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._book_sanity_enabled and IA._apply_safe) then return end
+
+    local sidx = -1
+    pcall(function()
+        local p = FindFirstOf("BP_LibrarianCharacter_C")
+        if p and p:IsValid() then sidx = p:GetShowingSameTypeIdx() end
+    end)
+
+    if sidx == nil or sidx < 0 then
+        -- Skill is down. Keep re-asserting through the grace window before letting go.
+        if _insight.books and _insight.grace > 0 then
+            _insight.grace = _insight.grace - 1
+        else
+            if _insight.idx >= 0 then
+                log(("[magic] Insight ended (series %d): re-hid %d actor(s) over %d passes")
+                    :format(_insight.idx, _insight.rehid, _insight.passes))
+                _insight.idx, _insight.books = -1, nil
+                _insight.rehid, _insight.passes = 0, 0
+            end
+            return
+        end
+    elseif sidx ~= _insight.idx then
+        _insight.grace = INSIGHT_GRACE
+        _insight.idx, _insight.rehid, _insight.passes = sidx, 0, 0
+        local keep = {}
+        pcall(function()
+            local books = FindAllOf("BP_GrabbingBook_C")
+            local n = 0
+            if books then pcall(function() n = #books end) end
+            for i = 1, math.min(n, 8000) do
+                local b = books[i]
+                local alive = false
+                pcall(function() alive = b and b:IsValid() end)
+                if alive and _bh_book_is_warded(b) == true then
+                    local aidx
+                    pcall(function()
+                        local info = b.ItemInfo
+                        if info then aidx = tonumber(info.AssetIdx) end
+                    end)
+                    if aidx == sidx then keep[#keep + 1] = b end
+                end
+            end
+        end)
+        _insight.books = keep
+        log(("[magic] Insight showing series %d -- guarding %d warded book(s)")
+            :format(sidx, #keep))
+    end
+
+    -- Refresh the window on every pass the skill is up, not only on the edge: re-firing it on the
+    -- SAME series while the previous grace is draining would otherwise inherit the leftover count
+    -- and stand down early.
+    if sidx and sidx >= 0 then _insight.grace = INSIGHT_GRACE end
+
+    local list = _insight.books
+    if not list then return end
+    _insight.passes = _insight.passes + 1
+    for i = 1, #list do
+        local b = list[i]
+        pcall(function()
+            if b and b:IsValid() and b.bHidden == false then
+                b:SetActorHiddenInGame(true)
+                _insight.rehid = _insight.rehid + 1
+            end
+        end)
+    end
+end)
+
 gt_loop("magic_bag_watch", 1000, function()
     if not diag_on("MAGIC_LEAK_TRACE") then return false end
     local IA = package.loaded["AP/ItemApply"]

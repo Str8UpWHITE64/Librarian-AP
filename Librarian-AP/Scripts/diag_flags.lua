@@ -94,6 +94,11 @@ return {
     -- save you are willing to lose. Ships OFF; F6 does nothing while it is off.
     MAGIC_TEST_RECALL_STONE = false,
 
+    -- Insight: re-hide a warded book's ACTOR while the skill is up. Measured cause of the reveal --
+    -- the skill sets bHidden=false on the actor; the pile instance stays sunk throughout, which is
+    -- why re-sinking piles never helped. Off = locked books are visible (but still un-grabbable,
+    -- collision stays off) for the duration of the skill.
+    MAGIC_WARD_INSIGHT_ACTOR = true,
 
     -- DEV, WRITES BOOK POSITIONS. Arms F6 to send up to 10 displaced books back to their own
     -- SpawnTransform -- the first time the mod moves a book on purpose. It moves real books in the
