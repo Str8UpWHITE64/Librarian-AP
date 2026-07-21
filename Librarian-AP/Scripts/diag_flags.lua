@@ -112,6 +112,11 @@ return {
     -- run has not earned.
     MAGIC_WARD_BAG_EVICT = true,
 
+    -- Put books back in the bag that a load left attached to the player but outside it. The game
+    -- persists carry capacity only up to 15, so saving while holding more restores the surplus into
+    -- limbo -- following the player, undroppable. Off = the player must drop below 15 before saving.
+    BAG_ORPHAN_RECOVERY = true,
+
     -- Passive invisible-book scanner. OFF: too noisy without a camera-FOV filter (see known_bugs.txt).
     BOOK_INVIS_SCAN = false,
 

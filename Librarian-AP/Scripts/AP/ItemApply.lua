@@ -1354,6 +1354,9 @@ function M.reset_hism_state()
     M._attune_log_state = {}
     M._attune_dirty = false      -- fresh skill objects hold the game's own values
     M._bag_live_max = nil        -- capacity reset to the saved <=15; re-bootstrap from the chest checks
+    M._bag_logged_target = nil
+    M._bag_gate_logged = nil
+    M._bag_orphans_done = false  -- the surplus is re-orphaned by every load, so re-check each world
     M._unmapped_warded_books = {}
     M._last_applied_series_unlocked = {}
     M._case_last_applied_hidden = {}
@@ -3938,19 +3941,32 @@ end
 function M.apply_bag_capacity()
     if not (M._gameplay_active and M._apply_safe and M._slot_data) then return end
     if (tonumber(M._slot_data.bag_capacity) or 0) == 0 then return end
-    -- Bootstrap the live max: SetHandingMaxNum only fires on a CHANGE, so on a plain load we have no
-    -- value. Capacity is 15 iff both chests were grabbed (the only route there), so if both chest
-    -- checks are done, seed 15 -- the fill's first grant fires the hook and the real value takes over.
-    -- If a chest is still un-grabbed, leave capacity alone so the game keeps spawning it.
-    if M._bag_live_max == nil then
-        -- KNOWN: these chest ids are duplicated in main.lua (AP_LOC_CHEST_*) and Locations.py --
-        -- AP ids are frozen so they won't drift on their own, but keep the three in sync by hand.
-        if _bag_chest_grabbed(1910622) and _bag_chest_grabbed(1910623) then
-            M._bag_live_max = 15
-            log("[bag] bootstrapped live=15 (both chests grabbed)")
-        else
-            return
+
+    -- Both chests, before anything is granted.
+    --
+    -- KNOWN: these chest ids are duplicated in main.lua (AP_LOC_CHEST_*) and Locations.py -- AP ids
+    -- are frozen so they won't drift on their own, but keep the three in sync by hand.
+    --
+    -- This used to guard only the bootstrap below, which the live-max hook walked straight past:
+    -- grabbing ONE chest fires SetHandingMaxNum, so _bag_live_max stopped being nil and the fill
+    -- ran from a baseline that already held that chest's bonus. The surplus activated a chest
+    -- early, and the second chest then stacked on top of an already-filled bar -- 27 where 25 was
+    -- right, until a reload rebuilt it from the correct 15.
+    if not (_bag_chest_grabbed(1910622) and _bag_chest_grabbed(1910623)) then
+        if not M._bag_gate_logged then
+            M._bag_gate_logged = true
+            log("[bag] surplus parked -- both chests must be checked first")
         end
+        return
+    end
+    M._bag_gate_logged = nil
+
+    -- Bootstrap the live max: SetHandingMaxNum only fires on a CHANGE, so on a plain load we have
+    -- no value. Both chests are in by here, so capacity is exactly 15 -- the fill's first grant
+    -- fires the hook and the real value takes over.
+    if M._bag_live_max == nil then
+        M._bag_live_max = 15
+        log("[bag] bootstrapped live=15 (both chests grabbed)")
     end
     local player = FindFirstOf("BP_LibrarianCharacter_C")
     if not player or not player:IsValid() then return end
@@ -3975,6 +3991,98 @@ function M.apply_bag_capacity()
         M._bag_logged_target = target
         log(("[bag] target=%d live=%s"):format(target, tostring(M._bag_live_max)))
     end
+end
+
+--- Put books the game orphaned on load back into the bag.
+---
+--- The game persists carry capacity only up to 15, so a save taken while holding more restores a
+--- 15-slot bag holding all of them. The surplus ends up attached to the player but absent from
+--- Items: it follows the player around, cannot be dropped, and cannot be shelved.
+---
+--- Recovering is preferable to preventing. Capacity is rebuilt a moment after the world settles,
+--- so the bag can hold them again by the time this runs -- and the alternative, dropping the
+--- surplus before every save, would take books out of the player's hands on each autosave.
+---
+--- Runs only once capacity has reached its target, and only while the count is genuinely over what
+--- the game restored: re-adding while the bag still reads 15 would be re-orphaned immediately.
+function M.recover_orphaned_bag_books()
+    if not _diag_on("BAG_ORPHAN_RECOVERY") then return end
+    if not (M._gameplay_active and M._apply_safe) then return end
+    if M._bag_orphans_done then return end
+    -- Capacity has to be back up first, or the bag has nowhere to put them.
+    if not M._bag_live_max or (M._bag_logged_target and M._bag_live_max < M._bag_logged_target) then
+        return
+    end
+
+    local player = FindFirstOf("BP_LibrarianCharacter_C")
+    if not (player and player:IsValid()) then return end
+    local bag
+    pcall(function() bag = player.ItemBagComponent end)
+    if not (bag and bag:IsValid()) then return end
+
+    -- Address set of what the bag already holds; orphans are attached books absent from it.
+    local held, n_held = {}, 0
+    pcall(function()
+        local items = bag.Items
+        local n = 0
+        if items then pcall(function() n = #items end) end
+        for i = 1, math.min(n, 64) do
+            local it = items[i]
+            if it and it:IsValid() then
+                local a; pcall(function() a = it:GetAddress() end)
+                if a then held[a] = true; n_held = n_held + 1 end
+            end
+        end
+    end)
+
+    local orphans = {}
+    pcall(function()
+        local books = FindAllOf("BP_GrabbingBook_C")
+        local n = 0
+        if books then pcall(function() n = #books end) end
+        for i = 1, math.min(n, 8000) do
+            local b = books[i]
+            local alive = false
+            pcall(function() alive = b and b:IsValid() end)
+            if alive then
+                local parent
+                pcall(function() parent = b:GetAttachParentActor() end)
+                if parent and parent:IsValid() then
+                    local pa, ba
+                    pcall(function() pa = parent:GetAddress() end)
+                    pcall(function() ba = b:GetAddress() end)
+                    local player_addr
+                    pcall(function() player_addr = player:GetAddress() end)
+                    if pa and player_addr and pa == player_addr and ba and not held[ba] then
+                        orphans[#orphans + 1] = b
+                    end
+                end
+            end
+        end
+    end)
+
+    if #orphans == 0 then
+        M._bag_orphans_done = true
+        return
+    end
+
+    log(("[bag] %d book(s) attached to the player but not in the bag (holding %d, max %s) -- re-adding")
+        :format(#orphans, n_held, tostring(M._bag_live_max)))
+    local ok_n = 0
+    for _, b in ipairs(orphans) do
+        if pcall(function() bag:PickUpGameItem(b) end) then ok_n = ok_n + 1 end
+    end
+    M._bag_orphans_done = true
+
+    -- Report what the bag actually holds afterwards rather than what was attempted: PickUpGameItem
+    -- can refuse silently, and "re-added 3" with an unchanged bag would read as a fix that worked.
+    local after = 0
+    pcall(function()
+        local items = bag.Items
+        if items then pcall(function() after = #items end) end
+    end)
+    log(("[bag] re-add issued for %d/%d; bag now holds %d (was %d)")
+        :format(ok_n, #orphans, after, n_held))
 end
 
 -- ============================================================================
