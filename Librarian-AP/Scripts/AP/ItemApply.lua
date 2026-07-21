@@ -785,6 +785,16 @@ function M.run_baseline_sync()
     if M._baseline_sync_done then return end
     M._baseline_sync_done = true
 
+    -- Nothing to catch up on in a world that has just been created. Every sync below reads prior
+    -- progress -- completed rows, sections, floors, and the row count behind the XP level -- and
+    -- GameSaveData still holds the PREVIOUS session's save when a New Game world settles. Reading
+    -- it sent a burst of level-up checks the run had not earned into a live multiworld.
+    local SI = package.loaded["AP/SaveIdentity"]
+    if SI and SI.fresh_world then
+        log("[baseline] fresh New Game — no prior progress to sync")
+        return
+    end
+
     local row_synced = 0
     pcall(function() row_synced = M.detect_completed_rows() end)
     if row_synced and row_synced > 0 then
@@ -2983,11 +2993,15 @@ function M.detect_completed_rows()
             return false
         end
         if M._sent_row_locations[loc_id] then return false end
+        local APClient = package.loaded["AP/APClient"]
+        if not (APClient and APClient.send_check) then return false end
+        -- Mark it only once the send is accepted. send_check refuses while save identity is
+        -- unverified, and marking first burned the location for the session -- detected, never
+        -- sent, and never retried.
+        if not APClient:send_check(loc_id) then return false end
         M._sent_row_locations[loc_id] = true
         log(("[row-detect] %s / %s -> loc %d %s"):format(sid, series_name, loc_id, dbg or ""))
-        local APClient = package.loaded["AP/APClient"]
-        if APClient and APClient.send_check then APClient:send_check(loc_id); return true end
-        return false
+        return true
     end
 
     for sid, cases in pairs(M._section_to_cases) do
@@ -3458,15 +3472,20 @@ function M.sync_progress_state()
         local prev_levels_reached = M._levels_reached
         log(("[progress] sync catch-up: _levels_reached %d → %d (xp=%d sent=%d) — firing send_check for missed levels"):format(
             prev_levels_reached, floor_level, current_level, sent_level_floor))
-        M._levels_reached = floor_level
         -- Fire send_check for every level in the catch-up range, else the counter advances
         -- but skipped levels never transmit (send_check dedupes, so re-firing is a no-op).
+        -- The counter only advances once every send is accepted: advancing past a refusal would
+        -- close this branch and the levels would never be retried.
         local APClient = package.loaded["AP/APClient"]
         if APClient and APClient.send_check then
+            local all_sent = true
             for level = 1, floor_level do
-                APClient:send_check(AP_LOC_LEVEL_FIRST + (level - 1))
+                if not APClient:send_check(AP_LOC_LEVEL_FIRST + (level - 1)) then all_sent = false end
             end
-            levels_sent = floor_level - prev_levels_reached
+            if all_sent then
+                M._levels_reached = floor_level
+                levels_sent = floor_level - prev_levels_reached
+            end
         end
     end
 
@@ -3475,13 +3494,14 @@ function M.sync_progress_state()
     local thresholds = M._slot_data.milestone_thresholds or {}
     for i, threshold in ipairs(thresholds) do
         if books_placed >= threshold and not M._milestones_sent[threshold] then
-            M._milestones_sent[threshold] = true
             local loc = AP_LOC_MILESTONE_FIRST + (i - 1)
-            log(("[progress] milestone: %d books placed (have %d) → loc %d"):format(
-                threshold, books_placed, loc))
             local APClient = package.loaded["AP/APClient"]
-            if APClient and APClient.send_check then
-                APClient:send_check(loc)
+            -- Marked only on an accepted send: a milestone never re-fires, so recording one that
+            -- the identity gate refused would lose it for good.
+            if APClient and APClient.send_check and APClient:send_check(loc) then
+                M._milestones_sent[threshold] = true
+                log(("[progress] milestone: %d books placed (have %d) → loc %d"):format(
+                    threshold, books_placed, loc))
                 milestones_sent = milestones_sent + 1
             end
         end
@@ -3527,6 +3547,14 @@ end
 --- so AP's reconnect re-dump doesn't re-bump skills already at level. Also refreshes the HUD.
 function M._init_applied_skill_counts_from_save()
     M._applied_skill_counts = {}
+    -- A New Game world starts every skill at zero, but GameSaveData still holds the previous
+    -- session's save when it settles. Seeding from that made every incoming Progressive item
+    -- no-op against `applied >= target`, so the player was granted skills they never received.
+    local SI = package.loaded["AP/SaveIdentity"]
+    if SI and SI.fresh_world then
+        log("[skill-baseline] fresh New Game — skills start at zero, not reading the save")
+        return
+    end
     local gi = FindFirstOf("BP_LibrarianGameInstance_C")
         or FindFirstOf("LibrarianGameInstanceBase")
     if not gi or not gi:IsValid() then

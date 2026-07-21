@@ -2828,6 +2828,8 @@ gt_loop("autoload", 500, function()
         log(("[save-id] auto-load: loading slot %d (set=%s load=%s)")
             :format(SI.slot, tostring(set), tostring(ok)))
         SI.autoload_done = true
+        -- A loaded save DOES have history, so the baselines must read it again.
+        SI.fresh_world = false
         _autoload_stage = nil
         return false
     end
@@ -3295,6 +3297,10 @@ local function on_title_start_game_pressed(self)
     local SI = package.loaded["AP/SaveIdentity"]
     if AC and AC._slot_connected and SI and not SI.slot then
         SI.pending_fresh = true
+        -- Outlives pending_fresh on purpose: the progress baselines read GameSaveData, which still
+        -- holds the PREVIOUS session's save when a New Game world settles. Reading it granted
+        -- phantom level-ups and left incoming skills looking already-applied.
+        SI.fresh_world = true
         log("[save-id] fresh run armed — will claim a slot once the world settles")
     end
 end

@@ -39,6 +39,10 @@ M.seed         = nil       -- AP seed, set at connect
 M.ap_slot      = nil       -- AP slot number, set at connect
 M.storage_key  = nil       -- server key holding the claimed slot
 M.pending_fresh = false    -- New Game pressed; claim a slot once the world settles
+-- This world came from New Game, so it has no history: every progress baseline is zero by
+-- definition. Distinct from pending_fresh, which the slot claim clears within a second or two --
+-- too early to gate reads that wait on the player moving. Cleared when a save is loaded.
+M.fresh_world = false
 M.title_preapply = false   -- warding the title-behind world is worth doing this run
 M.stored_fp    = nil       -- layout hash recorded at this run's last save
 M.fp_checked   = false     -- layout compared for the current world already
@@ -526,7 +530,7 @@ function M.reset()
     M.slot, M.slot_source = nil, nil
     M.override = false
     M.seed, M.ap_slot, M.storage_key = nil, nil, nil
-    M.pending_fresh, M.title_preapply = false, false
+    M.pending_fresh, M.title_preapply, M.fresh_world = false, false, false
     M.stored_fp, M.fp_checked, M.autoload_done = nil, false, false
     M.mirror_pending = nil
     -- Cleared here on purpose: a connection re-arms the mod even if the player

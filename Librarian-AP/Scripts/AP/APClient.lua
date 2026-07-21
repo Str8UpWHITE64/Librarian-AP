@@ -455,10 +455,13 @@ end
 --- missed path is a false check in someone else's multiworld.
 --- Dropped rather than queued: a check derived from the wrong world must not be
 --- held and flushed later if the right save is loaded afterwards.
+--- Returns true when the check is sent or already known-sent, false when it was refused.
+--- Callers that record their own "already fired" state must gate on this: a refusal is temporary
+--- (identity not yet verified), and treating it as sent loses the check for the session.
 function Client:send_check(location_id)
     location_id = tonumber(location_id)
-    if not location_id then return end
-    if self._sent_checks[location_id] then return end
+    if not location_id then return false end
+    if self._sent_checks[location_id] then return true end
 
     local SI = package.loaded["AP/SaveIdentity"]
     if SI and not SI.may_send_checks() then
@@ -466,12 +469,13 @@ function Client:send_check(location_id)
             self._id_block_logged = true
             log(("Checks held: %s"):format(SI.reason or "save identity not confirmed"))
         end
-        return
+        return false
     end
     self._id_block_logged = nil
 
     self._outgoing_checks[#self._outgoing_checks + 1] = location_id
     if self.on_check_sent then pcall(self.on_check_sent, location_id) end
+    return true
 end
 
 --- Mark whether the player is currently in a gameplay level. When false,
