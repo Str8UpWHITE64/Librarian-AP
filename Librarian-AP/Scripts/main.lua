@@ -495,7 +495,21 @@ local function _bh_grab_check(b, tag)
     -- Some broken books have correct identity but corrupt display (out-of-range Tints + invisible)
     -- while every flag reads normal. RefreshInfo re-derives appearance from BookInfo; redraw on
     -- grab of an unwarded book. Gated BOOK_REFRESH_FIX.
-    if diag_on("BOOK_REFRESH_FIX") and unwarded_here == true then
+    --
+    -- Never while Insight is showing. RefreshInfo rebuilds the book's material instances, and the
+    -- highlight is one of them -- refreshing a lit book leaves the skill's later "turn it off"
+    -- writing to a material that is no longer the one on screen, so the book stays yellow until a
+    -- reload rebuilds it. Grabbing a highlighted book is exactly what Assemble does during Insight.
+    -- This redraw only heals a cosmetic fault, so deferring it past a skill window costs nothing.
+    local insight_showing = false
+    pcall(function()
+        local p = FindFirstOf("BP_LibrarianCharacter_C")
+        if p and p:IsValid() then
+            local sidx = p:GetShowingSameTypeIdx()
+            insight_showing = (type(sidx) == "number" and sidx >= 0)
+        end
+    end)
+    if diag_on("BOOK_REFRESH_FIX") and unwarded_here == true and not insight_showing then
         local ok = pcall(function() b:RefreshInfo() end)
         _bh.refreshed = (_bh.refreshed or 0) + 1
         if (_bh.refresh_samples or 0) < 20 then
@@ -1076,9 +1090,13 @@ local function bh_report_periodic()
     if not diag_on("BOOK_EVENT_HOOKS") then return end
     _bh_report_tick = _bh_report_tick + 1
     if _bh_report_tick % 6 ~= 0 then return end   -- ~every 30s (6 ticks of the 5s loop)
-    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d (denied=%d) Grab=%d (grabfix=%d) refresh-sweep=%d | magic: fx-denied=%d bag-evicted=%d"):format(
+    -- refresh-grab is reported alongside refresh-sweep: the grab-path redraw rewrites book
+    -- materials, and leaving it out of this line hid it while a material-state bug was being
+    -- chased through the counters that were printed.
+    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d (denied=%d) Grab=%d (grabfix=%d) refresh-grab=%d refresh-sweep=%d | magic: fx-denied=%d bag-evicted=%d"):format(
         _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab, _bh.grab_denied or 0,
-        _bh.grabbed, _bh.grabfix, _bh.rsweep or 0, _bh.fx_denied or 0, _bh.bag_evicted or 0))
+        _bh.grabbed, _bh.grabfix, _bh.refreshed or 0, _bh.rsweep or 0,
+        _bh.fx_denied or 0, _bh.bag_evicted or 0))
 end
 
 -- ============================================================================
@@ -2515,7 +2533,10 @@ local _insight = { idx = -1, books = nil, rehid = 0, passes = 0, grace = 0 }
 gt_loop("insight_ward", 100, function()
     if not diag_on("MAGIC_WARD_INSIGHT_ACTOR") then return end
     local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA._book_sanity_enabled and IA._apply_safe) then return end
+    -- Every mode, not just BookSanity. The reveal is the actor's own hidden flag, and books are
+    -- hidden the same way whichever unlock mode warded them -- gating this on book-sanity left the
+    -- two series modes exposed. _bh_book_is_warded already answers correctly in all of them.
+    if not (IA and IA._apply_safe) then return end
 
     local sidx = -1
     pcall(function()
@@ -2544,6 +2565,10 @@ gt_loop("insight_ward", 100, function()
             local books = FindAllOf("BP_GrabbingBook_C")
             local n = 0
             if books then pcall(function() n = #books end) end
+            -- The series' own volume count is how many there are to find, so the walk can stop
+            -- early instead of running the whole library on every activation. Two full sets of
+            -- book actors exist, so allow for the duplicate before giving up on an early exit.
+            local want = (IA._asset_to_volumes and IA._asset_to_volumes[sidx] or 0) * 2
             for i = 1, math.min(n, 8000) do
                 local b = books[i]
                 local alive = false
@@ -2554,7 +2579,10 @@ gt_loop("insight_ward", 100, function()
                         local info = b.ItemInfo
                         if info then aidx = tonumber(info.AssetIdx) end
                     end)
-                    if aidx == sidx then keep[#keep + 1] = b end
+                    if aidx == sidx then
+                        keep[#keep + 1] = b
+                        if want > 0 and #keep >= want then break end
+                    end
                 end
             end
         end)
