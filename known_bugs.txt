@@ -1,3 +1,12 @@
+1.2.0 Known Bugs:
+
+- A book can render but refuse interaction: visible, no title, cannot be picked up. Reloading the
+  game clears it. Not reproducible on demand -- reported once, one book, in a hidden-books run.
+  Suspected: the warded test returns "unknown" for a book whose series cannot be resolved, and the
+  visibility-enforce path deliberately leaves such a book alone rather than acting on a bad read, so
+  it is shown while its collision stays off. A reload rebuilds the mapping and the book behaves.
+  Low impact -- one book, self-clearing -- so it is recorded rather than chased.
+
 1.0.0 Known Bugs:
 
 - Crash when running Special Stage.  Need to remove that as an option and fix the underlying issue.
