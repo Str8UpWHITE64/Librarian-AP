@@ -678,6 +678,16 @@ function M.run_baseline_sync()
     if M._baseline_sync_done then return end
     M._baseline_sync_done = true
 
+    -- Nothing to catch up on in a just-created world. Every sync below reads prior progress --
+    -- completed rows, sections, floors, the row count behind the XP level -- and GameSaveData still
+    -- holds the PREVIOUS session's save when a New Game world settles. Reading it sent a burst of
+    -- level-up checks the run had not earned into a live multiworld.
+    local SI = package.loaded["AP/SaveIdentity"]
+    if SI and SI.fresh_world then
+        log("[baseline] fresh New Game — no prior progress to sync")
+        return
+    end
+
     local row_synced = 0
     pcall(function() row_synced = M.detect_completed_rows() end)
     if row_synced and row_synced > 0 then
@@ -3200,6 +3210,14 @@ end
 --- so AP's reconnect re-dump doesn't re-bump skills already at level. Also refreshes the HUD.
 function M._init_applied_skill_counts_from_save()
     M._applied_skill_counts = {}
+    -- A New Game starts every skill at zero, but GameSaveData still holds the previous session's
+    -- save when it settles. Seeding from that made incoming Progressive items no-op against
+    -- "already applied", so the player was granted skills they never received in game.
+    local SI = package.loaded["AP/SaveIdentity"]
+    if SI and SI.fresh_world then
+        log("[skill-baseline] fresh New Game — skills start at zero, not reading the save")
+        return
+    end
     local gi = FindFirstOf("BP_LibrarianGameInstance_C")
         or FindFirstOf("LibrarianGameInstanceBase")
     if not gi or not gi:IsValid() then
