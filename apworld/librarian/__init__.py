@@ -1022,7 +1022,7 @@ class LibrarianWorld(World):
             # the numeric X.Y.Z for its warding-rule gate; the -rcN/-betaN suffix is informational.
             # NOT the AP world version -- archipelago.json:world_version is a CLEAN semver (no suffix)
             # so AP can parse it for YAML `requires: game:` checks (a suffix there reads as 0.0.0).
-            "version": "1.1.2",
+            "version": "1.1.3",
             "goal": goal_value,
             # Row count at which the Lua client should send STATUS_GOAL.
             # Ignored for the "full" goal (the game's EndGame fires it).

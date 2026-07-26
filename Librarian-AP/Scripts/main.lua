@@ -1207,7 +1207,7 @@ end
 -- WBP_Title.Text_Version (bottom-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
-local MOD_VERSION = "1.1.2"
+local MOD_VERSION = "1.1.3"
 local TESTED_GAME_VERSIONS = { "1.0.12", "1.0.13" }
 
 -- Hard floor, not a preference. Below this the game keeps saves as one flat file, so the slot the
@@ -1781,7 +1781,11 @@ local function start_gameplay_loops()
                     rf = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
                 end
             end
-            if rf > 0 then IA.fire_row_completion_checks(rf) end
+            -- Same stale-save rule as the other progress reads: during a New Game this is the
+            -- PREVIOUS run's row count, and firing it sent 52 unearned thresholds.
+            if rf > 0 and not IA.save_progress_is_stale(rf) then
+                IA.fire_row_completion_checks(rf)
+            end
         end)
         -- Section-completion: a swap above may have closed out a section without a FinishRow. Idempotent.
         pcall(function() IA.fire_section_completions() end)

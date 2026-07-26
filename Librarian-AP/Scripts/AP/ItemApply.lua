@@ -390,6 +390,7 @@ function M.set_slot_data(slot_data)
     M._level_baseline_done = false
     M._milestones_sent = {}
     M._baseline_sync_done = false
+    M._stale_save_logged = false
     M._books_placed_observed = 0
     M._books_placed_peak = 0
     M._initialized = next(M._asset_to_series) ~= nil
@@ -532,6 +533,7 @@ function M.clear_check_dedupe()
     M._milestones_sent = {}
     M._baseline_sync_done = false
     M._level_baseline_done = false
+    M._stale_save_logged = false
 end
 
 --- Called by main.lua's LoadMap hook. Toggles whether we're in gameplay. World apply does
@@ -674,6 +676,33 @@ end
 
 -- Called by main.lua's movement-detection loop on first post-load movement, by which
 -- point GameSaveData reflects the actually-loaded save, so the baseline read is safe.
+--- Is GameSaveData still describing the PREVIOUS run rather than this one?
+---
+--- During a New Game the last session's save stays resident until the game resets it, so anything
+--- that derives progress from it grants the new run the old one's history. Every progress read
+--- funnels through here so a new one cannot be added without meeting the rule.
+---
+--- The save's own row count is the clearing signal: a world with no history reads 0, and the first
+--- time it does the guard drops for the rest of the session. Anything above 0 while the flag is up
+--- is last run's data -- a genuinely new world cannot have finished a row before the player has
+--- moved. Real progress still flows the whole time via the OnLevelUp / FinishRow hooks, which read
+--- events rather than the save; only the catch-up backstops are held back.
+function M.save_progress_is_stale(rows_finished)
+    local SI = package.loaded["AP/SaveIdentity"]
+    if not (SI and SI.fresh_world) then return false end
+    if (tonumber(rows_finished) or 0) == 0 then
+        SI.fresh_world = false
+        log("[baseline] save data now reads as a fresh world -- progress reads re-enabled")
+        return false
+    end
+    if not M._stale_save_logged then
+        M._stale_save_logged = true
+        log(("[baseline] ignoring stale save progress (rows=%s) -- New Game, previous save still resident")
+            :format(tostring(rows_finished)))
+    end
+    return true
+end
+
 function M.run_baseline_sync()
     if M._baseline_sync_done then return end
     M._baseline_sync_done = true
@@ -3090,6 +3119,13 @@ function M.sync_progress_state()
             log(("[progress] skipping GameSaveData read — current slot %q is not our AP slot"):format(
                 tostring(current_slot)))
         end
+    end
+    -- The is_ap_slot test above only proves the save NAME is ours; on a New Game the name is set
+    -- before the previous run's contents are cleared, so it passes while the data is still stale.
+    -- That is the gap this closes: 44 level-ups and 52 row thresholds were sent from a save the
+    -- new run had never played.
+    if M.save_progress_is_stale(rows_finished) then
+        rows_finished, books_placed_save = 0, 0
     end
     local books_placed_widget = M._read_widget_book_count() or 0
     local books_placed_current = math.max(books_placed_save, books_placed_widget,
