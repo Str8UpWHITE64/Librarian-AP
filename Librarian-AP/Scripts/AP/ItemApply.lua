@@ -2891,7 +2891,10 @@ end
 --- verdict, the gold-highlight) and fire the per-book location check for newly-correct books.
 --- De-duped via M._books_correct_seen. Runs on the game thread, so it may read actors directly.
 --- Returns the count of new checks sent.
-local DCB_CHUNK = 500   -- books per pass; ~3000 books wrap in ~6 passes of the 3s loop
+local DCB_CHUNK = 250        -- books per rolling pass. Halved from 500: this sweep is only the
+                             -- backstop now (inserts drive the fast sweep), and 250 reflected
+                             -- "Is Abs Correct" reads fit a frame without a visible spike.
+local DCB_FAST_CHUNK = 1536  -- insert-triggered sweep: whole library in ~4 passes of the 500ms loop
 
 --- Ask the next scan to cover every book instead of one chunk. Called when the
 --- game reports a book was shelved, so the check fires promptly rather than
@@ -2911,18 +2914,18 @@ function M.detect_correct_books()
     -- streaming), so snapshot the list once and walk a slice per pass; actors freed under the
     -- snapshot are caught by the IsValid() below. The re-snap at the wrap is the only thing that
     -- refreshes the list after a world reload.
-    -- A book was just shelved, so scan the whole set now instead of waiting for
-    -- the rolling cursor to reach it. Chunking exists to keep the periodic sweep
-    -- off the frame budget; an insert is a discrete player action, so paying for
-    -- one full pass there is both rare and exactly when the check is expected.
-    local full = M._dcb_full_scan
-    M._dcb_full_scan = false
+    -- A shelved book used to trigger a FULL scan in one frame -- the exact stall the chunking
+    -- exists to avoid, paid on every insert, which in BookSanity is the player's core loop. It now
+    -- arms a FAST sweep instead: fresh snapshot, larger chunks, driven by the 500ms loop until it
+    -- wraps. Worst-case check latency is ~2s after shelving; no single frame carries the library.
+    if M._dcb_full_scan then
+        M._dcb_full_scan = false
+        M._dcb_fast = true
+        M._dcb_books, M._dcb_cursor = nil, 0   -- fresh snapshot, from the top
+    end
 
     local books = M._dcb_books
     local cursor = M._dcb_cursor or 0
-    if full then
-        books, cursor = nil, 0   -- force a re-snapshot and start from the top
-    end
     if not books or cursor >= (M._dcb_n or 0) then
         books = FindAllOf("BP_GrabbingBook_C")
         if not books then M._dcb_books = nil; return 0 end
@@ -2936,7 +2939,7 @@ function M.detect_correct_books()
 
     local seen = M._books_correct_seen
     local sent = 0
-    local stop = full and n or math.min(cursor + DCB_CHUNK, n)
+    local stop = math.min(cursor + (M._dcb_fast and DCB_FAST_CHUNK or DCB_CHUNK), n)
     for i = cursor + 1, stop do
         local book = books[i]
         if book and book:IsValid() then
@@ -2956,12 +2959,15 @@ function M.detect_correct_books()
                 if is_correct and chapter ~= nil and series_name then
                     local bid = series_name .. "|" .. chapter
                     if not seen[bid] then
-                        -- Mark seen regardless so a book with no mapped location
-                        -- (e.g. the other floor under a floor goal) isn't rescanned.
-                        seen[bid] = true
                         local loc_id = tonumber(blm[bid])
-                        if loc_id then
-                            APClient:send_check(loc_id)
+                        if not loc_id then
+                            -- No mapped location (e.g. the other floor under a floor goal):
+                            -- mark seen so it isn't rescanned every sweep.
+                            seen[bid] = true
+                        elseif APClient:send_check(loc_id) then
+                            -- Marked only on an accepted send. send_check refuses while identity
+                            -- is unverified, and marking first burned the check for the session.
+                            seen[bid] = true
                             sent = sent + 1
                             log(("[book-correct] %s ch%d -> loc %d"):format(
                                 series_name, chapter, loc_id))
@@ -2972,6 +2978,7 @@ function M.detect_correct_books()
         end
     end
     M._dcb_cursor = stop
+    if M._dcb_fast and stop >= n then M._dcb_fast = false end   -- fast sweep wrapped; back to rolling
     if sent > 0 then
         log(("[book-correct] sent %d new book check(s)"):format(sent))
     end

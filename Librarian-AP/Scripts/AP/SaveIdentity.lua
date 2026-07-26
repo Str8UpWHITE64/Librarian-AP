@@ -260,6 +260,15 @@ function M.fingerprint()
     -- Every nil return records WHY: a fingerprint that silently declines to exist reads exactly
     -- like one with nothing to say, and that ambiguity cost two wrong diagnoses.
     M.fp_why = nil
+    -- Homes never move while a world is loaded, so one complete read is valid for that world's
+    -- whole session. Without this the mirror recomputed it behind every game autosave -- a walk
+    -- over ~6k actors, several times a minute during active shelving, felt as a periodic hitch.
+    local IA = package.loaded["AP/ItemApply"]
+    local epoch = IA and IA._world_epoch
+    local cch = M._fp_cache
+    if cch and epoch and cch.epoch == epoch then
+        return cch.fp, cch.sample, cch.unplaced
+    end
     local books = FindAllOf("BP_GrabbingBook_C")
     if not books then M.fp_why = "FindAllOf returned nothing"; return nil end
     local n = 0
@@ -319,6 +328,11 @@ function M.fingerprint()
         for c = 1, #s do
             h = (h * 33 + s:byte(c)) % 4294967296
         end
+    end
+    -- Cache only a COMPLETE read: a partial one (books still spawning, some at the origin) must
+    -- not freeze for the session, or the frozen hash would never match a finished world.
+    if epoch and unplaced == 0 and #entries >= 3000 then
+        M._fp_cache = { epoch = epoch, fp = h, sample = #entries, unplaced = unplaced }
     end
     return h, #entries, unplaced
 end

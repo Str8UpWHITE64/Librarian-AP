@@ -69,6 +69,15 @@ local _gt_pending_f6  = false     -- dev: fire the Recall Stone once (MAGIC_TEST
 local _l3_resume = nil            -- L3 (book-pile HISM) chunk resume; the master scheduler advances it one chunk/frame
 local _l3c_ep, _l3c_mgr, _l3c_mat, _l3c_ready   -- L3 setup scan cache (per world epoch): HISM mgr / mask material / ready flag
 local _gt_last_epoch = -1         -- last world epoch the scheduler saw; a bump means the captured warding arrays are freed
+-- Hitch attribution + memory triage, reported to the log so a TESTER'S session can name the
+-- culprit. dt is the whole previous frame, so a spike blames every step that ran in it plus
+-- whatever the game itself was doing -- the names are suspects, not verdicts. The 60s summary
+-- carries the Lua heap: if the process RSS climbs while that line stays flat, the growth is not
+-- in the mod's Lua (engine streaming, or native-side object caches).
+local _perf = { names = {}, n = 0, worst = 0, sum = 0, cnt = 0,
+                b33 = 0, b66 = 0, b100 = 0, b150 = 0,
+                blame = {}, since = 0, cool = 0, kb0 = nil }
+
 local function gt_loop(name, interval_ms, fn)
     if POLL_GT then
         if not _gt_steps[name] then _gt_step_order[#_gt_step_order + 1] = name end
@@ -85,6 +94,8 @@ local function gt_run_steps(dt_ms)
             st.accum = st.accum + dt_ms
             if st.accum >= st.interval then
                 st.accum = 0
+                _perf.n = _perf.n + 1
+                _perf.names[_perf.n] = name
                 local ok, res = pcall(st.fn)
                 if ok then
                     if res == true then st.stopped = true end
@@ -2258,7 +2269,9 @@ local function start_gameplay_loops()
         local IA = package.loaded["AP/ItemApply"]
         if not IA then return false end
         if not (IA._gameplay_active or IA._allow_pre_apply) then return true end
-        if IA._dcb_full_scan and IA._apply_safe and not IA._flush_in_progress then
+        -- _dcb_fast keeps the insert-triggered sweep riding this 500ms loop until it wraps;
+        -- without it the fast chunks would fall back to the 3s loop and take ~12s to cover.
+        if (IA._dcb_full_scan or IA._dcb_fast) and IA._apply_safe and not IA._flush_in_progress then
             local sent = 0
             pcall(function() sent = IA.detect_correct_books() or 0 end)
             if sent > 0 then
@@ -2278,8 +2291,15 @@ local function start_gameplay_loops()
         if not (IA._gameplay_active or IA._allow_pre_apply) then return true end
 
         _mirror_ticks = (_mirror_ticks or 0) + 1
+        if (_mirror_cool or 0) > 0 then _mirror_cool = _mirror_cool - 1 end
         if _mirror_ticks % 60 == 0 then SI.mirror_pending = "timer" end   -- ~2 min
         if not SI.mirror_pending then return false end
+        -- Coalesce bursts. The game autosaves on every shelved book, and each echo used to cost a
+        -- second full SaveGameData right behind the game's own -- back-to-back full saves several
+        -- times a minute during active shelving, felt as hitches. The request stays armed and fires
+        -- once the window passes; a hard crash loses at most the last ~30s of mirror, which the
+        -- home-keyed fingerprint still verifies. Quitting mirrors immediately via mirror_now.
+        if (_mirror_cool or 0) > 0 then return false end
 
         local ok, why = SI.can_force_save()
         if not ok then
@@ -2298,6 +2318,7 @@ local function start_gameplay_loops()
         local wrote = pcall(function() gi:SaveGameData(SI.slot, false) end)
         SI.mirroring = false
         if wrote then
+            _mirror_cool = 15   -- 15 ticks of the 2s loop ≈ 30s before the next mirror
             log(("[save-id] mirrored to slot %d on %s (layout=%s)")
                 :format(SI.slot, tostring(which), _fp_desc(SI.record_layout)))
         end
@@ -2367,47 +2388,49 @@ local function start_gameplay_loops()
             IA._pending_level_ups = 0
             for _ = 1, _lvls do pcall(function() IA.on_level_up_event() end) end
         end
-        pcall(function() IA.sync_progress_state() end)
-        -- Re-run row-completion detection: FinishRow only fires when the row count INCREASES, so a
-        -- swap (remove a completed series, refill the slot with another) goes undetected. Idempotent.
-        pcall(function() IA.detect_completed_rows() end)
-        -- BookSanity: fire per-book location checks for books newly placed correctly (reads each
-        -- book's "Is Abs Correct"). De-duped in ItemApply; no-op unless book_sanity is enabled.
-        pcall(function() IA.detect_correct_books() end)
-        -- Row-threshold catch-up: re-fire any "Complete N Rows" threshold the save shows reached
-        -- (catches a run_baseline_sync that ran with stale GameSaveData). Idempotent.
-        pcall(function()
-            local rf = 0
-            local gi = FindFirstOf("BP_LibrarianGameInstance_C")
-                or FindFirstOf("LibrarianGameInstanceBase")
-            if gi and gi:IsValid() then
-                local sg = gi.GameSaveData
-                if sg and sg:IsValid() then
-                    rf = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
+        -- ONE group of passes per tick, not all of them. Running the whole tail back-to-back put
+        -- ~11 passes -- a 500-book reflected-read chunk, nine FindFirstOf scans, the save reads --
+        -- into a single frame every 3s, measured as a 33-50ms spike every ~3.5s: the rhythmic
+        -- hitch players felt. Everything here is an idempotent backstop (the prompt paths are
+        -- hooks and the insert-triggered fast sweep), so each group running every 12s costs only
+        -- edge-case latency, not correctness.
+        _sync_rot = ((_sync_rot or 0) % 4) + 1
+        if _sync_rot == 1 then
+            -- Row-ish re-checks: FinishRow only fires when the row count INCREASES, so a swap
+            -- (remove a completed series, refill with another) goes undetected without these.
+            pcall(function() IA.detect_completed_rows() end)
+            pcall(function()
+                local rf = 0
+                local gi = FindFirstOf("BP_LibrarianGameInstance_C")
+                    or FindFirstOf("LibrarianGameInstanceBase")
+                if gi and gi:IsValid() then
+                    local sg = gi.GameSaveData
+                    if sg and sg:IsValid() then
+                        rf = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
+                    end
                 end
-            end
-            if rf > 0 then IA.fire_row_completion_checks(rf) end
-        end)
-        -- Section-completion: a swap above may have closed out a section without a FinishRow. Idempotent.
-        pcall(function() IA.fire_section_completions() end)
-        -- Floor-completion: same, one granularity coarser. Idempotent.
-        pcall(function() IA.fire_floor_completions() end)
-        -- Skill resync: if save-side level lags received item count (a dropped UpgradePlayer),
-        -- retry the missing applies. Never over-grants past received counts.
-        pcall(function() IA.resync_skill_state() end)
-        -- Attunement extensions for maxed skills, plus the countdown on running Fatigue
-        -- debuffs (arg = this loop's interval, seconds).
-        pcall(function() IA.apply_attunement(3) end)
-        -- Book capacity: re-apply the bag-grant surplus (capacity resets past 15 each load).
-        pcall(function() IA.apply_bag_capacity() end)
-        -- Then reclaim anything the load left attached to the player but outside the bag: saving
-        -- with more than the persisted 15 restores the surplus into limbo. Runs after the capacity
-        -- pass above, since the bag needs the room before it will take them back.
-        pcall(function() IA.recover_orphaned_bag_books() end)
-        -- BookSanity: re-hide any pile instances Insight dragged back into view. Must run from here
-        -- and not the SetActorVisible hook -- a re-hide issued inside the hook is overwritten while
-        -- the skill is still showing. No-op unless book_sanity + hidden mode.
-        pcall(function() IA.resweep_book_piles() end)
+                if rf > 0 then IA.fire_row_completion_checks(rf) end
+            end)
+            pcall(function() IA.fire_section_completions() end)
+            pcall(function() IA.fire_floor_completions() end)
+        elseif _sync_rot == 2 then
+            -- BookSanity rolling sweep (reads each book's "Is Abs Correct"). The insert-triggered
+            -- fast sweep is the prompt path; this is the backstop for missed events.
+            pcall(function() IA.detect_correct_books() end)
+        elseif _sync_rot == 3 then
+            pcall(function() IA.sync_progress_state() end)
+            -- Skill resync: if save-side level lags received item count (a dropped
+            -- UpgradePlayer), retry the missing applies. Never over-grants.
+            pcall(function() IA.resync_skill_state() end)
+        else
+            -- Attunement extensions + Fatigue countdown (arg = seconds since this group last ran).
+            pcall(function() IA.apply_attunement(12) end)
+            pcall(function() IA.apply_bag_capacity() end)
+            pcall(function() IA.recover_orphaned_bag_books() end)
+            -- Re-hide pile instances Insight dragged up. From here and not the SetActorVisible
+            -- hook: a re-hide issued inside the hook is overwritten while the skill still shows.
+            pcall(function() IA.resweep_book_piles() end)
+        end
         return false
     end)
 
@@ -2540,7 +2563,11 @@ gt_loop("insight_ward", 100, function()
 
     local sidx = -1
     pcall(function()
-        local p = FindFirstOf("BP_LibrarianCharacter_C")
+        -- This step runs inside the pawn-tick callback, so the per-frame wrapper is valid here.
+        -- FindFirstOf scans the whole object array; at this loop's 100ms cadence that was a
+        -- measurable steady cost for a pawn the tick already has in hand.
+        local p = _G._librarian_tick_pawn
+        if not (p and p:IsValid()) then p = FindFirstOf("BP_LibrarianCharacter_C") end
         if p and p:IsValid() then sidx = p:GetShowingSameTypeIdx() end
     end)
 
@@ -3417,6 +3444,55 @@ _G._librarian_gt_master_tick = function(dt_ms)
     local c = package.loaded["AP/APClient"]
     if not (c and c._poll_on_game_thread) then return end
     c._gt_tick_count = (c._gt_tick_count or 0) + 1
+
+    -- This frame's dt reflects the PREVIOUS tick's work, so the steps recorded then are the
+    -- suspects for a spike now. worst/avg/buckets are tracked UNCONDITIONALLY -- the first version
+    -- only measured frames past a 150ms bar and reported "worst=0ms" through stutter the player
+    -- could feel: at ~115fps a 60-120ms spike drops a dozen frames and never reached the bar.
+    _perf.cnt = _perf.cnt + 1
+    _perf.sum = _perf.sum + dt_ms
+    if dt_ms > _perf.worst then _perf.worst = dt_ms end
+    if dt_ms >= 33 then
+        _perf.b33 = _perf.b33 + 1
+        if dt_ms >= 66 then _perf.b66 = _perf.b66 + 1 end
+        if dt_ms >= 100 then _perf.b100 = _perf.b100 + 1 end
+        if dt_ms >= 150 then _perf.b150 = _perf.b150 + 1 end
+    end
+    _perf.cool = _perf.cool - dt_ms
+    -- Blame accrues from 33ms up -- the felt stutter class at high fps sits at 33-50ms, and the
+    -- first version's 66ms gate counted those spikes without naming a suspect. Detail lines keep
+    -- the higher bar plus a cooldown so the log stays readable.
+    if dt_ms >= 33 and _perf.n > 0 then
+        local parts = {}
+        for i = 1, _perf.n do
+            parts[i] = _perf.names[i]
+            _perf.blame[parts[i]] = (_perf.blame[parts[i]] or 0) + 1
+        end
+        local IAp = package.loaded["AP/ItemApply"]
+        if dt_ms >= 66 and IAp and IAp._gameplay_active and _perf.cool <= 0 then
+            _perf.cool = 5000
+            log(("[perf] %dms frame; steps last tick: %s")
+                :format(math.floor(dt_ms), table.concat(parts, ",")))
+        end
+    end
+    _perf.n = 0
+    _perf.since = _perf.since + dt_ms
+    if _perf.since >= 60000 then
+        _perf.since = 0
+        local kb = collectgarbage("count")
+        _perf.kb0 = _perf.kb0 or kb
+        local top = {}
+        for k, v in pairs(_perf.blame) do top[#top + 1] = ("%s=%d"):format(k, v) end
+        table.sort(top)
+        log(("[perf] 60s: avg=%.1fms worst=%dms spikes(33/66/100/150ms)=%d/%d/%d/%d lua=%.1fMB (%+.1fMB since start)%s"):format(
+            _perf.sum / math.max(1, _perf.cnt), math.floor(_perf.worst),
+            _perf.b33, _perf.b66, _perf.b100, _perf.b150,
+            kb / 1024, (kb - _perf.kb0) / 1024,
+            #top > 0 and ("; spike-steps: " .. table.concat(top, ",")) or ""))
+        _perf.worst, _perf.sum, _perf.cnt = 0, 0, 0
+        _perf.b33, _perf.b66, _perf.b100, _perf.b150 = 0, 0, 0, 0
+        _perf.blame = {}
+    end
     pcall(function() c:_tick_once() end)                 -- create + poll + outgoing + item-apply
     -- Both reached at runtime, not through the file-locals: `APClient` and `menu_toggle` are
     -- declared further down the file, so a closure built here would only see nil globals.
@@ -3525,6 +3601,12 @@ register_bp_hooks_once = function()
                 local _wok, _werr = pcall(function()
                     local pawn = self:get()
                     if not pawn then error("self:get() returned nothing", 0) end
+                    -- SAME-FRAME USE ONLY. The gt steps run synchronously inside this callback, so
+                    -- they may read this wrapper this frame; it is overwritten every tick and must
+                    -- never be read from a later frame or an async context (stale wrappers read as
+                    -- invalid -- that failure has already cost one silent outage). Consumers must
+                    -- IsValid() and fall back to FindFirstOf.
+                    _G._librarian_tick_pawn = pawn
                     local w = pawn:GetWorld()
                     if not w then error("pawn:GetWorld() returned nothing", 0) end
                     if not w:IsValid() then error("pawn world is not valid", 0) end
