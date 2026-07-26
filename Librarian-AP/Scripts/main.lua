@@ -2409,7 +2409,11 @@ local function start_gameplay_loops()
                         rf = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
                     end
                 end
-                if rf > 0 then IA.fire_row_completion_checks(rf) end
+                -- Same stale-save rule as the other progress reads: during a New Game this is the
+                -- PREVIOUS run's row count, and firing it sent 52 unearned thresholds.
+                if rf > 0 and not IA.save_progress_is_stale(rf) then
+                    IA.fire_row_completion_checks(rf)
+                end
             end)
             pcall(function() IA.fire_section_completions() end)
             pcall(function() IA.fire_floor_completions() end)
