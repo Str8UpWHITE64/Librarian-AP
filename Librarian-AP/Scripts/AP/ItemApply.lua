@@ -876,11 +876,12 @@ function M.run_baseline_sync()
             rc_synced, rows_finished))
     end
 
-    -- Level-up baseline. current_level = max(xp_level, sent_level):
+    -- Level-up baseline. current_level = max(xp_level, capped sent_level):
     --   xp_level   — walk player.SkillLevelUpRowNum vs rows_finished (needs BP loaded).
     --   sent_level — highest level loc in APClient._sent_checks (works without GameSaveData).
     -- The _sent_checks floor stops _levels_reached resetting to 0 on reconnect (else every
-    -- OnLevelUp re-queues an already-deduped level and the real one never sends).
+    -- OnLevelUp re-queues an already-deduped level and the real one never sends), but it is
+    -- server-side state that outlives the save, so save_level_cap bounds it by this run's rows.
     local xp_level = 0
     do
         local player = FindFirstOf("BP_LibrarianCharacter_C")
@@ -917,6 +918,8 @@ function M.run_baseline_sync()
         end
     end
     local sent_level = M._compute_sent_level_baseline()
+    local lvl_cap = M.save_level_cap()
+    if lvl_cap and sent_level > lvl_cap then sent_level = lvl_cap end
     local current_level = math.max(xp_level, sent_level)
     log(("Level-up baseline sync: rows_finished=%d, xp_level=%d, sent_level=%d → current_level=%d"):format(
         rows_finished, xp_level, sent_level, current_level))
@@ -3353,6 +3356,49 @@ function M._compute_sent_level_baseline()
     return max_sent
 end
 
+--- The highest level THIS save's own progress justifies, or nil when the save can't be read.
+--- _sent_checks lives on the server, so it outlives restarts, reinstalls and deleted saves: a run
+--- that starts over on the same slot inherits the old run's level count. Capping the sent floor
+--- with this keeps the reconnect case working (an unreadable save still gets the floor) while a
+--- restarted run can no longer claim levels it never earned.
+function M.save_level_cap()
+    local rows, ok = 0, false
+    pcall(function()
+        local gi = FindFirstOf("BP_LibrarianGameInstance_C")
+            or FindFirstOf("LibrarianGameInstanceBase")
+        if gi and gi:IsValid() then
+            local sg = gi.GameSaveData
+            if sg and sg:IsValid() then
+                rows = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
+                ok = true
+            end
+        end
+    end)
+    if not ok then return nil end
+    -- Read-only stale check: during a New Game these are still the PREVIOUS save's numbers, which
+    -- say nothing about this run. Deliberately not save_progress_is_stale() -- that clears
+    -- fresh_world as a side effect, and this is only meant to observe.
+    local SI = package.loaded["AP/SaveIdentity"]
+    if SI and SI.fresh_world and rows > 0 then return nil end
+    local lvl = 0
+    local player = FindFirstOf("BP_LibrarianCharacter_C")
+    if player and player:IsValid() then
+        pcall(function()
+            local arr = player.SkillLevelUpRowNum
+            local n = 0; pcall(function() n = #arr end)
+            for i = 1, math.min(n, AP_MAX_PLAYER_LEVEL) do
+                if rows >= (tonumber(arr[i]) or 0) then lvl = i else return end
+            end
+        end)
+    end
+    if lvl == 0 and rows > 0 then   -- BP not resolved; same static fallback as the baseline sync
+        for i = 1, #XP_CURVE do
+            if rows >= XP_CURVE[i] then lvl = i else break end
+        end
+    end
+    return lvl
+end
+
 -- Bump _levels_reached and send the level-up check. Called from main.lua's OnLevelUp hook,
 -- one per in-game level-up. Self-heals from _sent_checks BEFORE incrementing: else after a
 -- reload (_levels_reached=0) every OnLevelUp re-queues an already-deduped level and lags forever.
@@ -3363,6 +3409,14 @@ function M.on_level_up_event()
     if M._levels_reached >= AP_MAX_PLAYER_LEVEL then return end
 
     local sent_level = M._compute_sent_level_baseline()
+    -- Cap the server floor at what this save supports. Without it, a player who reached level 10,
+    -- lost the save and started over levels up once and sends level 11 instead of their own first.
+    local lvl_cap = M.save_level_cap()
+    if lvl_cap and sent_level > lvl_cap then
+        log(("[progress] level-up event: sent floor %d exceeds this save's level (%d) → capping (restarted run?)"):format(
+            sent_level, lvl_cap))
+        sent_level = lvl_cap
+    end
     if sent_level > M._levels_reached then
         log(("[progress] level-up event: catch-up _levels_reached %d → %d (server's _sent_checks reflects prior-session levels)"):format(
             M._levels_reached, sent_level))
@@ -3514,6 +3568,10 @@ function M.sync_progress_state()
         M._level_baseline_done = true
     end
     local sent_level_floor = M._compute_sent_level_baseline()
+    -- current_level is this save's own row-derived level; the server floor may stand in for a save
+    -- we couldn't read, but must never exceed what the save justifies. See save_level_cap.
+    local lvl_cap = M.save_level_cap()
+    if lvl_cap and sent_level_floor > lvl_cap then sent_level_floor = lvl_cap end
     local floor_level = math.max(current_level, sent_level_floor)
     if floor_level > M._levels_reached then
         local prev_levels_reached = M._levels_reached
