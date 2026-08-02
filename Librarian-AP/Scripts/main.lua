@@ -1211,6 +1211,10 @@ end
 -- recorded first), REVEAL restores them. Runs every pass; cheap when nothing drifted.
 -- CRASH RULE: a MID on the book HISM crashes this game -- never reintroduce CreateDynamicMaterial*.
 local _b2_state = {}        -- [hi] = { hidden = bool, ns = N, mats = {[s] = origMaterial} }
+                            -- plus string-keyed pass state: .pass (tick count), .sn (cached
+                            -- per-HISM instance counts), .force (re-read on the next pass).
+                            -- Integer and string keys can't collide, and the wholesale reset on
+                            -- world reload clears both together.
 local _b2_last_sig = nil
 local _b2_running = false
 local _b2_load_requested = false
@@ -1241,7 +1245,10 @@ local function apply_book_visibility()
     -- Cache the world-stable scan targets per world epoch. Each FindFirstOf / StaticFindObject walks the
     -- whole (huge) GUObjectArray (~3-4ms); doing 3-4 of them every 5s was the L3 setup hitch. Re-scan only
     -- when the cached object was freed (streaming) or the world reloaded (epoch bump).
-    if _l3c_ep ~= (epoch0 or 0) then _l3c_ep = epoch0 or 0; _l3c_mgr = nil; _l3c_mat = nil; _l3c_ready = false end
+    if _l3c_ep ~= (epoch0 or 0) then
+        _l3c_ep = epoch0 or 0; _l3c_mgr = nil; _l3c_mat = nil; _l3c_ready = false
+        _b2_state.force = true   -- fresh world: instance counts must be re-read, not carried over
+    end
     local mgr = _l3c_mgr
     if not (mgr and mgr:IsValid()) then mgr = FindFirstOf("BP_HISM_Manager_C"); _l3c_mgr = mgr end
     if not (mgr and mgr:IsValid()) then return end
@@ -1284,9 +1291,11 @@ local function apply_book_visibility()
         _l3c_mat = mat
     end
     _b2_mat_ref = mat  -- pin against GC
-    -- Re-classify on EVERY call, not just on unwarded-set change: the actor<->HISM swap can drift
-    -- a group's classification, so an unwarded book's instance lands in a hidden group and vanishes;
-    -- re-running self-corrects within a pass. Cheap at steady state (reads only). sig labels the log.
+    -- What can actually differ between two passes: with the spatial cross-check disabled the
+    -- classification driver is _asset_to_series, a static Lua map, so only the unwarded set and a
+    -- HISM going empty/non-empty can move a decision. Re-classifying every 5s to notice that cost a
+    -- reflected PerInstanceSMData read per HISM whether or not anything changed. Run the pass when
+    -- the set moves, the world changes, or the backstop falls due; sig now gates as well as labels.
     local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
     local unwarded = IA._compute_unwarded_set(only_shelfable) or {}
     local skeys = {}
@@ -1295,6 +1304,16 @@ local function apply_book_visibility()
     local sig = #skeys .. ":" .. table.concat(skeys, "|")
     local sig_changed = (sig ~= _b2_last_sig)
     _b2_last_sig = sig
+    -- Drift backstop every 12th pass (~60s here), mirroring REFRESH_FORCE_EVERY for bookcases: a
+    -- pile whose instance count moved without the set moving is caught there. A hide delayed until
+    -- then is cosmetic -- collision and the actor ward are separate layers and stay current.
+    _b2_state.pass = (_b2_state.pass or 0) + 1
+    local due = (_b2_state.pass % 12) == 0
+    if not (sig_changed or _b2_state.force or due) then return end
+    -- Counts are re-read on a backstop or a new world; a set-change pass reuses them, since arriving
+    -- items don't move instances.
+    if due or _b2_state.force or not _b2_state.sn then _b2_state.sn = {} end
+    _b2_state.force = false
     _b2_running = true
     -- 2D nearest-match (X,Y only): HISM instance transforms are component-LOCAL, so their Z doesn't
     -- match the actor's WORLD Z. Stacked books share X,Y (minor ambiguity) but all get classified.
@@ -1364,11 +1383,23 @@ local function apply_book_visibility()
         end
         local cur_hn = hn; pcall(function() cur_hn = #arr end)
         local last = math.min(cursor + CHUNK - 1, cur_hn)
+        -- Re-fetched per chunk: a world reload between frames swaps _b2_state out from under us.
+        local sncache = _b2_state.sn
+        if not sncache then sncache = {}; _b2_state.sn = sncache end
         for hi = cursor, last do
             local h; pcall(function() h = arr[hi] end)
             if h and h:IsValid() then
-                local sm; pcall(function() sm = h.PerInstanceSMData end)
-                local sn = 0; if sm then pcall(function() sn = #sm end) end
+                -- sn only answers "is this HISM empty" now that the cross-check is off, and the
+                -- PerInstanceSMData read behind it is the expensive crossing in this loop -- so
+                -- serve it from the cache and re-read only when the backstop cleared it. The
+                -- cross-check, when enabled, needs the live sm array and so always reads.
+                local sm = nil
+                local sn = sncache[hi]
+                if sn == nil or B2_SPATIAL_CROSSCHECK then
+                    pcall(function() sm = h.PerInstanceSMData end)
+                    sn = 0; if sm then pcall(function() sn = #sm end) end
+                    sncache[hi] = sn
+                end
                 -- DRIVER: the index mapping. hi == the series' position in the data order, so the
                 -- hi-th HISM's series is _asset_to_series[hi-1]. Deterministic, resume-safe, no warm-up.
                 local idx_series = IA._asset_to_series[hi - 1]
