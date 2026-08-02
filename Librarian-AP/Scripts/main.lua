@@ -1796,7 +1796,7 @@ end
 -- ============================================================
 -- Title-screen status text hijack
 -- ============================================================
--- WBP_Title.Text_Version (bottom-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
+-- WBP_Title.Text_Version (top-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
 local MOD_VERSION = "1.2.0-beta3"
