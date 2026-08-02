@@ -1409,6 +1409,11 @@ function M.reset_hism_state()
     M._stray_cases = {}
     M._cases_indexed = false
     M._ward_canary = nil
+    -- Everything above just dropped its refs to the old world's actors -- several thousand bridge
+    -- wrappers per snapshot. Reclaim them here instead of leaving it to the incremental collector:
+    -- a world transition can afford one full collect, and a heap that only grows across a long
+    -- session cannot.
+    collectgarbage("collect")
     log("[hism-reset] cleared HISM mapping state (will re-init on next apply-safe)")
 end
 

@@ -988,6 +988,15 @@ local function try_register_magic_hooks()
             return ok
         end
 
+        -- Shared reader for the UpdateInstance hook below. Built once and passed to pcall by
+        -- reference: that hook fires on every instance the game re-places, so an inline
+        -- pcall(function() ... end) would allocate a fresh closure each time, before it even knows
+        -- whether the book is warded.
+        local function inst_key(info)
+            local i = info:get()
+            return tonumber(i.AssetIdx), tonumber(i.Chapter)
+        end
+
         -- Insight. Correcting the transform the game hands its own UpdateInstance does not stick --
         -- the hook lands on exactly the right books, but a struct argument written back from Lua is
         -- not what the game goes on to use. So let the call complete and put the instance straight
@@ -996,12 +1005,8 @@ local function try_register_magic_hooks()
             if not diag_on("BOOK_EVENT_HOOKS") then return end
             local IA = package.loaded["AP/ItemApply"]
             if not (IA and IA._book_sanity_enabled and IA._book_inst_state) then return end
-            local aidx, chap
-            pcall(function()
-                local i = info:get()
-                aidx, chap = tonumber(i.AssetIdx), tonumber(i.Chapter)
-            end)
-            if not (aidx and chap) then return end
+            local ok, aidx, chap = pcall(inst_key, info)
+            if not (ok and aidx and chap) then return end
             local st = IA._book_inst_state[aidx .. "|" .. chap]
             if not (st and st.hidden) then return end
             if not diag_on("MAGIC_WARD_HISM_WRITE") then return end
