@@ -1501,6 +1501,10 @@ local function apply_book_visibility()
         else
             _l3_resume = nil
             _b2_running = false
+            -- Stamped whether or not anything changed: the ready gate waits on this to know the
+            -- piles have actually been masked for THIS world, and a pass that hid nothing still
+            -- answers that question.
+            _b2_state.applied_epoch = epoch0 or 0
             -- Log only when something changed or the cross-check disagrees.
             if sig_changed or (newly_hidden + revealed) > 0 or mismatch > 0 or leader_changed > 0 or n_locked > 0 then
                 log(("[b2] applied: newly_hidden=%d revealed=%d kept_hidden=%d kept_shown=%d / %d HISMs"):format(
@@ -1773,6 +1777,12 @@ local function update_title_buttons()
     -- called Button_LoadGame but the widget property is Button_Continue, so
     -- writing the delegate name silently did nothing. Button_Load is the slot
     -- picker, which reaches any save and so has to follow Continue.
+    -- Publish the New Game verdict so auto-New-Game can defer to it instead of re-deriving
+    -- "does this run have a save" and drifting from what the button actually shows.
+    pcall(function()
+        local S = package.loaded["AP/SaveIdentity"]
+        if S then S.start_enabled = enable_start end
+    end)
     pcall(function() set_button_enabled(widget.Button_Continue, enable_continue, "Button_Continue") end)
     pcall(function() set_button_enabled(widget.Button_Load, enable_continue, "Button_Load") end)
     pcall(function() set_button_enabled(widget.Button_StartGame, enable_start, "Button_StartGame") end)
@@ -2202,12 +2212,10 @@ local function start_gameplay_loops()
             pcall(function() update_title_buttons() end)
             pcall(function() update_title_status_text() end)
             if _G._librarian_menu and _G._librarian_menu.set_status then
-                _G._librarian_menu.set_status("World ready — click Continue", "ok")
+                _G._librarian_menu.set_status("World ready", "ok")
             end
-            local hud = package.loaded["AP/HUD"]
-            if hud and hud.notify then
-                hud.notify("AP: World ready — click Continue", 10.0)
-            end
+            -- No toast here any more: the mod enters the world itself the moment it is ready, so a
+            -- "world ready" popup only ever appeared a beat before the screen changed under it.
             return true
         end
         return false
@@ -2561,6 +2569,8 @@ local _prev_selected_level = -1
 -- its slot widgets after the button press.
 local TITLE_LOAD_BTN =
     "BndEvt__WBP_Title_Button_Load_K2Node_ComponentBoundEvent_2_OnButtonPressedEvent__DelegateSignature"
+local TITLE_START_BTN =
+    "BndEvt__TitleUMG_Button_StartGame_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature"
 local _autoload_stage = nil   -- nil | "opening"
 
 -- HUD notification drain, on the game thread. Lives here rather than in AP/HUD.lua because
@@ -2933,6 +2943,131 @@ gt_loop("autoload", 500, function()
         return false
     end
 
+    return false
+end)
+
+-- First connect to a seed leaves the player on the title with exactly one legal move, and nothing
+-- saying so -- it reads as the mod having stalled. Press New Game for them, the same way auto-load
+-- drives the load menu for a run that already has a save.
+--
+-- The failure this must never have is starting a new game over someone's run, so every condition is
+-- the strict form. slot_resolved means the server has actually answered about this run's slot: until
+-- then M.slot holds at most the local fallback and "no slot" only means "not yet told". start_enabled
+-- is the title gating's own verdict, so this can never press a button the mod is holding disabled.
+-- And it defers outright to auto-load, which owns the case where a save exists.
+--
+-- One shot, whether or not the press lands: a retry loop on this button risks starting twice, and a
+-- press that silently fails leaves the player exactly where they are today, able to click it.
+gt_loop("autonew", 500, function()
+    local SI = package.loaded["AP/SaveIdentity"]
+    local IA = package.loaded["AP/ItemApply"]
+    local AC = package.loaded["AP/APClient"]
+    if not (SI and IA and AC) then return false end
+    if SI.disabled then return true end   -- vanilla: the mod does not touch the buttons at all
+    if SI.autonew_done or SI.autoload_done or IA._gameplay_active then return false end
+    if not (AC._slot_connected and SI.slot_resolved and SI.start_enabled) then return false end
+    -- No slot recorded at all: this seed has genuinely never been started. A run that HAS a record
+    -- is left alone even when its save has gone missing, because the StartGame hook only arms the
+    -- slot claim while SI.slot is nil -- auto-pressing there would build a world that never claims
+    -- one. That case keeps today's behaviour: New Game is enabled and the player clicks it.
+    if SI.slot ~= nil then return false end
+
+    local title = FindFirstOf("WBP_Title_C")
+    if not (title and title:IsValid()) then return false end
+    SI.autonew_done = true
+    local ok = pcall(function() title[TITLE_START_BTN](title) end)
+    log(("[save-id] auto-New Game: fresh run, no save to load (slot=%s) — pressed Start (ok=%s)")
+        :format(tostring(SI.slot), tostring(ok)))
+    return false
+end)
+
+-- Hold the player still until the world is actually ready.
+--
+-- The title screen used to do this: Continue and New Game stayed disabled until warding finished,
+-- so nobody entered an unwarded world. Entering automatically took that guard away -- the player now
+-- lands in the world as soon as the run is verified, seconds before the shelves are warded, free to
+-- walk into books that are about to change under them.
+--
+-- The game's own pause menu stands in for it. Measured: it does not stop BP_LibrarianCharacter's
+-- tick, so the warding we are waiting on continues normally behind the menu. Resume, Save and Load
+-- are disabled while it waits, since each either lets the player out early or writes a save of a
+-- half-warded world. Quit, Back, Options and How To Play stay live, and the wait is capped, so a
+-- readiness signal that never arrives cannot trap anyone in here.
+local _pause_gate = { shown = false, done = false, waited = 0 }
+
+--- Enable/disable the three buttons that would let the player out or save mid-ward. Returns false
+--- when the widget is not up yet, which is also how the gate knows the menu has not appeared.
+_pause_gate.apply = function(pawn, enable)
+    local w
+    pcall(function() w = pawn.PasueMenuWidget end)   -- the game's own spelling, not a typo here
+    if not (w and w:IsValid()) then w = FindFirstOf("WBP_PauseMenu_C") end
+    if not (w and w:IsValid()) then return false end
+    for _, name in ipairs({ "Button_Resume", "Button_Save", "Button_Load" }) do
+        pcall(function() set_button_enabled(w[name], enable, name) end)
+    end
+    return true
+end
+
+gt_loop("ready_gate", 250, function()
+    local IA = package.loaded["AP/ItemApply"]
+    local SI = package.loaded["AP/SaveIdentity"]
+    if not (IA and SI) then return false end
+    if SI.disabled then return true end   -- vanilla: the mod holds nobody
+    if not IA._gameplay_active then
+        if _pause_gate.shown or _pause_gate.done then
+            _pause_gate = { shown = false, done = false, waited = 0, apply = _pause_gate.apply }
+        end
+        return false
+    end
+    if _pause_gate.done then return false end
+
+    local pawn = _G._librarian_tick_pawn
+    if not (pawn and pawn:IsValid()) then pawn = FindFirstOf("BP_LibrarianCharacter_C") end
+    if not (pawn and pawn:IsValid()) then return false end
+
+    -- The same drain predicate claim_slot and the pre-apply settle use, plus the bookcase settle,
+    -- plus pre-apply's own completion where it is running. That last clause is not redundant:
+    -- measured, the drain went quiet 1.5s before _pre_apply_complete was set, and releasing on the
+    -- drain alone handed the player those 1.5s early -- the beat of freedom testers noticed.
+    -- The pile mask is the LAST thing to finish, ~750ms after everything above went quiet, and it is
+    -- the one the player can see: releasing before it ran handed them a world whose shelves were
+    -- still being hidden. Only wait for it in the modes that actually run it -- BookSanity masks per
+    -- book elsewhere and stacks mode never hides piles, and in both this pass returns immediately
+    -- without ever stamping, so waiting on it there would stall until the timeout.
+    local l3_needed = not IA._book_sanity_enabled and IA._book_hide_mode ~= false
+    local l3_done = (not l3_needed)
+        or (not _b2_running and _b2_state.applied_epoch == (IA._world_epoch or 0))
+
+    local ready = IA._apply_safe and IA._ward_settled
+        and not IA._flush_in_progress
+        and (not IA._pump_idle or IA._pump_idle())
+        and (not IA._allow_pre_apply or IA._pre_apply_complete)
+        and l3_done
+
+    if not _pause_gate.shown then
+        -- Already ready on arrival (a quick world, or a reload into a warded one): never show it.
+        if ready then _pause_gate.done = true; return false end
+        pcall(function() pawn:SetPauseMenuVisible(true) end)
+        -- Only latch once the widget is really up; on the first frames of a world it may not be
+        -- spawned yet, and latching early would leave the buttons live behind a menu we think we own.
+        if not _pause_gate.apply(pawn, false) then return false end
+        _pause_gate.shown = true
+        log("[ready-gate] world not ready — holding the player in the pause menu")
+        return false
+    end
+
+    _pause_gate.waited = _pause_gate.waited + 250
+    local timed_out = _pause_gate.waited >= 60000
+    if ready or timed_out then
+        _pause_gate.done = true
+        _pause_gate.apply(pawn, true)    -- re-enable BEFORE releasing, never leave them dead
+        pcall(function() pawn:SetPauseMenuVisible(false) end)
+        log(("[ready-gate] released after %.1fs (%s)"):format(
+            _pause_gate.waited / 1000, timed_out and "TIMEOUT — world may still be warding" or "world ready"))
+        return false
+    end
+    -- Re-assert every pass: the menu rebuilds its buttons when it is shown or navigated back to.
+    _pause_gate.apply(pawn, false)
     return false
 end)
 
@@ -4118,7 +4253,9 @@ APClient.on_slot_connected = function(slot_data)
         end
 
         -- The reply is asynchronous and decides which buttons make sense, so
-        -- re-run the gating now that the run's slot is known.
+        -- re-run the gating now that the run's slot is known. This is also the point at which
+        -- "no slot" becomes trustworthy rather than merely unanswered, which auto-New-Game waits on.
+        SaveIdentity.slot_resolved = true
         pcall(function() update_title_buttons() end)
     end
     APClient:storage_read(slot_key, -1)
@@ -4128,9 +4265,11 @@ APClient.on_slot_connected = function(slot_data)
     -- state instead of ward-then-unwarding the starting series on every item.
     APClient:set_in_game(true)
 
-    -- Warn the player: pre-apply takes ~10-20s. Long toast to span the window.
+    -- Pre-apply takes ~10-20s and the screen sits still for it, so say something. It no longer
+    -- mentions Continue: the mod loads the run, or starts a new one, without the player pressing
+    -- anything. Shorter than the old 30s toast, which used to outlive the wait it described.
     if HUD and HUD.notify then
-        HUD.notify("AP: Preparing world — Continue will enable when ready...", 30.0)
+        HUD.notify("AP: Connected, preparing your world...", 15.0)
     end
 end
 

@@ -47,6 +47,11 @@ M.title_preapply = false   -- warding the title-behind world is worth doing this
 M.stored_fp    = nil       -- layout hash recorded at this run's last save
 M.fp_checked   = false     -- layout compared for the current world already
 M.autoload_done = false    -- this run's save was already auto-loaded this session
+M.autonew_done = false     -- New Game was already pressed for this run this session
+-- The server's answer about this run's slot has arrived. Until it does, M.slot holds at most the
+-- local fallback, so "no slot" does not yet mean "no save" -- and auto-New-Game must not act on it.
+M.slot_resolved = false
+M.start_enabled = false    -- the title gating's own verdict on New Game; auto-New-Game defers to it
 M.mirror_pending = nil     -- a save happened; copy the world into our slot
 M.mirroring    = false     -- a mirror write is in flight; ignore its own hook echo
 M.disabled     = false     -- player chose vanilla; passive until the next connect
@@ -546,6 +551,7 @@ function M.reset()
     M.seed, M.ap_slot, M.storage_key = nil, nil, nil
     M.pending_fresh, M.title_preapply, M.fresh_world = false, false, false
     M.stored_fp, M.fp_checked, M.autoload_done = nil, false, false
+    M.autonew_done, M.slot_resolved, M.start_enabled = false, false, false
     M.mirror_pending = nil
     -- Cleared here on purpose: a connection re-arms the mod even if the player
     -- had chosen vanilla earlier in the session. The vanilla path sets this
