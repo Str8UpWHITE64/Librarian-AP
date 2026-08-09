@@ -676,7 +676,7 @@ class LibrarianWorld(World):
         if individual and self.options.goal.value == self.options.goal.option_custom:
             raise ValueError(
                 "Librarian: unlock_mode individual_series_unlocks does not support "
-                "goal: custom (v1.2.0). Use goal: full, floor_1, or floor_2."
+                "goal: custom (v2.0.0). Use goal: full, floor_1, or floor_2."
             )
 
         precollect_names: list[str] = []
@@ -949,7 +949,7 @@ class LibrarianWorld(World):
         mw = self.multiworld
         if self.options.goal.value == self.options.goal.option_custom:
             raise ValueError(
-                "Librarian: book_sanity does not support goal: custom (v1.2.0). "
+                "Librarian: book_sanity does not support goal: custom (v2.0.0). "
                 "Use goal: full, floor_1, or floor_2.")
         if self.options.goal.value == self.options.goal.option_full:
             print("[Librarian] BookSanity + full goal (~3072 book checks): "
@@ -1702,7 +1702,7 @@ class LibrarianWorld(World):
             # suffix is informational. NOT the AP world version -- that one
             # (archipelago.json:world_version) must be clean semver so AP can parse it
             # for YAML `requires: game:` checks (a suffix there reads as 0.0.0).
-            "version": "1.2.0-beta3",
+            "version": "2.0.0",
             "goal": goal_value,
             # Row count at which the Lua client should send STATUS_GOAL.
             # Ignored for the "full" goal (the game's EndGame fires it).
