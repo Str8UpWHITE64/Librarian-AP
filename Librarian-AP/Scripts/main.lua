@@ -3287,6 +3287,23 @@ local function mirror_now(which)
     if not gi then return end
     SI.mirroring = true
     local wrote = pcall(function() gi:SaveGameData(SI.slot, false) end)
+    -- SaveGameData is ASYNCHRONOUS -- can_force_save consults SaveSubsystem.WaitingSave for exactly
+    -- that reason. On the quit path the engine goes straight on to tear the world down, and a save
+    -- still serialising actors as they are destroyed reads a freed object: a native access
+    -- violation, engine-side, a couple of hundred ms after this call.
+    --
+    -- Until 71d045b the fingerprint walk below ran uncached and took long enough that the save
+    -- always won that race; caching it removed the delay and exposed the bug. So wait on the flag
+    -- deliberately rather than on a side effect. Bounded, because a wait that never ends would hang
+    -- the quit instead of crashing it, and no os.clock in this UE4SS build to time it with.
+    for _ = 1, 400 do
+        local busy = false
+        pcall(function()
+            local ss = FindFirstOf("SaveSubsystem")
+            if ss and ss:IsValid() then busy = ss.WaitingSave and true or false end
+        end)
+        if not busy then break end
+    end
     SI.mirroring = false
     if wrote then
         SI.mirror_pending = nil
@@ -3585,6 +3602,9 @@ _G._librarian_gt_master_tick = function(dt_ms)
             _l3_resume = nil
             _b2_running = false
             IA._l1_resume = nil
+            -- Same reason the resumes go: a pawn resolved under the old world must not be reachable
+            -- by any step running under the new one.
+            _G._librarian_tick_pawn = nil
         end
         if IA._apply_safe then
             if IA._l1_resume then pcall(IA._l1_resume) end   -- one L1 warding chunk / frame
@@ -3638,13 +3658,21 @@ register_bp_hooks_once = function()
                 -- only inside this callback, and stashing the object left every later read
                 -- looking at an invalid handle. The name is refreshed only when the address
                 -- changes, i.e. once per world.
+                --
+                -- Dropped BEFORE the resolve, never merely overwritten after it. The resolve below
+                -- throws when self:get() comes back empty, which is what a world teardown looks
+                -- like -- and the steps still run afterwards, since that failure is only logged. A
+                -- cache that is only overwritten on success therefore hands those steps the
+                -- PREVIOUS world's pawn, and calling a method on a destroyed pawn is a native
+                -- access violation no pcall can catch. It cost a long hunt through the warding
+                -- layers before the cache itself turned out to be the difference.
+                _G._librarian_tick_pawn = nil
                 local _wok, _werr = pcall(function()
                     local pawn = self:get()
                     if not pawn then error("self:get() returned nothing", 0) end
-                    -- SAME-FRAME USE ONLY. The gt steps run synchronously inside this callback, so
-                    -- they may read this wrapper this frame; it is overwritten every tick and must
-                    -- never be read from a later frame or an async context (stale wrappers read as
-                    -- invalid -- that failure has already cost one silent outage). Consumers must
+                    -- SAME-FRAME USE ONLY: set here, read by the gt steps that the master tick runs
+                    -- later in this same callback, and cleared again at the top of the next one.
+                    -- Never read it from a later frame or an async context. Consumers must still
                     -- IsValid() and fall back to FindFirstOf.
                     _G._librarian_tick_pawn = pawn
                     local w = pawn:GetWorld()

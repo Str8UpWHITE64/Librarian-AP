@@ -1409,11 +1409,12 @@ function M.reset_hism_state()
     M._stray_cases = {}
     M._cases_indexed = false
     M._ward_canary = nil
-    -- Everything above just dropped its refs to the old world's actors -- several thousand bridge
-    -- wrappers per snapshot. Reclaim them here instead of leaving it to the incremental collector:
-    -- a world transition can afford one full collect, and a heap that only grows across a long
-    -- session cannot.
-    collectgarbage("collect")
+    -- A full collect used to run here, to reclaim the world's worth of bridge wrappers the clears
+    -- above just released. Removed: this function runs inside the LoadMap teardown, which is the
+    -- one window this game is known to die in (the 1.1.0-beta5 use-after-free), and a crash landed
+    -- there within milliseconds of this line. Finalizing wrappers while the engine frees the
+    -- objects behind them is not a risk worth taking for an unproven memory saving. The collector
+    -- reclaims them a little later on its own.
     log("[hism-reset] cleared HISM mapping state (will re-init on next apply-safe)")
 end
 
@@ -2962,6 +2963,16 @@ function M.detect_correct_books()
         M._dcb_books, M._dcb_cursor = nil, 0   -- fresh snapshot, from the top
     end
 
+    -- Drop the snapshot when the world reloaded, the same guard reconcile_book_actors applies to
+    -- its own. This sweep spans passes, so a world change mid-sweep leaves the array holding the
+    -- OLD world's book actors; the next pass then walks destroyed objects, and reading a freed
+    -- actor is a native access violation no pcall can catch. Every other cross-pass snapshot in
+    -- the mod is epoch-guarded -- this one was missed, and it only became reachable once the sweep
+    -- started running on the 500ms loop instead of finishing inside a single call.
+    if M._dcb_books and (M._world_epoch or 0) ~= (M._dcb_epoch or 0) then
+        M._dcb_books, M._dcb_cursor, M._dcb_n = nil, 0, 0
+    end
+
     local books = M._dcb_books
     local cursor = M._dcb_cursor or 0
     if not books or cursor >= (M._dcb_n or 0) then
@@ -2970,6 +2981,7 @@ function M.detect_correct_books()
         local cnt = 0; pcall(function() cnt = #books end)
         M._dcb_books = books
         M._dcb_n = cnt
+        M._dcb_epoch = M._world_epoch or 0
         cursor = 0
     end
     local n = M._dcb_n or 0
