@@ -2322,6 +2322,13 @@ local function start_gameplay_loops()
                 log(("[book-sanity] shelving → %d check(s) sent"):format(sent))
             end
         end
+        -- Finishing a row is announced by FinishRow, which only arms this flag. Run the checks
+        -- here, on the same 500ms loop BookSanity's shelving sweep already rides, so every mode
+        -- reacts to a completed row at the same speed rather than waiting on the rotation.
+        if IA._row_check_pending and IA._apply_safe and not IA._flush_in_progress then
+            IA._row_check_pending = false
+            pcall(function() IA.fire_completion_passes() end)
+        end
         return false
     end)
 
@@ -2440,27 +2447,10 @@ local function start_gameplay_loops()
         -- edge-case latency, not correctness.
         _sync_rot = ((_sync_rot or 0) % 4) + 1
         if _sync_rot == 1 then
-            -- Row-ish re-checks: FinishRow only fires when the row count INCREASES, so a swap
-            -- (remove a completed series, refill with another) goes undetected without these.
-            pcall(function() IA.detect_completed_rows() end)
-            pcall(function()
-                local rf = 0
-                local gi = FindFirstOf("BP_LibrarianGameInstance_C")
-                    or FindFirstOf("LibrarianGameInstanceBase")
-                if gi and gi:IsValid() then
-                    local sg = gi.GameSaveData
-                    if sg and sg:IsValid() then
-                        rf = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
-                    end
-                end
-                -- Same stale-save rule as the other progress reads: during a New Game this is the
-                -- PREVIOUS run's row count, and firing it sent 52 unearned thresholds.
-                if rf > 0 and not IA.save_progress_is_stale(rf) then
-                    IA.fire_row_completion_checks(rf)
-                end
-            end)
-            pcall(function() IA.fire_section_completions() end)
-            pcall(function() IA.fire_floor_completions() end)
+            -- Backstop only. A finished row is picked up within 500ms by the fast path below;
+            -- this catches what no event announces, chiefly a swap (remove a completed series,
+            -- refill with another), which leaves the row count unchanged so FinishRow never fires.
+            pcall(function() IA.fire_completion_passes() end)
         elseif _sync_rot == 2 then
             -- BookSanity rolling sweep (reads each book's "Is Abs Correct"). The insert-triggered
             -- fast sweep is the prompt path; this is the backstop for missed events.
@@ -3959,12 +3949,15 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
         end
     end
 
-    -- Completion checks + progress sync used to run INLINE here, but FinishRow fires on the GAME
-    -- thread, and fire_row_completion_checks / fire_section_completions / fire_floor_completions /
-    -- sync_progress_state mutate the shared _sent_* / _milestones_sent / _levels_reached de-dup
-    -- tables that the 3s mod-thread loop ALSO writes -> cross-thread Lua-heap race (the rc3 crash
-    -- class). The 3s loop already runs every one of these each tick (plus detect_completed_rows), so
-    -- they are covered there on the mod thread (<=3s latency). Nothing to do on the game thread here.
+    -- Arm the fast path; do not run the checks here. They mutate the shared _sent_* / _milestones_sent
+    -- de-dup tables, and this hook can fire in the middle of a pass that is already walking them.
+    -- Setting one boolean cannot, so the 500ms loop does the work a beat later.
+    --
+    -- It used to be enough to leave this to the sync loop, which ran every pass each tick. Splitting
+    -- that loop into a four-way rotation to kill the periodic hitch quietly turned <=3s of latency
+    -- into <=12s, which reads as the check having failed rather than being on its way.
+    local IAf = package.loaded["AP/ItemApply"]
+    if IAf then IAf._row_check_pending = true end
 end)
 
 RegisterHook("/Script/Librarian.LibrarianGameMode:NewRowFinished", function(self, num)

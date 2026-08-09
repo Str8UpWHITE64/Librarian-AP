@@ -3165,16 +3165,71 @@ function M.detect_completed_rows()
                                 end
                             end
                         end
-                        table.sort(candidates, function(a, b) return a.aidx < b.aidx end)
-                        local cap = #completed - already_fired
-                        if cap > 0 then
-                            for k = 1, math.min(cap, #candidates) do
-                                local c = candidates[k]
+                        -- Which of these actually finished, read from the books rather than
+                        -- guessed from index order.
+                        --
+                        -- Being present is not being finished: a series can have every volume in the
+                        -- case, contiguous, and still not count, because they are out of order. A
+                        -- finished row reads as a complete ascending chapter run. Measured in 1C,
+                        -- ordered runs matched the game's own completed-row count exactly.
+                        --
+                        -- Do NOT swap this for a slot-to-row map. None is reachable: GetRowNumArray
+                        -- answers [0,0,0], GetCorrectColumn's values do not read, GetCurrentRowNum
+                        -- does not marshal, and the row geometry differs per section shape.
+                        local chapters = {}
+                        pcall(function()
+                            for slot = 1, pbi_n do
+                                local book = pbi[slot]
+                                if book and book:IsValid() then
+                                    local info
+                                    pcall(function() info = book.ItemInfo end)
+                                    if info and info:IsValid() then
+                                        local a, ch
+                                        pcall(function()
+                                            a = tonumber(info.AssetIdx)
+                                            ch = tonumber(info.Chapter)
+                                        end)
+                                        if a then
+                                            chapters[a] = chapters[a] or {}
+                                            chapters[a][#chapters[a] + 1] = ch
+                                        end
+                                    end
+                                end
+                            end
+                        end)
+                        local finished = {}
+                        for _, c in ipairs(candidates) do
+                            local ch = chapters[c.aidx]
+                            local want = M._asset_to_volumes[c.aidx] or 0
+                            if ch and want > 0 and #ch == want and ch[1] == 0 then
+                                local asc = true
+                                for k = 2, #ch do
+                                    if not ch[k] or ch[k] ~= ch[k - 1] + 1 then asc = false; break end
+                                end
+                                if asc then finished[#finished + 1] = c end
+                            end
+                        end
+                        -- Cross-check against the game's own count before sending anything. They
+                        -- agree when the reading is right; a disagreement means a row is complete
+                        -- that this cannot see (or vice versa), and firing on a guess is what the
+                        -- old behaviour did. Hold instead -- the periodic pass retries every cycle.
+                        if #finished + already_fired == #completed then
+                            for _, c in ipairs(finished) do
                                 if fire_row(sid, c.name,
-                                        ("(AssetIdx %d) [scan %d/%d rows]"):format(c.aidx, #completed, rs_n)) then
+                                        ("(AssetIdx %d) [ordered %d/%d rows]"):format(
+                                            c.aidx, #completed, rs_n)) then
                                     sent_count = sent_count + 1
                                 end
                             end
+                        elseif #candidates > 0 then
+                            local names = {}
+                            for k = 1, #candidates do
+                                names[k] = ("%d"):format(candidates[k].aidx)
+                            end
+                            log(("[row-detect] %s: holding -- %d ordered + %d already sent ~= %d complete"
+                                .. " (candidates %s). Nothing fired; will retry.")
+                                :format(sid, #finished, already_fired, #completed,
+                                    table.concat(names, ",")))
                         end
                     end
                 end
@@ -3297,6 +3352,34 @@ function M.fire_floor_completions()
 end
 
 --- Fire "Complete N Rows" for any threshold <= total_rows (the game's correct-row counter
+--- Every check that a finished row can produce: the row itself, the "complete N rows" thresholds,
+--- and the section/floor completions a row can close out. One place, because it is called from two
+--- -- the 500ms fast path a FinishRow arms, and the rotating sync loop that backstops it -- and a
+--- copy in each would drift.
+---
+--- All of it is idempotent and de-duped, so running it twice costs nothing.
+function M.fire_completion_passes()
+    pcall(function() M.detect_completed_rows() end)
+    pcall(function()
+        local rf = 0
+        local gi = FindFirstOf("BP_LibrarianGameInstance_C")
+            or FindFirstOf("LibrarianGameInstanceBase")
+        if gi and gi:IsValid() then
+            local sg = gi.GameSaveData
+            if sg and sg:IsValid() then
+                rf = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
+            end
+        end
+        -- Same stale-save rule as the other progress reads: during a New Game this is the PREVIOUS
+        -- run's row count, and firing it sent 52 unearned thresholds.
+        if rf > 0 and not M.save_progress_is_stale(rf) then
+            M.fire_row_completion_checks(rf)
+        end
+    end)
+    pcall(function() M.fire_section_completions() end)
+    pcall(function() M.fire_floor_completions() end)
+end
+
 --- from FinishRow or CurrentFinishedRowNum). Returns the count sent.
 function M.fire_row_completion_checks(total_rows)
     if not M._slot_data then return 0 end
