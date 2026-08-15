@@ -117,7 +117,8 @@ return {
     -- limbo -- following the player, undroppable. Off = the player must drop below 15 before saving.
     BAG_ORPHAN_RECOVERY = true,
 
-    -- Passive invisible-book scanner. OFF: too noisy without a camera-FOV filter (see known_bugs.txt).
+    -- Passive invisible-book scanner. OFF: too noisy without a camera-FOV filter -- "shown but not
+    -- drawn" is dominated by ordinary off-screen culling and floods the log.
     BOOK_INVIS_SCAN = false,
 
     -- Single-thread mode. Drives AP client create + poll() + item-apply AND all warding on ONE thread

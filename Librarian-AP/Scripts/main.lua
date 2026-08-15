@@ -1127,7 +1127,8 @@ end
 -- leaves no flag/material/transform trace; only WasRecentlyRendered exposes it.
 -- Every 5s, walk a budget of unwarded shown books; one NEAR + shown-but-not-drawn
 -- across INVIS_STREAK scans is a SUSPECT, dumped once. Gated BOOK_INVIS_SCAN;
--- budgeted so it never starves the AP poll loop. See known_bugs.txt.
+-- budgeted so it never starves the AP poll loop. The fault it hunts is the stuck render proxy
+-- described under Known issues in the README, which the mod cannot fix from its side.
 -- ============================================================================
 local _invis_books, _invis_cursor, _invis_n, _invis_epoch, _invis_uw = nil, 1, 0, nil, nil
 local _invis_streak, _invis_dumped = {}, {}

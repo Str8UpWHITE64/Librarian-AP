@@ -210,12 +210,15 @@ or host it locally.
    automatically. Type your server (e.g. `archipelago.gg:38281`), slot
    name, and password (leave blank if none), then click **Connect**.
    You can also press **F4** any time to toggle the menu.
-3. Wait for `AP: World ready — click Continue` to appear (about 10–20
-   seconds while the mod wards locked books behind the menu). The
-   Continue / Start Game buttons stay disabled until then.
-4. Click **Continue** (or **Start Game** if this is a fresh slot) and
-   play normally. As you complete shelves, the mod sends location
-   checks to Archipelago; received items unlock more series and shelves.
+3. The mod takes it from here. Connecting to a seed for the first time
+   starts a New Game for you; returning to one loads that run's save.
+   You don't need to click Continue or Start Game.
+4. While the shelves are still being prepared (about 10 to 20 seconds)
+   you're held in the pause menu, with Resume, Save and Load unavailable
+   and Quit and Options still working. It releases itself as soon as the
+   world is ready, so you never walk into a library mid-setup.
+5. Play normally. As you complete shelves, the mod sends location checks
+   to Archipelago; received items unlock more series and shelves.
 
 ### Tips
 
@@ -319,6 +322,52 @@ If you see those, both the Lua mod and the BP pak are loaded correctly.
 If the connection menu doesn't appear at the title screen, check the
 log for `[menu]` lines. The most common issues are a server URL the
 client can't reach or a slot name that doesn't match the YAML.
+
+---
+
+## Managing save files
+
+Each AP run claims one of the game's save slots, in the **20–30** range.
+Your own saves use the lower slots and are never touched.
+
+**To delete an old run**, right-click its slot in the **Load** menu at the
+title screen and confirm. You can also do it from the Save menu in-game.
+Either way the mod clears its own record of that run at the same time, so
+there is nothing to tidy up by hand.
+
+Note the game won't let you delete the save you're currently playing, so
+clear old runs from the title screen before starting a new one.
+
+**Deleting an AP save cannot be undone.** The run can only be regenerated,
+not resumed.
+
+**If a run's save goes missing**, whether you moved it or deleted it and
+changed your mind, connecting to that seed will say so and wait. Put the save file
+back and reconnect and the run continues as before. Press **New Game** and
+the seed starts over from scratch. Nothing is thrown away until you press
+it.
+
+---
+
+## Known issues
+
+**A BookSanity check can lag behind the shelving that earned it.** The game
+marks a book correctly placed slightly after it tells the mod the book was
+shelved, so a check can occasionally miss its moment. If one hasn't
+appeared, pull the book off the shelf and place it again; that sends it
+immediately.
+
+**A book can turn invisible the moment you pick it up** (hidden-book modes).
+It looks fine on the shelf and stays grabbable, and it's random: different
+books each session. Throw it out of bounds and the game's own stray-book
+recovery returns it, visible, a few seconds later. Reloading also clears it.
+Nothing is lost either way and your save is never affected.
+
+This one is not fixable from the mod's side. The book's render proxy gets
+stuck below the layer the mod can reach: every readable property matches a
+healthy book, and rebuilding the proxy every way the engine allows produces
+an equally invisible one. Only a brand-new component clears it, which is
+what a reload or the out-of-bounds recovery gives you.
 
 ---
 
