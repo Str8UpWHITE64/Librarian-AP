@@ -48,6 +48,11 @@ M.stored_fp    = nil       -- layout hash recorded at this run's last save
 M.fp_checked   = false     -- layout compared for the current world already
 M.autoload_done = false    -- this run's save was already auto-loaded this session
 M.autonew_done = false     -- New Game was already pressed for this run this session
+-- Set to the recorded slot number when this run has a save on record that is no longer on disk.
+-- Nothing is erased while this is set: the records still point at the missing save, so a player who
+-- merely moved their files can put them back and reconnect with progress intact. Pressing New Game
+-- is the confirmation, and only then are the records cleared and a fresh slot claimed.
+M.save_missing = nil
 -- The server's answer about this run's slot has arrived. Until it does, M.slot holds at most the
 -- local fallback, so "no slot" does not yet mean "no save" -- and auto-New-Game must not act on it.
 M.slot_resolved = false
@@ -196,6 +201,44 @@ end
 
 --- Rewrites the file with this record replaced. Small enough that a full
 --- rewrite beats an append-and-dedupe.
+--- Drop any record pointing at a game save slot the player has deleted.
+---
+--- Keyed by slot, not by seed, because the delete hook only knows the slot number. A slot is held
+--- by one seed at a time, so at most one line should match; the count is returned so an unexpected
+--- number can be logged rather than passed over.
+---
+--- Leaving a stale line behind is not harmful on its own -- auto-load simply waits for a save that
+--- is not there -- but it is the reason a player had to edit this file by hand after clearing an
+--- old run, which is what this exists to stop.
+function M.forget_local_slot(slot)
+    slot = tonumber(slot)
+    local p = local_path()
+    if not (p and slot) then return false, 0 end
+    local f = io.open(p, "r")
+    if not f then return false, 0 end
+    local kept, dropped = {}, 0
+    pcall(function()
+        for line in f:lines() do
+            local v = line:match("^.-=(%d+)")
+            if v and tonumber(v) == slot then
+                dropped = dropped + 1
+            else
+                kept[#kept + 1] = line
+            end
+        end
+    end)
+    pcall(function() f:close() end)
+    if dropped == 0 then return true, 0 end
+    local out = io.open(p, "w")
+    if not out then return false, 0 end
+    local ok = pcall(function()
+        if #kept > 0 then out:write(table.concat(kept, "\n"), "\n") end
+        out:flush()
+    end)
+    pcall(function() out:close() end)
+    return ok, dropped
+end
+
 function M.write_local(seed, ap_slot, slot)
     local p = local_path()
     if not p then return false end
@@ -552,6 +595,7 @@ function M.reset()
     M.pending_fresh, M.title_preapply, M.fresh_world = false, false, false
     M.stored_fp, M.fp_checked, M.autoload_done = nil, false, false
     M.autonew_done, M.slot_resolved, M.start_enabled = false, false, false
+    M.save_missing = nil
     M.mirror_pending = nil
     -- Cleared here on purpose: a connection re-arms the mod even if the player
     -- had chosen vanilla earlier in the session. The vanilla path sets this

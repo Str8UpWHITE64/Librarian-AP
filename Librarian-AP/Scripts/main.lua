@@ -3378,6 +3378,168 @@ RegisterHook("/Script/Engine.GameplayStatics:DoesSaveGameExist", function(self, 
 end)
 
 -- /Script/Librarian.LibrarianGameInstanceBase:SaveGameData(saveSlotNum)
+-- Deleting a save is only offered in the SAVE menu. A player clearing an old AP run before
+-- starting a new one therefore has to load a world first, or go digging in AppData -- for the one
+-- operation they most want to do from the title screen.
+--
+-- So offer it in the Load menu too, by calling the menu's own DeleteSave rather than deleting
+-- anything ourselves. Measured: DeleteSave raises the confirmation dialog and OnDeleteSave runs
+-- when it is accepted (0.9s apart while the dialog was read), so going through it inherits the
+-- guard. A right-click must never destroy an AP save on its own -- those cannot be recovered.
+--
+-- The click is only observed, never interpreted here: the pre-hook sets a scalar, and the work
+-- happens a frame later off a fresh lookup. The BP sets IsRightClick during its own execution, so
+-- the flag cannot be read until after that, and holding a widget wrapper across frames is the
+-- stale-handle hazard that has already cost a crash hunt.
+gt_loop("load_delete_hooks", 2000, function()
+    if _G._librarian_slot_hook_done then return true end
+    local slot = FindFirstOf("WBP_SaveSlot_C")
+    if not (slot and slot:IsValid()) then return false end   -- only exists while a slot list is up
+    _G._librarian_slot_hook_done = true
+    local cls = "?"
+    pcall(function() cls = slot:GetClass():GetFullName() end)
+    local pkg = tostring(cls):match("(/Game/[%w_/]+%.[%w_]+)_C")
+    if not pkg then
+        log(("[save-delete] could not derive a class path from %s; Load-menu delete unavailable")
+            :format(tostring(cls)))
+        return true
+    end
+    local path = pkg .. "_C:OnMouseButtonDown"
+    local ok, err = pcall(function()
+        RegisterHook(path, function(self, geometry, mouse)
+            -- IsRightClick is set and cleared inside the Blueprint's own execution, so reading it a
+            -- frame later always finds false. Take the button from the event instead, and the slot
+            -- number from the widget as a plain value -- never the widget itself, which must not be
+            -- held across frames.
+            -- Every call here IS a right-click. Measured: three right-clicks produced three calls
+            -- and a left-click produced none, because Button_Slot's own pressed-event delegate
+            -- consumes the left button before it reaches the widget's OnMouseButtonDown. So the
+            -- button never has to be decoded -- which is just as well, since the event param reads
+            -- as opaque userdata and every property path into it returned nil.
+            --
+            -- Only the slot NUMBER is kept, as a plain value. The widget itself must not be held
+            -- across frames.
+            local slotn
+            pcall(function() slotn = tonumber(self:get().CurrentSlotIdx.SlotNum) end)
+            _G._librarian_slot_num = slotn
+            _G._librarian_slot_rclick = true
+        end)
+    end)
+    log(("[save-delete] hook %s %s"):format(path, ok and "registered" or ("FAILED: " .. tostring(err))))
+    return true
+end)
+
+-- Drain: one frame after a slot was clicked, decide whether it was a right-click in the Load menu
+-- and, if so, hand it to the menu's own delete.
+gt_loop("load_delete_drain", 100, function()
+    if not _G._librarian_slot_rclick then return false end
+    _G._librarian_slot_rclick = false
+    pcall(function()
+        local menu = FindFirstOf("WBP_SaveMenu_C")
+        local mode, n, hit = nil, 0, nil
+        if menu and menu:IsValid() then
+            -- 1 is Load; the auto-load path sets it to that for the same reason. In Save mode the
+            -- game already offers this, so leave that alone rather than firing it twice.
+            pcall(function() mode = tonumber(menu.SaveLoadMode) end)
+            local widgets
+            pcall(function() widgets = menu.SaveSlotWidgets end)
+            if widgets then pcall(function() n = #widgets end) end
+            -- Match on the slot NUMBER captured at click time, not on a stored widget.
+            local want = _G._librarian_slot_num
+            for i = 1, n do
+                local w = widgets[i]
+                if w and w:IsValid() and want then
+                    local sn
+                    pcall(function() sn = tonumber(w.CurrentSlotIdx.SlotNum) end)
+                    if sn == want then hit = w break end
+                end
+            end
+        end
+        -- Report every click, not just the ones that act. A drain that only logs on success is
+        -- indistinguishable from one that never ran, which has already wasted two test rounds here.
+        local fired = false
+        if hit and mode == 1 then
+            -- DeleteSave returns cleanly in Load mode but raises no dialog, so it gates on
+            -- SaveLoadMode itself. Flip to Save for the duration of the call and put it straight
+            -- back: the mode is restored before anything else can read it, and leaving it on Save
+            -- would turn the next slot click into an overwrite, which is far worse than the
+            -- inconvenience this fixes.
+            pcall(function() menu.SaveLoadMode = 0 end)
+            fired = pcall(function() menu:DeleteSave(hit) end)
+            pcall(function() menu.SaveLoadMode = 1 end)
+            local back
+            pcall(function() back = tonumber(menu.SaveLoadMode) end)
+            if back ~= 1 then
+                log(("[save-delete] WARNING: mode did not restore (now %s) -- forcing Load")
+                    :format(tostring(back)))
+                pcall(function() menu.SaveLoadMode = 1 end)
+            end
+        end
+        log(("[save-delete] right-click on slot %s (mode=%s, %d slots) -> %s")
+            :format(tostring(_G._librarian_slot_num), tostring(mode), n,
+                (mode ~= 1 and "not the Load menu, left to the game")
+                    or (not hit and "slot widget not found")
+                    or ("DeleteSave ok=" .. tostring(fired))))
+    end)
+    return false
+end)
+
+-- Deleting a save in-game clears our record of it too, so nobody has to go and edit
+-- LibrarianAP_slots.txt by hand. POST-hook: act only once the deletion has actually run.
+--
+-- Clearing SI.slot is what makes the delete stick. Both mirror paths write to that slot -- the quit
+-- mirror and the 2s timer -- and with it still set, quitting rewrote the file the player had just
+-- deleted. mirror_now bails on a nil slot and can_force_save answers "no slot claimed", so dropping
+-- it silences both.
+--
+-- The server key matters as much as the local line. It is authoritative on reconnect, so leaving it
+-- pointing at a deleted save is the state the 1.1.2 hotfix existed to dig people out of: auto-load
+-- waiting forever for a save that is not there. -1 is the sentinel the storage handler already
+-- reads as "never claimed", after which auto-New-Game starts a fresh run and claim_slot writes a
+-- new slot, server value and fingerprint.
+-- Single (pre) hook, deliberately. The pre+post form was tried and the post callback never fired,
+-- so the cleanup silently did nothing while looking correct. Running just before the deletion is
+-- fine here: the player has already confirmed by this point (DeleteSave raises the dialog and
+-- OnDeleteSave, which precedes this, is the confirm handler), and the worst case of a failed
+-- deletion is a dropped record the next claim rebuilds.
+RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:DeleteGameData",
+    function(self, mapIdx, deleteSlotNum, isAuto)
+        local slot, auto
+        pcall(function() slot = tonumber(deleteSlotNum:get()) end)
+        pcall(function() auto = isAuto:get() and true or false end)
+        if not slot or auto then return end            -- autosaves are never ours
+        local SI = package.loaded["AP/SaveIdentity"]
+        if not SI then return end
+        if slot < SI.SLOT_MIN or slot > SI.SLOT_MAX then return end   -- a player's own save; leave it
+
+        -- Deliberately NOT gated on SI.disabled. Vanilla is exactly when this runs: the game will
+        -- not let you delete the slot you are playing, so clearing old AP saves means going in
+        -- passive and deleting them there. Pruning our own record is bookkeeping, not gameplay, and
+        -- skipping it in vanilla is why the first attempt did nothing while looking correct.
+        -- Only the server write below needs a live connection.
+
+        local was_ours = (SI.slot == slot)
+        local ok, dropped = SI.forget_local_slot(slot)
+        if was_ours then
+            SI.slot, SI.slot_source = nil, nil
+            SI.stored_fp, SI.fp_checked, SI.stored_fp_kind = nil, false, nil
+            SI.autoload_done, SI.autonew_done = false, false
+            local AC = package.loaded["AP/APClient"]
+            if AC and SI.storage_key then
+                pcall(function() AC:storage_write(SI.storage_key, -1) end)
+            end
+        end
+        log(("[save-id] save slot %d deleted: %d local record(s) dropped%s%s")
+            :format(slot, dropped, ok and "" or " (FILE WRITE FAILED)",
+                was_ours and "; this run's slot released and the server record cleared" or ""))
+        if was_ours then
+            pcall(function()
+                local H = package.loaded["AP/HUD"]
+                if H then H.notify("AP: this run's save was deleted. Reconnect to start it again.", 15.0) end
+            end)
+        end
+    end)
+
 RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:SaveGameData", function(self, slot_num_param)
     local n = "?"
     pcall(function() n = tostring(slot_num_param:get()) end)
@@ -3543,6 +3705,19 @@ local function on_title_start_game_pressed(self)
     -- claim is armed here and completes once the world has settled.
     local AC = package.loaded["AP/APClient"]
     local SI = package.loaded["AP/SaveIdentity"]
+    -- Pressing New Game while a recorded save is missing IS the confirmation. Only now are the
+    -- records cleared, so a player who declined -- by restoring their files instead, or by simply
+    -- not pressing it -- still has an intact binding between this seed and its save.
+    if AC and AC._slot_connected and SI and SI.save_missing then
+        local gone = SI.save_missing
+        log(("[save-id] New Game pressed with slot %d missing -- releasing it and starting over")
+            :format(gone))
+        pcall(function() SI.forget_local_slot(gone) end)
+        if SI.storage_key then pcall(function() AC:storage_write(SI.storage_key, -1) end) end
+        SI.slot, SI.slot_source = nil, nil
+        SI.stored_fp, SI.fp_checked = nil, false
+        SI.save_missing = nil
+    end
     if AC and AC._slot_connected and SI and not SI.slot then
         SI.pending_fresh = true
         -- Outlives pending_fresh on purpose: the progress baselines read GameSaveData, which still
@@ -4226,14 +4401,65 @@ APClient.on_slot_connected = function(slot_data)
     storage_handlers[slot_key] = function(v)
         local n = tonumber(v)
         -- The server seeds this key to -1 when absent, which means "never claimed".
-        if n and n >= SaveIdentity.SLOT_MIN and n <= SaveIdentity.SLOT_MAX then
+        if n and n >= SaveIdentity.SLOT_MIN and n <= SaveIdentity.SLOT_MAX
+                and SaveIdentity.slot_exists(n, false) == false then
+            -- The record names a save that is gone: the player deleted it. Adopting it strands the
+            -- run -- auto-load waits for a save that is not there, auto-New-Game and the claim both
+            -- require a nil slot, so pressing New Game by hand never claims one either, the identity
+            -- never verifies and warding stays off. That is the "sat at the title with nothing
+            -- warded" report.
+            --
+            -- Nothing is erased here, and the slot is deliberately left set. A missing save is not
+            -- proof the run is over: the player may have moved their saves, or copied them to
+            -- another machine. Clearing the records at this point would throw away the only binding
+            -- between this seed and its progress, and it cannot be reconstructed.
+            --
+            -- So say so and let them decide. Continue is already disabled (there is nothing to
+            -- load), New Game is enabled, and pressing it is the confirmation -- the records are
+            -- cleared there, not here. Doing nothing is the safe answer: restore the save file,
+            -- reconnect, and the run picks up exactly where it was.
+            --
+            -- Only an explicit false counts. slot_exists returns nil when the check itself failed,
+            -- and warning on a failed read would push people into starting over for no reason.
+            SaveIdentity.save_missing = n
+            log(("[save-id] recorded slot %d is missing on disk -- holding the record; "
+                .. "New Game will start this seed over, doing nothing keeps it"):format(n))
+            pcall(function()
+                if HUD and HUD.notify then
+                    HUD.notify(("AP: this run's save (slot %d) is missing. Press New Game to start "
+                        .. "this seed over, or restore the save file and reconnect to keep your progress.")
+                        :format(n), 45.0)
+                end
+            end)
+            pcall(function()
+                if _G._librarian_menu and _G._librarian_menu.set_status then
+                    _G._librarian_menu.set_status(
+                        ("Save for slot %d is missing — New Game starts over, or restore it and reconnect")
+                            :format(n), "warn")
+                end
+            end)
+        elseif n and n >= SaveIdentity.SLOT_MIN and n <= SaveIdentity.SLOT_MAX then
             SaveIdentity.slot, SaveIdentity.slot_source = n, "server"
             if n ~= from_local then SaveIdentity.write_local(seed, ap_slot, n) end
-            log(("[save-id] server says slot %d%s"):format(
-                n, SaveIdentity.slot_exists(n, false) and "" or " (MISSING on disk)"))
+            log(("[save-id] server says slot %d"):format(n))
         else
             log(("[save-id] no slot recorded on server (local=%s) -- fresh run"):format(
                 tostring(from_local)))
+            -- The local file is only a fallback, and it is read before this reply arrives. If it
+            -- named a save that is gone, warn the same way rather than discarding it: the server
+            -- has no claim on this seed, so the local line is the last thing tying it to a save.
+            if SaveIdentity.slot and SaveIdentity.slot_exists(SaveIdentity.slot, false) == false then
+                SaveIdentity.save_missing = SaveIdentity.slot
+                log(("[save-id] local record names slot %d, which is missing on disk -- holding it")
+                    :format(SaveIdentity.slot))
+                pcall(function()
+                    if HUD and HUD.notify then
+                        HUD.notify(("AP: this run's save (slot %d) is missing. Press New Game to start "
+                            .. "this seed over, or restore the save file and reconnect to keep your progress.")
+                            :format(SaveIdentity.slot), 45.0)
+                    end
+                end)
+            end
         end
         log("[save-id] " .. SaveIdentity.describe())
 
