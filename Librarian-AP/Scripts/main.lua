@@ -168,7 +168,7 @@ end
 
 -- ============================================================================
 -- Book-event hooks: enforce the warded set at the game's own book events
--- (SetActorVisible / SetBookInfo / CanBeGrab). See WARDING_SYNC_PLAN.md.
+-- (SetActorVisible / SetBookInfo / CanBeGrab).
 -- Gated BOOK_EVENT_HOOKS; registered once on the game thread (single one-shot
 -- ExecuteInGameThread). Each callback re-checks its flag, so a flip = no-op.
 -- ============================================================================

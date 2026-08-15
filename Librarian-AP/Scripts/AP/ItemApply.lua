@@ -1080,7 +1080,7 @@ end
 -- profile. Treats ALL meshes, not just one — large cases have multiple placement meshes and a
 -- single-mesh approach left them placeable at angles hitting an unhandled mesh.
 -- Risk: if placement ever traces an object channel instead of a trace channel, cases stay
--- placeable. See WARDING_SYNC_PLAN.md for the full refinement history.
+-- placeable.
 local function _ward_collision(case, case_key, locked)
     if not (case and case:IsValid()) then return end
     -- Actor-level collision MUST be on or per-component settings are ignored.

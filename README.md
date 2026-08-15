@@ -8,6 +8,10 @@ items. As you complete shelves and milestones, the game sends location
 checks to the Archipelago server; in return, you receive item unlocks that
 open up new series and bookcases.
 
+If you want something far more granular, **BookSanity** turns every one of
+the ~3,072 individual books into its own item and its own check. See
+`unlock_mode` below.
+
 ---
 
 ## Requirements
@@ -242,6 +246,26 @@ or host it locally.
 
 All options go under your `Librarian:` section in the YAML.
 
+### `unlock_mode`
+
+How books become available. This is the biggest choice in the YAML: it
+changes the size and shape of the item pool, and what the other options
+mean.
+
+| Value                       | Meaning                                                                  |
+|-----------------------------|--------------------------------------------------------------------------|
+| `progressive_unlocks`       | (Default) Series unlock in groups of `series_per_unlock`. Smallest pool. |
+| `individual_series_unlocks` | Each of the ~400 series is its own item. Every bookcase starts open.     |
+| `booksanity`                | Every one of the ~3,072 books is its own item **and** its own check.     |
+
+In `booksanity`, every bookcase starts open and you send a check for each
+book you place correctly. Items arrive as `Book: <Series> Vol N`; the
+matching checks read `Book: <Section> - <Series> Vol N`. A floor goal is
+recommended, since the full goal is slow to generate at that size.
+
+Locked books can't be taken in any mode, including by the magic skills:
+Assemble won't pull one into your bag, and Insight won't reveal one.
+
 ### `goal`
 
 How much of the library must be tidied to win.
@@ -265,15 +289,37 @@ The starting set is randomized per seed but always includes at least one
 series whose shelf row is on the starting bookcase, so the first check
 is always reachable.
 
+In `booksanity` this counts series' *worth* of books rather than whole
+series: each one rolls a series size (3, 5 or 10 volumes), so a count of 5
+starts you with roughly 15 to 50 individual books.
+
 ### `series_per_unlock`
 
 How many series each `Progressive Series Unlock` item grants. Range 3–10.
 Default 5. Lower values mean more items in the pool, each with smaller
 impact; higher values mean fewer items, each more impactful.
 
-Books from locked (warded) series stay visible on the shelves but can't
-be picked up or collided with — you walk through them, and the
-"look through the pile" experience preserves the game's visual density.
+Only applies to `progressive_unlocks`; the other unlock modes hand out
+series or books individually.
+
+### `book_visibility`
+
+What locked books look like before you unlock them.
+
+| Value    | Meaning                                                                  |
+|----------|--------------------------------------------------------------------------|
+| `hidden` | (Default) Locked books are invisible. The library fills in as you unlock. |
+| `stacks` | Locked books stay visible but can't be taken; you walk through them.      |
+
+`stacks` keeps the shelves looking full, and avoids the hidden-book display
+glitch noted under Known issues.
+
+### `local_filler`
+
+Toggle (default `true`). Keeps this game's filler items in your own world
+instead of scattering them across the multiworld. Your meaningful items
+still circulate normally. Recommended, since Librarian adds a lot of
+checks. No effect in a solo game.
 
 ### `only_unward_shelfable_books`
 
@@ -296,13 +342,6 @@ The difference: **Off** lets you hold any received series' books immediately
 until the shelf is open. Either way, *finishing* a row requires its bookcase
 open.
 
-> **v1.0.3 note**: cumulative-book-placement milestones
-> (`Milestone: N Books Placed`) were removed from the seed entirely in
-> v1.0.3, regardless of this option. The 22 milestone slots were
-> replaced with finer-grained row-completion thresholds
-> (`Complete N Rows`) so the pool size stays the same. The book-count
-> tracking infrastructure on the Lua side is preserved for future use.
-
 ---
 
 ## Verifying the install
@@ -311,7 +350,7 @@ When you launch the game, the UE4SS log
 (`<Game>\Librarian\Binaries\Win64\UE4SS.log`) should include lines like:
 
 ```
-[Lua] [LibrarianAP] LibAP v1.1.0 — Game v1.0.11 (verified compatible)
+[Lua] [LibrarianAP] LibAP v2.0.0 — Game v1.0.13 (verified compatible)
 [Lua] [BPModLoaderMod] Actor: ModActor_C /Game/Librarian/Map/...
 [Lua] [LibrarianAP] Press F4 to toggle the connection menu.
 [Lua] [LibrarianAP] Press F12 to connect to Archipelago.
