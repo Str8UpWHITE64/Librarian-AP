@@ -200,6 +200,43 @@ local SKILL_ITEM_TO_ABILITY = {
     ["Progressive Assemble"]      = UPGRADE.GRAB_SAME_TYPE_BOOK,
 }
 
+-- Skill Mastery: a "<name> Mastery" item is interchangeable with a Progressive level -- both raise
+-- the same skill, so 1 Mastery + 1 Progressive = level 2. Levels 1..max are native (UpgradePlayer);
+-- each level past max instead retunes the top cd/at slot, steps 1..#cd. `max` must match the game's
+-- *PreLevel array length: too low and the past-max curve never engages, too high and UpgradePlayer
+-- no-ops past the cap and desyncs the applied counter. (Internally still called "attunement".)
+local ATTUNE_SKILLS = {
+    { name = "Sort",          prog = "Progressive Sort",          cls = "Skill_SortBook_C",            max = 5,  active = false,
+      cd = { 3, 2, 1, 1, 1 } },
+    { name = "Shelf Guide",   prog = "Progressive Shelf Guide",   cls = "Skill_ShowCorrentBookCase_C", max = 10, active = true,
+      cd = { 4, 3, 2, 2, 1 },      at = { 65, 70, 75, 80, 85 } },
+    { name = "Insight",       prog = "Progressive Insight",       cls = "Skill_ShowSameTypeBook_C",    max = 10, active = true,
+      cd = { 18, 16, 14, 12, 11 }, at = { 45, 50, 55, 60, 65 } },
+    { name = "Auto-Shelving", prog = "Progressive Auto-Shelving", cls = "Skill_AutoShelve_C",          max = 10, active = true,
+      cd = { 8, 6, 5, 4, 3 },      at = { 60, 65, 70, 75, 80 } },
+    { name = "Assemble",      prog = "Progressive Assemble",      cls = "Skill_GrabSameTypeBook_C",    max = 10, active = false,
+      cd = { 8, 6, 4, 3, 3 } },
+}
+
+-- Progressive item -> { mastery = item name, max = native max }; Mastery item -> Progressive.
+-- The "<name> Mastery" concat must match the names Items.py builds from its own _ATTUNE_SKILLS --
+-- a mismatch is silent: the Mastery routes nowhere and the item no-ops.
+local SKILL_INTERCHANGE = {}
+local MASTERY_TO_PROG = {}
+for _, _cfg in ipairs(ATTUNE_SKILLS) do
+    SKILL_INTERCHANGE[_cfg.prog] = { mastery = _cfg.name .. " Mastery", max = _cfg.max }
+    MASTERY_TO_PROG[_cfg.name .. " Mastery"] = _cfg.prog
+end
+
+-- Fatigue traps: one-shot debuffs. For FATIGUE_DURATION seconds the skill recovers at five
+-- times its normal cooldown and stays active for a tenth of its normal time, then snaps back.
+-- The highest fired item index is kept in server data storage, so a clean reconnect or a fresh
+-- session won't replay old traps. A second trap on the same skill while one is running extends
+-- the timer.
+local FATIGUE_DURATION = 120
+local FATIGUE_CD_MULT  = 5.0
+local FATIGUE_AT_MULT  = 0.1
+
 -- ============================================================================
 -- State
 -- ============================================================================
@@ -208,6 +245,18 @@ local SKILL_ITEM_TO_ABILITY = {
 M._asset_to_series  = {}  -- { [asset_idx_int] = series_name_string }
 M._asset_to_section = {}  -- { [asset_idx_int] = section_id_string }
 M._asset_to_volumes = {}  -- { [asset_idx_int] = volume_count_int (3/5/10) }
+
+-- individual_series_items (set from slot_data in set_slot_data; defaults = grouped mode).
+M._individual_series_items = false
+M._series_item_to_series   = {}
+
+-- BookSanity: each book is its own item AND its own check (set from slot_data; defaults = off).
+-- Keys are the "<AssetIdx>|<Chapter>" the in-game book actor reports.
+M._book_sanity_enabled = false
+M._book_location_map   = {}  -- { ["<asset>|<chapter>"] = AP location id }
+M._book_item_to_book   = {}  -- { ["Book: <series> Vol N"] = { asset, chapter } }
+M._books_unlocked      = {}  -- { ["<asset>|<chapter>"] = true } from received book items
+M._books_correct_seen  = {}  -- de-dupe: books whose correct-placement check already fired
 
 -- AP-supplied per-seed data (set in set_slot_data()).
 M._slot_data = nil
@@ -223,6 +272,21 @@ M._shelves_open      = {}  -- { [section_id] = open_count }
 M._unwarded_snapshot = {}
 -- Count of OnLevelUp events deferred off the game thread; drained by the 3s mod-thread loop.
 M._pending_level_ups = 0
+
+-- Fatigue-trap state. The floor is the highest item index whose trap already fired (read from
+-- server data storage on connect); traps received before it arrives wait in _fatigue_pending.
+-- _fatigue_active maps skill name -> debuff seconds remaining. _fatigue_persist is set by
+-- main.lua and pushes a newly fired index back to storage.
+M._fatigue_floor   = nil
+M._fatigue_pending = {}
+M._fatigue_active  = {}
+M._fatigue_persist = nil
+-- True while the live skill arrays hold attunement/fatigue edits, so a slot that turns the
+-- system off knows to put the game's own values back once instead of leaving them modified.
+M._attune_dirty    = false
+-- The player's live carry max, captured from the game's SetHandingMaxNum (main.lua hook). nil
+-- until the first capture; apply_bag_capacity grants up to its target by reading this back.
+M._bag_live_max    = nil
 
 -- True around AP-driven UpgradePlayer calls so the main.lua hook doesn't echo a check.
 M._ap_grant = false
@@ -365,6 +429,11 @@ end
 --- state. AP re-sends all items on (re)connect, so reset _received_counts to avoid double-counts.
 function M.set_slot_data(slot_data)
     M._slot_data = slot_data
+    -- Same-slot MID-GAMEPLAY reconnect. Clearing _applied_skill_counts would zero the
+    -- `applied >= target` guard, so AP's reconnect item re-dump re-issues UpgradePlayer against
+    -- skills already at level -> over-level. Re-seeding from the save can't cover it: the seed runs
+    -- only on the apply-safe false->true edge, and SkillData reads 0 between save events.
+    local midgame_reconnect = M._gameplay_active and M._apply_safe
     -- BookVisibility option. true = HIDE warded books (default); false = "stacks" = visible
     -- but non-grabbable. The three hide paths gate on this so stacks keeps only collision-off.
     -- "~= stacks" defaults any missing/unknown value to the safe hide.
@@ -377,8 +446,16 @@ function M.set_slot_data(slot_data)
     M._shelves_open       = {}
     M._unwarded_snapshot  = {}
     M._pending_level_ups  = 0
+    -- Fatigue: re-read the fired-floor from server storage each connect and drop traps queued
+    -- against a stale connection; main.lua re-wires the persist hook per connection. Running
+    -- debuffs stay -- a same-slot reconnect doesn't cure fatigue.
+    M._fatigue_floor      = nil
+    M._fatigue_pending    = {}
+    M._fatigue_persist    = nil
     M._pending_skill_grants = {}
-    M._applied_skill_counts = {}
+    if not midgame_reconnect then
+        M._applied_skill_counts = {}
+    end
     M._sent_row_locations = {}
     M._sent_row_completions = {}
     M._sent_section_completions = {}
@@ -416,6 +493,30 @@ function M.set_slot_data(slot_data)
         for sid, n in pairs(slot_data.bookcase_counts) do
             M._section_bookcase_count[sid] = tonumber(n) or 0
         end
+    end
+
+    -- individual_series_items: each received "Series Unlock: <name>" item unlocks its specific
+    -- series. Map item_name -> series_name (empty table for the grouped default path).
+    M._individual_series_items = (slot_data.individual_series_items == 1)
+    M._series_item_to_series = (type(slot_data.series_item_to_series) == "table")
+        and slot_data.series_item_to_series or {}
+
+    -- BookSanity: per-book items + per-volume checks. book_location_map ("<asset>|<chapter>" ->
+    -- loc id) fires the check when that book is placed correctly; book_item_to_book ("Book: ..."
+    -- -> {asset,chapter}) drives which book un-wards on receiving the item.
+    M._book_sanity_enabled = (slot_data.book_sanity == 1)
+    M._book_location_map = (type(slot_data.book_location_map) == "table")
+        and slot_data.book_location_map or {}
+    M._book_item_to_book = (type(slot_data.book_item_to_book) == "table")
+        and slot_data.book_item_to_book or {}
+    M._books_unlocked = {}
+    M._books_correct_seen = {}
+    if M._book_sanity_enabled then
+        local nloc, nitem = 0, 0
+        for _ in pairs(M._book_location_map) do nloc = nloc + 1 end
+        for _ in pairs(M._book_item_to_book) do nitem = nitem + 1 end
+        log(("[book-sanity] ENABLED: book_location_map=%d book_item_to_book=%d")
+            :format(nloc, nitem))
     end
 
     -- Build section_id → list of row location IDs from row_location_map keys
@@ -525,6 +626,8 @@ end
 --- would lose them for good; clearing here lets the next world re-derive them.
 --- Re-firing is free: send_check still dedupes against what the server has
 --- already recorded.
+---
+--- The book-sanity dedupe is cleared alongside this at the same call site.
 function M.clear_check_dedupe()
     M._sent_row_locations = {}
     M._sent_row_completions = {}
@@ -628,6 +731,10 @@ function M.apply_item(name)
     -- Skill items: grant immediately (no slot_data / asset_data dependency).
     if SKILL_ITEM_TO_ABILITY[name] then
         M._apply_skill(name)
+    elseif MASTERY_TO_PROG[name] then
+        -- Mastery is interchangeable with a level: drive the matching skill's native level up
+        -- toward the new combined count now, rather than waiting for the periodic resync.
+        M._apply_skill(MASTERY_TO_PROG[name])
     end
 
     -- Section / Series / Shelf items: affect derived state. Require slot_data.
@@ -679,8 +786,9 @@ end
 --- Is GameSaveData still describing the PREVIOUS run rather than this one?
 ---
 --- During a New Game the last session's save stays resident until the game resets it, so anything
---- that derives progress from it grants the new run the old one's history. Every progress read
---- funnels through here so a new one cannot be added without meeting the rule.
+--- that derives progress from it grants the new run the old one's history. The three read sites
+--- (this module's baseline and progress sync, plus main.lua's row-threshold catch-up) all funnel
+--- through here so a fourth cannot be added without meeting the rule.
 ---
 --- The save's own row count is the clearing signal: a world with no history reads 0, and the first
 --- time it does the guard drops for the rest of the session. Anything above 0 while the flag is up
@@ -707,10 +815,10 @@ function M.run_baseline_sync()
     if M._baseline_sync_done then return end
     M._baseline_sync_done = true
 
-    -- Nothing to catch up on in a just-created world. Every sync below reads prior progress --
-    -- completed rows, sections, floors, the row count behind the XP level -- and GameSaveData still
-    -- holds the PREVIOUS session's save when a New Game world settles. Reading it sent a burst of
-    -- level-up checks the run had not earned into a live multiworld.
+    -- Nothing to catch up on in a world that has just been created. Every sync below reads prior
+    -- progress -- completed rows, sections, floors, and the row count behind the XP level -- and
+    -- GameSaveData still holds the PREVIOUS session's save when a New Game world settles. Reading
+    -- it sent a burst of level-up checks the run had not earned into a live multiworld.
     local SI = package.loaded["AP/SaveIdentity"]
     if SI and SI.fresh_world then
         log("[baseline] fresh New Game — no prior progress to sync")
@@ -768,11 +876,12 @@ function M.run_baseline_sync()
             rc_synced, rows_finished))
     end
 
-    -- Level-up baseline. current_level = max(xp_level, sent_level):
+    -- Level-up baseline. current_level = max(xp_level, capped sent_level):
     --   xp_level   — walk player.SkillLevelUpRowNum vs rows_finished (needs BP loaded).
     --   sent_level — highest level loc in APClient._sent_checks (works without GameSaveData).
     -- The _sent_checks floor stops _levels_reached resetting to 0 on reconnect (else every
-    -- OnLevelUp re-queues an already-deduped level and the real one never sends).
+    -- OnLevelUp re-queues an already-deduped level and the real one never sends), but it is
+    -- server-side state that outlives the save, so save_level_cap bounds it by this run's rows.
     local xp_level = 0
     do
         local player = FindFirstOf("BP_LibrarianCharacter_C")
@@ -809,6 +918,8 @@ function M.run_baseline_sync()
         end
     end
     local sent_level = M._compute_sent_level_baseline()
+    local lvl_cap = M.save_level_cap()
+    if lvl_cap and sent_level > lvl_cap then sent_level = lvl_cap end
     local current_level = math.max(xp_level, sent_level)
     log(("Level-up baseline sync: rows_finished=%d, xp_level=%d, sent_level=%d → current_level=%d"):format(
         rows_finished, xp_level, sent_level, current_level))
@@ -843,14 +954,26 @@ function M._recompute_state()
     -- old table or the whole new one, never a half-built one mid-pairs() (which corrupts the Lua heap
     -- across threads -> the rc3 'next'/'compare' errors + UE4SS abort). See _unwarded_snapshot.
 
-    -- Series: series_order[1..N*per_unlock]
+    -- Series: which series are unlocked. Two modes.
     local series_unlocked = {}
-    local series_count = M._received_counts["Progressive Series Unlock"] or 0
-    local per_unlock = M._slot_data.series_per_unlock or 5
-    local series_order = M._slot_data.series_order or {}
-    local total_series = math.min(series_count * per_unlock, #series_order)
-    for i = 1, total_series do
-        series_unlocked[series_order[i]] = true
+    if M._individual_series_items then
+        -- Per-series: each received "Series Unlock: <name>" item unlocks its series.
+        local map = M._series_item_to_series or {}
+        for item_name, count in pairs(M._received_counts) do
+            if count and count > 0 then
+                local sname = map[item_name]
+                if sname then series_unlocked[sname] = true end
+            end
+        end
+    else
+        -- Grouped (default): series_order[1..count*per_unlock].
+        local series_count = M._received_counts["Progressive Series Unlock"] or 0
+        local per_unlock = M._slot_data.series_per_unlock or 5
+        local series_order = M._slot_data.series_order or {}
+        local total_series = math.min(series_count * per_unlock, #series_order)
+        for i = 1, total_series do
+            series_unlocked[series_order[i]] = true
+        end
     end
 
     -- Shelf unlocks: per-section open_count = received count of that section's item.
@@ -862,10 +985,30 @@ function M._recompute_state()
         end
     end
 
+    -- BookSanity: which individual books are unlocked (per-book item received). Built into a local
+    -- and swapped atomically below, same thread-safety discipline as series_unlocked.
+    local books_unlocked = {}
+    if M._book_sanity_enabled then
+        local item_to_book = M._book_item_to_book or {}
+        for item_name, count in pairs(M._received_counts) do
+            if count and count > 0 then
+                local ac = item_to_book[item_name]   -- { series_name, chapter }
+                if type(ac) == "table"
+                        and type(ac[1]) == "string" and type(ac[2]) == "number" then
+                    books_unlocked[ac[1] .. "|" .. ac[2]] = true
+                end
+            end
+        end
+        local nb = 0
+        for _ in pairs(books_unlocked) do nb = nb + 1 end
+        log(("[book-sanity] _books_unlocked = %d books"):format(nb))
+    end
+
     -- Publish atomically (single reference assignment each), tables first so the snapshot below is
     -- computed from the fresh state.
     M._series_unlocked = series_unlocked
     M._shelves_open    = shelves_open
+    M._books_unlocked  = books_unlocked
     -- Precompute the read-only unwarded snapshot the game-thread hooks lookup against (no per-call
     -- alloc/iterate on the game thread). only_unward_shelfable_books is constant per session, so one
     -- snapshot in the active gating mode serves every hook. _compute_unwarded_set allocates here on
@@ -1162,6 +1305,12 @@ end
 -- Read by the warding/unward passes and the unlocked-state dump.
 M._books_warded = {}
 
+-- BookSanity per-book pile-hide tracker. Key "aidx|chapter" (one HISM instance = one volume) ->
+-- { hidden=bool, orig=<captured world FTransform table> }. A locked book's pile instance is
+-- teleported to deep Z (piles stay visible as the game's actor<->pile backfill). orig is captured
+-- once at rest for a clean restore on unlock. Cleared on world reload (reset_hism_state).
+M._book_inst_state = {}
+
 -- Drift probe: per case (keyed by GetFullName), the bHidden we last wrote. Compared before
 -- the next write to log [bookcase-drift] if the game's BP tick reverted our flag.
 M._case_last_applied_hidden = {}
@@ -1233,6 +1382,14 @@ function M.reset_hism_state()
     M._fast_stable = 0; M._fast_total = 0; M._fast_prev_case_n = nil   -- reset the button-gate readiness poller
     M._section_sorted_cache = nil   -- old world's case refs; rebuild the cached per-section sort next pass
     M._books_warded = {}
+    M._book_inst_state = {}
+    M._attune_base = {}          -- old world's skill objects are gone; recapture on next pass
+    M._attune_log_state = {}
+    M._attune_dirty = false      -- fresh skill objects hold the game's own values
+    M._bag_live_max = nil        -- capacity reset to the saved <=15; re-bootstrap from the chest checks
+    M._bag_logged_target = nil
+    M._bag_gate_logged = nil
+    M._bag_orphans_done = false  -- the surplus is re-orphaned by every load, so re-check each world
     M._unmapped_warded_books = {}
     M._last_applied_series_unlocked = {}
     M._case_last_applied_hidden = {}
@@ -1252,6 +1409,12 @@ function M.reset_hism_state()
     M._stray_cases = {}
     M._cases_indexed = false
     M._ward_canary = nil
+    -- A full collect used to run here, to reclaim the world's worth of bridge wrappers the clears
+    -- above just released. Removed: this function runs inside the LoadMap teardown, which is the
+    -- one window this game is known to die in (the 1.1.0-beta5 use-after-free), and a crash landed
+    -- there within milliseconds of this line. Finalizing wrappers while the engine frees the
+    -- objects behind them is not a risk worth taking for an unproven memory saving. The collector
+    -- reclaims them a little later on its own.
     log("[hism-reset] cleared HISM mapping state (will re-init on next apply-safe)")
 end
 
@@ -1380,10 +1543,57 @@ function M._apply_books_to_world()
     local mod_actor = FindFirstOf("ModActor_C")
     if not (mod_actor and mod_actor:IsValid()) then mod_actor = nil end
 
-    -- Cache BP_HISM_Manager for UpdateWPO: WPO displaces book vertices via material param,
-    -- hiding at deep Z without touching bHidden (which the game toggles view-dependently).
-    local mgr_for_wpo = FindFirstOf("BP_HISM_Manager_C")
-    if not (mgr_for_wpo and mgr_for_wpo:IsValid()) then mgr_for_wpo = nil end
+    -- BookSanity per-book pile hide: cache the HISM manager's component array. A locked book's pile
+    -- instance is teleported to deep Z below (piles stay visible as the game's actor<->pile backfill).
+    -- Each series' HISM = HISMArray[aidx+1]; the instance at index==Chapter is that volume. nil
+    -- (feature off) unless book_sanity + hidden mode + the diag flag are all on.
+    local hism_arr
+    if M._book_sanity_enabled and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT") then
+        local mgr = FindFirstOf("BP_HISM_Manager_C")
+        if mgr and mgr:IsValid() then pcall(function() hism_arr = mgr.HISMArray end) end
+    end
+    -- Teleport one book's pile INSTANCE. hide=true: capture its rest transform (once) + move it to
+    -- deep Z; hide=false: restore the captured transform. Idempotent via M._book_inst_state, so the
+    -- ~2 actors sharing an instance only teleport it once. All calls are on the game thread (the
+    -- flush chunk) + pcall-guarded.
+    local function _teleport_inst(aidx, chapter, hide)
+        local ikey = aidx .. "|" .. chapter
+        local st = M._book_inst_state[ikey]
+        if hide then
+            if st and st.hidden then return end          -- already hidden
+        elseif not (st and st.hidden) then return end    -- not hidden -> nothing to restore
+        local comp; pcall(function() comp = hism_arr[aidx + 1] end)
+        if not (comp and comp:IsValid()) then return end
+        if hide then
+            -- Capture the instance's current WORLD transform (GetInstanceTransform fills the table).
+            local cap = {}
+            local got = false
+            pcall(function() got = comp:GetInstanceTransform(chapter, cap, true) end)
+            if not (got and cap.Translation) then return end
+            local ox, oy, oz, rx, ry, rz, rw, sx, sy, sz
+            pcall(function()
+                ox, oy, oz = cap.Translation.X, cap.Translation.Y, cap.Translation.Z
+                rx, ry, rz, rw = cap.Rotation.X, cap.Rotation.Y, cap.Rotation.Z, cap.Rotation.W
+                sx, sy, sz = cap.Scale3D.X, cap.Scale3D.Y, cap.Scale3D.Z
+            end)
+            if oz == nil then return end
+            local orig = { Translation = { X = ox, Y = oy, Z = oz },
+                           Rotation = { X = rx, Y = ry, Z = rz, W = rw },
+                           Scale3D = { X = sx, Y = sy, Z = sz } }
+            local deep = { Translation = { X = ox, Y = oy, Z = oz - 1000000.0 },
+                           Rotation = { X = rx, Y = ry, Z = rz, W = rw },
+                           Scale3D = { X = sx, Y = sy, Z = sz } }
+            local wok = pcall(function() comp:UpdateInstanceTransform(chapter, deep, true, true, true) end)
+            if wok then
+                M._book_inst_state[ikey] = { hidden = true, orig = orig }
+                stats.tp_hide = (stats.tp_hide or 0) + 1
+            end
+        else
+            local wok = pcall(function() comp:UpdateInstanceTransform(chapter, st.orig, true, true, true) end)
+            if wok then st.hidden = false; stats.tp_show = (stats.tp_show or 0) + 1 end
+        end
+    end
+
 
     -- Cache any valid BP_BookCase_C as a MoveToBookCase attachment target (it needs a
     -- non-null AttchedActor; any case works).
@@ -1448,6 +1658,20 @@ function M._apply_books_to_world()
         end
         local series_name = M._asset_to_series[asset_idx]
         local should_unward = series_name and unwarded_set[series_name]
+        -- BookSanity: read this book's Chapter once -- used for both the per-book unlock gate here
+        -- and the pile-instance teleport after warding. In book mode no series is unlocked, so the
+        -- per-book gate (its own item arrived) is what reveals a book. Reads the atomic snapshot.
+        local chapter = nil
+        if M._book_sanity_enabled and series_name then
+            pcall(function()
+                local info = book.ItemInfo
+                if info and info:IsValid() then chapter = tonumber(info.Chapter) end
+            end)
+            if not should_unward and chapter ~= nil then
+                local bu = M._books_unlocked
+                if bu and bu[series_name .. "|" .. chapter] then should_unward = true end
+            end
+        end
         local key = book:GetFullName()
         local is_warded = M._books_warded[key] or false
         local ok = pcall(function()
@@ -1475,6 +1699,11 @@ function M._apply_books_to_world()
                 end
             end
         end)
+        -- BookSanity pile hide: teleport this book's pile instance to deep Z when locked (restore on
+        -- unlock). Hides the far/rest form; the actor ward above hides the close/look form. index == Chapter.
+        if hism_arr and chapter ~= nil then
+            _teleport_inst(asset_idx, chapter, not should_unward)
+        end
         if ok then
             if should_unward then stats.unwarded = stats.unwarded + 1
             else stats.warded = stats.warded + 1 end
@@ -1486,6 +1715,10 @@ function M._apply_books_to_world()
     -- Finalizer after the last chunk: diff log, state summary, in-progress/pending bookkeeping.
     local function _finalize_apply()
         M._finalize_apply_books(books, n, stats, series_snap, shelves_snap, last_applied_snap)
+        if (stats.tp_hide or 0) + (stats.tp_show or 0) > 0 then
+            log(("[book-pile] instances teleported: hid=%d restored=%d (tracked=%d)"):format(
+                stats.tp_hide or 0, stats.tp_show or 0, (function() local c = 0; for _ in pairs(M._book_inst_state) do c = c + 1 end; return c end)()))
+        end
         M._flush_in_progress = false
 
         if M._flush_pending then
@@ -1685,7 +1918,23 @@ function M.reconcile_book_actors()
         if b and b:IsValid() then
             local aidx = _book_valid_asset_idx(b)
             local series = aidx ~= nil and M._asset_to_series[aidx] or nil
-            if series and unwarded[series] then
+            -- Reconcile (restore mesh/collision) any book that SHOULD be shown:
+            -- its series is unwarded, OR (book_sanity) its own per-book item
+            -- arrived. Without the per-book arm the distance-swap that hides
+            -- SM_Book_1 on look is never undone for individually-unlocked books.
+            local reconcile_this = series and unwarded[series]
+            if not reconcile_this and series
+                    and M._book_sanity_enabled and M._books_unlocked then
+                local chapter = nil
+                pcall(function()
+                    local info = b.ItemInfo
+                    if info and info:IsValid() then chapter = tonumber(info.Chapter) end
+                end)
+                if chapter ~= nil and M._books_unlocked[series .. "|" .. chapter] then
+                    reconcile_this = true
+                end
+            end
+            if reconcile_this then
                 checked_unwarded = checked_unwarded + 1
                 -- Collision must be ON for an unwarded book.
                 local coll
@@ -2677,6 +2926,127 @@ end
 -- Read the bool VALUES, never #RowStatus (that's the shelf count, not a completion count).
 --   • Uniform case  -> completed shelf i maps to series CorrectBookDataIndex[i].
 --   • Mixed cabinet -> "fully present in home section", capped by # completed shelves.
+--- BookSanity: scan every book actor's "Is Abs Correct" bool (the game's own correct-placement
+--- verdict, the gold-highlight) and fire the per-book location check for newly-correct books.
+--- De-duped via M._books_correct_seen. Runs on the game thread, so it may read actors directly.
+--- Returns the count of new checks sent.
+local DCB_CHUNK = 250        -- books per rolling pass. Halved from 500: this sweep is only the
+                             -- backstop now (inserts drive the fast sweep), and 250 reflected
+                             -- "Is Abs Correct" reads fit a frame without a visible spike.
+local DCB_FAST_CHUNK = 1536  -- insert-triggered sweep: whole library in ~4 passes of the 500ms loop
+
+--- Ask the next scan to cover every book instead of one chunk. Called when the
+--- game reports a book was shelved, so the check fires promptly rather than
+--- whenever the rolling cursor happens to reach it.
+function M.request_full_book_scan()
+    M._dcb_full_scan = true
+end
+function M.detect_correct_books()
+    if not M._book_sanity_enabled then return 0 end
+    local blm = M._book_location_map
+    if type(blm) ~= "table" or not next(blm) then return 0 end
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient.send_check) then return 0 end
+
+    -- CHUNKED scan: FindAllOf over ~3000 book actors plus a string-keyed book["Is Abs Correct"] read
+    -- on each stalls the frame at the 3s cadence. BookSanity loads every book up front (no mid-play
+    -- streaming), so snapshot the list once and walk a slice per pass; actors freed under the
+    -- snapshot are caught by the IsValid() below. The re-snap at the wrap is the only thing that
+    -- refreshes the list after a world reload.
+    -- A shelved book used to trigger a FULL scan in one frame -- the exact stall the chunking
+    -- exists to avoid, paid on every insert, which in BookSanity is the player's core loop. It now
+    -- arms a FAST sweep instead: fresh snapshot, larger chunks, driven by the 500ms loop until it
+    -- wraps. Worst-case check latency is ~2s after shelving; no single frame carries the library.
+    if M._dcb_full_scan then
+        M._dcb_full_scan = false
+        M._dcb_fast = true
+        -- Two laps, not one. BookInserted fires when the book goes in, but the game sets its own
+        -- "Is Abs Correct" a beat later, so a single ~1s lap can finish while the flag is still
+        -- false and the book then waits on the rolling backstop -- minutes away at 250 books per
+        -- rotation tick. Reported as a shelved book whose check only arrived after re-shelving it.
+        M._dcb_fast_laps = 2
+        M._dcb_books, M._dcb_cursor = nil, 0   -- fresh snapshot, from the top
+    end
+
+    -- Drop the snapshot when the world reloaded, the same guard reconcile_book_actors applies to
+    -- its own. This sweep spans passes, so a world change mid-sweep leaves the array holding the
+    -- OLD world's book actors; the next pass then walks destroyed objects, and reading a freed
+    -- actor is a native access violation no pcall can catch. Every other cross-pass snapshot in
+    -- the mod is epoch-guarded -- this one was missed, and it only became reachable once the sweep
+    -- started running on the 500ms loop instead of finishing inside a single call.
+    if M._dcb_books and (M._world_epoch or 0) ~= (M._dcb_epoch or 0) then
+        M._dcb_books, M._dcb_cursor, M._dcb_n = nil, 0, 0
+    end
+
+    local books = M._dcb_books
+    local cursor = M._dcb_cursor or 0
+    if not books or cursor >= (M._dcb_n or 0) then
+        books = FindAllOf("BP_GrabbingBook_C")
+        if not books then M._dcb_books = nil; return 0 end
+        local cnt = 0; pcall(function() cnt = #books end)
+        M._dcb_books = books
+        M._dcb_n = cnt
+        M._dcb_epoch = M._world_epoch or 0
+        cursor = 0
+    end
+    local n = M._dcb_n or 0
+    if n == 0 then M._dcb_books = nil; return 0 end
+
+    local seen = M._books_correct_seen
+    local sent = 0
+    local stop = math.min(cursor + (M._dcb_fast and DCB_FAST_CHUNK or DCB_CHUNK), n)
+    for i = cursor + 1, stop do
+        local book = books[i]
+        if book and book:IsValid() then
+            -- nil for uninitialized orphans; 0 is a valid AssetIdx (1A's first).
+            local asset_idx = _book_valid_asset_idx(book)
+            if asset_idx ~= nil then
+                local is_correct = false
+                local chapter = nil
+                pcall(function()
+                    is_correct = (book["Is Abs Correct"] == true)
+                    if is_correct then
+                        local info = book.ItemInfo
+                        if info and info:IsValid() then chapter = tonumber(info.Chapter) end
+                    end
+                end)
+                local series_name = M._asset_to_series[asset_idx]
+                if is_correct and chapter ~= nil and series_name then
+                    local bid = series_name .. "|" .. chapter
+                    if not seen[bid] then
+                        local loc_id = tonumber(blm[bid])
+                        if not loc_id then
+                            -- No mapped location (e.g. the other floor under a floor goal):
+                            -- mark seen so it isn't rescanned every sweep.
+                            seen[bid] = true
+                        elseif APClient:send_check(loc_id) then
+                            -- Marked only on an accepted send. send_check refuses while identity
+                            -- is unverified, and marking first burned the check for the session.
+                            seen[bid] = true
+                            sent = sent + 1
+                            log(("[book-correct] %s ch%d -> loc %d"):format(
+                                series_name, chapter, loc_id))
+                        end
+                    end
+                end
+            end
+        end
+    end
+    M._dcb_cursor = stop
+    if M._dcb_fast and stop >= n then                             -- fast sweep wrapped
+        M._dcb_fast_laps = (M._dcb_fast_laps or 1) - 1
+        if M._dcb_fast_laps > 0 then
+            M._dcb_cursor = 0                                    -- go round again, same snapshot
+        else
+            M._dcb_fast = false                                  -- back to the rolling backstop
+        end
+    end
+    if sent > 0 then
+        log(("[book-correct] sent %d new book check(s)"):format(sent))
+    end
+    return sent
+end
+
 function M.detect_completed_rows()
     if not M._cases_indexed then return 0 end
     if not M._slot_data then return 0 end
@@ -2695,11 +3065,15 @@ function M.detect_completed_rows()
             return false
         end
         if M._sent_row_locations[loc_id] then return false end
+        local APClient = package.loaded["AP/APClient"]
+        if not (APClient and APClient.send_check) then return false end
+        -- Mark it only once the send is accepted. send_check refuses while save identity is
+        -- unverified, and marking first burned the location for the session -- detected, never
+        -- sent, and never retried.
+        if not APClient:send_check(loc_id) then return false end
         M._sent_row_locations[loc_id] = true
         log(("[row-detect] %s / %s -> loc %d %s"):format(sid, series_name, loc_id, dbg or ""))
-        local APClient = package.loaded["AP/APClient"]
-        if APClient and APClient.send_check then APClient:send_check(loc_id); return true end
-        return false
+        return true
     end
 
     for sid, cases in pairs(M._section_to_cases) do
@@ -2803,16 +3177,71 @@ function M.detect_completed_rows()
                                 end
                             end
                         end
-                        table.sort(candidates, function(a, b) return a.aidx < b.aidx end)
-                        local cap = #completed - already_fired
-                        if cap > 0 then
-                            for k = 1, math.min(cap, #candidates) do
-                                local c = candidates[k]
+                        -- Which of these actually finished, read from the books rather than
+                        -- guessed from index order.
+                        --
+                        -- Being present is not being finished: a series can have every volume in the
+                        -- case, contiguous, and still not count, because they are out of order. A
+                        -- finished row reads as a complete ascending chapter run. Measured in 1C,
+                        -- ordered runs matched the game's own completed-row count exactly.
+                        --
+                        -- Do NOT swap this for a slot-to-row map. None is reachable: GetRowNumArray
+                        -- answers [0,0,0], GetCorrectColumn's values do not read, GetCurrentRowNum
+                        -- does not marshal, and the row geometry differs per section shape.
+                        local chapters = {}
+                        pcall(function()
+                            for slot = 1, pbi_n do
+                                local book = pbi[slot]
+                                if book and book:IsValid() then
+                                    local info
+                                    pcall(function() info = book.ItemInfo end)
+                                    if info and info:IsValid() then
+                                        local a, ch
+                                        pcall(function()
+                                            a = tonumber(info.AssetIdx)
+                                            ch = tonumber(info.Chapter)
+                                        end)
+                                        if a then
+                                            chapters[a] = chapters[a] or {}
+                                            chapters[a][#chapters[a] + 1] = ch
+                                        end
+                                    end
+                                end
+                            end
+                        end)
+                        local finished = {}
+                        for _, c in ipairs(candidates) do
+                            local ch = chapters[c.aidx]
+                            local want = M._asset_to_volumes[c.aidx] or 0
+                            if ch and want > 0 and #ch == want and ch[1] == 0 then
+                                local asc = true
+                                for k = 2, #ch do
+                                    if not ch[k] or ch[k] ~= ch[k - 1] + 1 then asc = false; break end
+                                end
+                                if asc then finished[#finished + 1] = c end
+                            end
+                        end
+                        -- Cross-check against the game's own count before sending anything. They
+                        -- agree when the reading is right; a disagreement means a row is complete
+                        -- that this cannot see (or vice versa), and firing on a guess is what the
+                        -- old behaviour did. Hold instead -- the periodic pass retries every cycle.
+                        if #finished + already_fired == #completed then
+                            for _, c in ipairs(finished) do
                                 if fire_row(sid, c.name,
-                                        ("(AssetIdx %d) [scan %d/%d rows]"):format(c.aidx, #completed, rs_n)) then
+                                        ("(AssetIdx %d) [ordered %d/%d rows]"):format(
+                                            c.aidx, #completed, rs_n)) then
                                     sent_count = sent_count + 1
                                 end
                             end
+                        elseif #candidates > 0 then
+                            local names = {}
+                            for k = 1, #candidates do
+                                names[k] = ("%d"):format(candidates[k].aidx)
+                            end
+                            log(("[row-detect] %s: holding -- %d ordered + %d already sent ~= %d complete"
+                                .. " (candidates %s). Nothing fired; will retry.")
+                                :format(sid, #finished, already_fired, #completed,
+                                    table.concat(names, ",")))
                         end
                     end
                 end
@@ -2935,6 +3364,34 @@ function M.fire_floor_completions()
 end
 
 --- Fire "Complete N Rows" for any threshold <= total_rows (the game's correct-row counter
+--- Every check that a finished row can produce: the row itself, the "complete N rows" thresholds,
+--- and the section/floor completions a row can close out. One place, because it is called from two
+--- -- the 500ms fast path a FinishRow arms, and the rotating sync loop that backstops it -- and a
+--- copy in each would drift.
+---
+--- All of it is idempotent and de-duped, so running it twice costs nothing.
+function M.fire_completion_passes()
+    pcall(function() M.detect_completed_rows() end)
+    pcall(function()
+        local rf = 0
+        local gi = FindFirstOf("BP_LibrarianGameInstance_C")
+            or FindFirstOf("LibrarianGameInstanceBase")
+        if gi and gi:IsValid() then
+            local sg = gi.GameSaveData
+            if sg and sg:IsValid() then
+                rf = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
+            end
+        end
+        -- Same stale-save rule as the other progress reads: during a New Game this is the PREVIOUS
+        -- run's row count, and firing it sent 52 unearned thresholds.
+        if rf > 0 and not M.save_progress_is_stale(rf) then
+            M.fire_row_completion_checks(rf)
+        end
+    end)
+    pcall(function() M.fire_section_completions() end)
+    pcall(function() M.fire_floor_completions() end)
+end
+
 --- from FinishRow or CurrentFinishedRowNum). Returns the count sent.
 function M.fire_row_completion_checks(total_rows)
     if not M._slot_data then return 0 end
@@ -3011,6 +3468,49 @@ function M._compute_sent_level_baseline()
     return max_sent
 end
 
+--- The highest level THIS save's own progress justifies, or nil when the save can't be read.
+--- _sent_checks lives on the server, so it outlives restarts, reinstalls and deleted saves: a run
+--- that starts over on the same slot inherits the old run's level count. Capping the sent floor
+--- with this keeps the reconnect case working (an unreadable save still gets the floor) while a
+--- restarted run can no longer claim levels it never earned.
+function M.save_level_cap()
+    local rows, ok = 0, false
+    pcall(function()
+        local gi = FindFirstOf("BP_LibrarianGameInstance_C")
+            or FindFirstOf("LibrarianGameInstanceBase")
+        if gi and gi:IsValid() then
+            local sg = gi.GameSaveData
+            if sg and sg:IsValid() then
+                rows = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
+                ok = true
+            end
+        end
+    end)
+    if not ok then return nil end
+    -- Read-only stale check: during a New Game these are still the PREVIOUS save's numbers, which
+    -- say nothing about this run. Deliberately not save_progress_is_stale() -- that clears
+    -- fresh_world as a side effect, and this is only meant to observe.
+    local SI = package.loaded["AP/SaveIdentity"]
+    if SI and SI.fresh_world and rows > 0 then return nil end
+    local lvl = 0
+    local player = FindFirstOf("BP_LibrarianCharacter_C")
+    if player and player:IsValid() then
+        pcall(function()
+            local arr = player.SkillLevelUpRowNum
+            local n = 0; pcall(function() n = #arr end)
+            for i = 1, math.min(n, AP_MAX_PLAYER_LEVEL) do
+                if rows >= (tonumber(arr[i]) or 0) then lvl = i else return end
+            end
+        end)
+    end
+    if lvl == 0 and rows > 0 then   -- BP not resolved; same static fallback as the baseline sync
+        for i = 1, #XP_CURVE do
+            if rows >= XP_CURVE[i] then lvl = i else break end
+        end
+    end
+    return lvl
+end
+
 -- Bump _levels_reached and send the level-up check. Called from main.lua's OnLevelUp hook,
 -- one per in-game level-up. Self-heals from _sent_checks BEFORE incrementing: else after a
 -- reload (_levels_reached=0) every OnLevelUp re-queues an already-deduped level and lags forever.
@@ -3021,6 +3521,14 @@ function M.on_level_up_event()
     if M._levels_reached >= AP_MAX_PLAYER_LEVEL then return end
 
     local sent_level = M._compute_sent_level_baseline()
+    -- Cap the server floor at what this save supports. Without it, a player who reached level 10,
+    -- lost the save and started over levels up once and sends level 11 instead of their own first.
+    local lvl_cap = M.save_level_cap()
+    if lvl_cap and sent_level > lvl_cap then
+        log(("[progress] level-up event: sent floor %d exceeds this save's level (%d) → capping (restarted run?)"):format(
+            sent_level, lvl_cap))
+        sent_level = lvl_cap
+    end
     if sent_level > M._levels_reached then
         log(("[progress] level-up event: catch-up _levels_reached %d → %d (server's _sent_checks reflects prior-session levels)"):format(
             M._levels_reached, sent_level))
@@ -3172,20 +3680,29 @@ function M.sync_progress_state()
         M._level_baseline_done = true
     end
     local sent_level_floor = M._compute_sent_level_baseline()
+    -- current_level is this save's own row-derived level; the server floor may stand in for a save
+    -- we couldn't read, but must never exceed what the save justifies. See save_level_cap.
+    local lvl_cap = M.save_level_cap()
+    if lvl_cap and sent_level_floor > lvl_cap then sent_level_floor = lvl_cap end
     local floor_level = math.max(current_level, sent_level_floor)
     if floor_level > M._levels_reached then
         local prev_levels_reached = M._levels_reached
         log(("[progress] sync catch-up: _levels_reached %d → %d (xp=%d sent=%d) — firing send_check for missed levels"):format(
             prev_levels_reached, floor_level, current_level, sent_level_floor))
-        M._levels_reached = floor_level
         -- Fire send_check for every level in the catch-up range, else the counter advances
         -- but skipped levels never transmit (send_check dedupes, so re-firing is a no-op).
+        -- The counter only advances once every send is accepted: advancing past a refusal would
+        -- close this branch and the levels would never be retried.
         local APClient = package.loaded["AP/APClient"]
         if APClient and APClient.send_check then
+            local all_sent = true
             for level = 1, floor_level do
-                APClient:send_check(AP_LOC_LEVEL_FIRST + (level - 1))
+                if not APClient:send_check(AP_LOC_LEVEL_FIRST + (level - 1)) then all_sent = false end
             end
-            levels_sent = floor_level - prev_levels_reached
+            if all_sent then
+                M._levels_reached = floor_level
+                levels_sent = floor_level - prev_levels_reached
+            end
         end
     end
 
@@ -3194,13 +3711,14 @@ function M.sync_progress_state()
     local thresholds = M._slot_data.milestone_thresholds or {}
     for i, threshold in ipairs(thresholds) do
         if books_placed >= threshold and not M._milestones_sent[threshold] then
-            M._milestones_sent[threshold] = true
             local loc = AP_LOC_MILESTONE_FIRST + (i - 1)
-            log(("[progress] milestone: %d books placed (have %d) → loc %d"):format(
-                threshold, books_placed, loc))
             local APClient = package.loaded["AP/APClient"]
-            if APClient and APClient.send_check then
-                APClient:send_check(loc)
+            -- Marked only on an accepted send: a milestone never re-fires, so recording one that
+            -- the identity gate refused would lose it for good.
+            if APClient and APClient.send_check and APClient:send_check(loc) then
+                M._milestones_sent[threshold] = true
+                log(("[progress] milestone: %d books placed (have %d) → loc %d"):format(
+                    threshold, books_placed, loc))
                 milestones_sent = milestones_sent + 1
             end
         end
@@ -3246,9 +3764,9 @@ end
 --- so AP's reconnect re-dump doesn't re-bump skills already at level. Also refreshes the HUD.
 function M._init_applied_skill_counts_from_save()
     M._applied_skill_counts = {}
-    -- A New Game starts every skill at zero, but GameSaveData still holds the previous session's
-    -- save when it settles. Seeding from that made incoming Progressive items no-op against
-    -- "already applied", so the player was granted skills they never received in game.
+    -- A New Game world starts every skill at zero, but GameSaveData still holds the previous
+    -- session's save when it settles. Seeding from that made every incoming Progressive item
+    -- no-op against `applied >= target`, so the player was granted skills they never received.
     local SI = package.loaded["AP/SaveIdentity"]
     if SI and SI.fresh_world then
         log("[skill-baseline] fresh New Game — skills start at zero, not reading the save")
@@ -3365,10 +3883,15 @@ function M._apply_skill(name)
 
     -- Counter-based skip: only bump if applied < received. The counter is seeded from save
     -- at apply-safe, so the reconnect re-dump doesn't double-bump skills already at level.
-    local target  = M._received_counts[name] or 0
+    -- Interchange: Progressive AND Mastery both level the skill. Drive the native level toward the
+    -- combined count, capped at the native max so UpgradePlayer never no-ops past the cap (which
+    -- would run the applied counter past the save-capped level and desync on reconnect).
+    local xc      = SKILL_INTERCHANGE[name]
+    local mastery = (xc and (M._received_counts[xc.mastery] or 0)) or 0
+    local native_max = (xc and xc.max) or (M._received_counts[name] or 0)
+    local target  = math.min((M._received_counts[name] or 0) + mastery, native_max)
     local applied = M._applied_skill_counts[name] or 0
     if applied >= target then
-        log(("Skill %s already applied %d/%d — skipping bump"):format(name, applied, target))
         return
     end
 
@@ -3401,11 +3924,15 @@ function M.resync_skill_state()
 
     local retried_total = 0
     for item_name, ability_idx in pairs(SKILL_ITEM_TO_ABILITY) do
-        local target = M._received_counts[item_name] or 0
+        -- Combined Progressive + Mastery target (capped at native max), matching _apply_skill.
+        local xc = SKILL_INTERCHANGE[item_name]
+        local mastery = (xc and (M._received_counts[xc.mastery] or 0)) or 0
+        local native_max = (xc and xc.max) or (M._received_counts[item_name] or 0)
+        local target = math.min((M._received_counts[item_name] or 0) + mastery, native_max)
         local applied = M._applied_skill_counts[item_name] or 0
         if target > applied then
             local missing = target - applied
-            log(("[skill-resync] %s (ability=%d): applied=%d received=%d → re-applying %d"):format(
+            log(("[skill-resync] %s (ability=%d): applied=%d target=%d → re-applying %d"):format(
                 item_name, ability_idx, applied, target, missing))
             for _ = 1, missing do
                 M._apply_skill(item_name)
@@ -3414,6 +3941,362 @@ function M.resync_skill_state()
         end
     end
     return retried_total
+end
+
+local function _alen(a)
+    local n = 0
+    if a then pcall(function() n = #a end) end
+    return n
+end
+
+-- Fire a fatigue trap if its item index is above the fired-floor, then raise the floor both
+-- locally and in server storage so the same trap can never fire again.
+local function _maybe_fire_fatigue(skill, index)
+    local floor = M._fatigue_floor or -1
+    if index <= floor then
+        log(("[fatigue] %s idx=%d already fired (floor=%d); skipping"):format(skill, index, floor))
+        return
+    end
+    if index > floor then M._fatigue_floor = index end
+    if M._fatigue_persist then pcall(M._fatigue_persist, index) end
+    M._fatigue_active[skill] = (M._fatigue_active[skill] or 0) + FATIGUE_DURATION
+    log(("[fatigue] %s hit for %ds (idx=%d, total %ds)"):format(
+        skill, FATIGUE_DURATION, index, M._fatigue_active[skill]))
+end
+
+--- Called by main.lua when the fired-floor arrives from server storage. Drains any traps that
+--- queued up while the floor was unknown.
+function M.set_fatigue_floor(value)
+    M._fatigue_floor = tonumber(value) or -1
+    log(("[fatigue] fired-floor = %d (%d trap(s) waiting)"):format(
+        M._fatigue_floor, #M._fatigue_pending))
+    local pending = M._fatigue_pending
+    M._fatigue_pending = {}
+    for _, p in ipairs(pending) do _maybe_fire_fatigue(p.skill, p.index) end
+end
+
+--- Called by main.lua for each received "Fatigue: <skill>" item. Held until the fired-floor is
+--- known so a reconnect's item re-dump can't replay old traps.
+function M.on_fatigue_received(skill, index)
+    if M._fatigue_floor == nil then
+        M._fatigue_pending[#M._fatigue_pending + 1] = { skill = skill, index = index }
+        return
+    end
+    _maybe_fire_fatigue(skill, index)
+end
+
+-- Write each captured skill's arrays back to the game's own values. Used when a slot with the
+-- tuning system off inherits arrays a previous slot left modified (mid-gameplay reconnect keeps
+-- the same skill objects, so a world reload won't do it for us).
+function M._restore_attune_base()
+    if not M._attune_base then return end
+    for _, cfg in ipairs(ATTUNE_SKILLS) do
+        local base = M._attune_base[cfg.cls]
+        if base then
+            local so = FindFirstOf(cfg.cls)
+            if so and so:IsValid() then
+                pcall(function()
+                    local cd = so.CoolDownTimePreLevel
+                    for i = 1, math.min(_alen(cd), #base.cd) do cd[i] = base.cd[i] end
+                end)
+                if cfg.active and base.at then
+                    pcall(function()
+                        local at = so.ActiveTimePreLevel
+                        for i = 1, math.min(_alen(at), #base.at) do at[i] = base.at[i] end
+                    end)
+                end
+            end
+        end
+    end
+end
+
+-- Skill-tuning pass: writes Attunement extensions for maxed skills and ticks down any running
+-- Fatigue debuffs (elapsed = seconds since the last pass, i.e. the caller's loop interval, so
+-- debuff time only burns during gameplay). Below the real max we write back the game's own
+-- values -- normal progression is untouched. A fatigued skill is debuffed at ANY level.
+-- Re-runs every maintenance pass so it survives level-ups and reloads.
+function M.apply_attunement(elapsed)
+    if not (M._gameplay_active and M._apply_safe and M._slot_data) then return end
+    local enabled = (tonumber(M._slot_data.attunement) or 0) ~= 0
+
+    -- Tick debuffs down every pass, even on a slot with the system off, so switching away can't
+    -- freeze one mid-effect.
+    for skill, left in pairs(M._fatigue_active) do
+        local remaining = left - (tonumber(elapsed) or 0)
+        if remaining > 0 then
+            M._fatigue_active[skill] = remaining
+        else
+            M._fatigue_active[skill] = nil
+            log(("[fatigue] %s recovered"):format(skill))
+        end
+    end
+
+    if not enabled then
+        -- A slot without the tuning system carries no debuffs; if a prior slot left the arrays
+        -- modified, put the game's values back once, then there's nothing more to maintain.
+        M._fatigue_active = {}
+        if M._attune_dirty then
+            M._restore_attune_base()
+            M._attune_dirty = false
+            M._attune_log_state = {}
+        end
+        return
+    end
+
+    M._attune_base = M._attune_base or {}
+    M._attune_log_state = M._attune_log_state or {}
+    local any_mod = false
+    for _, cfg in ipairs(ATTUNE_SKILLS) do
+        local so = FindFirstOf(cfg.cls)
+        if so and so:IsValid() then
+            local fatigued = (M._fatigue_active[cfg.name] or 0) > 0
+            -- Capture the game's default arrays once. Skip while fatigued so a mod hot-reload
+            -- mid-debuff can't record the multiplied values as "base" -- wait for it to recover.
+            local base = M._attune_base[cfg.cls]
+            if not base and not fatigued then
+                base = { cd = {}, at = {} }
+                pcall(function()
+                    local a = so.CoolDownTimePreLevel
+                    for i = 1, _alen(a) do base.cd[i] = tonumber(a[i]) end
+                end)
+                if cfg.active then
+                    pcall(function()
+                        local a = so.ActiveTimePreLevel
+                        for i = 1, _alen(a) do base.at[i] = tonumber(a[i]) end
+                    end)
+                end
+                M._attune_base[cfg.cls] = base
+            end
+            local max_level = base and #base.cd or 0
+            if max_level > 0 then
+                local real_level = M._applied_skill_counts[cfg.prog] or 0
+                -- Interchange: steps past the native max = (Progressive + Mastery) - max_level.
+                -- Native levels are driven by _apply_skill/resync; here we only retune the top
+                -- cooldown/active slot for each level beyond max (curve steps 1..#cd).
+                local total = (M._received_counts[cfg.prog] or 0)
+                    + (M._received_counts[cfg.name .. " Mastery"] or 0)
+                local steps = total - max_level
+                if steps < 0 then steps = 0 end
+                if steps > #cfg.cd then steps = #cfg.cd end
+                if real_level < max_level then steps = 0 end
+                if steps > 0 or fatigued then any_mod = true end
+                -- The game reads the current level's entry, so attunement only needs the top
+                -- slot; fatigue multiplies every level so it bites wherever the player is.
+                pcall(function()
+                    local cd = so.CoolDownTimePreLevel
+                    for i = 1, math.min(_alen(cd), max_level) do
+                        local v = base.cd[i]
+                        if steps > 0 and i == max_level then v = cfg.cd[steps] end
+                        if fatigued then v = base.cd[i] * FATIGUE_CD_MULT end
+                        cd[i] = v
+                    end
+                end)
+                if cfg.active then
+                    pcall(function()
+                        local at = so.ActiveTimePreLevel
+                        for i = 1, math.min(_alen(at), #base.at) do
+                            local v = base.at[i]
+                            if steps > 0 and cfg.at and i == #base.at then v = cfg.at[steps] end
+                            if fatigued then v = math.max(1.0, base.at[i] * FATIGUE_AT_MULT) end
+                            at[i] = v
+                        end
+                    end)
+                end
+                -- Log once per state change, not per pass.
+                local state = ("%d|%s"):format(steps, fatigued and "F" or "-")
+                if M._attune_log_state[cfg.name] ~= state then
+                    M._attune_log_state[cfg.name] = state
+                    if steps > 0 or fatigued then
+                        log(("[attune] %s: level=%d/%d steps=%d fatigued=%s"):format(
+                            cfg.name, real_level, max_level, steps, tostring(fatigued)))
+                    end
+                end
+            end
+        end
+    end
+    M._attune_dirty = any_mod
+end
+
+-- Book capacity: the two bag grants add +2 (UpgradeBag) and +3 (UpgradeBag2) to the carry max.
+-- The game saves capacity only up to 15, so the surplus is rebuilt each load -- but rather than
+-- guess how much was restored, apply_bag_capacity reads the LIVE max (captured from the game's
+-- SetHandingMaxNum via a main.lua hook) and grants up to the target. "value" is the grant's +N;
+-- ability 1 (+2) is used for the fill, ability 2 (+3) only to land an odd remainder exactly.
+local BAG_ITEMS = {
+    { item = "+2 Book Capacity", value = 2 },
+    { item = "+3 Book Capacity", value = 3 },
+}
+
+-- True if the player has checked that chest's location -- this session, or per the server's
+-- authoritative checked set after a reconnect. Both chests grabbed => carry capacity is 15.
+local function _bag_chest_grabbed(loc)
+    local ap = package.loaded["AP/APClient"]
+    if not ap then return false end
+    if ap._sent_checks and ap._sent_checks[loc] then return true end
+    local checked
+    pcall(function()
+        if ap._client and ap._client.get_checked_locations then
+            checked = ap._client:get_checked_locations()
+        end
+    end)
+    local hit = false
+    if checked then
+        pcall(function()
+            for _, l in ipairs(checked) do if tonumber(l) == loc then hit = true; break end end
+        end)
+    end
+    return hit
+end
+
+-- Grant book capacity up to what the player's "+N Book Capacity" items (and grabbed chests) call
+-- for. Reads the live carry max and grants up to target -- idempotent: on reload capacity restores
+-- to <=15, we read that and fill the rest; a mid-session chest grab shrinks the gap, never
+-- overshoots. Grabbing a chest (its AP check) adds that chest's +N on top of the items.
+function M.apply_bag_capacity()
+    if not (M._gameplay_active and M._apply_safe and M._slot_data) then return end
+    if (tonumber(M._slot_data.bag_capacity) or 0) == 0 then return end
+
+    -- Both chests, before anything is granted.
+    --
+    -- KNOWN: these chest ids are duplicated in main.lua (AP_LOC_CHEST_*) and Locations.py -- AP ids
+    -- are frozen so they won't drift on their own, but keep the three in sync by hand.
+    --
+    -- This used to guard only the bootstrap below, which the live-max hook walked straight past:
+    -- grabbing ONE chest fires SetHandingMaxNum, so _bag_live_max stopped being nil and the fill
+    -- ran from a baseline that already held that chest's bonus. The surplus activated a chest
+    -- early, and the second chest then stacked on top of an already-filled bar -- 27 where 25 was
+    -- right, until a reload rebuilt it from the correct 15.
+    if not (_bag_chest_grabbed(1910622) and _bag_chest_grabbed(1910623)) then
+        if not M._bag_gate_logged then
+            M._bag_gate_logged = true
+            log("[bag] surplus parked -- both chests must be checked first")
+        end
+        return
+    end
+    M._bag_gate_logged = nil
+
+    -- Bootstrap the live max: SetHandingMaxNum only fires on a CHANGE, so on a plain load we have
+    -- no value. Both chests are in by here, so capacity is exactly 15 -- the fill's first grant
+    -- fires the hook and the real value takes over.
+    if M._bag_live_max == nil then
+        M._bag_live_max = 15
+        log("[bag] bootstrapped live=15 (both chests grabbed)")
+    end
+    local player = FindFirstOf("BP_LibrarianCharacter_C")
+    if not player or not player:IsValid() then return end
+    local target = 15   -- base 10 + both chests (Azure +2, Golden +3)
+    for _, cfg in ipairs(BAG_ITEMS) do
+        target = target + cfg.value * (M._received_counts[cfg.item] or 0)
+    end
+    -- Fill up to target. The hook updates M._bag_live_max synchronously after each grant, so we
+    -- read it back and stop the instant it reaches target (only ever adding).
+    local guard = 0
+    while (M._bag_live_max or 0) < target and guard < 60 do
+        local gap = target - M._bag_live_max
+        local ability = (gap == 3) and 2 or 1   -- +2 normally; +3 to land an odd gap of 3 exactly
+        local prev = M._bag_live_max
+        M._ap_grant = true
+        pcall(function() player:UpgradePlayer(ability) end)
+        M._ap_grant = false
+        guard = guard + 1
+        if (M._bag_live_max or 0) <= prev then break end   -- grant didn't take; stop
+    end
+    if M._bag_logged_target ~= target then
+        M._bag_logged_target = target
+        log(("[bag] target=%d live=%s"):format(target, tostring(M._bag_live_max)))
+    end
+end
+
+--- Put books the game orphaned on load back into the bag.
+---
+--- The game persists carry capacity only up to 15, so a save taken while holding more restores a
+--- 15-slot bag holding all of them. The surplus ends up attached to the player but absent from
+--- Items: it follows the player around, cannot be dropped, and cannot be shelved.
+---
+--- Recovering is preferable to preventing. Capacity is rebuilt a moment after the world settles,
+--- so the bag can hold them again by the time this runs -- and the alternative, dropping the
+--- surplus before every save, would take books out of the player's hands on each autosave.
+---
+--- Runs only once capacity has reached its target, and only while the count is genuinely over what
+--- the game restored: re-adding while the bag still reads 15 would be re-orphaned immediately.
+function M.recover_orphaned_bag_books()
+    if not _diag_on("BAG_ORPHAN_RECOVERY") then return end
+    if not (M._gameplay_active and M._apply_safe) then return end
+    if M._bag_orphans_done then return end
+    -- Capacity has to be back up first, or the bag has nowhere to put them.
+    if not M._bag_live_max or (M._bag_logged_target and M._bag_live_max < M._bag_logged_target) then
+        return
+    end
+
+    local player = FindFirstOf("BP_LibrarianCharacter_C")
+    if not (player and player:IsValid()) then return end
+    local bag
+    pcall(function() bag = player.ItemBagComponent end)
+    if not (bag and bag:IsValid()) then return end
+
+    -- Address set of what the bag already holds; orphans are attached books absent from it.
+    local held, n_held = {}, 0
+    pcall(function()
+        local items = bag.Items
+        local n = 0
+        if items then pcall(function() n = #items end) end
+        for i = 1, math.min(n, 64) do
+            local it = items[i]
+            if it and it:IsValid() then
+                local a; pcall(function() a = it:GetAddress() end)
+                if a then held[a] = true; n_held = n_held + 1 end
+            end
+        end
+    end)
+
+    local orphans = {}
+    pcall(function()
+        local books = FindAllOf("BP_GrabbingBook_C")
+        local n = 0
+        if books then pcall(function() n = #books end) end
+        for i = 1, math.min(n, 8000) do
+            local b = books[i]
+            local alive = false
+            pcall(function() alive = b and b:IsValid() end)
+            if alive then
+                local parent
+                pcall(function() parent = b:GetAttachParentActor() end)
+                if parent and parent:IsValid() then
+                    local pa, ba
+                    pcall(function() pa = parent:GetAddress() end)
+                    pcall(function() ba = b:GetAddress() end)
+                    local player_addr
+                    pcall(function() player_addr = player:GetAddress() end)
+                    if pa and player_addr and pa == player_addr and ba and not held[ba] then
+                        orphans[#orphans + 1] = b
+                    end
+                end
+            end
+        end
+    end)
+
+    if #orphans == 0 then
+        M._bag_orphans_done = true
+        return
+    end
+
+    log(("[bag] %d book(s) attached to the player but not in the bag (holding %d, max %s) -- re-adding")
+        :format(#orphans, n_held, tostring(M._bag_live_max)))
+    local ok_n = 0
+    for _, b in ipairs(orphans) do
+        if pcall(function() bag:PickUpGameItem(b) end) then ok_n = ok_n + 1 end
+    end
+    M._bag_orphans_done = true
+
+    -- Report what the bag actually holds afterwards rather than what was attempted: PickUpGameItem
+    -- can refuse silently, and "re-added 3" with an unchanged bag would read as a fix that worked.
+    local after = 0
+    pcall(function()
+        local items = bag.Items
+        if items then pcall(function() after = #items end) end
+    end)
+    log(("[bag] re-add issued for %d/%d; bag now holds %d (was %d)")
+        :format(ok_n, #orphans, after, n_held))
 end
 
 -- ============================================================================
@@ -3532,6 +4415,163 @@ function M.dump_unmapped_books()
         log(("  [%s] '%s' aidx=%d @ (%.0f, %.0f, %.0f) [%s]"):format(
             ud.section or "?", ud.series or "?", ud.asset_idx or 0,
             ud.x or 0, ud.y or 0, ud.z or 0, unlocked))
+    end
+end
+
+-- ============================================================================
+-- Re-hide sweep for BookSanity pile instances
+-- ============================================================================
+-- Insight ("Show Same Type Book") drags a hidden pile instance back up to its rest position. The
+-- warding flush is state-change-driven and its teleport is idempotent on _book_inst_state.hidden,
+-- so it never re-teleports a drifted instance -- the book stays visible (still un-grabbable; the
+-- actor ward is untouched) until a reload. Only instances we hid (st.hidden) are swept, reusing
+-- the stored orig: re-capturing here would take the drifted pose as the rest transform.
+-- ============================================================================
+local RESWEEP_CHUNK   = 500
+local RESWEEP_DEEP_DZ = 1000000.0   -- must match _teleport_inst's hide offset
+
+-- Cached manager -> HISMArray (per-series HISMs); FindFirstOf every pass is not free. The manager
+-- is per-world, so a reload leaves the cache dangling: revalidate per call, never prime once.
+local function _hism_arr()
+    local mgr = M._hism_mgr
+    if not (mgr and mgr:IsValid()) then
+        mgr = FindFirstOf("BP_HISM_Manager_C")
+        M._hism_mgr = (mgr and mgr:IsValid()) and mgr or nil
+    end
+    if not M._hism_mgr then return nil end
+    local arr
+    pcall(function() arr = M._hism_mgr.HISMArray end)
+    return arr
+end
+
+--- Sink ONE pile instance back down, immediately.
+---
+--- Exists because rewriting the transform the game passes to its own UpdateInstance does not stick:
+--- the hook fires on exactly the right books, but a struct argument written back from Lua is not
+--- what the game goes on to use. So instead of correcting the call, let it land and put the
+--- instance back with the write that is already known to work -- the same one the hide path uses.
+---
+--- Re-derives deep Z from the stored orig and never re-captures: most calls arrive on a pile that
+--- is already down, and taking that pose as the rest pose would sink the well a second time and
+--- strand the book when it unlocks.
+function M.resink_pile(aidx, chapter)
+    if not (M._book_sanity_enabled and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT")) then return false end
+    local st = M._book_inst_state[aidx .. "|" .. chapter]
+    if not (st and st.hidden and st.orig and st.orig.Translation) then return false end
+    local arr = _hism_arr()
+    if not arr then return false end
+    local comp; pcall(function() comp = arr[aidx + 1] end)
+    if not (comp and comp:IsValid()) then return false end
+    local o = st.orig.Translation
+    local deep = { Translation = { X = o.X, Y = o.Y, Z = o.Z - RESWEEP_DEEP_DZ },
+                   Rotation = st.orig.Rotation, Scale3D = st.orig.Scale3D }
+    return pcall(function() comp:UpdateInstanceTransform(chapter, deep, true, true, true) end)
+end
+
+-- Insight-aware re-hide, run from the 3s game-thread loop. Insight ("Show Same Type Book") keeps
+-- pushing the revealed piles back up while it is showing, so a re-hide issued then is overwritten:
+-- only the >=0 -> -1 edge sticks. GetShowingSameTypeIdx is the gate -- it returns the shown
+-- asset-idx while the skill is up, -1 when idle. IsSkillActivated reads unlocked-ness, not firing.
+function M.resweep_book_piles()
+    if not (M._book_sanity_enabled and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT")) then return end
+    if not (M._gameplay_active and M._apply_safe) then return end
+    local hism_arr = _hism_arr()
+    if not hism_arr then return end
+
+    -- The shown idx is an asset-idx -- the same key space as the <aidx> half of ikey -- so recording
+    -- it here is what lets the just_ended pass match the drifted piles by series.
+    local showing = false
+    do
+        local player = FindFirstOf("BP_LibrarianCharacter_C")
+        if player and player:IsValid() then
+            local sidx
+            pcall(function() sidx = player:GetShowingSameTypeIdx() end)
+            if type(sidx) == "number" and sidx >= 0 then
+                showing = true
+                M._insight_shown = M._insight_shown or {}
+                M._insight_shown[sidx] = true
+            end
+        end
+    end
+    -- The skill's own end call is the reliable edge; the poll below is the fallback for when the
+    -- hook is not registered. Polling alone can miss a short skill entirely -- a fatigued Insight
+    -- can finish inside one sample -- and the drift then waits for the rolling backstop instead.
+    local hook_ended = M._insight_ended == true
+    M._insight_ended = false
+    local just_ended = hook_ended or ((M._insight_showing_prev == true) and (not showing))
+    M._insight_showing_prev = showing
+    if showing and not hook_ended then return end   -- don't fight the active skill; wait for it to stop
+
+    -- Re-hide one instance that drifted back out of the deep-Z well. Deep Z is re-derived from the
+    -- stored orig, never re-captured: most calls land on a still-deep pile, and taking that as orig
+    -- would sink the well another RESWEEP_DEEP_DZ and restore unlocked books to deep Z.
+    local function _recheck(ikey)
+        local st = M._book_inst_state[ikey]
+        if not (st and st.hidden and st.orig and st.orig.Translation) then return 0 end
+        local aidx, chapter = ikey:match("^(%-?%d+)|(%-?%d+)$")
+        aidx = tonumber(aidx); chapter = tonumber(chapter)
+        if not (aidx and chapter) then return 0 end
+        local comp; pcall(function() comp = hism_arr[aidx + 1] end)
+        if not (comp and comp:IsValid()) then return 0 end
+        local cur = {}
+        local got = false
+        pcall(function() got = comp:GetInstanceTransform(chapter, cur, true) end)
+        local oz = st.orig.Translation.Z
+        local cz = got and cur.Translation and cur.Translation.Z
+        if not (oz and cz) then return 0 end
+        if cz <= (oz - RESWEEP_DEEP_DZ) + (RESWEEP_DEEP_DZ * 0.5) then return 0 end
+        local deep = {
+            Translation = { X = st.orig.Translation.X, Y = st.orig.Translation.Y, Z = oz - RESWEEP_DEEP_DZ },
+            Rotation = st.orig.Rotation, Scale3D = st.orig.Scale3D }
+        if pcall(function() comp:UpdateInstanceTransform(chapter, deep, true, true, true) end) then
+            return 1
+        end
+        return 0
+    end
+
+    if just_ended then
+        -- Insight only lifts the piles of the type(s) it showed, so drift is confined to those
+        -- asset-idxs. That filter is what makes this pass safe to run unchunked -- it leaves ~a
+        -- dozen instances, where every hidden pile would be ~3000 transform reads in one tick.
+        local shown = M._insight_shown or {}
+        M._insight_shown = nil
+        local fixed = 0
+        for ikey in pairs(M._book_inst_state) do
+            local a = ikey:match("^(%-?%d+)|")
+            if a and shown[tonumber(a)] then fixed = fixed + _recheck(ikey) end
+        end
+        if fixed > 0 then
+            log(("[book-pile] re-hid %d instance(s) as Insight ended"):format(fixed))
+        end
+        return
+    end
+
+    -- Backstop for drift NOT from Insight: a rolling cursor probes RESWEEP_CHUNK per pass. Drift
+    -- comes per-series in bursts, so a hit means the rest is likely drifted too -- catch the whole
+    -- list now, skipping the range the probe just covered.
+    local list = M._resweep_list
+    local idx = M._resweep_idx or 0
+    if not list or idx >= #list then
+        list = {}
+        for ikey, st in pairs(M._book_inst_state) do
+            if st.hidden and st.orig then list[#list + 1] = ikey end
+        end
+        M._resweep_list = list
+        idx = 0
+    end
+    local fixed = 0
+    local stop = math.min(idx + RESWEEP_CHUNK, #list)
+    for i = idx + 1, stop do fixed = fixed + _recheck(list[i]) end
+    if fixed > 0 then
+        for i = 1, #list do
+            if i <= idx or i > stop then fixed = fixed + _recheck(list[i]) end
+        end
+        M._resweep_idx = #list
+    else
+        M._resweep_idx = stop
+    end
+    if fixed > 0 then
+        log(("[book-pile] re-hid %d drifted instance(s)"):format(fixed))
     end
 end
 

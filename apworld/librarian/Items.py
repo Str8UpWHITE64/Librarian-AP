@@ -55,8 +55,11 @@ class LibrarianItemCategory(IntEnum):
     SERIES      = 2   # Progressive Series Unlock (5 series each)
     SHELF       = 3   # Progressive Shelf Unlock: <SectionId>
     MAJOR_SKILL = 4   # 5 Major Magic skills (progressive)
+    USEFUL      = 5   # Attunement: extend a maxed skill's cooldown / active-time
     FILLER      = 6
-    TRAP        = 7   # reserved for v2; unused in v1
+    TRAP        = 7   # Fatigue: a timed debuff on a skill
+    SERIES_INDIV = 8  # per-series unlock items (individual_series_items)
+    BOOK        = 9   # per-book items (book_sanity)
 
 
 class LibrarianItemData(NamedTuple):
@@ -105,19 +108,17 @@ _shelf_items: list[LibrarianItemData] = [
 
 # --- Major Magic (progressive) ---
 #
-# progression_skip_balancing rather than plain progression: these items
-# gate ONLY the 45 level-up locations (one copy per post-level-1 level)
-# and have no row/section/floor/goal dependency. Including 45 progression
-# copies in fill's balancing pass inflates routing work without helping
-# routing — skip_balancing keeps them progression-priority (placed before
-# filler) but out of the balancing loop. One of the bigger single fill
-# speedup wins available.
+# USEFUL, not progression. Skills help you sort faster but are never REQUIRED to
+# finish a row or win -- feasible_rows models rows from series + shelf only, never
+# magic -- so gating on them was artificial. As useful items they spread across the
+# multiworld (not pinned to the player's own level-ups) and level-ups host filler
+# instead: less boring, more cross-world, and all 45 still ship in the pool.
 _major_skill_items: list[LibrarianItemData] = [
-    LibrarianItemData("Progressive Sort",          200, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),
-    LibrarianItemData("Progressive Shelf Guide",   201, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),
-    LibrarianItemData("Progressive Insight",       202, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),
-    LibrarianItemData("Progressive Auto-Shelving", 203, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),
-    LibrarianItemData("Progressive Assemble",      204, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.progression_skip_balancing),
+    LibrarianItemData("Progressive Sort",          200, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.useful),
+    LibrarianItemData("Progressive Shelf Guide",   201, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.useful),
+    LibrarianItemData("Progressive Insight",       202, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.useful),
+    LibrarianItemData("Progressive Auto-Shelving", 203, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.useful),
+    LibrarianItemData("Progressive Assemble",      204, LibrarianItemCategory.MAJOR_SKILL, ItemClassification.useful),
 ]
 
 # --- Filler (themed) ---
@@ -130,13 +131,89 @@ _filler_items: list[LibrarianItemData] = [
     LibrarianItemData("Dust of Ages",         404, LibrarianItemCategory.FILLER, ItemClassification.filler),
 ]
 
+# --- Individual series-unlock items (opt-in: individual_series_items) ---
+#
+# One distinct item per series (~400), each unlocking that specific series.
+# progression_skip_balancing, not plain progression: keeps progression priority
+# but stays out of fill's balancing loop, where 400 items x N players is far too
+# slow. Codes 700 + index in data.ALL_SERIES. Always defined so their AP ids
+# exist, but only enter the pool when the option is on (see create_items);
+# ITEM_QUANTITIES omits them.
+def series_unlock_item_name(series_name: str) -> str:
+    return f"Series Unlock: {series_name}"
+
+
+_individual_series_items: list[LibrarianItemData] = [
+    LibrarianItemData(
+        series_unlock_item_name(series_name),
+        700 + idx,
+        LibrarianItemCategory.SERIES_INDIV,
+        ItemClassification.progression_skip_balancing,
+    )
+    for idx, (_sid, series_name, _vols) in enumerate(data.ALL_SERIES)
+]
+
+
+# BookSanity: one item per individual book (volume). Added to the pool only
+# when book_sanity is on (see create_items); ITEM_QUANTITIES omits them. Global
+# order matches data.ALL_BOOKS. Series names are globally unique, so
+# "Book: <series> Vol N" is a unique item name.
+def book_item_name(series_name: str, chapter: int) -> str:
+    return f"Book: {series_name} Vol {chapter + 1}"
+
+
+_book_items: list[LibrarianItemData] = [
+    LibrarianItemData(
+        book_item_name(_series_name, _chapter),
+        2000 + _idx,
+        LibrarianItemCategory.BOOK,
+        ItemClassification.progression_skip_balancing,
+    )
+    for _idx, (_asset_idx, _chapter, _sid, _series_name) in enumerate(data.ALL_BOOKS)
+]
+
+# --- Skill Mastery (useful) + Fatigue (trap) ---
+#
+# Mastery: pushes a skill one step past its real max along the game's tuning curve (lower cooldown,
+# longer active-time). A useful item, not more Progressive copies -- those are load-bearing level-up
+# gates. Fatigue: a one-shot ~2-min debuff (slow recovery, short active-time) that bites at any
+# level. Client-side only; names must match the client's ATTUNE_SKILLS ("<skill> Mastery" /
+# "Fatigue: <skill>").
+_ATTUNE_SKILLS = ("Sort", "Shelf Guide", "Insight", "Auto-Shelving", "Assemble")
+
+_attunement_items: list[LibrarianItemData] = [
+    LibrarianItemData(f"{name} Mastery", 300 + i,
+                      LibrarianItemCategory.USEFUL, ItemClassification.useful)
+    for i, name in enumerate(_ATTUNE_SKILLS)
+]
+
+# Book capacity: the game's two bag upgrades as useful items. "+2" = UpgradeBag (Azure Star),
+# "+3" = UpgradeBag2 (Golden Diamond). The client applies these via the bag grant, gated on the
+# matching chest check, and re-applies each load (the game only saves capacity up to its 15 cap).
+_bag_items: list[LibrarianItemData] = [
+    LibrarianItemData("+2 Book Capacity", 305, LibrarianItemCategory.USEFUL, ItemClassification.useful),
+    LibrarianItemData("+3 Book Capacity", 306, LibrarianItemCategory.USEFUL, ItemClassification.useful),
+]
+
+_fatigue_items: list[LibrarianItemData] = [
+    LibrarianItemData(f"Fatigue: {name}", 307 + i,
+                      LibrarianItemCategory.TRAP, ItemClassification.trap)
+    for i, name in enumerate(_ATTUNE_SKILLS)
+]
+
+
 # --- Combined, in stable order for ID assignment ---
 
 _all_items: list[LibrarianItemData] = (
     _series_items
     + _shelf_items
     + _major_skill_items
+    + _attunement_items
+    + _bag_items
+    + _fatigue_items
     + _filler_items
+    + _individual_series_items
+    + _book_items
 )
 
 item_dictionary: dict[str, LibrarianItemData] = {it.name: it for it in _all_items}
@@ -152,6 +229,11 @@ item_name_groups: dict[str, set[str]] = {
     "Major Magic":      {it.name for it in _major_skill_items},
     "Skills":           {it.name for it in _major_skill_items},
     "Filler":           {it.name for it in _filler_items},
+    "Series Unlocks (Individual)": {it.name for it in _individual_series_items},
+    "Books":            {it.name for it in _book_items},
+    "Skill Mastery":    {it.name for it in _attunement_items},
+    "Book Capacity":    {it.name for it in _bag_items},
+    "Traps":            {it.name for it in _fatigue_items},
 }
 
 
@@ -181,63 +263,6 @@ ITEM_QUANTITIES: dict[str, int] = {
 
 
 # ============================================================================
-# Pool-construction helpers
-# ============================================================================
-
-def progression_pool_size() -> int:
-    """Total progression item count (series + shelf unlocks + major magic)."""
-    return (
-        ITEM_QUANTITIES["Progressive Series Unlock"]
-        + sum(s.bookcase_count for s in data.SECTIONS)
-        + sum(data.SKILL_MAX_LEVELS[a] for a in data.MAJOR_MAGIC_ABILITIES)
-    )
-
-
-def useful_pool_size() -> int:
-    """Total useful item count (none — Minor Magic abilities aren't items)."""
-    return 0
-
-
-def required_filler_count(total_locations: int) -> int:
-    """Filler items needed to fill remaining location slots."""
-    return total_locations - progression_pool_size() - useful_pool_size()
-
-
-def build_item_pool(total_locations: int, rng=None) -> list[LibrarianItemData]:
-    """Build the full item pool sized to fit `total_locations`.
-
-    Distribution:
-        - All progression items at their fixed quantities
-        - Filler items distributed roughly evenly to fill the remainder
-    """
-    pool: list[LibrarianItemData] = []
-
-    # 1. Progression items at fixed quantities
-    for name, qty in ITEM_QUANTITIES.items():
-        item = item_dictionary[name]
-        pool.extend([item] * qty)
-
-    # 2. Filler — distributed across the themed filler items
-    needed = total_locations - len(pool)
-    if needed < 0:
-        raise ValueError(
-            f"Item pool ({len(pool)}) already exceeds location count "
-            f"({total_locations}). Reduce shelf-group quantities or add more locations."
-        )
-
-    if needed > 0 and _filler_items:
-        per_filler = needed // len(_filler_items)
-        extras = needed % len(_filler_items)
-        for i, item in enumerate(_filler_items):
-            count = per_filler + (1 if i < extras else 0)
-            pool.extend([item] * count)
-
-    if rng is not None:
-        rng.shuffle(pool)
-    return pool
-
-
-# ============================================================================
 # Sanity assertions
 # ============================================================================
 
@@ -251,10 +276,14 @@ assert len(_names) == len(set(_names)), "Duplicate item name detected"
 
 # Item ID ranges shouldn't overlap categories
 for cat, lo, hi in [
-    (LibrarianItemCategory.SERIES,      2,   2),
-    (LibrarianItemCategory.SHELF,       100, 199),
-    (LibrarianItemCategory.MAJOR_SKILL, 200, 299),
-    (LibrarianItemCategory.FILLER,      400, 499),
+    (LibrarianItemCategory.SERIES,       2,   2),
+    (LibrarianItemCategory.SHELF,        100, 199),
+    (LibrarianItemCategory.MAJOR_SKILL,  200, 299),
+    (LibrarianItemCategory.USEFUL,       300, 306),
+    (LibrarianItemCategory.TRAP,         307, 311),
+    (LibrarianItemCategory.FILLER,       400, 499),
+    (LibrarianItemCategory.SERIES_INDIV, 700, 1199),
+    (LibrarianItemCategory.BOOK,         2000, 5099),
 ]:
     for it in _all_items:
         if it.category == cat:
@@ -266,38 +295,4 @@ for cat, lo, hi in [
 for name in ITEM_QUANTITIES:
     assert name in item_dictionary, f"ITEM_QUANTITIES references unknown item '{name}'"
 
-# Final sanity: useful pool is empty (Minor Magic abilities are not items)
-assert useful_pool_size() == 0, f"Expected 0 useful items, got {useful_pool_size()}"
 # (Progression count varies with section.bookcase_count; not asserted to a fixed value.)
-
-
-# ============================================================================
-# Self-test
-# ============================================================================
-
-if __name__ == "__main__":
-    print("Librarian — Items.py summary")
-    print("=" * 60)
-    print(f"Distinct item names:        {len(_all_items)}")
-    print(f"  Series:                    {len(_series_items)}")
-    print(f"  Shelf unlocks (per-section): {len(_shelf_items)}")
-    print(f"  Major skills (progressive): {len(_major_skill_items)}")
-    print(f"  Filler types:               {len(_filler_items)}")
-    print()
-    print(f"Pool sizes (excluding filler):")
-    print(f"  Progression: {progression_pool_size()}")
-    print(f"  Useful:      {useful_pool_size()}")
-    print(f"  Subtotal:    {progression_pool_size() + useful_pool_size()}")
-    print()
-    print(f"Item-name → ID mapping (sample):")
-    for name, item_id in list(LibrarianItem.get_name_to_id().items())[:10]:
-        print(f"  {name:42s} → {item_id}")
-    print(f"  ... ({len(_all_items) - 10} more)")
-    print()
-    print(f"Per-section shelf-unlock quantities:")
-    for s in data.SECTIONS:
-        print(f"  {s.id} {s.name:35s} bookcases={s.bookcase_count}")
-    print()
-    pool_for_481 = build_item_pool(481)
-    print(f"Sample build_item_pool(481): {len(pool_for_481)} items")
-    print(f"  Filler count in pool: {sum(1 for it in pool_for_481 if it.category == LibrarianItemCategory.FILLER)}")

@@ -12,14 +12,7 @@ open up new series and bookcases.
 
 ## Requirements
 
-- **Librarian: Tidy Up the Arcane Library!** — **game build 1.0.12 or newer.**
-  https://store.steampowered.com/app/4197610/Librarian_Tidy_Up_the_Arcane_Library/
-
-  1.0.12 moved saves into numbered slots, and this mod's save handling is
-  built on them. On older builds it cannot work — Continue stays disabled
-  and no save slot can be claimed — so the title screen marks the game
-  **TOO OLD** rather than failing quietly. If you're on an older build,
-  use **Librarian-AP 1.1.0** instead.
+- **Librarian: Tidy Up the Arcane Library!** https://store.steampowered.com/app/4197610/Librarian_Tidy_Up_the_Arcane_Library/
 - **Archipelago** 0.6.x or newer on the server side.
 - **UE4SS (experimental build)**. The stable UE4SS release isn't new
   enough; an experimental build is required. A known-good copy is
@@ -217,21 +210,15 @@ or host it locally.
    automatically. Type your server (e.g. `archipelago.gg:38281`), slot
    name, and password (leave blank if none), then click **Connect**.
    You can also press **F4** any time to toggle the menu.
-3. What happens next depends on whether this seed has been played before:
-   - **First time on this seed** — only **New Game** is available. Click
-     it. Once the world has settled the mod claims a save slot for the
-     run and tells you which one, e.g.
-     `AP: this run is saved to slot 22 — load that slot to continue it.`
-   - **Returning to a seed** — the mod knows which slot is yours and
-     loads it for you. The load menu flashes open on its own; that's
-     expected, and it means the mod is picking your slot.
-4. Play normally. As you complete shelves, the mod sends location checks
+3. The mod takes it from here. Connecting to a seed for the first time
+   starts a New Game for you; returning to one loads that run's save.
+   You don't need to click Continue or Start Game.
+4. While the shelves are still being prepared (about 10 to 20 seconds)
+   you're held in the pause menu, with Resume, Save and Load unavailable
+   and Quit and Options still working. It releases itself as soon as the
+   world is ready, so you never walk into a library mid-setup.
+5. Play normally. As you complete shelves, the mod sends location checks
    to Archipelago; received items unlock more series and shelves.
-
-The mod verifies that the loaded world really is this run's save before
-it does anything. If you load the wrong save while connected, it says so
-on screen and sends **no** checks and hides **no** books until the right
-one is loaded — your other saves are never touched.
 
 ### Tips
 
@@ -240,90 +227,14 @@ one is loaded — your other saves are never touched.
   so the menu prefills with your last-used values on the next launch.
   You can also pre-populate this JSON if you'd rather not type fields
   each time.
-- Your AP progress lives in its own numbered save slot, separate from
-  your normal saves. See [How saving works](#how-saving-works) — please
-  read it, since the one thing that can lose a run is saving over that
-  slot by hand.
+- Your AP progress is saved in a per-seed save slot named
+  `Sav_AP_<seed>_<slot>.sav`, separate from your normal save. The
+  original `Sav.sav` is left alone.
 - **F12** is a direct-connect shortcut that bypasses the menu and uses
   whatever's currently in `ap_config.json`. Useful for quick reconnects.
 - If you ever see visual artifacts (e.g., a book showing in an
   unexpected place), going to the title screen and clicking Continue
   again will force a clean world reload.
-
----
-
-## How saving works
-
-**Short version: leave save slots 20–30 alone. The mod handles saving.**
-
-> **Requires game 1.0.12+, and a run started under this version of the mod.**
-> Runs from an earlier release are **not compatible** — their save is not
-> brought across, and continuing one after updating is neither supported nor
-> tested. Generate a new seed and start it fresh on this version of the mod
-> and apworld.
-
-The game keeps saves in numbered slots. Each AP run claims one free slot
-in the **20–30** range and treats it as the run's own — it is told to you
-on screen the first time, and the mod loads it for you whenever you
-reconnect to that seed. Slots 1–19 are yours and the mod never touches
-them.
-
-### Rules for the AP slot
-
-- **Don't load slots 20–30 from the load menu yourself.** The mod loads
-  the right one when you connect. Loading one by hand while connected to
-  a different seed makes the mod refuse to send checks until you go back
-  to the correct save.
-- **Don't save over slots 20–30.** This is the one action that can
-  genuinely lose a run: saving a different world into the run's slot
-  overwrites it, and the mod cannot get it back.
-- **Be careful when deleting saves.** Deleting an AP save is not
-  recoverable, so make sure you are deleting the correct ones.
-- **You don't need to save manually at all.** The mod writes the run's
-  slot after every save the game makes, on a timer, and when you quit or
-  return to the title. Quitting from the pause menu is safe.
-
-### If you run out of slots
-
-Eleven runs can be in progress at once (20–30). Once they're all taken, a
-new run can't claim one, and the mod will say so and ask you to free a
-slot and reconnect — so it's worth clearing finished runs before starting
-a twelfth.
-
-Deleting a finished run's slot is how you make room. To work out which is
-which, the load menu shows each slot's date, play time and row count, and
-the exact seed-to-slot mapping lives in:
-
-```
-%LOCALAPPDATA%\Librarian\Saved\LibrarianAP_slots.txt
-```
-
-If you're not sure a slot is finished, leave it — deleting the wrong one
-cannot be undone.
-
-### Why the mod is strict about this
-
-An Archipelago run reports your progress to a shared multiworld, and a
-false report can't be taken back — it can hand other players items they
-haven't earned and break the seed for everyone in it. So before the mod
-sends anything, it checks that the world you have loaded is genuinely
-this run's save. Until that check passes it stays completely passive: no
-checks sent, no books hidden, nothing written.
-
-That means a wrong save is harmless — you'll get an on-screen warning and
-can simply load the right one. It also means the mod would rather do
-nothing than guess.
-
-### If something looks wrong
-
-- **"this save does not match your run"** — you have the wrong save
-  loaded. Return to the title and reconnect; the mod will load the right
-  slot.
-- **The slot the mod recorded is gone** — the mod says so rather than
-  silently starting over. If you deleted it, the run's progress on the
-  server is still intact, but the game-side world is not recoverable.
-- **Which slot is mine?** It's named on screen when claimed, and in the
-  UE4SS log as `[save-id] claimed slot N for this run`.
 
 ---
 
@@ -400,7 +311,7 @@ When you launch the game, the UE4SS log
 (`<Game>\Librarian\Binaries\Win64\UE4SS.log`) should include lines like:
 
 ```
-[Lua] [LibrarianAP] LibAP v1.1.1 — Game v1.0.13 (verified compatible)
+[Lua] [LibrarianAP] LibAP v1.1.0 — Game v1.0.11 (verified compatible)
 [Lua] [BPModLoaderMod] Actor: ModActor_C /Game/Librarian/Map/...
 [Lua] [LibrarianAP] Press F4 to toggle the connection menu.
 [Lua] [LibrarianAP] Press F12 to connect to Archipelago.
@@ -411,6 +322,52 @@ If you see those, both the Lua mod and the BP pak are loaded correctly.
 If the connection menu doesn't appear at the title screen, check the
 log for `[menu]` lines. The most common issues are a server URL the
 client can't reach or a slot name that doesn't match the YAML.
+
+---
+
+## Managing save files
+
+Each AP run claims one of the game's save slots, in the **20–30** range.
+Your own saves use the lower slots and are never touched.
+
+**To delete an old run**, right-click its slot in the **Load** menu at the
+title screen and confirm. You can also do it from the Save menu in-game.
+Either way the mod clears its own record of that run at the same time, so
+there is nothing to tidy up by hand.
+
+Note the game won't let you delete the save you're currently playing, so
+clear old runs from the title screen before starting a new one.
+
+**Deleting an AP save cannot be undone.** The run can only be regenerated,
+not resumed.
+
+**If a run's save goes missing**, whether you moved it or deleted it and
+changed your mind, connecting to that seed will say so and wait. Put the save file
+back and reconnect and the run continues as before. Press **New Game** and
+the seed starts over from scratch. Nothing is thrown away until you press
+it.
+
+---
+
+## Known issues
+
+**A BookSanity check can lag behind the shelving that earned it.** The game
+marks a book correctly placed slightly after it tells the mod the book was
+shelved, so a check can occasionally miss its moment. If one hasn't
+appeared, pull the book off the shelf and place it again; that sends it
+immediately.
+
+**A book can turn invisible the moment you pick it up** (hidden-book modes).
+It looks fine on the shelf and stays grabbable, and it's random: different
+books each session. Throw it out of bounds and the game's own stray-book
+recovery returns it, visible, a few seconds later. Reloading also clears it.
+Nothing is lost either way and your save is never affected.
+
+This one is not fixable from the mod's side. The book's render proxy gets
+stuck below the layer the mod can reach: every readable property matches a
+healthy book, and rebuilding the proxy every way the engine allows produces
+an equally invisible one. Only a brand-new component clears it, which is
+what a reload or the out-of-bounds recovery gives you.
 
 ---
 

@@ -55,18 +55,79 @@ return {
 
     -- Proactively RefreshInfo() unwarded books so corruption self-heals as you walk past.
     -- OFF: RefreshInfo on a cached book that's mid-destruction during heavy manipulation = a native
-    -- AV (RC1 crash). Grab-path BOOK_REFRESH_FIX still covers the targeted case. Set true to re-enable.
+    -- AV. Grab-path BOOK_REFRESH_FIX still covers the targeted case. Set true to re-enable.
     BOOK_REFRESH_SWEEP = false,
 
     -- Every 5s, re-assert collision + mesh-visible on unwarded books (heals flag drift). Logs only on a fix.
     BOOK_ACTOR_RECONCILE = true,
 
-    -- Passive invisible-book scanner. OFF: too noisy without a camera-FOV filter (see known_bugs.txt).
+    -- BookSanity: hide a locked book by teleporting its pile instance to deep Z (pile stays visible
+    -- as the actor<->pile backfill). Restored on unlock. Off = actor ward alone gates grabbing.
+    BOOK_PILE_TELEPORT = true,
+
+    -- Log what the mass-book magic skills actually touch: which books Assemble takes, whether the
+    -- game asks CanBeGrab first, and which pile instances get rewritten while Insight is up. Cheap
+    -- (a few lines per skill use) and it is the only evidence for whether the two guards below are
+    -- hitting the right path. Turn off once the behaviour is settled.
+    MAGIC_LEAK_TRACE = true,
+
+    -- Assemble: answer the game's own grabbable predicate with "no" for a warded book, so the skill
+    -- never takes one. Only bites if the skill consults the predicate -- MAGIC_LEAK_TRACE says
+    -- whether it does. Off = the skill can pull a hidden book into the bag, from where it can be
+    -- shelved and fire a check the run has not earned.
+    MAGIC_WARD_CANBEGRAB = true,
+
+    -- Insight: ride the game's own pile write and sink a warded book's instance back to deep Z, so
+    -- it is never shown rather than re-hidden afterwards. Off = the post-hoc resweep alone, which
+    -- deliberately leaves locked books visible for the whole skill duration.
+    MAGIC_WARD_HISM_WRITE = true,
+
+    -- Insight: refuse the per-book highlight for a warded book by answering its own toggle with
+    -- "off". The pile sink alone was not enough -- the skill also lights the book actor, which is a
+    -- separate layer and the one actually seen.
+    MAGIC_WARD_SAMETYPE_FX = true,
+
+    -- DEV, DESTRUCTIVE. Arms F6 to call the Recall Stone's confirm handler, to learn what it does to
+    -- books -- specifically which per-book call it makes, so that call can be aimed at just the books
+    -- we displaced. It takes no arguments, so it recalls EVERY loose book, not only ours: it
+    -- rearranges the world and will change the recorded book layout. Only ever turn this on for a
+    -- save you are willing to lose. Ships OFF; F6 does nothing while it is off.
+    MAGIC_TEST_RECALL_STONE = false,
+
+    -- Insight: re-hide a warded book's ACTOR while the skill is up. Measured cause of the reveal --
+    -- the skill sets bHidden=false on the actor; the pile instance stays sunk throughout, which is
+    -- why re-sinking piles never helped. Off = locked books are visible (but still un-grabbable,
+    -- collision stays off) for the duration of the skill.
+    MAGIC_WARD_INSIGHT_ACTOR = true,
+
+    -- DEV, WRITES BOOK POSITIONS. Arms F6 to send up to 10 displaced books back to their own
+    -- SpawnTransform -- the first time the mod moves a book on purpose. It moves real books in the
+    -- live save, so it changes the recorded layout; only turn it on for a save you are willing to
+    -- lose. Ships OFF; F6 only reads while it is off.
+    MAGIC_TEST_RESTORE_HOME = false,
+
+    -- Assemble: take back any warded book that reached the bag. Not prevention -- the skill does
+    -- not dispatch through anything hookable, so the bag's own intake is the first place the book
+    -- can be seen at all. Off = a locked book can be carried and shelved, which fires a check the
+    -- run has not earned.
+    MAGIC_WARD_BAG_EVICT = true,
+
+    -- Put books back in the bag that a load left attached to the player but outside it. The game
+    -- persists carry capacity only up to 15, so saving while holding more restores the surplus into
+    -- limbo -- following the player, undroppable. Off = the player must drop below 15 before saving.
+    BAG_ORPHAN_RECOVERY = true,
+
+    -- Passive invisible-book scanner. OFF: too noisy without a camera-FOV filter -- "shown but not
+    -- drawn" is dominated by ordinary off-screen culling and floods the log.
     BOOK_INVIS_SCAN = false,
 
-    -- Single-thread mode -- the rc5 crash cure. Drives AP client create + poll() + item-apply AND all
-    -- warding on ONE thread (the BP_LibrarianCharacter pawn tick) instead of the async LoopAsync, so the
-    -- DLL + apply + warding + hooks share one Lua executor -- no cross-thread lua_State corruption (the
-    -- rc4 heap-corruption crash). OFF = legacy async poll (the pre-rc5 path). Shipping ON.
+    -- Single-thread mode. Drives AP client create + poll() + item-apply AND all warding on ONE thread
+    -- (the BP_LibrarianCharacter pawn tick) instead of the async LoopAsync, so DLL + apply + warding +
+    -- hooks share one Lua executor -- no cross-thread lua_State heap corruption. OFF = legacy async poll.
     POLL_ON_GAME_THREAD = true,
+
+    -- DEV ONLY. true -> main.lua loads AP/probe.lua and its diagnostic keybinds. Ships OFF. Missing
+    -- flags default ON here, so main.lua gates on the RAW value == true (not diag_on). Strip this flag
+    -- + AP/probe.lua + the main.lua require before release.
+    PROBE_MODE = false,
 }

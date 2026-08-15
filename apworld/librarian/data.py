@@ -827,8 +827,8 @@ SECTIONS: tuple[Section, ...] = (
 class UpgradeAbility:
     """Integer constants matching EUpgradeAbility in the game."""
     JUMP = 0                  # Minor — Crimson Octagon chest
-    UPGRADE_BAG = 1           # Minor — Azure Star chest  (delta +3 in MaxBagItemLevel)
-    UPGRADE_BAG_2 = 2         # Minor — Golden Diamond chest (delta +2)
+    UPGRADE_BAG = 1           # Minor — Azure Star chest  (+2 book capacity)
+    UPGRADE_BAG_2 = 2         # Minor — Golden Diamond chest (+3 book capacity)
     SHOW_MATCHING_SHELF = 3   # Major — Shelf Guide
     JOGGING = 4               # Minor — Emerald Club chest
     SORT_BOOKS = 5            # Major — Sort
@@ -936,6 +936,18 @@ SERIES_TO_SECTION: dict[str, str] = {
     for section in SECTIONS
     for series in section.series
 }
+
+# Flat list of every individual book (volume) -- the BookSanity granularity.
+# One entry per (series, volume): (asset_idx, chapter, section_id, series_name).
+#   asset_idx = the series' global index in ALL_SERIES == the AssetIdx the
+#               in-game book actor reports.
+#   chapter   = 0-based volume index within the series == the actor's Chapter.
+# Global order = ALL_SERIES order, then volume order. len(ALL_BOOKS) == 3072.
+ALL_BOOKS: tuple[tuple[int, int, str, str], ...] = tuple(
+    (asset_idx, chapter, section_id, series_name)
+    for asset_idx, (section_id, series_name, _volumes) in enumerate(ALL_SERIES)
+    for chapter in range(_volumes)
+)
 
 
 # ============================================================================

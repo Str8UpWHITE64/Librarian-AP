@@ -63,11 +63,21 @@ _G._librarian_poll_gt = POLL_GT
 local _gt_steps = {}          -- name -> { fn, interval, accum, stopped }
 local _gt_step_order = {}
 local _gt_pending_activate = nil  -- reason string set by a title-button hook; consumed on the game thread by the scheduler
-local _gt_pending_f12 = false     -- F12/F4 fire on the UE4SS input thread; the binds set a
+local _gt_pending_f12 = false     -- F12/F4/F6 fire on the UE4SS input thread; the binds set a
 local _gt_pending_f4  = false     -- boolean and the master tick runs the actual work
+local _gt_pending_f6  = false     -- dev: fire the Recall Stone once (MAGIC_TEST_RECALL_STONE)
 local _l3_resume = nil            -- L3 (book-pile HISM) chunk resume; the master scheduler advances it one chunk/frame
 local _l3c_ep, _l3c_mgr, _l3c_mat, _l3c_ready   -- L3 setup scan cache (per world epoch): HISM mgr / mask material / ready flag
 local _gt_last_epoch = -1         -- last world epoch the scheduler saw; a bump means the captured warding arrays are freed
+-- Hitch attribution + memory triage, reported to the log so a TESTER'S session can name the
+-- culprit. dt is the whole previous frame, so a spike blames every step that ran in it plus
+-- whatever the game itself was doing -- the names are suspects, not verdicts. The 60s summary
+-- carries the Lua heap: if the process RSS climbs while that line stays flat, the growth is not
+-- in the mod's Lua (engine streaming, or native-side object caches).
+local _perf = { names = {}, n = 0, worst = 0, sum = 0, cnt = 0,
+                b33 = 0, b66 = 0, b100 = 0, b150 = 0,
+                blame = {}, since = 0, cool = 0, kb0 = nil }
+
 local function gt_loop(name, interval_ms, fn)
     if POLL_GT then
         if not _gt_steps[name] then _gt_step_order[#_gt_step_order + 1] = name end
@@ -84,6 +94,8 @@ local function gt_run_steps(dt_ms)
             st.accum = st.accum + dt_ms
             if st.accum >= st.interval then
                 st.accum = 0
+                _perf.n = _perf.n + 1
+                _perf.names[_perf.n] = name
                 local ok, res = pcall(st.fn)
                 if ok then
                     if res == true then st.stopped = true end
@@ -114,6 +126,12 @@ local function gt_defer(delay_ms, fn)
     end
     if delay_ms < 1 then delay_ms = 1 end   -- 0 would be due in the same pass it was queued
     _gt_deferred[#_gt_deferred + 1] = { due = _gt_clock_ms + delay_ms, fn = fn }
+end
+-- Run fn on the game thread. Under POLL_GT every caller is already there, so marshalling would
+-- only push the work onto UE4SS's deferred queue for no benefit.
+local function gt_run_now(fn)
+    if POLL_GT then return fn() end
+    if type(ExecuteInGameThread) == "function" then ExecuteInGameThread(fn) else fn() end
 end
 
 local function gt_run_deferred(dt_ms)
@@ -155,6 +173,13 @@ end
 -- ExecuteInGameThread). Each callback re-checks its flag, so a flip = no-op.
 -- ============================================================================
 local BOOK_BP = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingBook.BP_GrabbingBook_C"
+
+-- Book-restore helpers, on one table: the main chunk sits just under Lua's 200-local ceiling and
+-- a table costs one slot however many hang off it. PROBE_MODE attaches dev diagnostics here too.
+--
+-- Declared here rather than beside the functions because the eviction path above calls into it.
+-- A local declared later is not an upvalue for earlier code -- it would resolve to a nil global.
+local _dev = {}
 local _book_hooks_attempted = false
 local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0, enforced = 0, enf_samples = 0,
               revealed = 0, rev_samples = 0, grabbed = 0, grab_samples = 0, grabfix = 0 }
@@ -165,6 +190,54 @@ local function _bh_series(book_obj)
     local aidx = IA._book_valid_asset_idx(book_obj)
     if aidx == nil then return nil, nil end
     return aidx, IA._asset_to_series[aidx]
+end
+
+-- BookSanity: true when this book's own per-book item has arrived (no series is
+-- unlocked in book mode, so this is what unwards it). Reads the atomic
+-- _books_unlocked; game-thread safe (single lookup + a pcall Chapter read).
+local function _bh_book_unlocked(book_obj, series)
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._book_sanity_enabled and series) then return false end
+    local bu = IA._books_unlocked
+    if not bu then return false end
+    local chapter = nil
+    pcall(function()
+        local info = book_obj.ItemInfo
+        if info and info:IsValid() then chapter = tonumber(info.Chapter) end
+    end)
+    return chapter ~= nil and bu[series .. "|" .. chapter] == true
+end
+
+--- Is this book one the run has NOT earned? The same test the SetActorVisible ENFORCE path makes,
+--- factored out so the magic-skill guards below cannot drift from it.
+---
+--- Returns nil, not false, when the answer cannot be established -- no series, no snapshot yet, a
+--- book mid-spawn. Callers must treat nil as "leave it alone": denying a grab on a book we simply
+--- failed to read would break ordinary play, which is a worse outcome than the leak.
+--- The (asset, chapter) pair identifying a book, in the same key space as _book_inst_state.
+local function _bh_book_key(book_obj)
+    if not book_obj then return nil end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._book_valid_asset_idx) then return nil end
+    local aidx = IA._book_valid_asset_idx(book_obj)
+    if aidx == nil then return nil end
+    local chapter
+    pcall(function()
+        local info = book_obj.ItemInfo
+        if info and info:IsValid() then chapter = tonumber(info.Chapter) end
+    end)
+    if chapter == nil then return nil end
+    return aidx, chapter
+end
+
+local function _bh_book_is_warded(book_obj)
+    if not book_obj then return nil end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._unwarded_snapshot) then return nil end
+    local _, series = _bh_series(book_obj)
+    if not series then return nil end
+    if IA._unwarded_snapshot[series] then return false end
+    return not _bh_book_unlocked(book_obj, series)
 end
 
 local function _bh_sample(tag, book_obj, extra)
@@ -368,7 +441,7 @@ local function _bh_grab_check(b, tag)
         -- _compute_unwarded_set here races _recompute_state -> the rc3 crash. See
         -- ItemApply._unwarded_snapshot.
         local uw = IA._unwarded_snapshot
-        unwarded_here = uw and uw[series] or false
+        unwarded_here = (uw and uw[series]) or _bh_book_unlocked(b, series) or false
     end
     -- BROKEN = any signal that renders an unwarded book invisible/unpickable: meshZ far from
     -- actorZ (deep-Z hide), opacity<1 (stuck-transparent MID), scaleX~0, or the raw hide flags.
@@ -398,9 +471,9 @@ local function _bh_grab_check(b, tag)
         log(("[book-hook] %s-MESH series=%s actorZ=%s meshZ=%s cpd=%s mesh=%s"):format(
             tostring(tag), tostring(series), tostring(actorz), tostring(meshz), tostring(cpd), tostring(meshname)))
     end
-    -- The deferred render-truth re-check that used to sit here is gone: it held an actor reference
-    -- across a 600ms async delay and then read the actor off-thread, which is the shared-heap access
-    -- the single-thread rule exists to remove. The fields it logged are diagnostics only.
+    -- The deferred render-truth probe that used to sit here is gone: it held a book-actor
+    -- reference across a 0.6s async delay and then read it off-thread, so it both entered the VM
+    -- on the async thread and could deref an actor freed in the meantime.
     if diag_on("BOOK_EVENT_GRABFIX") and unwarded_here == true then
         local did = {}
         if bhidden == true then
@@ -433,7 +506,21 @@ local function _bh_grab_check(b, tag)
     -- Some broken books have correct identity but corrupt display (out-of-range Tints + invisible)
     -- while every flag reads normal. RefreshInfo re-derives appearance from BookInfo; redraw on
     -- grab of an unwarded book. Gated BOOK_REFRESH_FIX.
-    if diag_on("BOOK_REFRESH_FIX") and unwarded_here == true then
+    --
+    -- Never while Insight is showing. RefreshInfo rebuilds the book's material instances, and the
+    -- highlight is one of them -- refreshing a lit book leaves the skill's later "turn it off"
+    -- writing to a material that is no longer the one on screen, so the book stays yellow until a
+    -- reload rebuilds it. Grabbing a highlighted book is exactly what Assemble does during Insight.
+    -- This redraw only heals a cosmetic fault, so deferring it past a skill window costs nothing.
+    local insight_showing = false
+    pcall(function()
+        local p = FindFirstOf("BP_LibrarianCharacter_C")
+        if p and p:IsValid() then
+            local sidx = p:GetShowingSameTypeIdx()
+            insight_showing = (type(sidx) == "number" and sidx >= 0)
+        end
+    end)
+    if diag_on("BOOK_REFRESH_FIX") and unwarded_here == true and not insight_showing then
         local ok = pcall(function() b:RefreshInfo() end)
         _bh.refreshed = (_bh.refreshed or 0) + 1
         if (_bh.refresh_samples or 0) < 20 then
@@ -447,6 +534,10 @@ local function try_register_book_hooks()
     if _book_hooks_attempted then return end
     if not diag_on("BOOK_EVENT_HOOKS") then return end
     _book_hooks_attempted = true
+    -- Marshalled deliberately, even under POLL_GT: the only caller is the warding_maint step, which
+    -- runs inside the ReceiveTick hook, and RegisterHook would then mutate UE4SS's hook table from
+    -- inside a ProcessEvent dispatch of that same table (UE4SS #1180). Marshalling FROM the game
+    -- thread is heap-safe -- it takes no cross-thread reference -- and defers this out of dispatch.
     ExecuteInGameThread(function()
         local function reg(fn, cb, cb_post)
             local ok, err
@@ -478,9 +569,13 @@ local function try_register_book_hooks()
                     -- GAME THREAD: read the precomputed snapshot (single lookup, no alloc/iterate).
                     -- Calling _compute_unwarded_set here is the rc3 crash (races _recompute_state).
                     local unwarded = IA._unwarded_snapshot
+                    -- Show if the series is unwarded OR (book_sanity) this book's own item
+                    -- arrived -- else the game's show call re-hides it every time it's looked at.
+                    local show_book = (unwarded and unwarded[series])
+                        or _bh_book_unlocked(b, series)
                     -- stacks mode (_book_hide_mode==false): warded actor stays visible, just
                     -- non-grabbable (collision is layer 1's job) -- never force-hide it.
-                    if IA._book_hide_mode ~= false and not (unwarded and unwarded[series]) then
+                    if IA._book_hide_mode ~= false and not show_book then
                         local set_ok = pcall(function() is_visible:set(false) end)
                         _bh.enforced = _bh.enforced + 1
                         if _bh.enf_samples < 10 then
@@ -500,7 +595,7 @@ local function try_register_book_hooks()
                 if rseries and IA and IA._unwarded_snapshot then
                     -- GAME THREAD: snapshot lookup only (see ENFORCE above / ItemApply._unwarded_snapshot).
                     local unwarded = IA._unwarded_snapshot
-                    if unwarded and unwarded[rseries] then
+                    if (unwarded and unwarded[rseries]) or _bh_book_unlocked(b, rseries) then
                         local sm; pcall(function() sm = b.SM_Book_1 end)
                         if sm and sm:IsValid() then
                             local mh, vis, op, mid
@@ -511,11 +606,18 @@ local function try_register_book_hooks()
                             -- op < 1 = stuck-transparent book; restore Opacity here too so just
                             -- LOOKING at it repairs it. Gated BOOK_OPACITY_FIX.
                             local op_bad = diag_on("BOOK_OPACITY_FIX") and type(op) == "number" and op < 1.0
+                            -- Collision first, and unconditionally. It used to be restored only
+                            -- inside the mesh-repair branch below, so a book whose mesh flags were
+                            -- already fine came back visible and still not pickable -- reported as
+                            -- "unhid but not interactable, Assemble fixes it", Assemble being the
+                            -- grab path that restores collision by another route. Showing an
+                            -- unwarded book and leaving it un-grabbable is never right, and the
+                            -- call is idempotent.
+                            pcall(function() b:SetActorEnableCollision(true) end)
                             if mh == true or vis == false or op_bad then
                                 if mh == true then pcall(function() sm:SetHiddenInGame(false, false) end) end
                                 if vis == false then pcall(function() sm:SetVisibility(true, false) end) end
                                 if op_bad then pcall(function() mid:SetScalarParameterValue("Opacity", 1.0) end) end
-                                pcall(function() b:SetActorEnableCollision(true) end)
                                 _bh.revealed = _bh.revealed + 1
                                 if _bh.rev_samples < 15 then
                                     _bh.rev_samples = _bh.rev_samples + 1
@@ -534,11 +636,32 @@ local function try_register_book_hooks()
             local b; pcall(function() b = self:get() end)
             _bh_sample("SetBookInfo", b)
         end)
+        -- CanBeGrab is the game's own "may this be taken" predicate. Answering it is how a warded
+        -- book is refused without moving or touching the actor -- which matters twice over: the
+        -- save-identity fingerprint reads book actor positions, and collision-off only stops the
+        -- paths that trace, not a skill that walks a type registry.
         reg("CanBeGrab", function(self)
             if not diag_on("BOOK_EVENT_HOOKS") then return end
             _bh.canbegrab = _bh.canbegrab + 1
             local b; pcall(function() b = self:get() end)
             _bh_grab_check(b, "CANGRAB")
+        end, function(self, result)
+            if not (diag_on("BOOK_EVENT_HOOKS") and diag_on("MAGIC_WARD_CANBEGRAB")) then return end
+            if not result then return end          -- no return value handed to us; nothing to deny
+            local b; pcall(function() b = self:get() end)
+            if _bh_book_is_warded(b) ~= true then return end   -- nil/false: leave the answer alone
+            -- First denial reports whether the override actually took. Nothing else in this mod
+            -- writes a return value from a post-hook, so the capability itself is unproven and a
+            -- silent no-op would otherwise read as "the skill ignores the predicate".
+            local set_ok = pcall(function() result:set(false) end)
+            _bh.grab_denied = (_bh.grab_denied or 0) + 1
+            if _bh.deny_samples == nil then _bh.deny_samples = 0 end
+            if _bh.deny_samples < 5 then
+                _bh.deny_samples = _bh.deny_samples + 1
+                local _, series = _bh_series(b)
+                log(("[book-hook] CanBeGrab DENY warded series=%s set_ok=%s"):format(
+                    tostring(series), tostring(set_ok)))
+            end
         end)
         -- GRAB-path observe + fix for "pickable book invisible" (which SetActorVisible/REVEAL
         -- never sees). _bh_grab_check runs from BOTH CanBeGrab (above) and GrabFromPlayer.
@@ -552,13 +675,451 @@ local function try_register_book_hooks()
     end)
 end
 
+-- ============================================================
+-- Magic-skill guards: keep the mass-book skills off warded books
+-- ============================================================
+-- Pile instances the game has just re-placed that we still consider hidden, waiting to be put back
+-- down. A queue rather than an immediate write because the correction cannot happen inside the
+-- game's own call: rewriting the transform argument does not stick, and the post-hook that would
+-- run after it never fires for this function. So the pre-hook records, and the master tick -- which
+-- runs later in the same frame -- does the write, using the path the hide already relies on.
+local _magic_resink = {}
+local _magic_resink_n = 0
+
+local function _magic_queue_resink(aidx, chap)
+    local k = aidx .. "|" .. chap
+    if _magic_resink[k] then return end
+    _magic_resink[k] = { aidx = aidx, chap = chap }
+    _magic_resink_n = _magic_resink_n + 1
+end
+
+--- Drained from the master tick. Bounded per pass: Insight re-places a whole series at once, and a
+--- long queue must not turn one frame into a stall.
+local function gt_drain_magic_resink()
+    if _magic_resink_n == 0 then return end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA.resink_pile) then _magic_resink = {}; _magic_resink_n = 0; return end
+    local done = 0
+    for k, e in pairs(_magic_resink) do
+        _magic_resink[k] = nil
+        _magic_resink_n = _magic_resink_n - 1
+        pcall(function() IA.resink_pile(e.aidx, e.chap) end)
+        done = done + 1
+        if done >= 32 then break end
+    end
+end
+
+-- Set by the bag-intake hook when a warded book arrives. Only a hint for the watcher below -- the
+-- watcher does not depend on it, because the whole difficulty here is that the interesting routes
+-- may not dispatch through anything hookable.
+local _magic_bag_dirty = false
+
+-- Books dropped out of the bag that are on their way home. Held only until the game's own return
+-- has had time to run, then re-warded. Actor references are kept across frames here, which is only
+-- safe because every one of these runs on the game thread and each is re-validated at use.
+local _magic_reward_q = {}
+-- Wait for the book to STOP MOVING rather than for a fixed delay. Cancel only interrupts the grab;
+-- the game returns the book to its shelf position afterwards, on its own schedule, and a fixed
+-- timer expired before that happened -- re-warding mid-flight and, worse, re-opening the save gate
+-- while the book still had a journey left to make.
+local MAGIC_STILL_TICKS  = 3      -- consecutive ~stationary samples before it counts as at rest
+local MAGIC_OBSERVE_MAX  = 90     -- keep watching this long; the game's return is late and silent
+local MAGIC_STILL_DIST2  = 25.0   -- squared units; below this counts as not moving
+
+local function _magic_pos(book)
+    local x, y, z
+    pcall(function()
+        local l = book:K2_GetActorLocation()
+        x, y, z = l.X, l.Y, l.Z
+    end)
+    return x, y, z
+end
+
+local function _magic_queue_reward(book, sent_home)
+    local x, y, z = _magic_pos(book)
+    -- Where we asked it to end up, so the log can report whether it obeyed. A book that reports
+    -- "sent home" but comes to rest somewhere else is the failure mode that matters here.
+    --
+    -- Measured against the actor's own SpawnTransform, not the pile instance's stored transform.
+    -- The old target was the pile record, which is a different point: it reported every returned
+    -- book as ~1000 units adrift while the books were in fact sitting where they belonged. An
+    -- off_home number that cannot be trusted is worse than none.
+    local hx, hy, hz
+    pcall(function()
+        local v = book.SpawnTransform and book.SpawnTransform.Translation
+        if v then hx, hy, hz = v.X, v.Y, v.Z end
+    end)
+    _magic_reward_q[#_magic_reward_q + 1] = {
+        book = book, sent_home = sent_home,
+        x0 = x, y0 = y, z0 = z,           -- where it was dropped, for the moved= report
+        hx = hx, hy = hy, hz = hz,        -- where it should end up
+        lx = x, ly = y, lz = z,           -- last sample
+        still = 0, age = 0,
+    }
+end
+
+--- Re-ward the books whose return has had time to complete, and report how far each actually moved.
+--- The distance is the diagnostic that matters: a book that has not moved never went home, and its
+--- position will not be where a reload puts it -- which is the failure that refused a run its own
+--- save. Near-zero movement here means the return call is the wrong one.
+--- Watch an evicted book for as long as the game might still move it.
+---
+--- Coming to rest once is not the end of the story: the game returns books to their shelves on a
+--- delay of its own, well after they have stopped rolling, so a watcher that stopped at the first
+--- stillness declared victory while the real journey was still to come. Each book therefore stays
+--- under observation for the full window, is re-warded whenever it is at rest, and any later
+--- movement re-arms both the re-ward and the save gate.
+local function gt_drain_magic_reward()
+    if #_magic_reward_q == 0 then return end
+    local IA = package.loaded["AP/ItemApply"]
+    local keep = {}
+    for _, e in ipairs(_magic_reward_q) do
+        local b = e.book
+        local alive = false
+        pcall(function() alive = b and b:IsValid() end)
+        if alive then
+            e.age = e.age + 1
+
+            -- The game sets this while it is carrying the book somewhere; trust it over position.
+            local teleporting = false
+            pcall(function() teleporting = b.Teleporting and true or false end)
+
+            local x, y, z = _magic_pos(b)
+            local moved_now = false
+            if x and e.lx then
+                local dx, dy, dz = x - e.lx, y - e.ly, z - e.lz
+                moved_now = (dx*dx + dy*dy + dz*dz) >= MAGIC_STILL_DIST2
+            end
+            e.lx, e.ly, e.lz = x, y, z
+
+            if moved_now or teleporting then
+                e.still = 0
+                if e.warded then
+                    -- It moved after we had already put it away: the return we were waiting for.
+                    e.warded = false
+                    log("[magic] evicted book moved again -- still not home, holding slot writes")
+                end
+            else
+                e.still = e.still + 1
+            end
+
+            if e.still >= MAGIC_STILL_TICKS and not e.warded then
+                e.warded = true
+                local moved = "?"
+                if x and e.x0 then
+                    local dx, dy, dz = x - e.x0, y - e.y0, z - e.z0
+                    moved = ("%.0f"):format(math.sqrt(dx*dx + dy*dy + dz*dz))
+                end
+                pcall(function()
+                    if not IA or IA._book_hide_mode then b:SetActorHiddenInGame(true) end
+                    b:SetActorEnableCollision(false)
+                end)
+                -- The number that decides whether this approach works: how far the book came to
+                -- rest from where we told it to go. Near zero means the teleport home landed and
+                -- the recorded layout will still describe this world after a reload.
+                local off = "?"
+                if x and e.hx then
+                    local dx, dy, dz = x - e.hx, y - e.hy, z - e.hz
+                    off = ("%.0f"):format(math.sqrt(dx*dx + dy*dy + dz*dz))
+                end
+                log(("[magic] re-warded at rest (moved=%s after %ds, sent_home=%s, off_home=%s)")
+                    :format(moved, e.age, tostring(e.sent_home), off))
+            end
+
+            if e.age < MAGIC_OBSERVE_MAX then
+                keep[#keep + 1] = e
+            elseif not e.warded then
+                log("[magic] observation window closed while book was STILL MOVING -- position suspect")
+            end
+        end
+    end
+    _magic_reward_q = keep
+end
+
+--- Hand back any book in the bag the run has not earned.
+---
+--- Eviction rather than refusal because the skill that puts them there dispatches through nothing
+--- we can intercept -- its own functions register cleanly and never fire, so the bag is the first
+--- point the book is observable at all. Runs from the tick, never from inside the intake call: the
+--- game is mid-way through adding the item at that moment, and taking it back underneath itself is
+--- how re-entrancy bugs start.
+---
+--- Re-wards the actor after dropping. The game returns a dropped book to its rest position and
+--- restores its visibility on the way, so without this the book ends up parked in the open.
+local function _magic_evict_bag()
+    if not diag_on("MAGIC_WARD_BAG_EVICT") then return end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._book_sanity_enabled) then return end
+    pcall(function()
+        local pawn = FindFirstOf("BP_LibrarianCharacter_C")
+        if not (pawn and pawn:IsValid()) then return end
+        local bag; pcall(function() bag = pawn.ItemBagComponent end)
+        if not (bag and bag:IsValid()) then return end
+        -- Re-read the bag between every drop. DropGameItem re-packs the array, so references
+        -- collected up front go stale after the first removal -- which is what made this evict one
+        -- book per pass, i.e. one per second, instead of clearing in one go.
+        local guard = 0
+        while guard < 32 do
+            guard = guard + 1
+            local it
+            pcall(function()
+                local items = bag.Items
+                if not items then return end
+                local n = 0; pcall(function() n = #items end)
+                for i = 1, math.min(n, 32) do
+                    local cand = items[i]
+                    if cand and cand:IsValid() and _bh_book_is_warded(cand) == true then
+                        it = cand
+                        return
+                    end
+                end
+            end)
+            if not it then break end
+            local dropped = pcall(function() bag:DropGameItem(it) end)
+            -- Do NOT re-ward here. A warded book has collision off, so dropping one and immediately
+            -- re-warding leaves it hanging in the air exactly where the player stood -- which is how
+            -- the run's recorded book layout stopped matching its own save. Give it collision back,
+            -- ask the game to put it away, and re-ward only once it has arrived.
+            pcall(function() it:SetActorEnableCollision(true) end)
+            pcall(function() it:Cancel() end)
+
+            -- Put it back directly instead of letting it fall. The previous version aimed
+            -- TeleportEffect at the pile instance's stored transform and then waited; its own
+            -- telemetry showed 8 of 9 books coming to rest ~1000 units off. What actually returned
+            -- them was the game's out-of-bounds rescue -- the dropped book fell through the floor,
+            -- left the world, and was caught seconds later, banner and all. That round trip is the
+            -- window in which the layout the save fingerprint reads is in motion.
+            --
+            -- SpawnTransform is the book's own record of where it belongs, and the write holds once
+            -- simulation is off, so there is nothing to fall and nothing to wait for.
+            local home = false
+            if _dev.restore_book_home then
+                home = _dev.restore_book_home(it) and true or false
+            end
+            _magic_queue_reward(it, home)
+            _bh.bag_evicted = (_bh.bag_evicted or 0) + 1
+            if (_bh.evict_samples or 0) < 8 then
+                _bh.evict_samples = (_bh.evict_samples or 0) + 1
+                local _, series = _bh_series(it)
+                log(("[magic] BAG EVICT series=%s dropped=%s"):format(
+                    tostring(series), tostring(dropped)))
+            end
+        end
+    end)
+end
+
+-- Trace budget. These fire from inside a skill's own dispatch, so an unbounded log would both spam
+-- the file and perturb the thing it is measuring.
+local _magic_trace_n = 0
+local function _magic_trace(what, detail)
+    if _magic_trace_n >= 60 then return end
+    _magic_trace_n = _magic_trace_n + 1
+    log(("[magic] %s%s"):format(tostring(what), detail and (" -- " .. tostring(detail)) or ""))
+end
+
+--- Report what is in the player's bag and whether any of it is warded. The whole question about
+--- Assemble is whether a book the run has not earned can end up here: from the bag it can be
+--- shelved, and shelving is what fires row-completion checks.
+local function _magic_bag_report(when)
+    if _magic_trace_n >= 60 then return end
+    local total, warded, example = 0, 0, nil
+    pcall(function()
+        local pawn = FindFirstOf("BP_LibrarianCharacter_C")
+        if not (pawn and pawn:IsValid()) then return end
+        local bag
+        pcall(function() bag = pawn.ItemBagComponent end)
+        if not (bag and bag:IsValid()) then return end
+        local items
+        pcall(function() items = bag.Items end)
+        if not items then return end
+        local n = 0
+        pcall(function() n = #items end)
+        for i = 1, math.min(n, 32) do
+            local it = items[i]
+            if it and it:IsValid() then
+                total = total + 1
+                if _bh_book_is_warded(it) == true then
+                    warded = warded + 1
+                    if not example then
+                        local _, s = _bh_series(it)
+                        example = s
+                    end
+                end
+            end
+        end
+    end)
+    _magic_trace(("bag %s"):format(tostring(when)),
+        ("items=%d warded=%d%s"):format(total, warded,
+            example and (" e.g. " .. tostring(example)) or ""))
+end
+
+-- Two skills reach books by a route the ward does not cover. Assemble collects by book type rather
+-- than by what the player can touch, so collision-off does not stop it; Insight re-shows pile
+-- instances from the game's own rest data, overwriting the deep-Z sink.
+--
+-- Both guards ride the game's own call and correct its argument, the same shape as the
+-- SetActorVisible ENFORCE path -- nothing here moves an actor. That is deliberate: the save-identity
+-- fingerprint reads book actor positions to decide whether a save belongs to the run, so a mod that
+-- relocates actors turns that signal into a record of itself.
+--
+-- Registered separately from the book hooks because these live on the character and the HISM
+-- manager, not on the book, and each class only becomes resident once its actor exists.
+local _magic_hooks_attempted = false
+local HISM_MGR_BP  = "/Game/Librarian/Prop/BP_HISM_Manager.BP_HISM_Manager_C"
+local CHAR_NATIVE  = "/Script/Librarian.LibrarianCharacter"
+local BAG_NATIVE   = "/Script/Librarian.ItemBagComponent"
+-- The book's parent, where the skill-side grab actually lives. BP_GrabbingBook overrides
+-- GrabFromPlayer but NOT GrabFromSkill, so the book path resolves to nothing for that one.
+local ITEM_BP      = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingItem.BP_GrabbingItem_C"
+local ITEM_NATIVE  = "/Script/Librarian.GrabbingItemBase"
+
+local function try_register_magic_hooks()
+    if _magic_hooks_attempted then return end
+    if not diag_on("BOOK_EVENT_HOOKS") then return end
+    -- Both classes must be resident: registering against one that is not is not a harmless no-op.
+    local mgr, char
+    pcall(function() mgr = FindFirstOf("BP_HISM_Manager_C") end)
+    pcall(function() char = FindFirstOf("BP_LibrarianCharacter_C") end)
+    if not (mgr and mgr:IsValid() and char and char:IsValid()) then return end
+    _magic_hooks_attempted = true
+
+    -- Marshalled for the same reason the book hooks are: the caller runs inside ReceiveTick, and
+    -- RegisterHook would mutate UE4SS's hook table from inside a dispatch of that same table.
+    ExecuteInGameThread(function()
+        local function mreg(path, label, pre, post)
+            local ok, err
+            if post then ok, err = pcall(function() RegisterHook(path, pre, post) end)
+            else         ok, err = pcall(function() RegisterHook(path, pre) end) end
+            log(("[magic-hook] register %-22s %s"):format(
+                label, ok and "OK" or ("FAILED: " .. tostring(err))))
+            return ok
+        end
+
+        -- Shared reader for the UpdateInstance hook below. Built once and passed to pcall by
+        -- reference: that hook fires on every instance the game re-places, so an inline
+        -- pcall(function() ... end) would allocate a fresh closure each time, before it even knows
+        -- whether the book is warded.
+        local function inst_key(info)
+            local i = info:get()
+            return tonumber(i.AssetIdx), tonumber(i.Chapter)
+        end
+
+        -- Insight. Correcting the transform the game hands its own UpdateInstance does not stick --
+        -- the hook lands on exactly the right books, but a struct argument written back from Lua is
+        -- not what the game goes on to use. So let the call complete and put the instance straight
+        -- back down afterwards, using the write the hide path already relies on. Post, not pre.
+        mreg(HISM_MGR_BP .. ":UpdateInstance", "UpdateInstance", function(self, info, transform)
+            if not diag_on("BOOK_EVENT_HOOKS") then return end
+            local IA = package.loaded["AP/ItemApply"]
+            if not (IA and IA._book_sanity_enabled and IA._book_inst_state) then return end
+            local ok, aidx, chap = pcall(inst_key, info)
+            if not (ok and aidx and chap) then return end
+            local st = IA._book_inst_state[aidx .. "|" .. chap]
+            if not (st and st.hidden) then return end
+            if not diag_on("MAGIC_WARD_HISM_WRITE") then return end
+            _magic_queue_resink(aidx, chap)
+            if diag_on("MAGIC_LEAK_TRACE") then
+                _magic_trace("queued re-sink", ("aidx=%d chap=%d"):format(aidx, chap))
+            end
+        end)
+
+        -- Assemble. The ability is GrabSameTypeBook, but the character function of that name never
+        -- dispatches -- registered fine, never fired -- so the skill reaches books some other way.
+        -- These are the book-side routes by which a book can be taken or moved; log-only, to find
+        -- which one actually carries it. GrabFromSkill is on the PARENT class: BP_GrabbingBook does
+        -- not override it, so hooking the book path would register against nothing.
+        for _, probe in ipairs({
+            { ITEM_NATIVE .. ":GrabFromSkill",       "GrabFromSkill(native)" },
+            { BOOK_BP .. ":SpawnBehindPlayer",       "SpawnBehindPlayer" },
+            { BOOK_BP .. ":MoveToSpaceArea",         "MoveToSpaceArea" },
+            { BOOK_BP .. ":TeleportEffect",          "TeleportEffect" },
+            { BOOK_BP .. ":MoveToCaseWithSkill",     "MoveToCaseWithSkill" },
+            { BOOK_BP .. ":Cancel",                  "Cancel(BP)" },
+            { BOOK_BP .. ":DetachActor",             "DetachActor" },
+            { BOOK_BP .. ":SetSimulate",             "SetSimulate" },
+            -- Out-of-bounds recovery. This is the behaviour we actually want: the game's popup says
+            -- it puts the book back where it came from, which is exactly the move eviction needs.
+            -- FellOutOfWorld is UE's own below-KillZ hook; the rest are the game's likely handlers.
+            { BOOK_BP .. ":FellOutOfWorld",          "FellOutOfWorld" },
+            { ITEM_NATIVE .. ":FellOutOfWorld",      "FellOutOfWorld(native)" },
+            { BOOK_BP .. ":ReceiveActorBeginOverlap","BeginOverlap" },
+            { BOOK_BP .. ":ReceiveHit",              "ReceiveHit" },
+            { BOOK_BP .. ":MoveToBookCase",          "MoveToBookCase" },
+            { BOOK_BP .. ":BookDonePlace",           "BookDonePlace" },
+            { BOOK_BP .. ":SetBookInfo",             "SetBookInfo" },
+            { BOOK_BP .. ":RefreshInfo",             "RefreshInfo" },
+        }) do
+            local path, label = probe[1], probe[2]
+            mreg(path, label, function(self)
+                if not diag_on("MAGIC_LEAK_TRACE") then return end
+                local b; pcall(function() b = self:get() end)
+                -- Log the warded state rather than filtering on it. Filtering to warded-only made
+                -- silence ambiguous: a route that fired on an unreadable book (state nil) looked
+                -- identical to a route that never fired at all.
+                local _, series = _bh_series(b)
+                _magic_trace(label, ("warded=%s series=%s")
+                    :format(tostring(_bh_book_is_warded(b)), tostring(series)))
+            end)
+        end
+
+        -- Insight's per-book highlight. Sinking the pile was not enough: the skill lights the book
+        -- ACTOR too, and that is the layer the player actually sees -- which is why 24 pile
+        -- re-sinks changed nothing on screen. Answering the toggle with "off" refuses the effect at
+        -- source. A bool argument does write back, unlike the transform struct the pile path needed.
+        mreg(BOOK_BP .. ":ToggleSameTypeEffect", "ToggleSameTypeEffect", function(self, is_on)
+            if not diag_on("BOOK_EVENT_HOOKS") then return end
+            local v; pcall(function() v = is_on:get() end)
+            if v ~= true then return end                     -- turning it off is always fine
+            local b; pcall(function() b = self:get() end)
+            if _bh_book_is_warded(b) ~= true then return end
+            if not diag_on("MAGIC_WARD_SAMETYPE_FX") then return end
+            local set_ok = pcall(function() is_on:set(false) end)
+            _bh.fx_denied = (_bh.fx_denied or 0) + 1
+            if diag_on("MAGIC_LEAK_TRACE") and (_bh.fx_samples or 0) < 5 then
+                _bh.fx_samples = (_bh.fx_samples or 0) + 1
+                local _, series = _bh_series(b)
+                _magic_trace("ToggleSameTypeEffect DENY",
+                    ("series=%s set_ok=%s"):format(tostring(series), tostring(set_ok)))
+            end
+        end)
+
+        -- The bag's own intake. Whatever moves a book -- a skill, a manual grab, anything -- it
+        -- has to arrive here, so this catches the leak without knowing which route carried it.
+        -- That matters because the skill's own functions register fine and never dispatch.
+        mreg(BAG_NATIVE .. ":PickUpGameItem", "PickUpGameItem", function(self, item)
+            if not diag_on("BOOK_EVENT_HOOKS") then return end
+            local b; pcall(function() b = item:get() end)
+            local warded = _bh_book_is_warded(b)
+            if diag_on("MAGIC_LEAK_TRACE") then
+                local _, series = _bh_series(b)
+                _magic_trace("PickUpGameItem", ("warded=%s series=%s")
+                    :format(tostring(warded), tostring(series)))
+            end
+            if warded == true then _magic_bag_dirty = true end
+        end)
+
+        -- Insight ending. Zero-latency edge for the existing resweep, which otherwise waits for the
+        -- 3s poll to notice -- a fatigued Insight can be shorter than that and be missed entirely.
+        mreg(CHAR_NATIVE .. ":HideSameTypeBook", "HideSameTypeBook", function()
+            local IA = package.loaded["AP/ItemApply"]
+            if IA then IA._insight_ended = true end
+            if diag_on("MAGIC_LEAK_TRACE") then _magic_trace("HideSameTypeBook", "insight ended") end
+        end)
+    end)
+end
+
 local _bh_report_tick = 0
 local function bh_report_periodic()
     if not diag_on("BOOK_EVENT_HOOKS") then return end
     _bh_report_tick = _bh_report_tick + 1
     if _bh_report_tick % 6 ~= 0 then return end   -- ~every 30s (6 ticks of the 5s loop)
-    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d Grab=%d (grabfix=%d) refresh-sweep=%d"):format(
-        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab, _bh.grabbed, _bh.grabfix, _bh.rsweep or 0))
+    -- refresh-grab is reported alongside refresh-sweep: the grab-path redraw rewrites book
+    -- materials, and leaving it out of this line hid it while a material-state bug was being
+    -- chased through the counters that were printed.
+    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d (denied=%d) Grab=%d (grabfix=%d) refresh-grab=%d refresh-sweep=%d | magic: fx-denied=%d bag-evicted=%d"):format(
+        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab, _bh.grab_denied or 0,
+        _bh.grabbed, _bh.grabfix, _bh.refreshed or 0, _bh.rsweep or 0,
+        _bh.fx_denied or 0, _bh.bag_evicted or 0))
 end
 
 -- ============================================================================
@@ -566,7 +1127,8 @@ end
 -- leaves no flag/material/transform trace; only WasRecentlyRendered exposes it.
 -- Every 5s, walk a budget of unwarded shown books; one NEAR + shown-but-not-drawn
 -- across INVIS_STREAK scans is a SUSPECT, dumped once. Gated BOOK_INVIS_SCAN;
--- budgeted so it never starves the AP poll loop. See known_bugs.txt.
+-- budgeted so it never starves the AP poll loop. The fault it hunts is the stuck render proxy
+-- described under Known issues in the README, which the mod cannot fix from its side.
 -- ============================================================================
 local _invis_books, _invis_cursor, _invis_n, _invis_epoch, _invis_uw = nil, 1, 0, nil, nil
 local _invis_streak, _invis_dumped = {}, {}
@@ -662,6 +1224,10 @@ end
 -- recorded first), REVEAL restores them. Runs every pass; cheap when nothing drifted.
 -- CRASH RULE: a MID on the book HISM crashes this game -- never reintroduce CreateDynamicMaterial*.
 local _b2_state = {}        -- [hi] = { hidden = bool, ns = N, mats = {[s] = origMaterial} }
+                            -- plus string-keyed pass state: .pass (tick count), .sn (cached
+                            -- per-HISM instance counts), .force (re-read on the next pass).
+                            -- Integer and string keys can't collide, and the wholesale reset on
+                            -- world reload clears both together.
 local _b2_last_sig = nil
 local _b2_running = false
 local _b2_load_requested = false
@@ -680,6 +1246,11 @@ local function apply_book_visibility()
     -- stacks mode: leave the pile visible (warding is layer-1 collision-off only); skip pile hiding.
     -- (==false so a nil mode before slot_data arrives still runs the hide path.)
     if IA._book_hide_mode == false then return end
+    -- BookSanity: the whole-HISM mask is per-SERIES and can't isolate individual books, and hiding
+    -- every pile removes the backfill the game's actor<->pile toggle relies on (unlocked books then
+    -- flicker/vanish). Leave the piles visible here; locked books are hidden per-instance by
+    -- teleporting their pile instance to deep Z. Skip the series mask.
+    if IA._book_sanity_enabled then return end
     -- Snapshot the world epoch (bumped by reset_hism_state each LoadMap). The game-thread chunk
     -- re-checks it before touching the captured HISM array: if the world reloaded, the freed
     -- arr[hi] is a native AV pcall can't catch (the main-menu teardown crash).
@@ -687,7 +1258,10 @@ local function apply_book_visibility()
     -- Cache the world-stable scan targets per world epoch. Each FindFirstOf / StaticFindObject walks the
     -- whole (huge) GUObjectArray (~3-4ms); doing 3-4 of them every 5s was the L3 setup hitch. Re-scan only
     -- when the cached object was freed (streaming) or the world reloaded (epoch bump).
-    if _l3c_ep ~= (epoch0 or 0) then _l3c_ep = epoch0 or 0; _l3c_mgr = nil; _l3c_mat = nil; _l3c_ready = false end
+    if _l3c_ep ~= (epoch0 or 0) then
+        _l3c_ep = epoch0 or 0; _l3c_mgr = nil; _l3c_mat = nil; _l3c_ready = false
+        _b2_state.force = true   -- fresh world: instance counts must be re-read, not carried over
+    end
     local mgr = _l3c_mgr
     if not (mgr and mgr:IsValid()) then mgr = FindFirstOf("BP_HISM_Manager_C"); _l3c_mgr = mgr end
     if not (mgr and mgr:IsValid()) then return end
@@ -730,9 +1304,11 @@ local function apply_book_visibility()
         _l3c_mat = mat
     end
     _b2_mat_ref = mat  -- pin against GC
-    -- Re-classify on EVERY call, not just on unwarded-set change: the actor<->HISM swap can drift
-    -- a group's classification, so an unwarded book's instance lands in a hidden group and vanishes;
-    -- re-running self-corrects within a pass. Cheap at steady state (reads only). sig labels the log.
+    -- What can actually differ between two passes: with the spatial cross-check disabled the
+    -- classification driver is _asset_to_series, a static Lua map, so only the unwarded set and a
+    -- HISM going empty/non-empty can move a decision. Re-classifying every 5s to notice that cost a
+    -- reflected PerInstanceSMData read per HISM whether or not anything changed. Run the pass when
+    -- the set moves, the world changes, or the backstop falls due; sig now gates as well as labels.
     local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
     local unwarded = IA._compute_unwarded_set(only_shelfable) or {}
     local skeys = {}
@@ -741,6 +1317,16 @@ local function apply_book_visibility()
     local sig = #skeys .. ":" .. table.concat(skeys, "|")
     local sig_changed = (sig ~= _b2_last_sig)
     _b2_last_sig = sig
+    -- Drift backstop every 12th pass (~60s here), mirroring REFRESH_FORCE_EVERY for bookcases: a
+    -- pile whose instance count moved without the set moving is caught there. A hide delayed until
+    -- then is cosmetic -- collision and the actor ward are separate layers and stay current.
+    _b2_state.pass = (_b2_state.pass or 0) + 1
+    local due = (_b2_state.pass % 12) == 0
+    if not (sig_changed or _b2_state.force or due) then return end
+    -- Counts are re-read on a backstop or a new world; a set-change pass reuses them, since arriving
+    -- items don't move instances.
+    if due or _b2_state.force or not _b2_state.sn then _b2_state.sn = {} end
+    _b2_state.force = false
     _b2_running = true
     -- 2D nearest-match (X,Y only): HISM instance transforms are component-LOCAL, so their Z doesn't
     -- match the actor's WORLD Z. Stacked books share X,Y (minor ambiguity) but all get classified.
@@ -810,11 +1396,23 @@ local function apply_book_visibility()
         end
         local cur_hn = hn; pcall(function() cur_hn = #arr end)
         local last = math.min(cursor + CHUNK - 1, cur_hn)
+        -- Re-fetched per chunk: a world reload between frames swaps _b2_state out from under us.
+        local sncache = _b2_state.sn
+        if not sncache then sncache = {}; _b2_state.sn = sncache end
         for hi = cursor, last do
             local h; pcall(function() h = arr[hi] end)
             if h and h:IsValid() then
-                local sm; pcall(function() sm = h.PerInstanceSMData end)
-                local sn = 0; if sm then pcall(function() sn = #sm end) end
+                -- sn only answers "is this HISM empty" now that the cross-check is off, and the
+                -- PerInstanceSMData read behind it is the expensive crossing in this loop -- so
+                -- serve it from the cache and re-read only when the backstop cleared it. The
+                -- cross-check, when enabled, needs the live sm array and so always reads.
+                local sm = nil
+                local sn = sncache[hi]
+                if sn == nil or B2_SPATIAL_CROSSCHECK then
+                    pcall(function() sm = h.PerInstanceSMData end)
+                    sn = 0; if sm then pcall(function() sn = #sm end) end
+                    sncache[hi] = sn
+                end
                 -- DRIVER: the index mapping. hi == the series' position in the data order, so the
                 -- hi-th HISM's series is _asset_to_series[hi-1]. Deterministic, resume-safe, no warm-up.
                 local idx_series = IA._asset_to_series[hi - 1]
@@ -911,6 +1509,10 @@ local function apply_book_visibility()
         else
             _l3_resume = nil
             _b2_running = false
+            -- Stamped whether or not anything changed: the ready gate waits on this to know the
+            -- piles have actually been masked for THIS world, and a pass that hid nothing still
+            -- answers that question.
+            _b2_state.applied_epoch = epoch0 or 0
             -- Log only when something changed or the cross-check disagrees.
             if sig_changed or (newly_hidden + revealed) > 0 or mismatch > 0 or leader_changed > 0 or n_locked > 0 then
                 log(("[b2] applied: newly_hidden=%d revealed=%d kept_hidden=%d kept_shown=%d / %d HISMs"):format(
@@ -1170,9 +1772,11 @@ local function update_title_buttons()
     elseif _vanilla_mode then
         -- Vanilla (Close clicked): restore base-game button behavior -- Continue if
         -- the player's (non-AP) save exists, New Game always. Mod stays passive.
+        local vanilla_slot = read_save_slot()
         enable_continue = ap_save_exists()
         enable_start = true
-        log(("[title-buttons] vanilla — continue=%s start=true"):format(tostring(enable_continue)))
+        log(("[title-buttons] vanilla — continue=%s start=true (slot='%s')"):format(
+            tostring(enable_continue), tostring(vanilla_slot)))
     else
         log("[title-buttons] not connected; both gameplay buttons disabled")
     end
@@ -1181,6 +1785,12 @@ local function update_title_buttons()
     -- called Button_LoadGame but the widget property is Button_Continue, so
     -- writing the delegate name silently did nothing. Button_Load is the slot
     -- picker, which reaches any save and so has to follow Continue.
+    -- Publish the New Game verdict so auto-New-Game can defer to it instead of re-deriving
+    -- "does this run have a save" and drifting from what the button actually shows.
+    pcall(function()
+        local S = package.loaded["AP/SaveIdentity"]
+        if S then S.start_enabled = enable_start end
+    end)
     pcall(function() set_button_enabled(widget.Button_Continue, enable_continue, "Button_Continue") end)
     pcall(function() set_button_enabled(widget.Button_Load, enable_continue, "Button_Load") end)
     pcall(function() set_button_enabled(widget.Button_StartGame, enable_start, "Button_StartGame") end)
@@ -1204,10 +1814,10 @@ end
 -- ============================================================
 -- Title-screen status text hijack
 -- ============================================================
--- WBP_Title.Text_Version (bottom-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
+-- WBP_Title.Text_Version (top-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
-local MOD_VERSION = "1.1.3"
+local MOD_VERSION = "2.0.0"
 local TESTED_GAME_VERSIONS = { "1.0.12", "1.0.13" }
 
 -- Hard floor, not a preference. Below this the game keeps saves as one flat file, so the slot the
@@ -1359,6 +1969,22 @@ local _reject_nag = nil       -- tick counter for the repeated wrong-save warnin
 local _pre_apply_settle_state = nil  -- {empty_ticks, reapplies_done} during pre-apply settle
 local _reconnect_settle_state = nil  -- {last_item_tick, quiet_ticks, total_ticks} during mid-game reconnect
 
+--- Describe a layout record as "hash/sample". The sample count is the number of loose books that
+--- went into the hash, and it is the diagnostic that matters: if it differs between the save and
+--- the next load, no arrangement of books can make the hashes agree.
+local function _fp_desc(record_fn)
+    local fp, sample = record_fn()
+    if fp then return ("%d/%s books"):format(fp, tostring(sample or "?")) end
+    -- Re-sampling can legitimately fail here: the quit mirror runs while the world is being torn
+    -- down. That is not a problem as long as a layout was already taken during play -- report the
+    -- one on record rather than implying nothing was saved.
+    local SI = package.loaded["AP/SaveIdentity"]
+    if SI and SI.stored_fp then return ("%d (recorded earlier)"):format(SI.stored_fp) end
+    -- "none" on its own is what made two rounds of this hard to diagnose: it reads as "nothing to
+    -- record" when it actually meant "could not record, and here is why".
+    return ("none (%s)"):format((SI and SI.fp_why) or "no reason recorded")
+end
+
 --- Warding is held until the world is known to be this run's. Beyond saving the
 --- work, warding a foreign save would hide the player's own books in their own
 --- game.
@@ -1374,6 +2000,13 @@ local function identity_evaluate(why)
     if not SI then return end
     local before = SI.verdict
     local v = SI.evaluate()
+    -- The layout comparison decides accept-or-reject on its own, so its numbers have to be visible.
+    -- Without them a rejection says only "does not match" -- no way to tell a genuinely foreign save
+    -- from our own book count having shifted, which is the difference between working as intended
+    -- and refusing the player's own run.
+    if SI.last_fp then
+        log(("[save-id] %s: %s"):format(why, SI.last_fp))
+    end
     if SI.last_counts then
         log(("[save-id] %s: %s -> %s (%s)"):format(why, tostring(before), tostring(v), SI.last_counts))
     end
@@ -1587,12 +2220,10 @@ local function start_gameplay_loops()
             pcall(function() update_title_buttons() end)
             pcall(function() update_title_status_text() end)
             if _G._librarian_menu and _G._librarian_menu.set_status then
-                _G._librarian_menu.set_status("World ready — click Continue", "ok")
+                _G._librarian_menu.set_status("World ready", "ok")
             end
-            local hud = package.loaded["AP/HUD"]
-            if hud and hud.notify then
-                hud.notify("AP: World ready — click Continue", 10.0)
-            end
+            -- No toast here any more: the mod enters the world itself the moment it is ready, so a
+            -- "world ready" popup only ever appeared a beat before the screen changed under it.
             return true
         end
         return false
@@ -1662,9 +2293,11 @@ local function start_gameplay_loops()
         if not IA._apply_safe then return false end
         -- Not during a flush: registering the book hooks installs SetActorVisible / SetBookInfo /
         -- CanBeGrab callbacks that _apply_one_book's own visibility and collision writes would then
-        -- re-enter, nesting Lua inside the flush. It missed this window by timing rather than design.
+        -- re-enter, nesting Lua inside the flush. It missed this window by timing last run rather
+        -- than by design.
         if not IA._flush_in_progress then
             pcall(try_register_book_hooks)   -- register the book hooks (one-shot, game thread)
+            pcall(try_register_magic_hooks)  -- character + HISM-manager hooks (one-shot)
         end
         pcall(bh_report_periodic)        -- ~30s [book-hook] count report
         pcall(function() IA.refresh_index_if_changed() end)   -- catch lazy-spawned bookcases
@@ -1678,9 +2311,38 @@ local function start_gameplay_loops()
         return false
     end)
 
+    -- Periodic milestone / level sync (3s). Book-placement milestones key off InsertedBookNum,
+    -- which grows without finishing rows; the FinishRow hook would miss those until the next row.
+    -- Level-ups are event-driven (OnLevelUp), so this poll is mostly milestones.
+    -- Runs the scan a shelving event asked for. Separate from the 3s sync pass
+    -- so the check lands about as fast as the player expects; costs a flag test
+    -- per tick when nothing is pending.
+    gt_loop("book_scan", 500, function()
+        local IA = package.loaded["AP/ItemApply"]
+        if not IA then return false end
+        if not (IA._gameplay_active or IA._allow_pre_apply) then return true end
+        -- _dcb_fast keeps the insert-triggered sweep riding this 500ms loop until it wraps;
+        -- without it the fast chunks would fall back to the 3s loop and take ~12s to cover.
+        if (IA._dcb_full_scan or IA._dcb_fast) and IA._apply_safe and not IA._flush_in_progress then
+            local sent = 0
+            pcall(function() sent = IA.detect_correct_books() or 0 end)
+            if sent > 0 then
+                log(("[book-sanity] shelving → %d check(s) sent"):format(sent))
+            end
+        end
+        -- Finishing a row is announced by FinishRow, which only arms this flag. Run the checks
+        -- here, on the same 500ms loop BookSanity's shelving sweep already rides, so every mode
+        -- reacts to a completed row at the same speed rather than waiting on the rotation.
+        if IA._row_check_pending and IA._apply_safe and not IA._flush_in_progress then
+            IA._row_check_pending = false
+            pcall(function() IA.fire_completion_passes() end)
+        end
+        return false
+    end)
+
     -- Keep this run's slot current: after each save the game makes, and on a
-    -- timer as well, since the game only autosaves on row completion and a run
-    -- can go a long time without finishing one.
+    -- timer as well, since a BookSanity session can run for hours without the
+    -- game autosaving at all.
     gt_loop("slot_mirror", 2000, function()
         local IA = package.loaded["AP/ItemApply"]
         local SI = package.loaded["AP/SaveIdentity"]
@@ -1688,8 +2350,15 @@ local function start_gameplay_loops()
         if not (IA._gameplay_active or IA._allow_pre_apply) then return true end
 
         _mirror_ticks = (_mirror_ticks or 0) + 1
+        if (_mirror_cool or 0) > 0 then _mirror_cool = _mirror_cool - 1 end
         if _mirror_ticks % 60 == 0 then SI.mirror_pending = "timer" end   -- ~2 min
         if not SI.mirror_pending then return false end
+        -- Coalesce bursts. The game autosaves on every shelved book, and each echo used to cost a
+        -- second full SaveGameData right behind the game's own -- back-to-back full saves several
+        -- times a minute during active shelving, felt as hitches. The request stays armed and fires
+        -- once the window passes; a hard crash loses at most the last ~30s of mirror, which the
+        -- home-keyed fingerprint still verifies. Quitting mirrors immediately via mirror_now.
+        if (_mirror_cool or 0) > 0 then return false end
 
         local ok, why = SI.can_force_save()
         if not ok then
@@ -1708,15 +2377,13 @@ local function start_gameplay_loops()
         local wrote = pcall(function() gi:SaveGameData(SI.slot, false) end)
         SI.mirroring = false
         if wrote then
+            _mirror_cool = 15   -- 15 ticks of the 2s loop ≈ 30s before the next mirror
             log(("[save-id] mirrored to slot %d on %s (layout=%s)")
-                :format(SI.slot, tostring(which), tostring(SI.record_layout())))
+                :format(SI.slot, tostring(which), _fp_desc(SI.record_layout)))
         end
         return false
     end)
 
-    -- Periodic milestone / level sync (3s). Book-placement milestones key off InsertedBookNum,
-    -- which grows without finishing rows; the FinishRow hook would miss those until the next row.
-    -- Level-ups are event-driven (OnLevelUp), so this poll is mostly milestones.
     gt_loop("sync", 3000, function()
         local IA = package.loaded["AP/ItemApply"]
         if not IA then return false end
@@ -1727,6 +2394,21 @@ local function start_gameplay_loops()
         local SI = package.loaded["AP/SaveIdentity"]
         if SI and SI.verdict == SI.UNKNOWN and IA._apply_safe and IA._gameplay_active then
             identity_evaluate("progress made")
+        end
+
+        -- Sample the layout while the world is still alive.
+        --
+        -- The mirror writes on a timer and on quit, and it used to compute the fingerprint at that
+        -- moment. On quit that is too late: the gameplay world is already being torn down, its
+        -- books destroyed, and the only book actors left belong to the resident test level -- so
+        -- the fingerprint described nothing and recorded "none". Homes do not change during play,
+        -- so sampling once per world is both sufficient and cheap; the mirror then just writes
+        -- what is already stored.
+        if SI and SI.verdict == SI.VERIFIED and not SI.stored_fp
+           and IA._apply_safe and IA._gameplay_active and SI.record_layout then
+            local fp, sample = SI.record_layout()
+            log(("[save-id] layout recorded: %s (%s books)")
+                :format(tostring(fp), tostring(sample or (SI.fp_why or "?"))))
         end
 
         -- Keep saying it. A rejected save means everything the player does goes
@@ -1765,35 +2447,36 @@ local function start_gameplay_loops()
             IA._pending_level_ups = 0
             for _ = 1, _lvls do pcall(function() IA.on_level_up_event() end) end
         end
-        pcall(function() IA.sync_progress_state() end)
-        -- Re-run row-completion detection: FinishRow only fires when the row count INCREASES, so a
-        -- swap (remove a completed series, refill the slot with another) goes undetected. Idempotent.
-        pcall(function() IA.detect_completed_rows() end)
-        -- Row-threshold catch-up: re-fire any "Complete N Rows" threshold the save shows reached
-        -- (catches a run_baseline_sync that ran with stale GameSaveData). Idempotent.
-        pcall(function()
-            local rf = 0
-            local gi = FindFirstOf("BP_LibrarianGameInstance_C")
-                or FindFirstOf("LibrarianGameInstanceBase")
-            if gi and gi:IsValid() then
-                local sg = gi.GameSaveData
-                if sg and sg:IsValid() then
-                    rf = tonumber(sg.GameProgressData.CurrentFinishedRowNum) or 0
-                end
-            end
-            -- Same stale-save rule as the other progress reads: during a New Game this is the
-            -- PREVIOUS run's row count, and firing it sent 52 unearned thresholds.
-            if rf > 0 and not IA.save_progress_is_stale(rf) then
-                IA.fire_row_completion_checks(rf)
-            end
-        end)
-        -- Section-completion: a swap above may have closed out a section without a FinishRow. Idempotent.
-        pcall(function() IA.fire_section_completions() end)
-        -- Floor-completion: same, one granularity coarser. Idempotent.
-        pcall(function() IA.fire_floor_completions() end)
-        -- Skill resync: if save-side level lags received item count (a dropped UpgradePlayer),
-        -- retry the missing applies. Never over-grants past received counts.
-        pcall(function() IA.resync_skill_state() end)
+        -- ONE group of passes per tick, not all of them. Running the whole tail back-to-back put
+        -- ~11 passes -- a 500-book reflected-read chunk, nine FindFirstOf scans, the save reads --
+        -- into a single frame every 3s, measured as a 33-50ms spike every ~3.5s: the rhythmic
+        -- hitch players felt. Everything here is an idempotent backstop (the prompt paths are
+        -- hooks and the insert-triggered fast sweep), so each group running every 12s costs only
+        -- edge-case latency, not correctness.
+        _sync_rot = ((_sync_rot or 0) % 4) + 1
+        if _sync_rot == 1 then
+            -- Backstop only. A finished row is picked up within 500ms by the fast path below;
+            -- this catches what no event announces, chiefly a swap (remove a completed series,
+            -- refill with another), which leaves the row count unchanged so FinishRow never fires.
+            pcall(function() IA.fire_completion_passes() end)
+        elseif _sync_rot == 2 then
+            -- BookSanity rolling sweep (reads each book's "Is Abs Correct"). The insert-triggered
+            -- fast sweep is the prompt path; this is the backstop for missed events.
+            pcall(function() IA.detect_correct_books() end)
+        elseif _sync_rot == 3 then
+            pcall(function() IA.sync_progress_state() end)
+            -- Skill resync: if save-side level lags received item count (a dropped
+            -- UpgradePlayer), retry the missing applies. Never over-grants.
+            pcall(function() IA.resync_skill_state() end)
+        else
+            -- Attunement extensions + Fatigue countdown (arg = seconds since this group last ran).
+            pcall(function() IA.apply_attunement(12) end)
+            pcall(function() IA.apply_bag_capacity() end)
+            pcall(function() IA.recover_orphaned_bag_books() end)
+            -- Re-hide pile instances Insight dragged up. From here and not the SetActorVisible
+            -- hook: a re-hide issued inside the hook is overwritten while the skill still shows.
+            pcall(function() IA.resweep_book_piles() end)
+        end
         return false
     end)
 
@@ -1867,6 +2550,11 @@ local function deactivate_gameplay(reason)
     _gameplay_loops_started = false
 end
 
+-- SelectedLevel watcher (handles "Continue" path where no LoadMap fires).
+-- BP_LibrarianGameInstance_C.SelectedLevel is -1 at title and >= 0 once the
+-- player has picked a save. We poll once per second and activate/deactivate
+-- on transitions.
+local _prev_selected_level = -1
 -- Load this run's save automatically once we know which slot it is.
 --
 -- The slot cannot be handed to the loader directly: LoadGameData is discarded by
@@ -1879,6 +2567,8 @@ end
 -- its slot widgets after the button press.
 local TITLE_LOAD_BTN =
     "BndEvt__WBP_Title_Button_Load_K2Node_ComponentBoundEvent_2_OnButtonPressedEvent__DelegateSignature"
+local TITLE_START_BTN =
+    "BndEvt__TitleUMG_Button_StartGame_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature"
 local _autoload_stage = nil   -- nil | "opening"
 
 -- HUD notification drain, on the game thread. Lives here rather than in AP/HUD.lua because
@@ -1889,6 +2579,323 @@ if POLL_GT then gt_loop("hud_drain", 300, function()
     if H and H._drain_one then H._drain_one() end
     return false
 end) end   -- with the flag off, AP/HUD.lua keeps its own async drain; registering both halves DRAIN_MS
+
+-- Does a book the run has not earned ever end up in the bag? Polled rather than hooked on purpose:
+-- the skill's own functions register and never dispatch, so a hook-based answer could be a false
+-- negative. From the bag a book can be shelved, and shelving is what fires row-completion checks --
+-- so this is the question that decides whether the leak is cosmetic or reaches the multiworld.
+-- Reports only on change, so a steady bag costs one array walk a second and says nothing.
+local _magic_bag_last = -1
+-- Insight re-ward: keep a locked book's ACTOR hidden while the skill shows its series.
+--
+-- Measured: with the skill up a warded book reads bHidden=false while its pile instance is still
+-- sunk, so the reveal is the actor and re-sinking piles could never have fixed it.
+--
+-- The book list is walked once per activation and only warded books of that series are kept
+-- (about a dozen); walking all 3072 on a timer would hitch several times per use. `rehid` climbing
+-- with `passes` would mean the skill re-shows continuously -- then hook its call, not poll faster.
+-- Passes to keep guarding after the skill drops. The skill restores visibility on its way out, and
+-- standing down the instant it ends leaves that last reveal uncaught -- seen in testing as a
+-- split-second flash AFTER the effect expired.
+local INSIGHT_GRACE = 15
+
+local _insight = { idx = -1, books = nil, rehid = 0, passes = 0, grace = 0 }
+
+gt_loop("insight_ward", 100, function()
+    if not diag_on("MAGIC_WARD_INSIGHT_ACTOR") then return end
+    local IA = package.loaded["AP/ItemApply"]
+    -- Every mode, not just BookSanity. The reveal is the actor's own hidden flag, and books are
+    -- hidden the same way whichever unlock mode warded them -- gating this on book-sanity left the
+    -- two series modes exposed. _bh_book_is_warded already answers correctly in all of them.
+    if not (IA and IA._apply_safe) then return end
+
+    local sidx = -1
+    pcall(function()
+        -- This step runs inside the pawn-tick callback, so the per-frame wrapper is valid here.
+        -- FindFirstOf scans the whole object array; at this loop's 100ms cadence that was a
+        -- measurable steady cost for a pawn the tick already has in hand.
+        local p = _G._librarian_tick_pawn
+        if not (p and p:IsValid()) then p = FindFirstOf("BP_LibrarianCharacter_C") end
+        if p and p:IsValid() then sidx = p:GetShowingSameTypeIdx() end
+    end)
+
+    if sidx == nil or sidx < 0 then
+        -- Skill is down. Keep re-asserting through the grace window before letting go.
+        if _insight.books and _insight.grace > 0 then
+            _insight.grace = _insight.grace - 1
+        else
+            if _insight.idx >= 0 then
+                log(("[magic] Insight ended (series %d): re-hid %d actor(s) over %d passes")
+                    :format(_insight.idx, _insight.rehid, _insight.passes))
+                _insight.idx, _insight.books = -1, nil
+                _insight.rehid, _insight.passes = 0, 0
+            end
+            return
+        end
+    elseif sidx ~= _insight.idx then
+        _insight.grace = INSIGHT_GRACE
+        _insight.idx, _insight.rehid, _insight.passes = sidx, 0, 0
+        local keep = {}
+        pcall(function()
+            local books = FindAllOf("BP_GrabbingBook_C")
+            local n = 0
+            if books then pcall(function() n = #books end) end
+            -- The series' own volume count is how many there are to find, so the walk can stop
+            -- early instead of running the whole library on every activation. Two full sets of
+            -- book actors exist, so allow for the duplicate before giving up on an early exit.
+            local want = (IA._asset_to_volumes and IA._asset_to_volumes[sidx] or 0) * 2
+            for i = 1, math.min(n, 8000) do
+                local b = books[i]
+                local alive = false
+                pcall(function() alive = b and b:IsValid() end)
+                if alive and _bh_book_is_warded(b) == true then
+                    local aidx
+                    pcall(function()
+                        local info = b.ItemInfo
+                        if info then aidx = tonumber(info.AssetIdx) end
+                    end)
+                    if aidx == sidx then
+                        keep[#keep + 1] = b
+                        if want > 0 and #keep >= want then break end
+                    end
+                end
+            end
+        end)
+        _insight.books = keep
+        log(("[magic] Insight showing series %d -- guarding %d warded book(s)")
+            :format(sidx, #keep))
+    end
+
+    -- Refresh the window on every pass the skill is up, not only on the edge: re-firing it on the
+    -- SAME series while the previous grace is draining would otherwise inherit the leftover count
+    -- and stand down early.
+    if sidx and sidx >= 0 then _insight.grace = INSIGHT_GRACE end
+
+    local list = _insight.books
+    if not list then return end
+    _insight.passes = _insight.passes + 1
+    for i = 1, #list do
+        local b = list[i]
+        pcall(function()
+            if b and b:IsValid() and b.bHidden == false then
+                b:SetActorHiddenInGame(true)
+                _insight.rehid = _insight.rehid + 1
+            end
+        end)
+    end
+end)
+
+gt_loop("magic_bag_watch", 1000, function()
+    if not diag_on("MAGIC_LEAK_TRACE") then return false end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._gameplay_active and IA._book_sanity_enabled) then return false end
+    local total, warded, example = 0, 0, nil
+    pcall(function()
+        local pawn = FindFirstOf("BP_LibrarianCharacter_C")
+        if not (pawn and pawn:IsValid()) then return end
+        local bag; pcall(function() bag = pawn.ItemBagComponent end)
+        if not (bag and bag:IsValid()) then return end
+        local items; pcall(function() items = bag.Items end)
+        if not items then return end
+        local n = 0; pcall(function() n = #items end)
+        for i = 1, math.min(n, 32) do
+            local it = items[i]
+            if it and it:IsValid() then
+                total = total + 1
+                if _bh_book_is_warded(it) == true then
+                    warded = warded + 1
+                    if not example then local _, s = _bh_series(it); example = s end
+                end
+            end
+        end
+    end)
+    if warded ~= _magic_bag_last or _magic_bag_dirty then
+        _magic_bag_last = warded
+        _magic_bag_dirty = false
+        log(("[magic] BAG items=%d warded=%d%s"):format(
+            total, warded, example and (" e.g. " .. tostring(example)) or ""))
+    end
+    if warded > 0 then _magic_evict_bag() end
+    gt_drain_magic_reward()
+
+    -- There used to be a settle window here that blocked slot writes while evicted books were in
+    -- the air, because the layout hash was taken from where books currently sat and a book caught
+    -- mid-fall would record positions no reload reproduces. The hash now keys on each book's own
+    -- SpawnTransform, which does not move -- so a save taken mid-flight records exactly what a
+    -- save taken at rest would, and there is nothing left to wait for.
+    return false
+end)
+
+
+
+
+-- Telling live books from the inert copies in the resident test level is done by POSITION -- an
+-- inert copy sits exactly at the world origin, a book in play never does. There is deliberately no
+-- helper here for "the pawn's world", because using one to filter books is wrong and was written
+-- twice: which world holds the live books depends on how the world was entered, and on a loaded
+-- save they are NOT in the pawn's world. The pawn's world is published to _G purely so the load
+-- can be identified in the log.
+
+
+
+--- Move a book's pile instance to match its actor.
+---
+--- The actor is only half a book: at any distance the game draws books as HISM instances (one
+--- component per series, one instance per chapter) and swaps an actor in up close. Moving the actor
+--- alone leaves the book showing where it was taken from until you walk over and look at it.
+---
+--- Warded books must NOT follow the actor home -- their instance is sunk on purpose, and raising it
+--- would put an un-unlocked book back on the shelf in plain sight. Those stay sunk.
+function _dev.restore_book_pile(aidx, chapter, home)
+    if not (aidx and chapter and home and home.Translation) then return false, "no key" end
+    local mgr = FindFirstOf("BP_HISM_Manager_C")
+    if not (mgr and mgr:IsValid()) then return false, "no manager" end
+    local arr; pcall(function() arr = mgr.HISMArray end)
+    if not arr then return false, "no HISMArray" end
+    local comp; pcall(function() comp = arr[aidx + 1] end)
+    if not (comp and comp:IsValid()) then return false, "no component" end
+
+    local IA = package.loaded["AP/ItemApply"]
+    local st = IA and IA._book_inst_state and IA._book_inst_state[aidx .. "|" .. chapter]
+
+    if st and st.hidden then
+        -- Same deep offset the hide path uses; a different one here would strand the book.
+        local t = { Translation = { X = home.Translation.X, Y = home.Translation.Y,
+                                    Z = home.Translation.Z - 1000000.0 },
+                    Rotation = home.Rotation, Scale3D = home.Scale3D }
+        local ok = pcall(function() comp:UpdateInstanceTransform(chapter, t, true, true, true) end)
+        -- Deliberately NOT re-aiming st.orig from SpawnTransform. Measured equal, so the write
+        -- would be a no-op; and if they ever diverge, overwriting relocates the book on unlock.
+        return ok, "warded, kept sunk"
+    end
+
+    local ok = pcall(function() comp:UpdateInstanceTransform(chapter, home, true, true, true) end)
+    return ok, ok and "moved" or "write refused"
+end
+
+function _dev.restore_book_home(book)
+    local alive = false
+    pcall(function() alive = book and book:IsValid() end)
+    if not alive then return false end
+
+    local t
+    pcall(function() t = book.SpawnTransform end)
+    if not t then return false end
+
+    -- A plain-table copy as well as the struct: the actor call takes the FTransform as-is, but the
+    -- instance write wants the table form the rest of the pile code uses.
+    local hx, hy, hz
+    local home
+    pcall(function()
+        local p, r, s = t.Translation, t.Rotation, t.Scale3D
+        if not p then return end
+        hx, hy, hz = p.X, p.Y, p.Z
+        home = {
+            Translation = { X = p.X, Y = p.Y, Z = p.Z },
+            Rotation = r and { X = r.X, Y = r.Y, Z = r.Z, W = r.W }
+                         or { X = 0, Y = 0, Z = 0, W = 1 },
+            -- A zero scale would make the instance vanish rather than move, which reads as a
+            -- successful write and an invisible book.
+            Scale3D = (s and s.X and s.X ~= 0) and { X = s.X, Y = s.Y, Z = s.Z }
+                                               or { X = 1, Y = 1, Z = 1 },
+        }
+    end)
+    -- An unfilled FTransform reads as the world origin, and no book belongs there. Writing it
+    -- would pile every such book at 0,0,0 -- far worse than leaving it where it is.
+    if not hx or (hx == 0 and hy == 0 and hz == 0) then return false end
+
+    pcall(function() book:SetSimulate(false) end)
+
+    -- The transform carries rotation and scale as well as position, so the book lands the way it
+    -- was placed rather than at whatever angle it happened to stop rolling at. The out-parameter
+    -- is a concrete FHitResult, which UE4SS can marshal -- unlike the wildcard row struct that
+    -- kills the process; an empty table is enough to receive it.
+    local ok = false
+    pcall(function() ok = book:K2_SetActorTransform(t, false, {}, true) and true or false end)
+    if not ok then
+        -- No out-parameter at all on this one, so it survives a marshalling failure above.
+        pcall(function()
+            local r = book:K2_GetActorRotation()
+            ok = book:K2_TeleportTo(t.Translation, r) and true or false
+        end)
+    end
+
+    -- Second layer. Reported separately because the actor moving without it is exactly the
+    -- half-restored state this is here to fix.
+    local aidx, chap
+    pcall(function()
+        local info = book.ItemInfo
+        if info then aidx = tonumber(info.AssetIdx); chap = tonumber(info.Chapter) end
+    end)
+    local pile_ok, pile_why = _dev.restore_book_pile(aidx, chap, home)
+
+    return ok, hx, hy, hz, pile_ok, pile_why
+end
+
+
+
+
+-- Register the magic hooks from module scope, not from the warding maintenance step.
+--
+-- They used to ride warding_maint, which only starts once the mod is connected and gameplay is
+-- active. That meant loading a save just to look at something registered nothing, and every probe
+-- stayed silent -- which reads identically to "the game never calls these", and produced exactly
+-- that false negative once already. What the hooks observe is a property of the level, not the run.
+gt_loop("magic_hook_reg", 2000, function()
+    if _magic_hooks_attempted then return true end
+    if not diag_on("BOOK_EVENT_HOOKS") then return true end
+    pcall(try_register_magic_hooks)
+    return _magic_hooks_attempted   -- latch off once they are on
+end)
+
+-- Deliberately NOT gated on the mod being connected or the world being apply-safe: the stone is a
+-- fact about the level, not about the run, and gating it on gameplay meant it never ran at all for
+-- someone who just loaded a save to look.
+local _rs_tries = 0
+gt_loop("find_recall_stone", 5000, function()
+    if not diag_on("MAGIC_LEAK_TRACE") then return true end
+    _rs_tries = _rs_tries + 1
+    if _rs_tries > 12 then
+        log("[magic] recall stone: not found after a minute of looking -- giving up")
+        return true
+    end
+
+    -- The stone is BP_G01_Crystal_01 -- "TimeStone" internally, nothing in its class name says
+    -- Recall. Ask for it directly rather than sifting every actor by name.
+    local found = 0
+    pcall(function()
+        local all = FindAllOf("BP_G01_Crystal_01_C")
+        if not all then return end
+        local n = 0
+        pcall(function() n = #all end)
+        for i = 1, n do
+            local a = all[i]
+            if a and a:IsValid() then
+                found = found + 1
+                local nm, actived, ridx = "?", "?", "?"
+                pcall(function() nm = a:GetFullName() end)
+                pcall(function() actived = tostring(a.Actived) end)
+                pcall(function() ridx = tostring(a.RespawnIdx) end)
+                log(("[magic] recall stone PRESENT: Actived=%s RespawnIdx=%s %s")
+                    :format(actived, ridx, nm))
+                -- Which of its entry points actually exist on the instance. The interesting one is
+                -- OnConfirmed_Event: if that is callable we can put every loose book back with one
+                -- call instead of dropping books and waiting to see where they land.
+                for _, fn in ipairs({ "Interact", "OnConfirmed_Event", "OnCanceled_Event",
+                                      "ActiveTimeStone", "OnBookCaseNumChanged_Event" }) do
+                    local present = false
+                    pcall(function() present = type(a[fn]) ~= "nil" end)
+                    log(("    %-28s %s"):format(fn, present and "callable" or "MISSING"))
+                end
+            end
+        end
+    end)
+    if found == 0 then return false end   -- level may still be streaming; try again
+    if diag_on("MAGIC_TEST_RECALL_STONE") then
+        log("[magic] recall-stone test ARMED -- press F6 to fire it")
+    end
+    return true                            -- reported; this answers a yes/no question
+end)
 
 gt_loop("autoload", 500, function()
     local SI = package.loaded["AP/SaveIdentity"]
@@ -1928,12 +2935,137 @@ gt_loop("autoload", 500, function()
         log(("[save-id] auto-load: loading slot %d (set=%s load=%s)")
             :format(SI.slot, tostring(set), tostring(ok)))
         SI.autoload_done = true
-        -- A loaded save DOES have history, so its baselines must read it.
+        -- A loaded save DOES have history, so the baselines must read it again.
         SI.fresh_world = false
         _autoload_stage = nil
         return false
     end
 
+    return false
+end)
+
+-- First connect to a seed leaves the player on the title with exactly one legal move, and nothing
+-- saying so -- it reads as the mod having stalled. Press New Game for them, the same way auto-load
+-- drives the load menu for a run that already has a save.
+--
+-- The failure this must never have is starting a new game over someone's run, so every condition is
+-- the strict form. slot_resolved means the server has actually answered about this run's slot: until
+-- then M.slot holds at most the local fallback and "no slot" only means "not yet told". start_enabled
+-- is the title gating's own verdict, so this can never press a button the mod is holding disabled.
+-- And it defers outright to auto-load, which owns the case where a save exists.
+--
+-- One shot, whether or not the press lands: a retry loop on this button risks starting twice, and a
+-- press that silently fails leaves the player exactly where they are today, able to click it.
+gt_loop("autonew", 500, function()
+    local SI = package.loaded["AP/SaveIdentity"]
+    local IA = package.loaded["AP/ItemApply"]
+    local AC = package.loaded["AP/APClient"]
+    if not (SI and IA and AC) then return false end
+    if SI.disabled then return true end   -- vanilla: the mod does not touch the buttons at all
+    if SI.autonew_done or SI.autoload_done or IA._gameplay_active then return false end
+    if not (AC._slot_connected and SI.slot_resolved and SI.start_enabled) then return false end
+    -- No slot recorded at all: this seed has genuinely never been started. A run that HAS a record
+    -- is left alone even when its save has gone missing, because the StartGame hook only arms the
+    -- slot claim while SI.slot is nil -- auto-pressing there would build a world that never claims
+    -- one. That case keeps today's behaviour: New Game is enabled and the player clicks it.
+    if SI.slot ~= nil then return false end
+
+    local title = FindFirstOf("WBP_Title_C")
+    if not (title and title:IsValid()) then return false end
+    SI.autonew_done = true
+    local ok = pcall(function() title[TITLE_START_BTN](title) end)
+    log(("[save-id] auto-New Game: fresh run, no save to load (slot=%s) — pressed Start (ok=%s)")
+        :format(tostring(SI.slot), tostring(ok)))
+    return false
+end)
+
+-- Hold the player still until the world is actually ready.
+--
+-- The title screen used to do this: Continue and New Game stayed disabled until warding finished,
+-- so nobody entered an unwarded world. Entering automatically took that guard away -- the player now
+-- lands in the world as soon as the run is verified, seconds before the shelves are warded, free to
+-- walk into books that are about to change under them.
+--
+-- The game's own pause menu stands in for it. Measured: it does not stop BP_LibrarianCharacter's
+-- tick, so the warding we are waiting on continues normally behind the menu. Resume, Save and Load
+-- are disabled while it waits, since each either lets the player out early or writes a save of a
+-- half-warded world. Quit, Back, Options and How To Play stay live, and the wait is capped, so a
+-- readiness signal that never arrives cannot trap anyone in here.
+local _pause_gate = { shown = false, done = false, waited = 0 }
+
+--- Enable/disable the three buttons that would let the player out or save mid-ward. Returns false
+--- when the widget is not up yet, which is also how the gate knows the menu has not appeared.
+_pause_gate.apply = function(pawn, enable)
+    local w
+    pcall(function() w = pawn.PasueMenuWidget end)   -- the game's own spelling, not a typo here
+    if not (w and w:IsValid()) then w = FindFirstOf("WBP_PauseMenu_C") end
+    if not (w and w:IsValid()) then return false end
+    for _, name in ipairs({ "Button_Resume", "Button_Save", "Button_Load" }) do
+        pcall(function() set_button_enabled(w[name], enable, name) end)
+    end
+    return true
+end
+
+gt_loop("ready_gate", 250, function()
+    local IA = package.loaded["AP/ItemApply"]
+    local SI = package.loaded["AP/SaveIdentity"]
+    if not (IA and SI) then return false end
+    if SI.disabled then return true end   -- vanilla: the mod holds nobody
+    if not IA._gameplay_active then
+        if _pause_gate.shown or _pause_gate.done then
+            _pause_gate = { shown = false, done = false, waited = 0, apply = _pause_gate.apply }
+        end
+        return false
+    end
+    if _pause_gate.done then return false end
+
+    local pawn = _G._librarian_tick_pawn
+    if not (pawn and pawn:IsValid()) then pawn = FindFirstOf("BP_LibrarianCharacter_C") end
+    if not (pawn and pawn:IsValid()) then return false end
+
+    -- The same drain predicate claim_slot and the pre-apply settle use, plus the bookcase settle,
+    -- plus pre-apply's own completion where it is running. That last clause is not redundant:
+    -- measured, the drain went quiet 1.5s before _pre_apply_complete was set, and releasing on the
+    -- drain alone handed the player those 1.5s early -- the beat of freedom testers noticed.
+    -- The pile mask is the LAST thing to finish, ~750ms after everything above went quiet, and it is
+    -- the one the player can see: releasing before it ran handed them a world whose shelves were
+    -- still being hidden. Only wait for it in the modes that actually run it -- BookSanity masks per
+    -- book elsewhere and stacks mode never hides piles, and in both this pass returns immediately
+    -- without ever stamping, so waiting on it there would stall until the timeout.
+    local l3_needed = not IA._book_sanity_enabled and IA._book_hide_mode ~= false
+    local l3_done = (not l3_needed)
+        or (not _b2_running and _b2_state.applied_epoch == (IA._world_epoch or 0))
+
+    local ready = IA._apply_safe and IA._ward_settled
+        and not IA._flush_in_progress
+        and (not IA._pump_idle or IA._pump_idle())
+        and (not IA._allow_pre_apply or IA._pre_apply_complete)
+        and l3_done
+
+    if not _pause_gate.shown then
+        -- Already ready on arrival (a quick world, or a reload into a warded one): never show it.
+        if ready then _pause_gate.done = true; return false end
+        pcall(function() pawn:SetPauseMenuVisible(true) end)
+        -- Only latch once the widget is really up; on the first frames of a world it may not be
+        -- spawned yet, and latching early would leave the buttons live behind a menu we think we own.
+        if not _pause_gate.apply(pawn, false) then return false end
+        _pause_gate.shown = true
+        log("[ready-gate] world not ready — holding the player in the pause menu")
+        return false
+    end
+
+    _pause_gate.waited = _pause_gate.waited + 250
+    local timed_out = _pause_gate.waited >= 60000
+    if ready or timed_out then
+        _pause_gate.done = true
+        _pause_gate.apply(pawn, true)    -- re-enable BEFORE releasing, never leave them dead
+        pcall(function() pawn:SetPauseMenuVisible(false) end)
+        log(("[ready-gate] released after %.1fs (%s)"):format(
+            _pause_gate.waited / 1000, timed_out and "TIMEOUT — world may still be warding" or "world ready"))
+        return false
+    end
+    -- Re-assert every pass: the menu rebuilds its buttons when it is shown or navigated back to.
+    _pause_gate.apply(pawn, false)
     return false
 end)
 
@@ -1994,11 +3126,6 @@ gt_loop("claim_slot", 1000, function()
     return false
 end)
 
--- SelectedLevel watcher (handles "Continue" path where no LoadMap fires).
--- BP_LibrarianGameInstance_C.SelectedLevel is -1 at title and >= 0 once the
--- player has picked a save. We poll once per second and activate/deactivate
--- on transitions.
-local _prev_selected_level = -1
 gt_loop("selected_level", 1000, function()
     local gi = FindFirstOf("BP_LibrarianGameInstance_C")
     if not gi or not gi:IsValid() then return false end
@@ -2065,17 +3192,23 @@ RegisterLoadMapPostHook(function(Engine, World)
         -- so the incoming one is judged on its own -- otherwise verifying the
         -- run's own save would go on vouching for whatever is loaded next.
         local SIw = package.loaded["AP/SaveIdentity"]
-        if SIw then
-            -- Leaving a world we never verified means checks may have been held.
-            -- The detectors flag a location as handled whether or not it sent, so
-            -- without this they would never revisit it in the world where it
-            -- counts. Only on the unverified path -- a normal reload has nothing
-            -- to recover and would just re-scan for no reason.
-            if SIw.verdict ~= SIw.VERIFIED and IA and IA.clear_check_dedupe then
+        -- Read before the reset: it is what says whether this world's checks were
+        -- being held, and reset_world clears it.
+        local left_unverified = (not SIw) or SIw.verdict ~= SIw.VERIFIED
+        if SIw then SIw.reset_world() end
+
+        -- Every detector dedupes on what it has already seen, and marks a
+        -- location seen whether or not its check actually sent. Held checks in a
+        -- world we then leave would otherwise be lost for good: the location
+        -- stays flagged and is never re-examined where it does count. Rows,
+        -- sections, floors and milestones have the same shape as books here.
+        if IA then
+            IA._books_correct_seen = {}
+            IA._dcb_books, IA._dcb_cursor = nil, 0
+            if left_unverified and IA.clear_check_dedupe then
                 log("[save-id] leaving an unverified world → re-arming check detection")
                 pcall(IA.clear_check_dedupe)
             end
-            SIw.reset_world()
         end
 
         -- Layer-3 state is per-world (fresh HISMs start visible; the series cache is tied to the
@@ -2104,11 +3237,9 @@ RegisterLoadMapPostHook(function(Engine, World)
     if in_gameplay then
         activate_gameplay("LoadMap → in_gameplay")
     else
-        -- Post-connect title path: the OpenLevel triggered by connect
-        -- brings us here with the M01 world fresh-loaded but the player
-        -- still at the title menu. Kick off the apply-gate retry loop so
-        -- warding runs while the player waits — Continue / Start stay
-        -- disabled (see update_title_buttons) until _pre_apply_complete.
+        -- Title path: an M01 load with the player still at the menu. Kick off
+        -- the apply-gate retry loop so warding runs while they wait; Continue /
+        -- Start stay disabled until _pre_apply_complete.
         local IA = package.loaded["AP/ItemApply"]
         if IA and IA._allow_pre_apply and lvlname:find("PL_M01", 1, true) then
             log("LoadMap (post-connect title) → start pre-apply loops")
@@ -2145,6 +3276,42 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:UpgradePlayer", function(self
     end
 end)
 
+-- Book capacity: the game pushes the live carry max to the HUD via SetHandingMaxNum on every
+-- change (bag upgrade, reload, item pickup). Capture it so ItemApply.apply_bag_capacity reads the
+-- real capacity and grants up to its target instead of guessing what the save restored.
+-- Shelving a book is the moment its check becomes due. Without an event the
+-- rolling scan can take ~20s to reach it, which reads as the mod not working.
+-- Two sources because either alone could be missed: the HUD counter update and
+-- the game manager's own insert call.
+--- Shelving a book is when its check becomes due, but the counters that report
+--- it also move while the world streams and the connect item dump runs -- and a
+--- full actor walk there reads half-built books, which is a native access
+--- violation pcall cannot catch.
+---
+--- So this only ASKS for a full scan; the periodic pass runs it from the game
+--- thread at a moment already known to be safe. Latency drops from a full
+--- ~20s cursor wrap to one tick, without adding a scan on an unsafe path.
+local function on_book_shelved(which)
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._book_sanity_enabled) then return end
+    if not (IA._gameplay_active and IA._apply_safe) then return end
+    IA.request_full_book_scan()
+end
+
+RegisterHook("/Script/Librarian.LibrarianPlayerInfo:SetCurrentBookNum", function(_, n)
+    on_book_shelved("shelved-count changed")
+end)
+
+RegisterHook("/Script/Librarian.GameManager:BookInserted", function()
+    on_book_shelved("book inserted")
+end)
+
+RegisterHook("/Script/Librarian.LibrarianPlayerInfo:SetHandingMaxNum", function(_, maxBookNum)
+    local IA = package.loaded["AP/ItemApply"]
+    if not IA then return end
+    pcall(function() IA._bag_live_max = maxBookNum:get() end)
+end)
+
 RegisterHook("/Script/Librarian.LibrarianCharacter:UpgradePlayerBP", function(self, ability, levelNum)
     local idx, lvl
     pcall(function() idx = ability:get() end)
@@ -2173,7 +3340,13 @@ end
 -- that instant, so this is what a later load of that slot must reproduce.
 -- Autosaves fire StartSaveProgress and no SaveGameData; manual saves the
 -- reverse, so both are needed to catch every save.
+--- The game's own saves go to its own slots, so without mirroring, this run's
+--- slot falls behind whatever the player did since they last saved there by
+--- hand -- and then no longer matches the layout we recorded, which reads as the
+--- wrong save. Every save the game makes is therefore mirrored into our slot.
 ---
+--- Deferred rather than done here: this fires ~1s BEFORE the game writes, so
+--- saving now would race it. The mirror step below waits for that write to land.
 --- The game saves into its own slots, so without mirroring this run's slot falls
 --- behind whatever was played since the last manual save there -- and then stops
 --- matching the recorded layout, which reads as the wrong save.
@@ -2188,6 +3361,7 @@ local function record_layout_on_save(which)
     if SI.mirroring then return end
     SI.mirror_pending = which or "save"
 end
+
 
 -- /Script/Engine.GameplayStatics:SaveGameToSlot(SaveGameObject, SlotName, UserIndex)
 RegisterHook("/Script/Engine.GameplayStatics:SaveGameToSlot", function(self, _save, slot_param, _user)
@@ -2205,11 +3379,172 @@ RegisterHook("/Script/Engine.GameplayStatics:DoesSaveGameExist", function(self, 
 end)
 
 -- /Script/Librarian.LibrarianGameInstanceBase:SaveGameData(saveSlotNum)
+-- Deleting a save is only offered in the SAVE menu. A player clearing an old AP run before
+-- starting a new one therefore has to load a world first, or go digging in AppData -- for the one
+-- operation they most want to do from the title screen.
+--
+-- So offer it in the Load menu too, by calling the menu's own DeleteSave rather than deleting
+-- anything ourselves. Measured: DeleteSave raises the confirmation dialog and OnDeleteSave runs
+-- when it is accepted (0.9s apart while the dialog was read), so going through it inherits the
+-- guard. A right-click must never destroy an AP save on its own -- those cannot be recovered.
+--
+-- The click is only observed, never interpreted here: the pre-hook sets a scalar, and the work
+-- happens a frame later off a fresh lookup. The BP sets IsRightClick during its own execution, so
+-- the flag cannot be read until after that, and holding a widget wrapper across frames is the
+-- stale-handle hazard that has already cost a crash hunt.
+gt_loop("load_delete_hooks", 2000, function()
+    if _G._librarian_slot_hook_done then return true end
+    local slot = FindFirstOf("WBP_SaveSlot_C")
+    if not (slot and slot:IsValid()) then return false end   -- only exists while a slot list is up
+    _G._librarian_slot_hook_done = true
+    local cls = "?"
+    pcall(function() cls = slot:GetClass():GetFullName() end)
+    local pkg = tostring(cls):match("(/Game/[%w_/]+%.[%w_]+)_C")
+    if not pkg then
+        log(("[save-delete] could not derive a class path from %s; Load-menu delete unavailable")
+            :format(tostring(cls)))
+        return true
+    end
+    local path = pkg .. "_C:OnMouseButtonDown"
+    local ok, err = pcall(function()
+        RegisterHook(path, function(self, geometry, mouse)
+            -- IsRightClick is set and cleared inside the Blueprint's own execution, so reading it a
+            -- frame later always finds false. Take the button from the event instead, and the slot
+            -- number from the widget as a plain value -- never the widget itself, which must not be
+            -- held across frames.
+            -- Every call here IS a right-click. Measured: three right-clicks produced three calls
+            -- and a left-click produced none, because Button_Slot's own pressed-event delegate
+            -- consumes the left button before it reaches the widget's OnMouseButtonDown. So the
+            -- button never has to be decoded -- which is just as well, since the event param reads
+            -- as opaque userdata and every property path into it returned nil.
+            --
+            -- Only the slot NUMBER is kept, as a plain value. The widget itself must not be held
+            -- across frames.
+            local slotn
+            pcall(function() slotn = tonumber(self:get().CurrentSlotIdx.SlotNum) end)
+            _G._librarian_slot_num = slotn
+            _G._librarian_slot_rclick = true
+        end)
+    end)
+    log(("[save-delete] hook %s %s"):format(path, ok and "registered" or ("FAILED: " .. tostring(err))))
+    return true
+end)
+
+-- Drain: one frame after a slot was clicked, decide whether it was a right-click in the Load menu
+-- and, if so, hand it to the menu's own delete.
+gt_loop("load_delete_drain", 100, function()
+    if not _G._librarian_slot_rclick then return false end
+    _G._librarian_slot_rclick = false
+    pcall(function()
+        local menu = FindFirstOf("WBP_SaveMenu_C")
+        local mode, n, hit = nil, 0, nil
+        if menu and menu:IsValid() then
+            -- 1 is Load; the auto-load path sets it to that for the same reason. In Save mode the
+            -- game already offers this, so leave that alone rather than firing it twice.
+            pcall(function() mode = tonumber(menu.SaveLoadMode) end)
+            local widgets
+            pcall(function() widgets = menu.SaveSlotWidgets end)
+            if widgets then pcall(function() n = #widgets end) end
+            -- Match on the slot NUMBER captured at click time, not on a stored widget.
+            local want = _G._librarian_slot_num
+            for i = 1, n do
+                local w = widgets[i]
+                if w and w:IsValid() and want then
+                    local sn
+                    pcall(function() sn = tonumber(w.CurrentSlotIdx.SlotNum) end)
+                    if sn == want then hit = w break end
+                end
+            end
+        end
+        -- Report every click, not just the ones that act. A drain that only logs on success is
+        -- indistinguishable from one that never ran, which has already wasted two test rounds here.
+        local fired = false
+        if hit and mode == 1 then
+            -- DeleteSave returns cleanly in Load mode but raises no dialog, so it gates on
+            -- SaveLoadMode itself. Flip to Save for the duration of the call and put it straight
+            -- back: the mode is restored before anything else can read it, and leaving it on Save
+            -- would turn the next slot click into an overwrite, which is far worse than the
+            -- inconvenience this fixes.
+            pcall(function() menu.SaveLoadMode = 0 end)
+            fired = pcall(function() menu:DeleteSave(hit) end)
+            pcall(function() menu.SaveLoadMode = 1 end)
+            local back
+            pcall(function() back = tonumber(menu.SaveLoadMode) end)
+            if back ~= 1 then
+                log(("[save-delete] WARNING: mode did not restore (now %s) -- forcing Load")
+                    :format(tostring(back)))
+                pcall(function() menu.SaveLoadMode = 1 end)
+            end
+        end
+        log(("[save-delete] right-click on slot %s (mode=%s, %d slots) -> %s")
+            :format(tostring(_G._librarian_slot_num), tostring(mode), n,
+                (mode ~= 1 and "not the Load menu, left to the game")
+                    or (not hit and "slot widget not found")
+                    or ("DeleteSave ok=" .. tostring(fired))))
+    end)
+    return false
+end)
+
+-- Deleting a save in-game clears our record of it too, so nobody has to go and edit
+-- LibrarianAP_slots.txt by hand. POST-hook: act only once the deletion has actually run.
+--
+-- Clearing SI.slot is what makes the delete stick. Both mirror paths write to that slot -- the quit
+-- mirror and the 2s timer -- and with it still set, quitting rewrote the file the player had just
+-- deleted. mirror_now bails on a nil slot and can_force_save answers "no slot claimed", so dropping
+-- it silences both.
+--
+-- The server key matters as much as the local line. It is authoritative on reconnect, so leaving it
+-- pointing at a deleted save is the state the 1.1.2 hotfix existed to dig people out of: auto-load
+-- waiting forever for a save that is not there. -1 is the sentinel the storage handler already
+-- reads as "never claimed", after which auto-New-Game starts a fresh run and claim_slot writes a
+-- new slot, server value and fingerprint.
+-- Single (pre) hook, deliberately. The pre+post form was tried and the post callback never fired,
+-- so the cleanup silently did nothing while looking correct. Running just before the deletion is
+-- fine here: the player has already confirmed by this point (DeleteSave raises the dialog and
+-- OnDeleteSave, which precedes this, is the confirm handler), and the worst case of a failed
+-- deletion is a dropped record the next claim rebuilds.
+RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:DeleteGameData",
+    function(self, mapIdx, deleteSlotNum, isAuto)
+        local slot, auto
+        pcall(function() slot = tonumber(deleteSlotNum:get()) end)
+        pcall(function() auto = isAuto:get() and true or false end)
+        if not slot or auto then return end            -- autosaves are never ours
+        local SI = package.loaded["AP/SaveIdentity"]
+        if not SI then return end
+        if slot < SI.SLOT_MIN or slot > SI.SLOT_MAX then return end   -- a player's own save; leave it
+
+        -- Deliberately NOT gated on SI.disabled. Vanilla is exactly when this runs: the game will
+        -- not let you delete the slot you are playing, so clearing old AP saves means going in
+        -- passive and deleting them there. Pruning our own record is bookkeeping, not gameplay, and
+        -- skipping it in vanilla is why the first attempt did nothing while looking correct.
+        -- Only the server write below needs a live connection.
+
+        local was_ours = (SI.slot == slot)
+        local ok, dropped = SI.forget_local_slot(slot)
+        if was_ours then
+            SI.slot, SI.slot_source = nil, nil
+            SI.stored_fp, SI.fp_checked, SI.stored_fp_kind = nil, false, nil
+            SI.autoload_done, SI.autonew_done = false, false
+            local AC = package.loaded["AP/APClient"]
+            if AC and SI.storage_key then
+                pcall(function() AC:storage_write(SI.storage_key, -1) end)
+            end
+        end
+        log(("[save-id] save slot %d deleted: %d local record(s) dropped%s%s")
+            :format(slot, dropped, ok and "" or " (FILE WRITE FAILED)",
+                was_ours and "; this run's slot released and the server record cleared" or ""))
+        if was_ours then
+            pcall(function()
+                local H = package.loaded["AP/HUD"]
+                if H then H.notify("AP: this run's save was deleted. Reconnect to start it again.", 15.0) end
+            end)
+        end
+    end)
+
 RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:SaveGameData", function(self, slot_num_param)
     local n = "?"
     pcall(function() n = tostring(slot_num_param:get()) end)
-    log(("[AP][save-probe] GI.SaveGameData(slot=%s) — current SaveGameName='%s'")
-        :format(n, tostring(read_save_slot())))
+    log(("[AP][save-probe] GI.SaveGameData(slot=%s)"):format(n))
     record_layout_on_save("manual save")
     -- After save, InsertedBookNum is fresh -> re-run the progress sync so book milestones catch
     -- up (safety net if a BP-hook counter missed an event).
@@ -2227,9 +3562,6 @@ RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:LoadGameData", functio
         :format(n, tostring(read_save_slot())))
 end)
 
--- Autosaves never call SaveGameData; the subsystem announces them here, ~1s
--- before the write lands. Returning to the main menu triggers one too, which is
--- a save on a path that does not look like one.
 RegisterHook("/Script/Librarian.SaveSubsystem:StartSaveProgress", function()
     record_layout_on_save("autosave")
 end)
@@ -2250,11 +3582,28 @@ local function mirror_now(which)
     if not gi then return end
     SI.mirroring = true
     local wrote = pcall(function() gi:SaveGameData(SI.slot, false) end)
+    -- SaveGameData is ASYNCHRONOUS -- can_force_save consults SaveSubsystem.WaitingSave for exactly
+    -- that reason. On the quit path the engine goes straight on to tear the world down, and a save
+    -- still serialising actors as they are destroyed reads a freed object: a native access
+    -- violation, engine-side, a couple of hundred ms after this call.
+    --
+    -- Until 71d045b the fingerprint walk below ran uncached and took long enough that the save
+    -- always won that race; caching it removed the delay and exposed the bug. So wait on the flag
+    -- deliberately rather than on a side effect. Bounded, because a wait that never ends would hang
+    -- the quit instead of crashing it, and no os.clock in this UE4SS build to time it with.
+    for _ = 1, 400 do
+        local busy = false
+        pcall(function()
+            local ss = FindFirstOf("SaveSubsystem")
+            if ss and ss:IsValid() then busy = ss.WaitingSave and true or false end
+        end)
+        if not busy then break end
+    end
     SI.mirroring = false
     if wrote then
         SI.mirror_pending = nil
         log(("[save-id] mirrored to slot %d on %s (layout=%s)")
-            :format(SI.slot, tostring(which), tostring(SI.record_layout())))
+            :format(SI.slot, tostring(which), _fp_desc(SI.record_layout)))
     end
 end
 
@@ -2332,8 +3681,9 @@ local function on_title_load_game_pressed(self)
     log(("    SaveGameName='%s'  GameSaveData: %s"):format(
         tostring(read_save_slot()), snapshot_save_data()))
 
-    -- Do NOT reload the save here (gi:LoadGameData): the world is already AP-loaded from the
-    -- connect-time OpenLevel, and a reload re-applies bag-skill increments past the bag cap.
+    -- Do NOT reload the save here (gi:LoadGameData): Continue resumes the world
+    -- already loaded behind the title, and a reload re-applies bag-skill
+    -- increments past the bag cap.
 
     -- Force gameplay activation next tick in case LoadMap never fires. Delay so the widget's own
     -- handler (level transition / UI hide) runs first.
@@ -2356,11 +3706,24 @@ local function on_title_start_game_pressed(self)
     -- claim is armed here and completes once the world has settled.
     local AC = package.loaded["AP/APClient"]
     local SI = package.loaded["AP/SaveIdentity"]
+    -- Pressing New Game while a recorded save is missing IS the confirmation. Only now are the
+    -- records cleared, so a player who declined -- by restoring their files instead, or by simply
+    -- not pressing it -- still has an intact binding between this seed and its save.
+    if AC and AC._slot_connected and SI and SI.save_missing then
+        local gone = SI.save_missing
+        log(("[save-id] New Game pressed with slot %d missing -- releasing it and starting over")
+            :format(gone))
+        pcall(function() SI.forget_local_slot(gone) end)
+        if SI.storage_key then pcall(function() AC:storage_write(SI.storage_key, -1) end) end
+        SI.slot, SI.slot_source = nil, nil
+        SI.stored_fp, SI.fp_checked = nil, false
+        SI.save_missing = nil
+    end
     if AC and AC._slot_connected and SI and not SI.slot then
         SI.pending_fresh = true
-        -- Outlives pending_fresh: the progress baselines read GameSaveData, which still holds the
-        -- PREVIOUS session's save when a New Game world settles. Reading it granted phantom
-        -- level-ups and left incoming skills looking already-applied.
+        -- Outlives pending_fresh on purpose: the progress baselines read GameSaveData, which still
+        -- holds the PREVIOUS session's save when a New Game world settles. Reading it granted
+        -- phantom level-ups and left incoming skills looking already-applied.
         SI.fresh_world = true
         log("[save-id] fresh run armed — will claim a slot once the world settles")
     end
@@ -2446,6 +3809,55 @@ _G._librarian_gt_master_tick = function(dt_ms)
     local c = package.loaded["AP/APClient"]
     if not (c and c._poll_on_game_thread) then return end
     c._gt_tick_count = (c._gt_tick_count or 0) + 1
+
+    -- This frame's dt reflects the PREVIOUS tick's work, so the steps recorded then are the
+    -- suspects for a spike now. worst/avg/buckets are tracked UNCONDITIONALLY -- the first version
+    -- only measured frames past a 150ms bar and reported "worst=0ms" through stutter the player
+    -- could feel: at ~115fps a 60-120ms spike drops a dozen frames and never reached the bar.
+    _perf.cnt = _perf.cnt + 1
+    _perf.sum = _perf.sum + dt_ms
+    if dt_ms > _perf.worst then _perf.worst = dt_ms end
+    if dt_ms >= 33 then
+        _perf.b33 = _perf.b33 + 1
+        if dt_ms >= 66 then _perf.b66 = _perf.b66 + 1 end
+        if dt_ms >= 100 then _perf.b100 = _perf.b100 + 1 end
+        if dt_ms >= 150 then _perf.b150 = _perf.b150 + 1 end
+    end
+    _perf.cool = _perf.cool - dt_ms
+    -- Blame accrues from 33ms up -- the felt stutter class at high fps sits at 33-50ms, and the
+    -- first version's 66ms gate counted those spikes without naming a suspect. Detail lines keep
+    -- the higher bar plus a cooldown so the log stays readable.
+    if dt_ms >= 33 and _perf.n > 0 then
+        local parts = {}
+        for i = 1, _perf.n do
+            parts[i] = _perf.names[i]
+            _perf.blame[parts[i]] = (_perf.blame[parts[i]] or 0) + 1
+        end
+        local IAp = package.loaded["AP/ItemApply"]
+        if dt_ms >= 66 and IAp and IAp._gameplay_active and _perf.cool <= 0 then
+            _perf.cool = 5000
+            log(("[perf] %dms frame; steps last tick: %s")
+                :format(math.floor(dt_ms), table.concat(parts, ",")))
+        end
+    end
+    _perf.n = 0
+    _perf.since = _perf.since + dt_ms
+    if _perf.since >= 60000 then
+        _perf.since = 0
+        local kb = collectgarbage("count")
+        _perf.kb0 = _perf.kb0 or kb
+        local top = {}
+        for k, v in pairs(_perf.blame) do top[#top + 1] = ("%s=%d"):format(k, v) end
+        table.sort(top)
+        log(("[perf] 60s: avg=%.1fms worst=%dms spikes(33/66/100/150ms)=%d/%d/%d/%d lua=%.1fMB (%+.1fMB since start)%s"):format(
+            _perf.sum / math.max(1, _perf.cnt), math.floor(_perf.worst),
+            _perf.b33, _perf.b66, _perf.b100, _perf.b150,
+            kb / 1024, (kb - _perf.kb0) / 1024,
+            #top > 0 and ("; spike-steps: " .. table.concat(top, ",")) or ""))
+        _perf.worst, _perf.sum, _perf.cnt = 0, 0, 0
+        _perf.b33, _perf.b66, _perf.b100, _perf.b150 = 0, 0, 0, 0
+        _perf.blame = {}
+    end
     pcall(function() c:_tick_once() end)                 -- create + poll + outgoing + item-apply
     -- Both reached at runtime, not through the file-locals: `APClient` and `menu_toggle` are
     -- declared further down the file, so a closure built here would only see nil globals.
@@ -2456,6 +3868,21 @@ _G._librarian_gt_master_tick = function(dt_ms)
             pcall(function() c:connect() end)
         else
             log("[F12] already connected")
+        end
+    end
+    if _gt_pending_f6 then                               -- F6 pressed on the input thread
+        _gt_pending_f6 = false
+        -- Diagnostics live in dev/AP/probe_magic.lua and are attached to _dev only under
+        -- PROBE_MODE, so this does nothing in a normal build.
+        for _, name in ipairs({ "probe_spawn_home", "probe_insight_state", "probe_home_agreement",
+                                "probe_world_split", "probe_spawn_table" }) do
+            if _dev[name] then pcall(_dev[name]) end
+        end
+        if diag_on("MAGIC_TEST_RESTORE_HOME") and _dev.test_restore_home then
+            pcall(_dev.test_restore_home)
+        end
+        if diag_on("MAGIC_TEST_RECALL_STONE") and _dev.test_recall_stone then
+            pcall(_dev.test_recall_stone)
         end
     end
     if _gt_pending_f4 then                               -- F4 pressed on the input thread
@@ -2483,6 +3910,9 @@ _G._librarian_gt_master_tick = function(dt_ms)
             _l3_resume = nil
             _b2_running = false
             IA._l1_resume = nil
+            -- Same reason the resumes go: a pawn resolved under the old world must not be reachable
+            -- by any step running under the new one.
+            _G._librarian_tick_pawn = nil
         end
         if IA._apply_safe then
             if IA._l1_resume then pcall(IA._l1_resume) end   -- one L1 warding chunk / frame
@@ -2493,12 +3923,14 @@ _G._librarian_gt_master_tick = function(dt_ms)
             pcall(function() IA.flush_apply() end)
         end
     end
+    gt_drain_magic_resink()                                  -- put Insight-revealed piles back down
     gt_run_deferred(dt_ms)                                   -- one-shot deferred work (title/HUD refreshes)
     gt_run_steps(dt_ms)                                      -- apply-gate / settle / warding / sync / etc.
     if (c._gt_tick_count % 600) == 0 then
-        -- Name the registered steps, not just the count: a bare number says little when a dozen
-        -- registrations exist. Printing the array contents next to the key count of _gt_steps makes
-        -- damage visible -- array N with keys N-1 is a stray array entry that never registered.
+        -- Name the registered steps, not just the count: thirteen registrations exist (five at
+        -- module scope, eight in start_gameplay_loops), so a bare number says little. Printing the
+        -- array contents next to the key count of _gt_steps makes damage visible -- array N with
+        -- keys N-1 is a stray array entry that never registered.
         local names, keyn = {}, 0
         for i = 1, #_gt_step_order do names[i] = tostring(_gt_step_order[i]) end
         for _ in pairs(_gt_steps) do keyn = keyn + 1 end
@@ -2530,6 +3962,45 @@ register_bp_hooks_once = function()
                     local d = DeltaSeconds and DeltaSeconds:get()
                     if d and d > 0 then dt = d * 1000 end
                 end)
+                -- Resolve here and keep only plain values: the wrapper `self` yields is valid
+                -- only inside this callback, and stashing the object left every later read
+                -- looking at an invalid handle. The name is refreshed only when the address
+                -- changes, i.e. once per world.
+                --
+                -- Dropped BEFORE the resolve, never merely overwritten after it. The resolve below
+                -- throws when self:get() comes back empty, which is what a world teardown looks
+                -- like -- and the steps still run afterwards, since that failure is only logged. A
+                -- cache that is only overwritten on success therefore hands those steps the
+                -- PREVIOUS world's pawn, and calling a method on a destroyed pawn is a native
+                -- access violation no pcall can catch. It cost a long hunt through the warding
+                -- layers before the cache itself turned out to be the difference.
+                _G._librarian_tick_pawn = nil
+                local _wok, _werr = pcall(function()
+                    local pawn = self:get()
+                    if not pawn then error("self:get() returned nothing", 0) end
+                    -- SAME-FRAME USE ONLY: set here, read by the gt steps that the master tick runs
+                    -- later in this same callback, and cleared again at the top of the next one.
+                    -- Never read it from a later frame or an async context. Consumers must still
+                    -- IsValid() and fall back to FindFirstOf.
+                    _G._librarian_tick_pawn = pawn
+                    local w = pawn:GetWorld()
+                    if not w then error("pawn:GetWorld() returned nothing", 0) end
+                    if not w:IsValid() then error("pawn world is not valid", 0) end
+                    local a = w:GetAddress()
+                    if not a then error("world GetAddress() returned nothing", 0) end
+                    if a ~= _G._librarian_live_world_addr then
+                        _G._librarian_live_world_addr = a
+                        _G._librarian_live_world_name = w:GetFullName()
+                        log(("[world] live world = %s"):format(tostring(_G._librarian_live_world_name)))
+                    end
+                end)
+                -- Logged once. A silent failure here disables the world filter everywhere it is
+                -- used -- the fingerprint simply stops existing -- with nothing in the log to say
+                -- so, which is exactly how this went unnoticed twice.
+                if not _wok and not _G._librarian_world_err then
+                    _G._librarian_world_err = true
+                    log(("[world] FAILED to resolve live world: %s"):format(tostring(_werr)))
+                end
                 local f = _G._librarian_gt_master_tick
                 if f then f(dt) end
             end)
@@ -2661,12 +4132,15 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
         end
     end
 
-    -- Completion checks + progress sync used to run INLINE here, but FinishRow fires on the GAME
-    -- thread, and fire_row_completion_checks / fire_section_completions / fire_floor_completions /
-    -- sync_progress_state mutate the shared _sent_* / _milestones_sent / _levels_reached de-dup
-    -- tables that the 3s mod-thread loop ALSO writes -> cross-thread Lua-heap race (the rc3 crash
-    -- class). The 3s loop already runs every one of these each tick (plus detect_completed_rows), so
-    -- they are covered there on the mod thread (<=3s latency). Nothing to do on the game thread here.
+    -- Arm the fast path; do not run the checks here. They mutate the shared _sent_* / _milestones_sent
+    -- de-dup tables, and this hook can fire in the middle of a pass that is already walking them.
+    -- Setting one boolean cannot, so the 500ms loop does the work a beat later.
+    --
+    -- It used to be enough to leave this to the sync loop, which ran every pass each tick. Splitting
+    -- that loop into a four-way rotation to kill the periodic hitch quietly turned <=3s of latency
+    -- into <=12s, which reads as the check having failed rather than being on its way.
+    local IAf = package.loaded["AP/ItemApply"]
+    if IAf then IAf._row_check_pending = true end
 end)
 
 RegisterHook("/Script/Librarian.LibrarianGameMode:NewRowFinished", function(self, num)
@@ -2711,10 +4185,10 @@ local SaveIdentity = require("AP/SaveIdentity")
 trace.init({ version = MOD_VERSION, flags = diag_flags_str() })
 trace.mark("boot")
 
--- The 1 Hz crash-ledger heartbeat that used to run here is gone. It did string.format, os.date, a
--- shared ring write and flushed I/O on the async thread every second for the whole session, racing
--- trace.init's own close/reopen. The BEG/END markers already distinguish a synchronous-in-op crash
--- from an idle one.
+-- No crash-ledger heartbeat. It ran string.format + os.date + a shared ring write + flushed file
+-- I/O on the async thread every second, and raced trace.init's own close/reopen on the game
+-- thread. Its forensic value was marginal: trace.init truncates the ledger on slot connect
+-- anyway, so the heartbeat never survived to describe a connect-time crash.
 
 -- Lifecycle state machine, driven by the lc_event(...) calls below. Observational only: logs
 -- [lifecycle] transitions, gates nothing yet. pcall'd require so it can't break mod loading.
@@ -2774,6 +4248,12 @@ APClient.on_item = function(it, item_name)
 
     if item_name then
         ItemApply.apply_item(item_name)
+        -- Fatigue traps are one-shot, keyed on the item's server index so a reconnect
+        -- re-dump can't replay them. Everything else re-derives from counts and doesn't care.
+        local fatigue_skill = item_name:match("^Fatigue: (.+)$")
+        if fatigue_skill then
+            ItemApply.on_fatigue_received(fatigue_skill, tonumber(it.index) or -1)
+        end
     end
 end
 
@@ -2884,6 +4364,9 @@ APClient.on_slot_connected = function(slot_data)
     -- warding the title-behind world only pays off if that world might be this
     -- run's save. A mid-gameplay reconnect keeps its existing loops.
 
+    -- Fatigue traps fire once ever. The highest fired index lives in server storage under a
+    -- per-slot key (created at -1 on first connect); read it back and route into ItemApply,
+    -- which holds received traps until the floor lands. New traps raise the floor via storage_max.
     -- on_storage is a single function slot, cleared on every connect, so every
     -- reader has to share one dispatch table -- a second bare assignment would
     -- silently drop whichever handler lost the race.
@@ -2893,10 +4376,17 @@ APClient.on_slot_connected = function(slot_data)
         if h then pcall(h, v) end
     end
 
+    if (tonumber(slot_data.attunement) or 0) ~= 0 then
+        local fatigue_key = ("librarian_fatigue_fired_%d"):format(APClient.slot_number or 0)
+        ItemApply._fatigue_persist = function(idx) APClient:storage_max(fatigue_key, idx) end
+        storage_handlers[fatigue_key] = function(v) ItemApply.set_fatigue_floor(v) end
+        APClient:storage_read(fatigue_key, -1)
+    end
+
     -- Which save slot this run owns. The server copy is authoritative (it
-    -- survives a reinstall and a move to another machine); the local file is
-    -- the fallback and is also what lets the title screen know the slot before
-    -- any connection exists.
+    -- survives a reinstall and cannot be forged by copying local files); the
+    -- local file is the fallback and is also what lets the title screen know
+    -- the slot before any connection exists.
     SaveIdentity.reset()
     local ap_slot = APClient.slot_number or 0
     local slot_key = ("librarian_save_slot_%d"):format(ap_slot)
@@ -2912,14 +4402,65 @@ APClient.on_slot_connected = function(slot_data)
     storage_handlers[slot_key] = function(v)
         local n = tonumber(v)
         -- The server seeds this key to -1 when absent, which means "never claimed".
-        if n and n >= SaveIdentity.SLOT_MIN and n <= SaveIdentity.SLOT_MAX then
+        if n and n >= SaveIdentity.SLOT_MIN and n <= SaveIdentity.SLOT_MAX
+                and SaveIdentity.slot_exists(n, false) == false then
+            -- The record names a save that is gone: the player deleted it. Adopting it strands the
+            -- run -- auto-load waits for a save that is not there, auto-New-Game and the claim both
+            -- require a nil slot, so pressing New Game by hand never claims one either, the identity
+            -- never verifies and warding stays off. That is the "sat at the title with nothing
+            -- warded" report.
+            --
+            -- Nothing is erased here, and the slot is deliberately left set. A missing save is not
+            -- proof the run is over: the player may have moved their saves, or copied them to
+            -- another machine. Clearing the records at this point would throw away the only binding
+            -- between this seed and its progress, and it cannot be reconstructed.
+            --
+            -- So say so and let them decide. Continue is already disabled (there is nothing to
+            -- load), New Game is enabled, and pressing it is the confirmation -- the records are
+            -- cleared there, not here. Doing nothing is the safe answer: restore the save file,
+            -- reconnect, and the run picks up exactly where it was.
+            --
+            -- Only an explicit false counts. slot_exists returns nil when the check itself failed,
+            -- and warning on a failed read would push people into starting over for no reason.
+            SaveIdentity.save_missing = n
+            log(("[save-id] recorded slot %d is missing on disk -- holding the record; "
+                .. "New Game will start this seed over, doing nothing keeps it"):format(n))
+            pcall(function()
+                if HUD and HUD.notify then
+                    HUD.notify(("AP: this run's save (slot %d) is missing. Press New Game to start "
+                        .. "this seed over, or restore the save file and reconnect to keep your progress.")
+                        :format(n), 45.0)
+                end
+            end)
+            pcall(function()
+                if _G._librarian_menu and _G._librarian_menu.set_status then
+                    _G._librarian_menu.set_status(
+                        ("Save for slot %d is missing — New Game starts over, or restore it and reconnect")
+                            :format(n), "warn")
+                end
+            end)
+        elseif n and n >= SaveIdentity.SLOT_MIN and n <= SaveIdentity.SLOT_MAX then
             SaveIdentity.slot, SaveIdentity.slot_source = n, "server"
             if n ~= from_local then SaveIdentity.write_local(seed, ap_slot, n) end
-            log(("[save-id] server says slot %d%s"):format(
-                n, SaveIdentity.slot_exists(n, false) and "" or " (MISSING on disk)"))
+            log(("[save-id] server says slot %d"):format(n))
         else
             log(("[save-id] no slot recorded on server (local=%s) -- fresh run"):format(
                 tostring(from_local)))
+            -- The local file is only a fallback, and it is read before this reply arrives. If it
+            -- named a save that is gone, warn the same way rather than discarding it: the server
+            -- has no claim on this seed, so the local line is the last thing tying it to a save.
+            if SaveIdentity.slot and SaveIdentity.slot_exists(SaveIdentity.slot, false) == false then
+                SaveIdentity.save_missing = SaveIdentity.slot
+                log(("[save-id] local record names slot %d, which is missing on disk -- holding it")
+                    :format(SaveIdentity.slot))
+                pcall(function()
+                    if HUD and HUD.notify then
+                        HUD.notify(("AP: this run's save (slot %d) is missing. Press New Game to start "
+                            .. "this seed over, or restore the save file and reconnect to keep your progress.")
+                            :format(SaveIdentity.slot), 45.0)
+                    end
+                end)
+            end
         end
         log("[save-id] " .. SaveIdentity.describe())
 
@@ -2939,7 +4480,9 @@ APClient.on_slot_connected = function(slot_data)
         end
 
         -- The reply is asynchronous and decides which buttons make sense, so
-        -- re-run the gating now that the run's slot is known.
+        -- re-run the gating now that the run's slot is known. This is also the point at which
+        -- "no slot" becomes trustworthy rather than merely unanswered, which auto-New-Game waits on.
+        SaveIdentity.slot_resolved = true
         pcall(function() update_title_buttons() end)
     end
     APClient:storage_read(slot_key, -1)
@@ -2949,9 +4492,11 @@ APClient.on_slot_connected = function(slot_data)
     -- state instead of ward-then-unwarding the starting series on every item.
     APClient:set_in_game(true)
 
-    -- Warn the player: pre-apply takes ~10-20s. Long toast to span the window.
+    -- Pre-apply takes ~10-20s and the screen sits still for it, so say something. It no longer
+    -- mentions Continue: the mod loads the run, or starts a new one, without the player pressing
+    -- anything. Shorter than the old 30s toast, which used to outlive the wait it described.
     if HUD and HUD.notify then
-        HUD.notify("AP: Preparing world — Continue will enable when ready...", 30.0)
+        HUD.notify("AP: Connected, preparing your world...", 15.0)
     end
 end
 
@@ -3019,8 +4564,8 @@ end
 gt_defer(2000, _initial_hud_status)
 
 -- F12: connect to Archipelago (or trigger a reconnect if the socket dropped).
--- UE4SS dispatches keybinds on the input thread, so the bind only sets a flag; the master tick
--- does the work. Entering the VM from a third thread is the same corruption as the async timers.
+-- Keybind callbacks fire on the UE4SS input thread, so the handler only sets a scalar; the master
+-- tick does the work on the game thread. Same discipline probe.lua already applies to its binds.
 RegisterKeyBind(Key.F12, function() _gt_pending_f12 = true end)
 
 log("Press F12 to connect to Archipelago.")
@@ -3121,13 +4666,33 @@ _G._librarian_menu = {
     enter_vanilla = enter_vanilla_mode,
 }
 
--- Input thread again: set the flag, let the master tick construct the widget. See the F12 bind.
+-- Input thread: set a scalar only. menu_toggle walks actors and builds a UMG widget, none of which
+-- may run off the game thread. Drained by the master tick.
 RegisterKeyBind(Key.F4, function() _gt_pending_f4 = true end)
+
+-- DEV: fire the Recall Stone once per press. Same discipline as the two above -- the handler sets a
+-- boolean and nothing else, since a key runs on a third thread and reaching into the game from there
+-- is the corruption everything else here was rewritten to avoid.
+-- Inert unless MAGIC_TEST_RECALL_STONE is on, so a stray press cannot rearrange a real run.
+RegisterKeyBind(Key.F6, function() _gt_pending_f6 = true end)
+
+-- DEV: feasibility probe harness (AP/probe.lua). Loads only when diag PROBE_MODE is EXPLICITLY
+-- true -- diag_on() defaults missing flags to ON, so gate on the raw table value to keep the
+-- probe out of normal builds. Strip this block + AP/probe.lua before shipping.
+do
+    local _pok, _pf = pcall(require, "diag_flags")
+    if _pok and type(_pf) == "table" and _pf.PROBE_MODE == true then
+        local ok, err = pcall(function() require("AP/probe") end)
+        if ok then log("[probe] AP/probe loaded (PROBE_MODE on)")
+        else log("[probe] failed to load AP/probe: " .. tostring(err)) end
+    end
+end
 
 -- Poll for ModActor on startup and show the menu once. Subsequent shows
 -- are user-driven via F4 — auto-show on disconnect is handled in the
--- on_disconnected handler. On the game-thread scheduler: the body does
--- FindFirstOf plus UMG construction, which must not run off-thread.
+-- on_disconnected handler.
+-- On the game thread: it walks actors (FindFirstOf), reads GetFullName and constructs the menu
+-- widget. Returning true latches the step off, the same contract gt_loop and LoopAsync share.
 gt_loop("menu_show", 500, function()
     if _menu_initial_shown then return true end
     if APClient._slot_connected then

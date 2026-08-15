@@ -157,7 +157,7 @@ Client._poll_on_game_thread = false
 -- POLL_ON_GAME_THREAD is off, or does nothing at all. This loop cannot move: it bootstraps the AP
 -- client during the window before any pawn exists, which is the one situation a game-thread step
 -- could never cover. Its async-side work is a few table reads -- no UObject access, no allocation,
--- no I/O. Do not add work here; if you need more, do it inside gt_bootstrap_tick.
+-- no I/O. Do not add work here; if you need more, do it inside _gt_bootstrap_tick.
 --
 -- Once the pawn tick has been seen advancing it LATCHES OFF for good. "Is the tick advancing right
 -- now" is not a usable test: a pause menu, a cutscene, an unpossessed pawn or a single long frame
@@ -250,9 +250,8 @@ function Client:_register_handlers()
         self._player_alias_cache = {}
         -- Fresh connection: drop item-tracking and data-storage state from any prior slot/socket.
         -- The server re-dumps received items on connect, so the applied-index high-water mark must
-        -- reset or the re-dump is skipped; clearing the queue and on_storage stops a stranded item
-        -- or stale key from a prior slot leaking into this one. The check sets are cleared in
-        -- connect() instead -- see there.
+        -- reset or the re-dump is skipped; clearing the queues and on_storage stops a stranded item
+        -- or stale key from a prior slot leaking into this one.
         self._applied_index = -1
         self._pending_items = {}
         self._outgoing_storage = {}
@@ -285,6 +284,9 @@ function Client:_register_handlers()
             if self.on_message then pcall(self.on_message, tostring(text)) end
         end
     end)
+    c:set_data_package_changed_handler(function(_)
+        log("Data package updated")
+    end)
     -- Data-storage replies. Retrieved answers a Get; set_reply answers a Set with
     -- want_reply. Both funnel into on_storage(key, value) so callers see one path.
     c:set_retrieved_handler(function(data)
@@ -296,9 +298,6 @@ function Client:_register_handlers()
     c:set_set_reply_handler(function(reply)
         if type(reply) ~= "table" then return end
         if self.on_storage then pcall(self.on_storage, reply.key, reply.value) end
-    end)
-    c:set_data_package_changed_handler(function(_)
-        log("Data package updated")
     end)
     c:set_location_info_handler(function(locations)
         if type(locations) ~= "table" then return end
@@ -456,10 +455,13 @@ end
 --- missed path is a false check in someone else's multiworld.
 --- Dropped rather than queued: a check derived from the wrong world must not be
 --- held and flushed later if the right save is loaded afterwards.
+--- Returns true when the check is sent or already known-sent, false when it was refused.
+--- Callers that record their own "already fired" state must gate on this: a refusal is temporary
+--- (identity not yet verified), and treating it as sent loses the check for the session.
 function Client:send_check(location_id)
     location_id = tonumber(location_id)
-    if not location_id then return end
-    if self._sent_checks[location_id] then return end
+    if not location_id then return false end
+    if self._sent_checks[location_id] then return true end
 
     local SI = package.loaded["AP/SaveIdentity"]
     if SI and not SI.may_send_checks() then
@@ -467,11 +469,13 @@ function Client:send_check(location_id)
             self._id_block_logged = true
             log(("Checks held: %s"):format(SI.reason or "save identity not confirmed"))
         end
-        return
+        return false
     end
     self._id_block_logged = nil
+
     self._outgoing_checks[#self._outgoing_checks + 1] = location_id
     if self.on_check_sent then pcall(self.on_check_sent, location_id) end
+    return true
 end
 
 --- Mark whether the player is currently in a gameplay level. When false,
@@ -541,13 +545,6 @@ function Client:_process_outgoing()
         end
     end
 
-    if #self._outgoing_storage > 0 then
-        for _, s in ipairs(self._outgoing_storage) do
-            self._client:Set(s.key, s.dflt, s.reply, s.ops)
-        end
-        self._outgoing_storage = {}
-    end
-
     if #self._outgoing_say > 0 then
         for _, text in ipairs(self._outgoing_say) do
             self._client:Say(text)
@@ -558,6 +555,13 @@ function Client:_process_outgoing()
     if self._outgoing_status ~= nil then
         self._client:StatusUpdate(self._outgoing_status)
         self._outgoing_status = nil
+    end
+
+    if #self._outgoing_storage > 0 then
+        for _, s in ipairs(self._outgoing_storage) do
+            self._client:Set(s.key, s.dflt, s.reply, s.ops)
+        end
+        self._outgoing_storage = {}
     end
 
     -- Single-thread: drain ONE stashed scout batch per ~12 polls, so all DLL LocationScouts calls
