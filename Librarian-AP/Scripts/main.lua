@@ -606,11 +606,18 @@ local function try_register_book_hooks()
                             -- op < 1 = stuck-transparent book; restore Opacity here too so just
                             -- LOOKING at it repairs it. Gated BOOK_OPACITY_FIX.
                             local op_bad = diag_on("BOOK_OPACITY_FIX") and type(op) == "number" and op < 1.0
+                            -- Collision first, and unconditionally. It used to be restored only
+                            -- inside the mesh-repair branch below, so a book whose mesh flags were
+                            -- already fine came back visible and still not pickable -- reported as
+                            -- "unhid but not interactable, Assemble fixes it", Assemble being the
+                            -- grab path that restores collision by another route. Showing an
+                            -- unwarded book and leaving it un-grabbable is never right, and the
+                            -- call is idempotent.
+                            pcall(function() b:SetActorEnableCollision(true) end)
                             if mh == true or vis == false or op_bad then
                                 if mh == true then pcall(function() sm:SetHiddenInGame(false, false) end) end
                                 if vis == false then pcall(function() sm:SetVisibility(true, false) end) end
                                 if op_bad then pcall(function() mid:SetScalarParameterValue("Opacity", 1.0) end) end
-                                pcall(function() b:SetActorEnableCollision(true) end)
                                 _bh.revealed = _bh.revealed + 1
                                 if _bh.rev_samples < 15 then
                                     _bh.rev_samples = _bh.rev_samples + 1

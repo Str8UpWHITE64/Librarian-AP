@@ -2960,6 +2960,11 @@ function M.detect_correct_books()
     if M._dcb_full_scan then
         M._dcb_full_scan = false
         M._dcb_fast = true
+        -- Two laps, not one. BookInserted fires when the book goes in, but the game sets its own
+        -- "Is Abs Correct" a beat later, so a single ~1s lap can finish while the flag is still
+        -- false and the book then waits on the rolling backstop -- minutes away at 250 books per
+        -- rotation tick. Reported as a shelved book whose check only arrived after re-shelving it.
+        M._dcb_fast_laps = 2
         M._dcb_books, M._dcb_cursor = nil, 0   -- fresh snapshot, from the top
     end
 
@@ -3028,7 +3033,14 @@ function M.detect_correct_books()
         end
     end
     M._dcb_cursor = stop
-    if M._dcb_fast and stop >= n then M._dcb_fast = false end   -- fast sweep wrapped; back to rolling
+    if M._dcb_fast and stop >= n then                             -- fast sweep wrapped
+        M._dcb_fast_laps = (M._dcb_fast_laps or 1) - 1
+        if M._dcb_fast_laps > 0 then
+            M._dcb_cursor = 0                                    -- go round again, same snapshot
+        else
+            M._dcb_fast = false                                  -- back to the rolling backstop
+        end
+    end
     if sent > 0 then
         log(("[book-correct] sent %d new book check(s)"):format(sent))
     end
