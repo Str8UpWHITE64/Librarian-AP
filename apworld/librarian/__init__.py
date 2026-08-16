@@ -1242,7 +1242,7 @@ class LibrarianWorld(World):
     def _set_rules_book(self) -> None:
         """Access rules for BookSanity. Each book location needs only its own
         book item (all shelves precollected -> depth-1). Count-gated locations
-        (level-ups, 'Complete N Books', section/floor completions, goal) gate on
+        (level-ups, 'Correctly shelve N books', section/floor completions, goal) gate on
         feasible_books = number of distinct held book items (all placeable)."""
         mw = self.multiworld
         p = self.player
@@ -1324,7 +1324,7 @@ class LibrarianWorld(World):
         for thresh in BOOK_COMPLETION_THRESHOLDS:
             if thresh > max_books:
                 continue
-            loc = mw.get_location(f"Complete {thresh} Books", p)
+            loc = mw.get_location(f"Correctly shelve {thresh} books", p)
             loc.access_rule = (lambda state, n=thresh: feasible_books(state) >= n)
 
         total_active_books = sum(s.volume_count for s in active_sections)
@@ -1684,7 +1684,7 @@ class LibrarianWorld(World):
             max_books = self.max_reachable_books
             for thresh in BOOK_COMPLETION_THRESHOLDS:
                 if thresh <= max_books:
-                    bc_id = self.location_name_to_id.get(f"Complete {thresh} Books")
+                    bc_id = self.location_name_to_id.get(f"Correctly shelve {thresh} books")
                     if bc_id is not None:
                         book_completion_map[str(thresh)] = bc_id
             if goal_value == self.options.goal.option_floor_1:

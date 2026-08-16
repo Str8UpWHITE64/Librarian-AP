@@ -260,8 +260,8 @@ _book_locations: list[LibrarianLocationData] = [
     in enumerate(data.ALL_BOOKS)
 ]
 
-# Cumulative "Complete N Books" milestones (book_sanity). Dense early, sparse
-# late; count kept modest to bound the deep-lock. Access rule:
+# Cumulative "Correctly shelve N books" milestones (book_sanity). Dense early,
+# sparse late; count kept modest to bound the deep-lock. Access rule:
 # feasible_books(state) >= N.
 BOOK_COMPLETION_THRESHOLDS: tuple[int, ...] = (
     5,   10,   25,   50,   75,  100,  150,  200,  300,  400,
@@ -271,7 +271,7 @@ BOOK_COMPLETION_THRESHOLDS: tuple[int, ...] = (
 
 _book_completion_locations: list[LibrarianLocationData] = [
     LibrarianLocationData(
-        f"Complete {_thresh} Books",
+        f"Correctly shelve {_thresh} books",
         5100 + _idx,
         LibrarianLocationCategory.BOOK_COMPLETION,
     )

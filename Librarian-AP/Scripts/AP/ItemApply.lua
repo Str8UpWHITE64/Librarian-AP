@@ -342,6 +342,12 @@ M._sent_row_locations = {}
 -- Already-fired row-completion thresholds this session (de-dupe), keyed by threshold value.
 M._sent_row_completions = {}
 
+-- Already-fired book-completion thresholds this session (de-dupe), keyed by threshold value.
+M._sent_book_completions = {}
+
+-- This seed's book location IDs as a flat array; see set_slot_data. Empty outside BookSanity.
+M._book_loc_ids = {}
+
 -- Already-fired section completions this session (de-dupe, keyed by section_id).
 -- Fires when every row location in the section is in _sent_row_locations.
 M._sent_section_completions = {}
@@ -458,6 +464,7 @@ function M.set_slot_data(slot_data)
     end
     M._sent_row_locations = {}
     M._sent_row_completions = {}
+    M._sent_book_completions = {}
     M._sent_section_completions = {}
     M._section_to_row_locs = {}
     M._sent_floor_completions = {}
@@ -511,6 +518,13 @@ function M.set_slot_data(slot_data)
         and slot_data.book_item_to_book or {}
     M._books_unlocked = {}
     M._books_correct_seen = {}
+    -- Flat array of this seed's book location IDs, so the completion count can be taken against the
+    -- server's checked set without walking the string-keyed map each time.
+    M._book_loc_ids = {}
+    for _, lid in pairs(M._book_location_map) do
+        local n = tonumber(lid)
+        if n then M._book_loc_ids[#M._book_loc_ids + 1] = n end
+    end
     if M._book_sanity_enabled then
         local nloc, nitem = 0, 0
         for _ in pairs(M._book_location_map) do nloc = nloc + 1 end
@@ -631,6 +645,7 @@ end
 function M.clear_check_dedupe()
     M._sent_row_locations = {}
     M._sent_row_completions = {}
+    M._sent_book_completions = {}
     M._sent_section_completions = {}
     M._sent_floor_completions = {}
     M._milestones_sent = {}
@@ -715,6 +730,15 @@ function M.set_apply_safe(state)
             for _, name in ipairs(q) do
                 M._apply_skill(name)
             end
+        end
+        -- Count what the save arrived with. Nothing else asks for a full sweep until the player
+        -- shelves something, so a run resuming with books already correct was discovered only as
+        -- the rolling backstop crawled past them -- 250 books a pass over ~3000, which read as the
+        -- completion thresholds being late or missing. Asking here costs one fast sweep (the whole
+        -- library in ~4 passes) and it still runs behind the same apply-safe gate as every other
+        -- book walk, so it cannot touch a half-built actor.
+        if M._book_sanity_enabled then
+            M.request_full_book_scan()
         end
     end
 end
@@ -3044,6 +3068,9 @@ function M.detect_correct_books()
     if sent > 0 then
         log(("[book-correct] sent %d new book check(s)"):format(sent))
     end
+    -- Thresholds ride the same sweep that counts the books: shelving is what moves the count, and
+    -- waiting for the row hub would leave them unfired until a whole row happened to close.
+    pcall(function() M.fire_book_completion_checks() end)
     return sent
 end
 
@@ -3388,6 +3415,7 @@ function M.fire_completion_passes()
             M.fire_row_completion_checks(rf)
         end
     end)
+    pcall(function() M.fire_book_completion_checks() end)
     pcall(function() M.fire_section_completions() end)
     pcall(function() M.fire_floor_completions() end)
 end
@@ -3405,12 +3433,71 @@ function M.fire_row_completion_checks(total_rows)
     for i = 1, #thresholds do
         local t = tonumber(thresholds[i])
         if t and total_rows >= t and not M._sent_row_completions[t] then
-            M._sent_row_completions[t] = true
             local loc_id = AP_LOC_ROW_COMPLETION_FIRST + (i - 1)
-            log(("[row-completion] %d rows finished → loc %d ('Complete %d Rows')"):format(
-                total_rows, loc_id, t))
-            APClient:send_check(loc_id)
-            sent = sent + 1
+            -- Marked only on an accepted send, per send_check's contract: a refusal is temporary
+            -- (identity not yet verified) and marking through one loses the threshold for the
+            -- session. This ran often enough before identity settles for it to matter.
+            if APClient:send_check(loc_id) then
+                M._sent_row_completions[t] = true
+                log(("[row-completion] %d rows finished → loc %d ('Complete %d Rows')"):format(
+                    total_rows, loc_id, t))
+                sent = sent + 1
+            end
+        end
+    end
+    return sent
+end
+
+--- How many of this seed's books are correctly shelved, counted from the SERVER's checked set.
+---
+--- This is the only cross-session record of the answer. Counting live sweep detections instead
+--- looked equivalent and was not: a sweep can only see books the game has evaluated in the current
+--- session, so a run resuming with books already shelved counted zero of them and the thresholds
+--- restarted from nothing on every load. The server has known the real figure the whole time --
+--- one book check per correctly shelved book -- and hands it back as checked_locations on connect.
+---
+--- Counts mapped books only, since _book_loc_ids is built from book_location_map: under a floor
+--- goal the other floor's books are not locations of ours and must not inflate the total.
+function M.count_correct_books()
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient._sent_checks) then return 0 end
+    local ids = M._book_loc_ids
+    if not ids then return 0 end
+    local sent, n = APClient._sent_checks, 0
+    for i = 1, #ids do
+        if sent[ids[i]] then n = n + 1 end
+    end
+    return n
+end
+
+--- Fire "Correctly shelve N books" for every threshold the run has reached.
+---
+--- BookSanity only; the apworld sends book_completion_map ({ "<threshold>" = location id }) just for
+--- that mode and leaves it empty otherwise, so this is inert elsewhere without needing to ask.
+---
+--- The map is keyed by threshold rather than indexed, so unlike the row version there is no base-id
+--- arithmetic to keep aligned with the apworld's ordering.
+function M.fire_book_completion_checks()
+    if not M._slot_data then return 0 end
+    if not M._book_sanity_enabled then return 0 end
+    local map = M._slot_data.book_completion_map
+    if type(map) ~= "table" then return 0 end
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient.send_check) then return 0 end
+    local total_books = M.count_correct_books()
+    if total_books <= 0 then return 0 end
+
+    local sent = 0
+    for k, v in pairs(map) do
+        local t = tonumber(k)
+        local loc_id = tonumber(v)
+        if t and loc_id and total_books >= t and not M._sent_book_completions[t] then
+            if APClient:send_check(loc_id) then
+                M._sent_book_completions[t] = true
+                log(("[book-completion] %d books shelved → loc %d ('Correctly shelve %d books')")
+                    :format(total_books, loc_id, t))
+                sent = sent + 1
+            end
         end
     end
     return sent
