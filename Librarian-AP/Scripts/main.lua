@@ -968,10 +968,6 @@ local _magic_hooks_attempted = false
 local HISM_MGR_BP  = "/Game/Librarian/Prop/BP_HISM_Manager.BP_HISM_Manager_C"
 local CHAR_NATIVE  = "/Script/Librarian.LibrarianCharacter"
 local BAG_NATIVE   = "/Script/Librarian.ItemBagComponent"
--- The book's parent, where the skill-side grab actually lives. BP_GrabbingBook overrides
--- GrabFromPlayer but NOT GrabFromSkill, so the book path resolves to nothing for that one.
-local ITEM_BP      = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingItem.BP_GrabbingItem_C"
-local ITEM_NATIVE  = "/Script/Librarian.GrabbingItemBase"
 
 local function try_register_magic_hooks()
     if _magic_hooks_attempted then return end
@@ -1022,45 +1018,6 @@ local function try_register_magic_hooks()
                 _magic_trace("queued re-sink", ("aidx=%d chap=%d"):format(aidx, chap))
             end
         end)
-
-        -- Assemble. The ability is GrabSameTypeBook, but the character function of that name never
-        -- dispatches -- registered fine, never fired -- so the skill reaches books some other way.
-        -- These are the book-side routes by which a book can be taken or moved; log-only, to find
-        -- which one actually carries it. GrabFromSkill is on the PARENT class: BP_GrabbingBook does
-        -- not override it, so hooking the book path would register against nothing.
-        for _, probe in ipairs({
-            { ITEM_NATIVE .. ":GrabFromSkill",       "GrabFromSkill(native)" },
-            { BOOK_BP .. ":SpawnBehindPlayer",       "SpawnBehindPlayer" },
-            { BOOK_BP .. ":MoveToSpaceArea",         "MoveToSpaceArea" },
-            { BOOK_BP .. ":TeleportEffect",          "TeleportEffect" },
-            { BOOK_BP .. ":MoveToCaseWithSkill",     "MoveToCaseWithSkill" },
-            { BOOK_BP .. ":Cancel",                  "Cancel(BP)" },
-            { BOOK_BP .. ":DetachActor",             "DetachActor" },
-            { BOOK_BP .. ":SetSimulate",             "SetSimulate" },
-            -- Out-of-bounds recovery. This is the behaviour we actually want: the game's popup says
-            -- it puts the book back where it came from, which is exactly the move eviction needs.
-            -- FellOutOfWorld is UE's own below-KillZ hook; the rest are the game's likely handlers.
-            { BOOK_BP .. ":FellOutOfWorld",          "FellOutOfWorld" },
-            { ITEM_NATIVE .. ":FellOutOfWorld",      "FellOutOfWorld(native)" },
-            { BOOK_BP .. ":ReceiveActorBeginOverlap","BeginOverlap" },
-            { BOOK_BP .. ":ReceiveHit",              "ReceiveHit" },
-            { BOOK_BP .. ":MoveToBookCase",          "MoveToBookCase" },
-            { BOOK_BP .. ":BookDonePlace",           "BookDonePlace" },
-            { BOOK_BP .. ":SetBookInfo",             "SetBookInfo" },
-            { BOOK_BP .. ":RefreshInfo",             "RefreshInfo" },
-        }) do
-            local path, label = probe[1], probe[2]
-            mreg(path, label, function(self)
-                if not diag_on("MAGIC_LEAK_TRACE") then return end
-                local b; pcall(function() b = self:get() end)
-                -- Log the warded state rather than filtering on it. Filtering to warded-only made
-                -- silence ambiguous: a route that fired on an unreadable book (state nil) looked
-                -- identical to a route that never fired at all.
-                local _, series = _bh_series(b)
-                _magic_trace(label, ("warded=%s series=%s")
-                    :format(tostring(_bh_book_is_warded(b)), tostring(series)))
-            end)
-        end
 
         -- Insight's per-book highlight. Sinking the pile was not enough: the skill lights the book
         -- ACTOR too, and that is the layer the player actually sees -- which is why 24 pile
@@ -1817,7 +1774,7 @@ end
 -- WBP_Title.Text_Version (top-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
-local MOD_VERSION = "2.0.0"
+local MOD_VERSION = "2.0.1"
 local TESTED_GAME_VERSIONS = { "1.0.12", "1.0.13" }
 
 -- Hard floor, not a preference. Below this the game keeps saves as one flat file, so the slot the
