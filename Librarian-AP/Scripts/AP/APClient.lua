@@ -54,6 +54,11 @@ local Client = {
     _applied_index = -1,
     _pending_items = {},
 
+    -- Which item index the drain is currently waiting on a data-package name for, and for how many
+    -- passes. Only ever set while an item is held back; cleared as soon as one applies.
+    _name_wait_idx = nil,
+    _name_wait_tries = 0,
+
     -- Outgoing queues (populated by hooks, drained by LoopAsync)
     _outgoing_checks = {},
     _outgoing_say = {},
@@ -254,6 +259,7 @@ function Client:_register_handlers()
         -- or stale key from a prior slot leaking into this one.
         self._applied_index = -1
         self._pending_items = {}
+        self._name_wait_idx, self._name_wait_tries = nil, 0
         self._outgoing_storage = {}
         self.on_storage = nil
         if self.on_slot_connected then pcall(self.on_slot_connected, self.slot_data) end
@@ -420,18 +426,65 @@ function Client:_on_items_received(items)
     end
 end
 
+--- Drain passes an item may spend waiting for the data package to name it. The drain runs once per
+--- frame, so this is a few seconds of real time; it exists only so an id the package never names
+--- cannot wedge every later item behind it forever.
+local NAME_RESOLVE_MAX_TRIES = 600
+
+--- Has the data package named this id yet? apclientpp answers "Unknown" for an id it cannot map,
+--- which reads exactly like a real name at the call site -- so the test has to be explicit.
+local function name_resolved(name)
+    return name ~= nil and name ~= "" and name ~= "Unknown"
+end
+
+--- Apply received items in index order, oldest first.
+---
+--- The name is resolved BEFORE _applied_index moves. on_item dispatches on the item's NAME, so an
+--- item handed over as "Unknown" matches nothing and vanishes -- and with the index already past it,
+--- nothing ever re-sends it. That is how the connect burst lost items: the server delivers starting
+--- inventory in the same instant as slot_data, before the data package is indexed, so the first few
+--- ids resolved to "Unknown" and were applied to nothing. Reconnecting appeared to "fix" it only
+--- because _applied_index resets and the server re-sends the lot.
+---
+--- An unnamed item therefore stops the drain and goes back on the queue with everything behind it,
+--- rather than being consumed. Order is the reason the whole tail waits: letting a later item
+--- through would advance the index past the one still waiting.
 function Client:_apply_pending_items()
     if not self._in_game then return end  -- hold until player has loaded M01
     if #self._pending_items == 0 then return end
     local pending = self._pending_items
     self._pending_items = {}
-    for _, it in ipairs(pending) do
+    for i, it in ipairs(pending) do
         local idx = tonumber(it.index) or -1
         if idx > self._applied_index then
-            self._applied_index = idx
             local item_id = tonumber(it.item) or 0
             local name = nil
             pcall(function() name = self._client:get_item_name(item_id, "") end)
+
+            if not name_resolved(name) then
+                self._name_wait_tries = (self._name_wait_idx == idx)
+                    and (self._name_wait_tries + 1) or 0
+                self._name_wait_idx = idx
+                if self._name_wait_tries < NAME_RESOLVE_MAX_TRIES then
+                    if self._name_wait_tries == 0 then
+                        log(("item idx=%d id=%d not yet named by the data package; holding it and %d behind it")
+                            :format(idx, item_id, #pending - i))
+                    end
+                    -- Re-queue from here, ahead of anything that arrived during this pass.
+                    local carry = {}
+                    for k = i, #pending do carry[#carry + 1] = pending[k] end
+                    for _, later in ipairs(self._pending_items) do carry[#carry + 1] = later end
+                    self._pending_items = carry
+                    return
+                end
+                -- Gave up waiting. Let it through unnamed so the queue behind it still drains:
+                -- losing this one item beats stalling every item after it.
+                log(("item idx=%d id=%d still unnamed after %d tries; releasing it unapplied")
+                    :format(idx, item_id, NAME_RESOLVE_MAX_TRIES))
+            end
+            self._name_wait_idx, self._name_wait_tries = nil, 0
+
+            self._applied_index = idx
             log(("Received item idx=%d id=%d name=%s player=%s loc=%s"):format(
                 idx, item_id, tostring(name or "?"),
                 tostring(it.player), tostring(it.location)))
