@@ -4079,10 +4079,13 @@ end
 -- FinishRow gives a global Nth-row counter but not which (section, series); ItemApply resolves
 -- that by diffing its per-bookcase RowStatus snapshot. `row` is logged for diagnostics only.
 -- Goal latch: set on the first STATUS_GOAL so a re-fire doesn't double-send. Reset on connect/disconnect.
-local _goal_sent = false
-
--- Goal-progress milestones at 25/50/75%, each at most once per connection; cleared with _goal_sent.
-local _progress_milestones_fired = {}
+-- All goal state on one table, on purpose. The main chunk sits at Lua's hard ceiling of 200
+-- locals, so anything goal-related that wants a name up here has to share this one slot -- a
+-- second `local` at this level does not fail at its own line, it stops the whole file loading.
+--   sent       -- latched on the first STATUS_GOAL so a re-fire cannot double-send
+--   milestones -- 25/50/75% progress toasts, each at most once per connection
+--   send       -- the row-threshold check itself
+local _goal = { sent = false, milestones = {} }
 
 local function announce_goal_progress(row)
     local APClient_mod = package.loaded["AP/APClient"]
@@ -4094,13 +4097,40 @@ local function announce_goal_progress(row)
     if not (HUD_mod and HUD_mod.notify) then return end
     for _, pct in ipairs({25, 50, 75}) do
         local mark = math.floor((threshold * pct) / 100)
-        if mark > 0 and row >= mark and not _progress_milestones_fired[pct] then
-            _progress_milestones_fired[pct] = true
+        if mark > 0 and row >= mark and not _goal.milestones[pct] then
+            _goal.milestones[pct] = true
             HUD_mod.notify(
                 ("Goal progress: %d / %d rows (%d%%)"):format(row, threshold, pct),
                 6.0)
         end
     end
+end
+
+--- Send STATUS_GOAL when `rows` meets the seed's threshold. Idempotent; the latch does the rest.
+---
+--- EVERY goal resolves here now, "full" included. Full used to be excluded and left to the game's
+--- own EndGame at the end door, on the assumption the two amount to the same thing. They do not:
+--- EndGame is a walk-through-a-door event, not a completion one, so a player sitting on every check
+--- in the seed had no goal and no way to get one. The apworld has always sent the full row count in
+--- goal_row_threshold, so the threshold path needed no new data -- only permission to run.
+---
+--- EndGame stays hooked and still fires the goal wherever it does happen; the latch stops the two
+--- paths double-sending.
+function _goal.send(rows)
+    if _goal.sent or not rows then return end
+    local APClient_mod = package.loaded["AP/APClient"]
+    local sd = APClient_mod and APClient_mod.slot_data
+    if not (sd and sd.goal_row_threshold) then return end
+    local threshold = tonumber(sd.goal_row_threshold) or 0
+    if threshold <= 0 or rows < threshold then return end
+    _goal.sent = true
+    log(("[AP] %d/%d rows finished — sending STATUS_GOAL (goal=%s)"):format(
+        rows, threshold, tostring(sd.goal)))
+    local HUD_mod = package.loaded["AP/HUD"]
+    if HUD_mod and HUD_mod.notify then
+        HUD_mod.notify(("Goal complete! (%d rows)"):format(threshold), 10.0)
+    end
+    ap_send_goal()
 end
 
 RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, finishedRow)
@@ -4110,27 +4140,7 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
     log((">> FinishRow        row=%s"):format(tostring(row)))
 
     if row then announce_goal_progress(row) end
-
-    -- Row-count goal trigger for non-full goals (full goal waits for the game's EndGame at the end
-    -- door). option_full=0 in Options.py -- compare goal against 0, not 1, or custom goals never fire.
-    if not _goal_sent and row then
-        local APClient_mod = package.loaded["AP/APClient"]
-        local sd = APClient_mod and APClient_mod.slot_data
-        if sd and sd.goal_row_threshold and sd.goal ~= nil then
-            local is_full = (sd.goal == 0)  -- option_full = 0
-            local threshold = tonumber(sd.goal_row_threshold) or 400
-            if not is_full and row >= threshold then
-                _goal_sent = true
-                log(("[AP] reached %d rows — sending STATUS_GOAL (goal=%s)"):format(
-                    threshold, tostring(sd.goal)))
-                local HUD_mod = package.loaded["AP/HUD"]
-                if HUD_mod and HUD_mod.notify then
-                    HUD_mod.notify(("Goal complete! (%d rows)"):format(threshold), 10.0)
-                end
-                ap_send_goal()
-            end
-        end
-    end
+    _goal.send(row)
 
     -- Arm the fast path; do not run the checks here. They mutate the shared _sent_* / _milestones_sent
     -- de-dup tables, and this hook can fire in the middle of a pass that is already walking them.
@@ -4153,13 +4163,41 @@ end)
 RegisterHook("/Script/Librarian.LibrarianGameMode:EndGame", function(self)
     if not diag_on("NAMED_HOOKS") then return end
     log(">> EndGame  (GAME COMPLETE)")
-    if _goal_sent then
+    if _goal.sent then
         log("[AP] STATUS_GOAL already sent (threshold reached earlier); skipping")
         return
     end
-    _goal_sent = true
+    _goal.sent = true
     log("[AP] sending STATUS_GOAL")
     ap_send_goal()
+end)
+
+-- Goal catch-up. FinishRow announces a row as it completes and nothing re-announces it, so a run
+-- that finished its last row in an earlier session -- or while disconnected -- would never see the
+-- trigger again however long it played. The save's own counter is the durable record of the same
+-- fact, so re-read it on a slow timer. Cheap, and the latch makes it a no-op the moment the goal
+-- is out; it deliberately does NOT unregister on success, so a second connection can still fire.
+gt_loop("goal_catchup", 5000, function()
+    if _goal.sent then return false end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA._gameplay_active and IA._apply_safe) then return false end
+    local rows
+    pcall(function()
+        local gi = FindFirstOf("BP_LibrarianGameInstance_C")
+            or FindFirstOf("LibrarianGameInstanceBase")
+        if gi and gi:IsValid() then
+            local sg = gi.GameSaveData
+            if sg and sg:IsValid() then
+                rows = tonumber(sg.GameProgressData.CurrentFinishedRowNum)
+            end
+        end
+    end)
+    -- Same stale-save rule as every other progress read: during a New Game this still describes the
+    -- PREVIOUS run, and a goal is the one check that genuinely cannot be taken back.
+    if rows and rows > 0 and not IA.save_progress_is_stale(rows) then
+        _goal.send(rows)
+    end
+    return false
 end)
 
 
@@ -4348,8 +4386,8 @@ APClient.on_slot_connected = function(slot_data)
         _G._librarian_menu.hide()
     end
     -- Reset goal latch so this fresh connection can fire STATUS_GOAL again.
-    _goal_sent = false
-    _progress_milestones_fired = {}
+    _goal.sent = false
+    _goal.milestones = {}
 
     -- Persist working connection info so next launch auto-fills.
     pcall(function()
@@ -4503,8 +4541,8 @@ end
 APClient.on_disconnected = function()
     log("[AP] disconnected")
     restore_save_slot()
-    _goal_sent = false
-    _progress_milestones_fired = {}
+    _goal.sent = false
+    _goal.milestones = {}
     -- Clear pre-apply state so a reconnect starts fresh (else buttons enable early / settle thinks
     -- it's done).
     local IA = package.loaded["AP/ItemApply"]
