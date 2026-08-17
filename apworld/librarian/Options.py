@@ -113,14 +113,17 @@ class LocalFiller(DefaultOnToggle):
     display_name = "Local Filler"
 
 
-class OnlyUnwardShelfableBooks(Toggle):
+class OnlyUnwardShelfableBooks(DefaultOnToggle):
     """Require both the series unlock AND its bookcase before a book is pickable.
 
-    Off (default): a book is pickable as soon as its series arrives -- you can stash
-    it on any open shelf and move it later.
-    On: stricter -- a book stays warded until its series and its bookcase are both open."""
+    On (default): a book stays hidden until its series and its bookcase are
+    both open.  Default option to avoid having to shuffle series around.
+
+    Off: books are unhidden and grabbable once they are sent to you. This means you
+    can place books on shelves 'out of order'.  This may lead you to need to
+    shelf a series and then replace it with a different series on the same
+    shelf in order to get all available checks."""
     display_name = "Only Unward Shelfable Books"
-    default = 0
 
 
 @dataclass

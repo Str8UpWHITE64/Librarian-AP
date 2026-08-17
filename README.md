@@ -323,19 +323,22 @@ checks. No effect in a solo game.
 
 ### `only_unward_shelfable_books`
 
-Toggle (default `false`). Controls how strictly books are gated by
+Toggle (default `true`). Controls how strictly books are gated by
 shelf unlocks.
 
-**Off (default)** — A series's books are pickable as soon as you receive its
-series unlock, **regardless of whether its bookcase is open yet**. You can pick
-books up early and stash them on any open shelf — mis-shelving and moving them
-later is part of the loop. (Correctly *completing* a row still needs that row's
-home bookcase open so you can shelve its books in the right place.)
+**On (default)** — A book stays hidden until its series **and** its bookcase are
+both open. This is the default so you never have to shuffle series around: you
+need **both** the series unlock **and** enough Progressive Shelf Unlocks for that
+section to reach the series's home bookcase. No visibility floor — if a section
+has zero bookcases open, none of its series are pickable.
 
-**On** — Stricter. A series's books stay warded until you have **both**
-the series unlock **and** enough Progressive Shelf Unlocks for that
-section to reach the series's home bookcase. No visibility floor — if
-a section has zero bookcases open, none of its series are pickable.
+**Off** — Books are unhidden and grabbable as soon as they are sent to you,
+**regardless of whether their bookcase is open yet**. This means you can place
+books on shelves "out of order".
+
+Be aware of what that involves: to collect every available check you may need to
+shelf a series, then **replace it with a different series on the same shelf**,
+working through the series you hold using the shelves you have.
 
 The difference: **Off** lets you hold any received series' books immediately
 (placing them once that shelf opens); **On** withholds the books themselves
