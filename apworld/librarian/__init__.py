@@ -80,13 +80,27 @@ _MAJOR_MAGIC_NAMES = frozenset((
 _SERIES_ITEM_PREFIX = "Series Unlock: "
 
 
+_SKILL_NAMES = ("Sort", "Shelf Guide", "Insight", "Auto-Shelving", "Assemble")
+
+
+def _trap_names() -> list:
+    """Fatigue items, the only trap category. First to be dropped when the pool overshoots."""
+    return [f"Fatigue: {n}" for n in _SKILL_NAMES]
+
+
+def _mastery_names() -> list:
+    """Skill Mastery items -- useful, but they only extend a skill already at its native max,
+    so they are the cheapest useful thing to lose before the bag and base magic."""
+    return [f"{n} Mastery" for n in _SKILL_NAMES]
+
+
 def _buffs_traps_quantities() -> dict:
     """{item_name: qty} for the buff/trap items every mode adds: Skill Mastery (useful), Fatigue
     (trap), and Book Capacity (useful). Every skill gets its full 5-item Mastery set -- the pool now
     keeps all Major Magic so each skill maxes, and the client treats Mastery as extra skill levels
     past the native max. Fatigue (bites at any level) and the bag items always go in too."""
     q: dict = {}
-    for name in ("Sort", "Shelf Guide", "Insight", "Auto-Shelving", "Assemble"):
+    for name in _SKILL_NAMES:
         q[f"{name} Mastery"] = 5
         q[f"Fatigue: {name}"] = 2
     q["+2 Book Capacity"] = 8
@@ -814,9 +828,17 @@ class LibrarianWorld(World):
             if excess > 0:
                 # Still over (or nothing to lift -- individual mode has no Progressive Series
                 # Unlock). Magic + Mastery + Fatigue + bag items are all useful/trap now (optional),
-                # so drop the surplus from them to fit the smaller goal; magic first (most numerous).
-                for name in (list(major_magic_names)
-                             + list(_buffs_traps_quantities().keys())):
+                # so drop the surplus from them to fit the smaller goal.
+                #
+                # Order is deliberate, worst-to-keep first. It used to run magic first "(most
+                # numerous)", which meant a trimmed goal stripped Progressive Insight and friends
+                # while keeping every Fatigue trap -- a smaller seed made of debuffs. Traps go
+                # first now, then the extras that only extend an already-maxed skill, then the bag,
+                # and base magic last since that is what makes a skill work at all.
+                for name in (_trap_names()
+                             + _mastery_names()
+                             + ["+2 Book Capacity", "+3 Book Capacity"]
+                             + list(major_magic_names)):
                     if excess <= 0:
                         break
                     take = min(quantities.get(name, 0), excess)
@@ -1009,18 +1031,24 @@ class LibrarianWorld(World):
 
         filler_needed = target - len(pool_items)
         if filler_needed < 0:
-            # Overshoot relief (mirrors the row path): drop surplus optional items
-            # -- Major Magic, then buffs/traps -- all non-book, non-progression, so
-            # dropping them never affects winnability. Book items are never dropped.
-            drop_set = set(_MAJOR_MAGIC_NAMES) | set(_buffs_traps_quantities().keys())
-            excess = -filler_needed
-            kept: list[LibrarianItem] = []
-            for it in reversed(pool_items):
-                if excess > 0 and it.name in drop_set:
-                    excess -= 1
-                    continue
-                kept.append(it)
-            pool_items = list(reversed(kept))
+            # Overshoot relief (mirrors the row path): drop surplus optional items -- all
+            # non-book, non-progression, so dropping them never affects winnability. Book
+            # items are never dropped.
+            #
+            # Worst-to-keep order, same as the row path: traps, then the extras that only
+            # extend an already-maxed skill, then the bag, then base magic. This used to walk
+            # the pool backwards against an unordered set, so what survived depended on list
+            # position rather than on whether the player was losing a debuff or their Insight
+            # levels -- and a trimmed goal could leave a seed made largely of Fatigue.
+            drop_order = (_trap_names() + _mastery_names()
+                          + ["+2 Book Capacity", "+3 Book Capacity"]
+                          + list(_MAJOR_MAGIC_NAMES))
+            rank = {n: i for i, n in enumerate(drop_order)}
+            droppable = sorted(
+                (i for i, it in enumerate(pool_items) if it.name in rank),
+                key=lambda i: rank[pool_items[i].name])
+            remove = set(droppable[:-filler_needed])
+            pool_items = [it for i, it in enumerate(pool_items) if i not in remove]
             filler_needed = target - len(pool_items)
             if filler_needed < 0:
                 raise ValueError(
