@@ -276,7 +276,68 @@ class LibrarianWorld(World):
             return [s for s in data.SECTIONS if s.floor == 1]
         if v == self.options.goal.option_floor_2:
             return [s for s in data.SECTIONS if s.floor == 2]
+        if v == self.options.goal.option_custom:
+            # UT re-gen: unlike the floor goals, this set is a seeded roll and cannot be
+            # re-derived from the options, so fill_slot_data emits it and we read it back.
+            ids = pt.get("active_sections") if pt else None
+            if ids:
+                keep = set(ids)
+                return [s for s in data.SECTIONS if s.id in keep]
+            return self._custom_active_sections()
         return list(data.SECTIONS)
+
+    def _custom_active_sections(self) -> list[data.Section]:
+        """Sections kept for a custom goal: enough to cover the goal plus
+        extra_series_percent slack, and no more.
+
+        A custom goal only needs its own count, so every section past that is surplus --
+        checks that still hold items, and in a multiworld can hold another game's
+        progression, which then waits on a check this player has no reason to do. Trimming
+        the world is what stops that, rather than trying to force those checks to filler:
+        in individual/booksanity every series IS a check, so there is no filler to move
+        there anyway.
+
+        Whole sections only. A partially included section could never complete its section
+        check, and the same whole-section shape is what the floor goals already rely on.
+        Measured in books under booksanity and rows otherwise, matching what that mode's
+        goal actually counts.
+        """
+        cached = getattr(self, "_custom_sections_cache", None)
+        if cached is not None:
+            return cached
+
+        book_mode = self.book_sanity
+        if book_mode:
+            need = self.options.custom_goal_book_count.value
+            size = lambda s: s.volume_count
+        else:
+            need = self.options.custom_goal_row_count.value
+            size = lambda s: s.shelf_count
+        library_total = sum(size(s) for s in data.SECTIONS)
+        # Clamp to the library. Both the goal itself and the slack can be asked for beyond what
+        # exists -- 400 rows plus 10% is 440 -- and an uncapped target just means "keep
+        # everything" while reading like a real number in logs and in the section maths.
+        need = min(need, library_total)
+        target = min(
+            math.ceil(need * (1 + self.options.extra_series_percent.value / 100)),
+            library_total,
+        )
+
+        pool = list(data.SECTIONS)
+        self.random.shuffle(pool)
+        kept, total = [], 0
+        for sec in pool:
+            if total >= target:
+                break
+            kept.append(sec)
+            total += size(sec)
+        if not kept:                      # target 0 cannot leave an empty world
+            kept = [pool[0]]
+        # Restore declaration order so section/floor grouping downstream is stable.
+        keep_ids = {s.id for s in kept}
+        kept = [s for s in data.SECTIONS if s.id in keep_ids]
+        self._custom_sections_cache = kept
+        return kept
 
     @property
     def active_section_ids(self) -> set[str]:
@@ -687,11 +748,6 @@ class LibrarianWorld(World):
 
         # unlock_mode == individual_series_unlocks: every series is its own item.
         individual = self.individual
-        if individual and self.options.goal.value == self.options.goal.option_custom:
-            raise ValueError(
-                "Librarian: unlock_mode individual_series_unlocks does not support "
-                "goal: custom (v2.0.1). Use goal: full, floor_1, or floor_2."
-            )
 
         precollect_names: list[str] = []
         if individual:
@@ -969,10 +1025,6 @@ class LibrarianWorld(World):
         starting series' books. Pool = the other book items + Major Magic
         (capped) + filler padded to the location count."""
         mw = self.multiworld
-        if self.options.goal.value == self.options.goal.option_custom:
-            raise ValueError(
-                "Librarian: book_sanity does not support goal: custom (v2.0.1). "
-                "Use goal: full, floor_1, or floor_2.")
         if self.options.goal.value == self.options.goal.option_full:
             print("[Librarian] BookSanity + full goal (~3072 book checks): "
                   "generation's spoiler-playthrough step is quadratic in item "
@@ -1253,10 +1305,16 @@ class LibrarianWorld(World):
         # and since each section's max shelf_req equals its bookcase_count, every
         # bookcase is open too -> every section done. Reuses the cached
         # feasible_rows instead of iterating every section x section_done.
+        # custom: the same counter against the player's own row target, capped at what this
+        # goal's sections actually hold so an over-large target cannot be unwinnable.
         total_active_rows = sum(len(sec.series) for sec in active_sections)
+        if self.options.goal.value == self.options.goal.option_custom:
+            goal_rows_needed = min(self.options.custom_goal_row_count.value, total_active_rows)
+        else:
+            goal_rows_needed = total_active_rows
         goal = mw.get_location(GOAL_LOCATION_NAME, p)
         goal.access_rule = (
-            lambda state, n=total_active_rows: feasible_rows(state) >= n
+            lambda state, n=goal_rows_needed: feasible_rows(state) >= n
         )
 
         self._ban_advancement_on_deep(self._DEEP_CATEGORIES)
@@ -1355,10 +1413,16 @@ class LibrarianWorld(World):
             loc = mw.get_location(f"Correctly shelve {thresh} books", p)
             loc.access_rule = (lambda state, n=thresh: feasible_books(state) >= n)
 
+        # custom counts BOOKS here, not rows: 400 rows hold 3072 books, so a row-shaped
+        # target would end the run almost immediately. Capped at the goal's own book total.
         total_active_books = sum(s.volume_count for s in active_sections)
+        if self.options.goal.value == self.options.goal.option_custom:
+            books_needed = min(self.options.custom_goal_book_count.value, total_active_books)
+        else:
+            books_needed = total_active_books
         goal = mw.get_location(GOAL_LOCATION_NAME, p)
         goal.access_rule = (
-            lambda state, n=total_active_books: feasible_books(state) >= n)
+            lambda state, n=books_needed: feasible_books(state) >= n)
         self._ban_advancement_on_deep(self._DEEP_CATEGORIES_BOOK)
         mw.completion_condition[p] = lambda state: state.has(VICTORY_ITEM_NAME, p)
 
@@ -1721,6 +1785,12 @@ class LibrarianWorld(World):
             elif goal_value == self.options.goal.option_floor_2:
                 goal_book_threshold = sum(
                     s.volume_count for s in data.SECTIONS if s.floor == 2)
+            elif goal_value == self.options.goal.option_custom:
+                # The one goal where books and rows are NOT the same finish line, so this is
+                # the only threshold the client can fire a booksanity custom goal from.
+                goal_book_threshold = min(
+                    self.options.custom_goal_book_count.value,
+                    sum(s.volume_count for s in data.SECTIONS))
             else:
                 goal_book_threshold = sum(s.volume_count for s in data.SECTIONS)
 
@@ -1730,7 +1800,7 @@ class LibrarianWorld(World):
             # suffix is informational. NOT the AP world version -- that one
             # (archipelago.json:world_version) must be clean semver so AP can parse it
             # for YAML `requires: game:` checks (a suffix there reads as 0.0.0).
-            "version": "2.0.1",
+            "version": "2.0.2",
             "goal": goal_value,
             # Row count at which the Lua client should send STATUS_GOAL.
             # Ignored for the "full" goal (the game's EndGame fires it).
@@ -1738,6 +1808,10 @@ class LibrarianWorld(World):
             # Seed identifier — Lua uses this to isolate the in-game save slot
             # so each AP seed has its own Sav_AP_<seed>_<slot>.sav file.
             "seed": str(self.multiworld.seed_name),
+            # Which sections this seed actually contains. Informational for the floor and
+            # full goals (derivable from `goal`), load-bearing for custom: that set is a
+            # seeded roll, so a UT re-gen has no other way to reproduce it.
+            "active_sections": sorted(self.active_section_ids),
             "starting_section": self.starting_section,
             "starting_section_b": self.starting_section_b,
             "starting_series": self.starting_series,

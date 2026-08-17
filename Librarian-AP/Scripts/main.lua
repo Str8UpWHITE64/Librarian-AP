@@ -1774,7 +1774,7 @@ end
 -- WBP_Title.Text_Version (top-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
-local MOD_VERSION = "2.0.1"
+local MOD_VERSION = "2.0.2"
 local TESTED_GAME_VERSIONS = { "1.0.12", "1.0.13" }
 
 -- Hard floor, not a preference. Below this the game keeps saves as one flat file, so the slot the
@@ -4073,19 +4073,44 @@ end
 ---
 --- EndGame stays hooked and still fires the goal wherever it does happen; the latch stops the two
 --- paths double-sending.
+--- BookSanity + custom is the one goal counted in BOOKS rather than rows. Everywhere else the two
+--- describe the same finish line -- a row completes exactly when its books are correctly placed --
+--- so the row threshold covers them and goal_book_threshold is redundant. Under a custom target it
+--- stops being redundant: 400 rows hold 3072 books, so "500" means very different runs, and only
+--- the book threshold describes the one the player picked.
+---
+--- Books come from the server's checked set rather than the world, so this needs no stale-save
+--- guard: it cannot describe the previous run the way GameSaveData can.
+function _goal.book_target(sd)
+    if not (sd and sd.book_sanity == 1 and sd.goal == 1) then return nil end   -- 1 = option_custom
+    local want = tonumber(sd.goal_book_threshold)
+    if not want or want <= 0 then return nil end
+    local IA = package.loaded["AP/ItemApply"]
+    if not (IA and IA.count_correct_books) then return nil end
+    return IA.count_correct_books(), want
+end
+
 function _goal.send(rows)
-    if _goal.sent or not rows then return end
+    if _goal.sent then return end
     local APClient_mod = package.loaded["AP/APClient"]
     local sd = APClient_mod and APClient_mod.slot_data
-    if not (sd and sd.goal_row_threshold) then return end
-    local threshold = tonumber(sd.goal_row_threshold) or 0
-    if threshold <= 0 or rows < threshold then return end
+    if not sd then return end
+
+    local have, want, unit = _goal.book_target(sd)
+    if have then
+        unit = "books shelved"
+    else
+        if not rows then return end
+        have, want, unit = rows, tonumber(sd.goal_row_threshold) or 0, "rows finished"
+    end
+    if not (have and want) or want <= 0 or have < want then return end
+
     _goal.sent = true
-    log(("[AP] %d/%d rows finished — sending STATUS_GOAL (goal=%s)"):format(
-        rows, threshold, tostring(sd.goal)))
+    log(("[AP] %d/%d %s — sending STATUS_GOAL (goal=%s)"):format(
+        have, want, unit, tostring(sd.goal)))
     local HUD_mod = package.loaded["AP/HUD"]
     if HUD_mod and HUD_mod.notify then
-        HUD_mod.notify(("Goal complete! (%d rows)"):format(threshold), 10.0)
+        HUD_mod.notify(("Goal complete! (%d %s)"):format(want, unit:match("^(%a+)")), 10.0)
     end
     ap_send_goal()
 end
@@ -4138,6 +4163,14 @@ gt_loop("goal_catchup", 5000, function()
     if _goal.sent then return false end
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._gameplay_active and IA._apply_safe) then return false end
+    -- A book-counted goal reads the server's checked set, not the save, so it needs neither the
+    -- GameSaveData walk below nor its stale guard -- and it must not be gated on a row count, since
+    -- the target can be met with few rows finished.
+    local APClient_mod = package.loaded["AP/APClient"]
+    if _goal.book_target(APClient_mod and APClient_mod.slot_data) then
+        _goal.send(nil)
+        return false
+    end
     local rows
     pcall(function()
         local gi = FindFirstOf("BP_LibrarianGameInstance_C")

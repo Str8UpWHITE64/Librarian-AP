@@ -275,12 +275,53 @@ How much of the library must be tidied to win.
 | `full`     | (Default) Complete both floors — game ends naturally          |
 | `floor_1`  | Complete Floor 1 only (~176 rows). Floor 2 removed from pool  |
 | `floor_2`  | Complete Floor 2 only (~224 rows). Floor 1 removed from pool  |
-| `custom`   | Configurable row count via `custom_goal_row_count`            |
+| `custom`   | A count you choose — see below. Works in all three unlock modes |
+
+With `custom`, the seed is trimmed to roughly what your goal needs plus
+`extra_series_percent` slack. Sections past that leave the pool entirely,
+rather than remaining as checks holding items nobody will collect.
 
 ### `custom_goal_row_count`
 
 When `goal: custom`, the number of rows needed to win. Range 1–400.
 Supports `random`, `random-low`, `random-high`. Default 200.
+
+Used by `progressive_unlocks` and `individual_series_unlocks`. In
+`booksanity` the goal counts books instead, so `custom_goal_book_count`
+applies there and this is ignored.
+
+### `custom_goal_book_count`
+
+When `goal: custom` **and** `unlock_mode: booksanity`, the number of
+correctly shelved books needed to win. Range 1–3072. Default 1500.
+Supports `random`, `random-low`, `random-high`. Ignored for every other
+goal and unlock mode.
+
+Note the scale: the library holds 3072 books across 400 rows, so a
+row-shaped number here is a far shorter run than it looks. The default of
+1500 is about half the library, which lands near the size of a floor goal.
+
+A custom book goal is also the fastest way to play BookSanity — it
+sidesteps the full goal's slow generation entirely.
+
+### `extra_series_percent`
+
+When `goal: custom`, how much of the library to keep past what the goal
+needs, as a percentage. Range 0–100. Default 10.
+
+This is one dial controlling two things:
+
+- **Lower** trims harder. Fewer surplus checks means less chance that
+  another player's progression is sitting behind a check you have no
+  reason to do, which matters in a multiworld.
+- **Higher** gives you more choice about *which* rows you finish, instead
+  of a forced march through nearly everything the seed contains.
+
+At `0` you get the tightest possible seed. Sections are always kept
+whole — a partial section could never complete its section check — so the
+real total lands on the next section boundary rather than exactly on your
+percentage. Both the goal and the slack are clamped to the library, so
+asking for more than exists simply keeps everything.
 
 ### `starting_series_count`
 

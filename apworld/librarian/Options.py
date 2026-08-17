@@ -16,12 +16,14 @@ class Goal(Choice):
     full    -- Complete the whole library, both floors (default).
     floor_1 -- Complete Floor 1 only (1A-1N); Floor 2 leaves the pool.
     floor_2 -- Complete Floor 2 only (2A-2Q); Floor 1 leaves the pool.
-    custom  -- Win after custom_goal_row_count rows; the full pool stays checkable.
-               Only for the progressive_unlocks mode (not individual_series_unlocks
-               or booksanity).
+    custom  -- Win after a count you choose: custom_goal_row_count rows, or
+               custom_goal_book_count books under booksanity. Works in all three
+               unlock modes. The seed is trimmed to about what that goal needs, plus
+               extra_series_percent slack -- sections past it leave the pool rather
+               than sitting there holding items nobody will collect.
 
-    For booksanity, a floor goal (floor_1 / floor_2) is recommended: the full goal
-    has ~3072 book items and takes noticeably longer to generate."""
+    For booksanity, a floor or custom goal is recommended: the full goal has ~3072
+    book items and takes noticeably longer to generate."""
     display_name = "Goal"
 
     option_full = 0
@@ -34,13 +36,44 @@ class Goal(Choice):
 class CustomGoalRowCount(Range):
     """Rows needed to win when goal = custom. Ignored for every other goal.
 
-    Only applies to the progressive_unlocks unlock mode -- goal = custom is not
-    supported with individual_series_unlocks or booksanity. Accepts 'random',
-    'random-low', 'random-high' in your yaml."""
+    Used by progressive_unlocks and individual_series_unlocks. In booksanity the
+    goal counts books instead, so custom_goal_book_count applies there and this is
+    ignored. Accepts 'random', 'random-low', 'random-high' in your yaml."""
     display_name = "Custom Goal Row Count"
     range_start = 1
     range_end = 400
     default = 200
+
+
+class CustomGoalBookCount(Range):
+    """Books needed to win when goal = custom and unlock_mode = booksanity.
+
+    Ignored for every other goal and unlock mode -- the other two modes count rows,
+    via custom_goal_row_count. The library holds 3072 books across 400 rows, so a
+    row-shaped number here is a much shorter run than it looks; the default is about
+    half the library, which lands near the size of a floor goal. Accepts 'random',
+    'random-low', 'random-high' in your yaml."""
+    display_name = "Custom Goal Book Count"
+    range_start = 1
+    range_end = 3072
+    default = 1500
+
+
+class ExtraSeriesPercent(Range):
+    """Spare series to include past a custom goal, as a percentage. goal = custom only.
+
+    A custom goal only needs its own row count, so the rest of the library is surplus:
+    those checks still exist, still hold items, and in a multiworld can hold another
+    game's progression -- which then waits on a check you have no reason to do. This
+    trims the seed to roughly what the goal needs, plus this much slack so the run does
+    not become a forced march through every remaining row.
+
+    0 means no slack at all. Sections are kept whole, so the real total lands on the
+    next section boundary rather than exactly on the percentage."""
+    display_name = "Extra Series Percent"
+    range_start = 0
+    range_end = 100
+    default = 10
 
 
 class UnlockMode(Choice):
@@ -130,6 +163,8 @@ class OnlyUnwardShelfableBooks(DefaultOnToggle):
 class LibrarianOptions(PerGameCommonOptions):
     goal: Goal
     custom_goal_row_count: CustomGoalRowCount
+    custom_goal_book_count: CustomGoalBookCount
+    extra_series_percent: ExtraSeriesPercent
     unlock_mode: UnlockMode
     starting_series_count: StartingSeriesCount
     series_per_unlock: SeriesPerUnlock
