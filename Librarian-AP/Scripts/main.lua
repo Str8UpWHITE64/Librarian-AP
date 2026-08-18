@@ -1774,7 +1774,7 @@ end
 -- WBP_Title.Text_Version (top-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
-local MOD_VERSION = "2.0.2"
+local MOD_VERSION = "2.0.3"
 local TESTED_GAME_VERSIONS = { "1.0.12", "1.0.13" }
 
 -- Hard floor, not a preference. Below this the game keeps saves as one flat file, so the slot the
