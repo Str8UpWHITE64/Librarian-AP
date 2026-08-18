@@ -345,29 +345,15 @@ class LibrarianWorld(World):
 
     @property
     def max_reachable_rows(self) -> int:
-        """Upper bound on rows finishable in this seed. Drives the
-        level-up + milestone filter in create_regions:
-        - Floor goals: rows on that floor only.
-        - Custom goal: the player's chosen row threshold (the player can
-          play past it in-game, but AP only tracks up to that point).
-        - Full goal: all 400 rows."""
-        # UT passthrough: options hold defaults during regen; slot_data
-        # has the real value.
-        pt = self._ut_passthrough()
-        if pt:
-            goal_v = pt.get("goal")
-            custom = pt.get("custom_goal_row_count")
-            if goal_v == self.options.goal.option_custom and custom is not None:
-                return int(custom)
-            if goal_v == self.options.goal.option_floor_1:
-                return sum(s.shelf_count for s in data.SECTIONS if s.floor == 1)
-            if goal_v == self.options.goal.option_floor_2:
-                return sum(s.shelf_count for s in data.SECTIONS if s.floor == 2)
-            if goal_v == self.options.goal.option_full:
-                return sum(s.shelf_count for s in data.SECTIONS)
-        v = self.options.goal.value
-        if v == self.options.goal.option_custom:
-            return self.options.custom_goal_row_count.value
+        """Rows this seed actually contains: the bound for the level-up + milestone
+        filter in create_regions.
+
+        Just the rows in the active sections, for every goal. It used to answer the
+        player's chosen row count under a custom goal, which stopped being true once
+        2.0.2 began trimming the seed: it claimed 200 rows while the world held about
+        60, so create_regions made level locations nothing could reach and generation
+        failed its accessibility check. active_sections is already the trimmed,
+        UT-aware set, so deriving from it cannot drift again."""
         return sum(s.shelf_count for s in self.active_sections)
 
     # ------------------------------------------------------------------
@@ -401,17 +387,22 @@ class LibrarianWorld(World):
 
     @property
     def max_reachable_books(self) -> int:
-        """Total books in the active-goal scope (drives the level-up /
-        book-completion filter, analogous to max_reachable_rows)."""
+        """Total books in the active-goal scope. Drives the book-completion filter and
+        a booksanity custom goal -- NOT the level-up filter, which is row-counted like
+        XP_CURVE and uses max_reachable_rows in every mode."""
         return sum(s.volume_count for s in self.active_sections)
 
     def _levels_kept(self, max_reachable: int) -> int:
         """How many player levels are reachable given `max_reachable` rows/books
         (how many XP_CURVE thresholds fit). Single source of truth for BOTH the
         Major Magic pool size (create_items) and the goal's magic requirement
-        (set_rules), so they cannot drift -- pass rows for grouped/individual and
-        books for book_sanity. At the full goal this is MAX_PLAYER_LEVEL (45), so
-        all magic is kept and required; it self-limits for floor/custom goals."""
+        (set_rules), so they cannot drift.
+
+        ALWAYS pass ROWS, in every mode. XP_CURVE counts rows finished, and levels are
+        earned by finishing rows whether or not books are the items. This used to say
+        "books for book_sanity", and passing 3072 where 400 was meant kept the full magic
+        pool and put every level in logic at once. At the full goal this is
+        MAX_PLAYER_LEVEL (45); it self-limits for floor/custom goals."""
         return sum(1 for idx in range(data.MAX_PLAYER_LEVEL)
                    if data.XP_CURVE[idx] <= max_reachable)
 
@@ -1061,7 +1052,7 @@ class LibrarianWorld(World):
 
         # Major Magic: keep one per reachable level (levels_kept), like the row
         # path; the goal requires mm >= levels_kept so none is redundant.
-        levels_kept = self._levels_kept(self.max_reachable_books)
+        levels_kept = self._levels_kept(self.max_reachable_rows)
         max_major_magic = levels_kept
         magic_q = {n: ITEM_QUANTITIES.get(n, 0) for n in _MAJOR_MAGIC_NAMES}
         excess = sum(magic_q.values()) - max_major_magic
@@ -1367,6 +1358,32 @@ class LibrarianWorld(World):
                     return False
             return True
 
+        # Rows the player could actually FINISH: series whose every volume is held.
+        #
+        # Levels are earned by finishing rows, and XP_CURVE counts rows, so the level rules
+        # cannot use feasible_books. Comparing a row threshold against a book count asked for
+        # "254 books" where it meant 254 rows, and with 3072 books in play that put all 45
+        # levels in sphere 1 -- a tracker would call the whole ladder reachable immediately.
+        # Holding N books is not N rows: a row needs its whole set.
+        #
+        # Uncached for the same reason section_done_book is: level-ups are in
+        # _DEEP_CATEGORIES_BOOK, so they hold filler and advancement sweeps skip them.
+        series_book_items: list[list[str]] = [
+            [book_item_name(ser.name, ch) for ch in range(ser.volumes)]
+            for sec in active_sections for ser in sec.series
+        ]
+
+        def feasible_rows_book(state) -> int:
+            prog = state.prog_items[p]
+            done = 0
+            for names in series_book_items:
+                for iname in names:
+                    if prog.get(iname, 0) < 1:
+                        break
+                else:
+                    done += 1
+            return done
+
         # Per-book locations (depth-1) + section completions. The rule inlines
         # has() (state.prog_items[p][n] >= 1); this lambda is evaluated a huge
         # number of times per fill, so skipping the method call is a real win.
@@ -1397,15 +1414,21 @@ class LibrarianWorld(World):
                 return rule
             floor_loc.access_rule = make_floor(sids)
 
-        # Level-ups (only those created) + book-completion milestones.
+        # Level-ups (only those created) + book-completion milestones. The level filter
+        # matches create_regions, which has always filtered on max_reachable_ROWS -- this
+        # side filtered on books, so the two disagreed about which levels exist.
+        #
+        # Two units live here on purpose: levels count ROWS (XP_CURVE), the completion
+        # milestones count BOOKS. Conflating them is exactly what broke this.
+        max_rows = self.max_reachable_rows
         max_books = self.max_reachable_books
         for level_n in range(1, data.MAX_PLAYER_LEVEL + 1):
-            if data.XP_CURVE[level_n - 1] > max_books:
+            if data.XP_CURVE[level_n - 1] > max_rows:
                 continue
             loc = mw.get_location(f"Reached Level {level_n}", p)
             loc.access_rule = (
                 lambda state, n=data.XP_CURVE[level_n - 1]:
-                feasible_books(state) >= n)
+                feasible_rows_book(state) >= n)
 
         for thresh in BOOK_COMPLETION_THRESHOLDS:
             if thresh > max_books:
