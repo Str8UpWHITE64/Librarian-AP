@@ -76,6 +76,33 @@ class ExtraSeriesPercent(Range):
     default = 10
 
 
+class SpareUnlockPercent(Range):
+    """Spare copies of the unlock items, as a percentage. Full and floor goals only.
+
+    A full or floor goal needs every series in its scope, so one unlock item stuck in a
+    stalled or abandoned game can leave you unable to finish. This adds that percentage
+    of extra Progressive Series Unlock and Progressive Shelf Unlock copies, taken out of
+    the filler, so you only need MOST of them rather than all.
+
+    The extras cost nothing once you are at the cap -- the client already stops applying
+    unlocks past the last series and the last bookcase.
+
+    Rounds up per item, so any value above 0 gives every section at least one spare
+    bookcase unlock. Sections hold as few as 3, and a section with no spare is still a
+    single point of failure, so the shelf side ends up more generous than the number
+    suggests: at 10 the series unlocks rise about a tenth while the shelf unlocks rise
+    nearer a half.
+
+    Only helps progressive_unlocks, where those items are interchangeable. In
+    individual_series_unlocks and booksanity each series or book is its own specific
+    item, so a duplicate unlocks nothing new and this is ignored. goal: custom gets its
+    slack from extra_series_percent instead."""
+    display_name = "Spare Unlock Percent"
+    range_start = 0
+    range_end = 100
+    default = 10
+
+
 class UnlockMode(Choice):
     """Choose how book series are unlocked.
 
@@ -165,6 +192,7 @@ class LibrarianOptions(PerGameCommonOptions):
     custom_goal_row_count: CustomGoalRowCount
     custom_goal_book_count: CustomGoalBookCount
     extra_series_percent: ExtraSeriesPercent
+    spare_unlock_percent: SpareUnlockPercent
     unlock_mode: UnlockMode
     starting_series_count: StartingSeriesCount
     series_per_unlock: SeriesPerUnlock

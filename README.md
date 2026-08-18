@@ -323,6 +323,27 @@ real total lands on the next section boundary rather than exactly on your
 percentage. Both the goal and the slack are clamped to the library, so
 asking for more than exists simply keeps everything.
 
+### `spare_unlock_percent`
+
+Range 0-100. Default 10. Full and floor goals, `progressive_unlocks` only.
+
+A full or floor goal needs every series in its scope, so a single unlock item
+stuck in a stalled or abandoned game can leave you unable to finish. This adds
+that percentage of extra `Progressive Series Unlock` and `Progressive Shelf
+Unlock` copies, paid for out of filler, so you only need *most* of them rather
+than all. The spares cost nothing once you are at the cap — the mod already
+stops applying unlocks past the last series and the last bookcase.
+
+It rounds up per item, so any value above 0 gives **every section at least one
+spare bookcase unlock**. Sections hold as few as three, and a section with no
+spare is still a single point of failure. That makes the shelf side more
+generous than the number suggests: at 10, series unlocks rise about a tenth
+while shelf unlocks rise nearer a half.
+
+Ignored in `individual_series_unlocks` and `booksanity`, where every series or
+book is its own specific item and a duplicate unlocks nothing new. `goal:
+custom` gets its slack from `extra_series_percent` instead.
+
 ### `starting_series_count`
 
 How many series the player begins with unlocked. Range 5–25. Default 10.

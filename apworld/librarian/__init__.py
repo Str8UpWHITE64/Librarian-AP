@@ -808,6 +808,27 @@ class LibrarianWorld(World):
             for s in self.series_order:
                 quantities[series_unlock_item_name(s)] = 1
 
+        # Spare unlock copies, paid for out of filler (the pool is padded to the location
+        # count, so raising these lowers filler by the same amount).
+        #
+        # A full or floor goal needs every series in its scope, which means a single unlock
+        # sitting in a stalled game can end the run. Extra copies make the requirement "most
+        # of them" instead of "all of them", and cost nothing once the player is at the cap:
+        # the client already clamps to the last series and the last bookcase.
+        #
+        # Grouped only, and deliberately so. These two items are interchangeable, so a spare
+        # is worth something; in individual/booksanity every item is one specific series or
+        # book, so a duplicate unlocks nothing. Custom goals get their slack from the seed
+        # trimming instead, so they are left alone here.
+        spare_pct = self._ut_opt("spare_unlock_percent", self.options.spare_unlock_percent)
+        if (not individual and not self.book_sanity and spare_pct > 0
+                and self.options.goal.value != self.options.goal.option_custom):
+            for name in list(quantities):
+                if name == ITEM_PROG_SERIES or name.startswith("Progressive Shelf Unlock ("):
+                    base = quantities[name]
+                    if base > 0:
+                        quantities[name] = base + math.ceil(base * spare_pct / 100)
+
         # Subtract precollected.
         for name in precollect_names:
             quantities[name] = max(0, quantities.get(name, 0) - 1)
@@ -1860,6 +1881,10 @@ class LibrarianWorld(World):
             # other modes. Emitted so Universal Tracker can reconstruct the seed.
             "starting_books": self.starting_book_names,
             "starting_series_count": self.options.starting_series_count.value,
+            # Rides slot_data for the same reason the two above do: a tracker re-gen sees
+            # option defaults, and guessing this one wrong changes how many unlocks it
+            # thinks the pool holds.
+            "spare_unlock_percent": self.options.spare_unlock_percent.value,
             "series_per_unlock": self.options.series_per_unlock.value,
             "series_order": self.series_order,
             # Derived from unlock_mode for the Lua client (unchanged contract).
