@@ -4096,8 +4096,14 @@ function _goal.send(rows)
     local sd = APClient_mod and APClient_mod.slot_data
     if not sd then return end
 
-    local have, want, unit = _goal.book_target(sd)
-    if have then
+    local have, want, unit
+    if sd.book_sanity == 1 and sd.goal == 1 then
+        -- Book-counted goal. Never fall through to the row path from here: this seed still
+        -- carries a goal_row_threshold (the row default, meaningless under booksanity), and
+        -- firing off it would send the goal hundreds of books early. If the count is not
+        -- readable yet -- ItemApply still loading -- wait for the next pass instead.
+        have, want = _goal.book_target(sd)
+        if not have then return end
         unit = "books shelved"
     else
         if not rows then return end
