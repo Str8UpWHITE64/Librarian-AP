@@ -415,6 +415,22 @@ class LibrarianWorld(World):
     # carries everything needed to reconstruct the seed's state.
     ut_can_gen_without_yaml = True
 
+    def _ut_opt(self, key: str, option):
+        """Read an option the way generation saw it, not the way this run was configured.
+
+        Under a Universal Tracker re-gen the options object holds DEFAULTS -- the player's
+        yaml is not replayed -- so anything derived from options silently describes a
+        different seed than the one being tracked. slot_data carries the real values, so
+        prefer those whenever a passthrough is present.
+        """
+        pt = self._ut_passthrough()
+        if pt and key in pt:
+            try:
+                return int(pt[key])
+            except (TypeError, ValueError):
+                pass
+        return option.value
+
     def _ut_passthrough(self) -> dict:
         """Return the re_gen_passthrough dict for this game (or {} if not
         in UT regen mode). Centralised so callers don't repeat the lookup."""
@@ -725,7 +741,7 @@ class LibrarianWorld(World):
 
         active_ids = self.active_section_ids
         active_series_count = sum(len(s.series) for s in self.active_sections)
-        per_unlock = self.options.series_per_unlock.value
+        per_unlock = self._ut_opt("series_per_unlock", self.options.series_per_unlock)
 
         # Precollect: one shelf unlock for each of the two starting sections
         # + N starting-series worth of Progressive Series Unlock items.
@@ -734,7 +750,8 @@ class LibrarianWorld(World):
         # broadens sphere-1 fill flexibility — AP fill can route progression
         # through items that gate either section's rows. Multiple bookcases
         # in one section all gate behind the same shelf-unlock chain.
-        starting_count = self.options.starting_series_count.value
+        starting_count = self._ut_opt("starting_series_count",
+                                      self.options.starting_series_count)
         starting_unlock_count = math.ceil(starting_count / per_unlock)
 
         # unlock_mode == individual_series_unlocks: every series is its own item.
