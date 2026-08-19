@@ -19,7 +19,7 @@ class Goal(Choice):
     custom  -- Win after a count you choose: custom_goal_row_count rows, or
                custom_goal_book_count books under booksanity. Works in all three
                unlock modes. The seed is trimmed to about what that goal needs, plus
-               extra_series_percent slack -- sections past it leave the pool rather
+               spare_book_item_percent slack -- sections past it leave the pool rather
                than sitting there holding items nobody will collect.
 
     For booksanity, a floor or custom goal is recommended: the full goal has ~3072
@@ -30,6 +30,25 @@ class Goal(Choice):
     option_custom = 1
     option_floor_1 = 2
     option_floor_2 = 3
+    default = 0
+
+
+class UnlockMode(Choice):
+    """Choose how book series are unlocked.
+
+    progressive_unlocks (default) -- series unlock in fungible groups: each
+        Progressive Series Unlock item reveals series_per_unlock series, and
+        bookcases unlock progressively. The classic, most compact item pool.
+    individual_series_unlocks -- every one of the ~400 series is its own unlock
+        item. More granular and a larger pool; every bookcase starts open.
+    booksanity -- every individual book (~3072) is its own item AND its own check,
+        the most granular option. Every bookcase starts open. A floor goal is
+        recommended (the full goal is slow to generate at this size)."""
+    display_name = "Unlock Mode"
+
+    option_progressive_unlocks = 0
+    option_individual_series_unlocks = 1
+    option_booksanity = 2
     default = 0
 
 
@@ -59,66 +78,28 @@ class CustomGoalBookCount(Range):
     default = 1500
 
 
-class ExtraSeriesPercent(Range):
-    """Spare series to include past a custom goal, as a percentage. goal = custom only.
+class SpareBookItemPercent(Range):
+    """Spare Progressive Series Unlock copies, as a percentage, so you do not need
+    every one of them to finish.
 
-    A custom goal only needs its own row count, so the rest of the library is surplus:
-    those checks still exist, still hold items, and in a multiworld can hold another
-    game's progression -- which then waits on a check you have no reason to do. This
-    trims the seed to roughly what the goal needs, plus this much slack so the run does
-    not become a forced march through every remaining row.
-
-    0 means no slack at all. Sections are kept whole, so the real total lands on the
-    next section boundary rather than exactly on the percentage."""
-    display_name = "Extra Series Percent"
+    On goal: custom it sets how much of the library the seed keeps past your goal.
+    A goal of 200 rows and 10% spare leads to at least 220 series in the pool.
+    A BookSanity goal of 1500 books and 10% spare has at least 1650 books in it."""
+    display_name = "Spare Book Item Percent"
     range_start = 0
-    range_end = 100
+    range_end = 20
     default = 10
 
 
-class SpareUnlockPercent(Range):
-    """Spare copies of the unlock items, as a percentage. Full and floor goals only.
+class SpareShelfItems(Range):
+    """Spare Progressive Shelf Unlock copies, as a count per bookcase, so you do not
+    need every one of them to open a section.
 
-    A full or floor goal needs every series in its scope, so one unlock item stuck in a
-    stalled or abandoned game can leave you unable to finish. This adds that percentage
-    of extra Progressive Series Unlock and Progressive Shelf Unlock copies, taken out of
-    the filler, so you only need MOST of them rather than all.
-
-    The extras cost nothing once you are at the cap -- the client already stops applying
-    unlocks past the last series and the last bookcase.
-
-    Rounds up per item, so any value above 0 gives every section at least one spare
-    bookcase unlock. Sections hold as few as 3, and a section with no spare is still a
-    single point of failure, so the shelf side ends up more generous than the number
-    suggests: at 10 the series unlocks rise about a tenth while the shelf unlocks rise
-    nearer a half.
-
-    Only helps progressive_unlocks, where those items are interchangeable. In
-    individual_series_unlocks and booksanity each series or book is its own specific
-    item, so a duplicate unlocks nothing new and this is ignored. goal: custom gets its
-    slack from extra_series_percent instead."""
-    display_name = "Spare Unlock Percent"
+    Full and floor goals with progressive_unlocks. A seed with no room for the number
+    you pick uses fewer and says so during generation."""
+    display_name = "Spare Shelf Items"
     range_start = 0
-    range_end = 100
-    default = 10
-
-
-class UnlockMode(Choice):
-    """Choose how book series are unlocked.
-
-    progressive_unlocks (default) -- series unlock in fungible groups: each
-        Progressive Series Unlock item reveals series_per_unlock series, and
-        bookcases unlock progressively. The classic, most compact item pool.
-    individual_series_unlocks -- every one of the ~400 series is its own unlock
-        item. More granular and a larger pool; every bookcase starts open.
-    booksanity -- every individual book (~3072) is its own item AND its own check,
-        the most granular option. Every bookcase starts open. A floor goal is
-        recommended (the full goal is slow to generate at this size)."""
-    display_name = "Unlock Mode"
-
-    option_progressive_unlocks = 0
-    option_individual_series_unlocks = 1
-    option_booksanity = 2
+    range_end = 3
     default = 0
 
 
@@ -189,11 +170,11 @@ class OnlyUnwardShelfableBooks(DefaultOnToggle):
 @dataclass
 class LibrarianOptions(PerGameCommonOptions):
     goal: Goal
+    unlock_mode: UnlockMode
     custom_goal_row_count: CustomGoalRowCount
     custom_goal_book_count: CustomGoalBookCount
-    extra_series_percent: ExtraSeriesPercent
-    spare_unlock_percent: SpareUnlockPercent
-    unlock_mode: UnlockMode
+    spare_book_item_percent: SpareBookItemPercent
+    spare_shelf_items: SpareShelfItems
     starting_series_count: StartingSeriesCount
     series_per_unlock: SeriesPerUnlock
     book_visibility: BookVisibility

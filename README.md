@@ -278,7 +278,7 @@ How much of the library must be tidied to win.
 | `custom`   | A count you choose — see below. Works in all three unlock modes |
 
 With `custom`, the seed is trimmed to roughly what your goal needs plus
-`extra_series_percent` slack. Sections past that leave the pool entirely,
+`spare_book_item_percent` slack. Sections past that leave the pool entirely,
 rather than remaining as checks holding items nobody will collect.
 
 ### `custom_goal_row_count`
@@ -304,45 +304,68 @@ row-shaped number here is a far shorter run than it looks. The default of
 A custom book goal is also the fastest way to play BookSanity — it
 sidesteps the full goal's slow generation entirely.
 
-### `extra_series_percent`
+### `spare_book_item_percent`
 
-When `goal: custom`, how much of the library to keep past what the goal
-needs, as a percentage. Range 0–100. Default 10.
+Range 0-20. Default 10. `progressive_unlocks` only.
 
-This is one dial controlling two things:
+**Renamed from `extra_series_percent` in 2.0.3. Regenerate your YAML to update
+the name.**
 
-- **Lower** trims harder. Fewer surplus checks means less chance that
-  another player's progression is sitting behind a check you have no
-  reason to do, which matters in a multiworld.
-- **Higher** gives you more choice about *which* rows you finish, instead
-  of a forced march through nearly everything the seed contains.
+How much slack to leave beyond what your goal actually needs. A goal that needs
+every last unlock is fragile in a multiworld: one item sitting in a stalled or
+abandoned game can leave you stuck for good. This gives you a margin, so you
+need most of what the seed holds rather than all of it, which should cut down on
+getting BK'd.
 
-At `0` you get the tightest possible seed. Sections are always kept
-whole — a partial section could never complete its section check — so the
-real total lands on the next section boundary rather than exactly on your
-percentage. Both the goal and the slack are clamped to the library, so
-asking for more than exists simply keeps everything.
+It does that two ways, depending on the goal:
 
-### `spare_unlock_percent`
+| goal | what it does |
+|---|---|
+| `custom` | Grows the trimmed seed. A 200-row goal at 10 keeps about 220 rows instead of 200, and the extra rows bring extra unlocks with them. |
+| `full` / `floor_1` / `floor_2` | The seed already holds everything, so there is nothing to grow. It adds that percentage of extra `Progressive Series Unlock` items to the pool instead, replacing filler. |
 
-Range 0-100. Default 10. Full and floor goals, `progressive_unlocks` only.
+On a 200-row custom goal: 0 gives no margin, 10 gives about three spare unlocks,
+20 gives about eight.
 
-A full or floor goal needs every series in its scope, so a single unlock item
-stuck in a stalled or abandoned game can leave you unable to finish. This adds
-that percentage of extra `Progressive Series Unlock` and `Progressive Shelf
-Unlock` copies, paid for out of filler, so you only need *most* of them rather
-than all. The spares cost nothing once you are at the cap — the mod already
-stops applying unlocks past the last series and the last bookcase.
+The cap is 20. Past that it starts costing `spare_shelf_items` whole steps, and
+on a custom goal a bigger margin mostly just re-adds the surplus checks the trim
+exists to remove.
 
-It rounds up per item, so any value above 0 gives **every section at least one
-spare bookcase unlock**. Sections hold as few as three, and a section with no
-spare is still a single point of failure. That makes the shelf side more
-generous than the number suggests: at 10, series unlocks rise about a tenth
-while shelf unlocks rise nearer a half.
+In `individual_series_unlocks` and `booksanity` every series or book is its own
+specific item, so a duplicate unlocks nothing and the spare-copy half does
+nothing. A `custom` goal there still trims the seed by this percentage.
 
-Ignored in `individual_series_unlocks` and `booksanity`, where every series or
-book is its own specific item and a duplicate unlocks nothing new. `goal:
-custom` gets its slack from `extra_series_percent` instead.
+### `spare_shelf_items`
+
+Range 0-3. Default 0. Full and floor goals, `progressive_unlocks` only.
+
+The same for bookcases, as a count per bookcase rather than a percentage, since
+sections hold as few as three. It adds an extra N `Progressive Shelf Unlock`
+items for each section, so any section can lose that many copies to a stalled
+game and still open fully.
+
+This is the most expensive setting in the YAML. Every step is one item slot per
+bookcase, 71 of them at the full goal, all replacing filler:
+
+| `spare_shelf_items` | shelf unlocks | filler left |
+|---------------------|---------------|-------------|
+| 0 | 69 | 244 |
+| 1 | 140 | 173 |
+| 2 | 211 | 102 |
+| 3 | 282 | 31 |
+
+*(full goal, `series_per_unlock: 5`, `spare_book_item_percent: 0`)*
+
+A seed without room drops back a step rather than failing, and says so during
+generation, so asking for more than fits costs nothing. How much room there is
+depends on the goal and on `series_per_unlock`, so tighter configurations keep
+fewer steps: `floor_1` with `series_per_unlock: 3` tops out at 1.
+
+Spares past the cap do nothing. The mod already stops applying unlocks past the
+last series and the last bookcase.
+
+Ignored in `individual_series_unlocks` and `booksanity`, which start with every
+bookcase already open.
 
 ### `starting_series_count`
 

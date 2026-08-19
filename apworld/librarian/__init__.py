@@ -288,7 +288,7 @@ class LibrarianWorld(World):
 
     def _custom_active_sections(self) -> list[data.Section]:
         """Sections kept for a custom goal: enough to cover the goal plus
-        extra_series_percent slack, and no more.
+        spare_book_item_percent slack, and no more.
 
         A custom goal only needs its own count, so every section past that is surplus --
         checks that still hold items, and in a multiworld can hold another game's
@@ -319,7 +319,8 @@ class LibrarianWorld(World):
         # everything" while reading like a real number in logs and in the section maths.
         need = min(need, library_total)
         target = min(
-            math.ceil(need * (1 + self.options.extra_series_percent.value / 100)),
+            math.ceil(need * (1 + self._ut_opt("spare_book_item_percent",
+                                                self.options.spare_book_item_percent) / 100)),
             library_total,
         )
 
@@ -820,14 +821,56 @@ class LibrarianWorld(World):
         # is worth something; in individual/booksanity every item is one specific series or
         # book, so a duplicate unlocks nothing. Custom goals get their slack from the seed
         # trimming instead, so they are left alone here.
-        spare_pct = self._ut_opt("spare_unlock_percent", self.options.spare_unlock_percent)
-        if (not individual and not self.book_sanity and spare_pct > 0
+        if (not individual and not self.book_sanity
                 and self.options.goal.value != self.options.goal.option_custom):
-            for name in list(quantities):
-                if name == ITEM_PROG_SERIES or name.startswith("Progressive Shelf Unlock ("):
-                    base = quantities[name]
-                    if base > 0:
-                        quantities[name] = base + math.ceil(base * spare_pct / 100)
+            # Series unlocks scale as a PERCENTAGE: there are ~80 of them, so a share of
+            # the whole reads sensibly.
+            # The buff/trap items join the pool further down, so they have to be counted
+            # or the estimate reads ~46 slots richer than the seed really is.
+            def _free_slots():
+                return (target - sum(quantities.values())
+                        - sum(_buffs_traps_quantities().values()))
+
+            spare_pct = self._ut_opt("spare_book_item_percent",
+                                     self.options.spare_book_item_percent)
+            if spare_pct > 0 and quantities.get(ITEM_PROG_SERIES, 0) > 0:
+                base = quantities[ITEM_PROG_SERIES]
+                # Clamped like the shelf side. At the capped 20% this has never bound in
+                # testing, but overshooting does not fail loudly -- the guard quietly lifts
+                # Series Unlocks into the starting inventory -- so it should not be able to
+                # happen at all if a later config change makes the pool tighter.
+                quantities[ITEM_PROG_SERIES] = base + min(
+                    math.ceil(base * spare_pct / 100), max(0, _free_slots()))
+
+            # Shelf unlocks take a COUNT PER BOOKCASE instead. Sections hold as few as
+            # three, so a percentage either rounds away to nothing or hands a small
+            # section a disproportionate share; a flat per-bookcase count gives every
+            # section the same protection regardless of size.
+            spare_shelf = self._ut_opt("spare_shelf_items",
+                                       self.options.spare_shelf_items)
+            shelf_base = sum(q for n, q in quantities.items()
+                             if n.startswith("Progressive Shelf Unlock ("))
+            # Clamp to what the seed can actually hold. Each step costs one item per
+            # bookcase -- 71 slots at the full goal -- and asking for more than the free
+            # slots does not fail loudly: the overshoot guard quietly lifts Series Unlocks
+            # into the starting inventory, handing out free series nobody asked for. How
+            # much room there is depends on the goal and on series_per_unlock, so a fixed
+            # maximum would be wrong for one config or the other; this reduces the step
+            # count until it fits, and says so.
+            headroom = _free_slots()
+            asked = spare_shelf
+            while spare_shelf > 0 and shelf_base * spare_shelf > headroom:
+                spare_shelf -= 1
+            if spare_shelf < asked:
+                print(f"[Librarian] spare_shelf_items {asked} does not fit this seed "
+                      f"({headroom} free item slots, {shelf_base} bookcases); "
+                      f"using {spare_shelf}.")
+            if spare_shelf > 0:
+                for name in list(quantities):
+                    if name.startswith("Progressive Shelf Unlock ("):
+                        base = quantities[name]
+                        if base > 0:
+                            quantities[name] = base + base * spare_shelf
 
         # Subtract precollected.
         for name in precollect_names:
@@ -1884,7 +1927,8 @@ class LibrarianWorld(World):
             # Rides slot_data for the same reason the two above do: a tracker re-gen sees
             # option defaults, and guessing this one wrong changes how many unlocks it
             # thinks the pool holds.
-            "spare_unlock_percent": self.options.spare_unlock_percent.value,
+            "spare_book_item_percent": self.options.spare_book_item_percent.value,
+            "spare_shelf_items": self.options.spare_shelf_items.value,
             "series_per_unlock": self.options.series_per_unlock.value,
             "series_order": self.series_order,
             # Derived from unlock_mode for the Lua client (unchanged contract).
