@@ -2301,8 +2301,14 @@ local function start_gameplay_loops()
         -- Finishing a row is announced by FinishRow, which only arms this flag. Run the checks
         -- here, on the same 500ms loop BookSanity's shelving sweep already rides, so every mode
         -- reacts to a completed row at the same speed rather than waiting on the rotation.
-        if IA._row_check_pending and IA._apply_safe and not IA._flush_in_progress then
+        -- The pass walks every bookcase, so shelving a full bag would otherwise run it on
+        -- consecutive ticks. The flag stays armed while the cooldown holds: nothing is lost,
+        -- the check just lands within ~1.5s instead of 0.5s.
+        if (IA._row_pass_cool or 0) > 0 then IA._row_pass_cool = IA._row_pass_cool - 1 end
+        if IA._row_check_pending and IA._apply_safe and not IA._flush_in_progress
+            and (IA._row_pass_cool or 0) <= 0 then
             IA._row_check_pending = false
+            IA._row_pass_cool = 3
             pcall(function() IA.fire_completion_passes() end)
         end
         return false
@@ -3259,11 +3265,23 @@ end)
 --- So this only ASKS for a full scan; the periodic pass runs it from the game
 --- thread at a moment already known to be safe. Latency drops from a full
 --- ~20s cursor wrap to one tick, without adding a scan on an unsafe path.
-local function on_book_shelved(which)
+local function on_book_shelved(which, inserted)
     local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA._book_sanity_enabled) then return end
+    if not IA then return end
     if not (IA._gameplay_active and IA._apply_safe) then return end
-    IA.request_full_book_scan()
+    -- Row completions, every mode. FinishRow announces a row the FIRST time the count goes up,
+    -- so a swap -- pull a finished series off a shelf, refill it with another -- announces
+    -- nothing at all, and the check waited on the 12s rotation backstop. That reads as broken,
+    -- and it is the normal loop for anyone playing with only_unward_shelfable_books off.
+    -- Arming the flag here puts a swap on the same 500ms path as a first-time row.
+    --
+    -- Inserts only: a row can only complete when a book goes onto a shelf. The shelved-count
+    -- hook also fires on pickups, and arming there ran the full bookcase walk at 2Hz for
+    -- walking around, which is the hitch the rotation was split up to avoid.
+    if inserted then IA._row_check_pending = true end
+    if IA._book_sanity_enabled then
+        IA.request_full_book_scan()
+    end
 end
 
 RegisterHook("/Script/Librarian.LibrarianPlayerInfo:SetCurrentBookNum", function(_, n)
@@ -3271,7 +3289,7 @@ RegisterHook("/Script/Librarian.LibrarianPlayerInfo:SetCurrentBookNum", function
 end)
 
 RegisterHook("/Script/Librarian.GameManager:BookInserted", function()
-    on_book_shelved("book inserted")
+    on_book_shelved("book inserted", true)
 end)
 
 RegisterHook("/Script/Librarian.LibrarianPlayerInfo:SetHandingMaxNum", function(_, maxBookNum)
