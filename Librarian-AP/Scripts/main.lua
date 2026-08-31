@@ -195,6 +195,14 @@ end
 -- BookSanity: true when this book's own per-book item has arrived (no series is
 -- unlocked in book mode, so this is what unwards it). Reads the atomic
 -- _books_unlocked; game-thread safe (single lookup + a pcall Chapter read).
+--- Has the run received THIS book? BookSanity only; false elsewhere, where the series alone
+--- decides and the caller's series test has already answered.
+---
+--- Returns nil when the book cannot be identified. A book whose ItemInfo is unreadable -- one
+--- being carried, mid-spawn, or part-way through the bag's own intake -- used to answer "not
+--- unlocked", which the caller turned into "warded" and acted on. That is how Assemble came to
+--- evict books the player had legitimately earned: not a strictness problem, a book the guard
+--- simply could not read.
 local function _bh_book_unlocked(book_obj, series)
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._book_sanity_enabled and series) then return false end
@@ -205,7 +213,8 @@ local function _bh_book_unlocked(book_obj, series)
         local info = book_obj.ItemInfo
         if info and info:IsValid() then chapter = tonumber(info.Chapter) end
     end)
-    return chapter ~= nil and bu[series .. "|" .. chapter] == true
+    if chapter == nil then return nil end
+    return bu[series .. "|" .. chapter] == true
 end
 
 --- Is this book one the run has NOT earned? The same test the SetActorVisible ENFORCE path makes,
@@ -237,7 +246,9 @@ local function _bh_book_is_warded(book_obj)
     local _, series = _bh_series(book_obj)
     if not series then return nil end
     if IA._unwarded_snapshot[series] then return false end
-    return not _bh_book_unlocked(book_obj, series)
+    local unlocked = _bh_book_unlocked(book_obj, series)
+    if unlocked == nil then return nil end   -- unreadable book: leave it alone, per the rule above
+    return not unlocked
 end
 
 local function _bh_sample(tag, book_obj, extra)
