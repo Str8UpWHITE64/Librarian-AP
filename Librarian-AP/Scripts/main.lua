@@ -192,17 +192,17 @@ local function _bh_series(book_obj)
     return aidx, IA._asset_to_series[aidx]
 end
 
--- BookSanity: true when this book's own per-book item has arrived (no series is
--- unlocked in book mode, so this is what unwards it). Reads the atomic
--- _books_unlocked; game-thread safe (single lookup + a pcall Chapter read).
---- Has the run received THIS book? BookSanity only; false elsewhere, where the series alone
---- decides and the caller's series test has already answered.
+--- Refuse a warded book by setting what the game's own predicate reads, since we cannot answer it.
 ---
---- Returns nil when the book cannot be identified. A book whose ItemInfo is unreadable -- one
---- being carried, mid-spawn, or part-way through the bag's own intake -- used to answer "not
---- unlocked", which the caller turned into "warded" and acted on. That is how Assemble came to
---- evict books the player had legitimately earned: not a strictness problem, a book the guard
---- simply could not read.
+--- The trace settled how the game excludes shelved books: it asks CanBeGrab about every book of
+--- the series, shelved ones included, and its own answer keeps them out. Across one Assemble, the
+--- only book of ten it declined was the one carrying AttachedActor=BP_BookCase_C. So anchor a
+--- warded book to a bookcase and the game refuses it for us -- no grab, nothing to evict.
+---
+--- Writes only over nil and clears only its own anchor, so a genuinely shelved book's attachment
+--- is never disturbed. Note what this deliberately does NOT touch: 'Is Abs Correct' is the other
+--- field that marked the shelved book, and it is the flag our own book checks read -- setting it
+--- would hand out checks the run has not earned.
 local function _bh_book_unlocked(book_obj, series)
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._book_sanity_enabled and series) then return false end
@@ -251,6 +251,48 @@ local function _bh_book_is_warded(book_obj)
     return not unlocked
 end
 
+function _bh.set_ward_attach(b, warded)
+    local anchor = _bh.ward_anchor
+    local ok = false; pcall(function() ok = anchor and anchor:IsValid() end)
+    if not ok then
+        pcall(function() anchor = FindFirstOf("BP_BookCase_C") end)
+        pcall(function() ok = anchor and anchor:IsValid() end)
+        if not ok then return end
+        _bh.ward_anchor = anchor
+        pcall(function() _bh.ward_anchor_name = anchor:GetFullName() end)
+    end
+    local cur, cur_name, has = nil, nil, false
+    pcall(function() cur = b.AttachedActor end)
+    pcall(function() has = cur and cur:IsValid() end)
+    if has then pcall(function() cur_name = cur:GetFullName() end) end
+    local key; pcall(function() key = b:GetFullName() end)
+    _bh.anchored = _bh.anchored or {}
+    if warded then
+        if has then return end                     -- already attached to something real
+        pcall(function() b.AttachedActor = anchor end)
+        if key then _bh.anchored[key] = true end
+        _bh.ward_attached = (_bh.ward_attached or 0) + 1
+    elseif has and key and _bh.anchored[key] and cur_name == _bh.ward_anchor_name then
+        -- Clear only an anchor we recorded setting. The anchor is a real bookcase, so matching on
+        -- identity alone would also strip the attachment off a book the player genuinely shelves
+        -- there, which is the game's own bookkeeping and not ours to erase.
+        pcall(function() b.AttachedActor = nil end)
+        _bh.anchored[key] = nil
+        _bh.ward_detached = (_bh.ward_detached or 0) + 1
+    end
+end
+
+-- BookSanity: true when this book's own per-book item has arrived (no series is
+-- unlocked in book mode, so this is what unwards it). Reads the atomic
+-- _books_unlocked; game-thread safe (single lookup + a pcall Chapter read).
+--- Has the run received THIS book? BookSanity only; false elsewhere, where the series alone
+--- decides and the caller's series test has already answered.
+---
+--- Returns nil when the book cannot be identified. A book whose ItemInfo is unreadable -- one
+--- being carried, mid-spawn, or part-way through the bag's own intake -- used to answer "not
+--- unlocked", which the caller turned into "warded" and acted on. That is how Assemble came to
+--- evict books the player had legitimately earned: not a strictness problem, a book the guard
+--- simply could not read.
 local function _bh_sample(tag, book_obj, extra)
     if _bh.samples >= 15 then return end
     _bh.samples = _bh.samples + 1
@@ -651,27 +693,23 @@ local function try_register_book_hooks()
         -- book is refused without moving or touching the actor -- which matters twice over: the
         -- save-identity fingerprint reads book actor positions, and collision-off only stops the
         -- paths that trace, not a skill that walks a type registry.
+        -- CanBeGrab cannot be answered, only pre-empted. UE4SS registers it as a script hook,
+        -- which has a single callback slot, so a post-hook that would write the return value is
+        -- registered OK and never called -- the denial that used to live here never ran once.
+        -- What works instead is setting the state the skill reads BEFORE it asks: Assemble skips
+        -- any book whose AttachedActor is set, which is how it leaves shelved books alone.
+        --
+        -- The anchor is applied with the rest of the warding, so this is only a top-up for a book
+        -- the flush has not reached. It cannot help the cast in progress: the skill tests the
+        -- attachment before calling this, so a write here lands a cast late.
         reg("CanBeGrab", function(self)
             if not diag_on("BOOK_EVENT_HOOKS") then return end
             _bh.canbegrab = _bh.canbegrab + 1
             local b; pcall(function() b = self:get() end)
             _bh_grab_check(b, "CANGRAB")
-        end, function(self, result)
-            if not (diag_on("BOOK_EVENT_HOOKS") and diag_on("MAGIC_WARD_CANBEGRAB")) then return end
-            if not result then return end          -- no return value handed to us; nothing to deny
-            local b; pcall(function() b = self:get() end)
-            if _bh_book_is_warded(b) ~= true then return end   -- nil/false: leave the answer alone
-            -- First denial reports whether the override actually took. Nothing else in this mod
-            -- writes a return value from a post-hook, so the capability itself is unproven and a
-            -- silent no-op would otherwise read as "the skill ignores the predicate".
-            local set_ok = pcall(function() result:set(false) end)
-            _bh.grab_denied = (_bh.grab_denied or 0) + 1
-            if _bh.deny_samples == nil then _bh.deny_samples = 0 end
-            if _bh.deny_samples < 5 then
-                _bh.deny_samples = _bh.deny_samples + 1
-                local _, series = _bh_series(b)
-                log(("[book-hook] CanBeGrab DENY warded series=%s set_ok=%s"):format(
-                    tostring(series), tostring(set_ok)))
+            if diag_on("MAGIC_WARD_CANBEGRAB") then
+                local w = _bh_book_is_warded(b)
+                if w ~= nil then _bh.set_ward_attach(b, w) end
             end
         end)
         -- GRAB-path observe + fix for "pickable book invisible" (which SetActorVisible/REVEAL
@@ -909,6 +947,11 @@ local function _magic_evict_bag()
             end
             _magic_queue_reward(it, home)
             _bh.bag_evicted = (_bh.bag_evicted or 0) + 1
+            -- Remember what we evicted so the anchor can be re-applied to it between casts.
+            -- Dropping clears AttachedActor, which is why every cast so far has anchored these
+            -- books from inside the query pass -- too late, if the skill tests attachment first.
+            _bh.evicted = _bh.evicted or {}
+            if #_bh.evicted < 32 then _bh.evicted[#_bh.evicted + 1] = it end
             if (_bh.evict_samples or 0) < 8 then
                 _bh.evict_samples = (_bh.evict_samples or 0) + 1
                 local _, series = _bh_series(it)
@@ -1059,9 +1102,15 @@ local function try_register_magic_hooks()
             local b; pcall(function() b = item:get() end)
             local warded = _bh_book_is_warded(b)
             if diag_on("MAGIC_LEAK_TRACE") then
-                local _, series = _bh_series(b)
-                _magic_trace("PickUpGameItem", ("warded=%s series=%s")
-                    :format(tostring(warded), tostring(series)))
+                local aidx = _bh_series(b)
+                local chap; pcall(function()
+                    local i = b.ItemInfo
+                    if i and i:IsValid() then chap = i.Chapter end
+                end)
+                -- Chapter, not just the series: the skill queries ten books and the bag takes
+                -- nine, so the only thing worth logging is which one it leaves behind.
+                _magic_trace("PickUpGameItem", ("warded=%s aidx=%s chap=%s")
+                    :format(tostring(warded), tostring(aidx), tostring(chap)))
             end
             if warded == true then _magic_bag_dirty = true end
         end)
@@ -1084,9 +1133,10 @@ local function bh_report_periodic()
     -- refresh-grab is reported alongside refresh-sweep: the grab-path redraw rewrites book
     -- materials, and leaving it out of this line hid it while a material-state bug was being
     -- chased through the counters that were printed.
-    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d (denied=%d) Grab=%d (grabfix=%d) refresh-grab=%d refresh-sweep=%d | magic: fx-denied=%d bag-evicted=%d"):format(
-        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab, _bh.grab_denied or 0,
+    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d Grab=%d (grabfix=%d) refresh-grab=%d refresh-sweep=%d | magic: anchored=%d cleared=%d fx-denied=%d bag-evicted=%d"):format(
+        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab,
         _bh.grabbed, _bh.grabfix, _bh.refreshed or 0, _bh.rsweep or 0,
+        _bh.ward_attached or 0, _bh.ward_detached or 0,
         _bh.fx_denied or 0, _bh.bag_evicted or 0))
 end
 
@@ -2663,6 +2713,22 @@ gt_loop("magic_bag_watch", 1000, function()
     if not diag_on("MAGIC_LEAK_TRACE") then return false end
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._gameplay_active and IA._book_sanity_enabled) then return false end
+    -- Re-anchor the books we evicted, a second after the drop cleared the field. The rolling
+    -- reconcile sweep gets there on its own, but a book dropped at the player's feet is the one
+    -- most likely to be grabbed again before the cursor comes back around.
+    if _bh.evicted and diag_on("MAGIC_WARD_CANBEGRAB") then
+        local n = 0
+        for i = 1, #_bh.evicted do
+            local b = _bh.evicted[i]
+            local ok = false; pcall(function() ok = b and b:IsValid() end)
+            if ok and _bh_book_is_warded(b) == true then
+                local a, has = nil, false
+                pcall(function() a = b.AttachedActor end)
+                pcall(function() has = a and a:IsValid() end)
+                if not has then _bh.set_ward_attach(b, true); n = n + 1 end
+            end
+        end
+    end
     local total, warded, example = 0, 0, nil
     pcall(function()
         local pawn = FindFirstOf("BP_LibrarianCharacter_C")
@@ -4239,6 +4305,9 @@ end)
 
 local APClient = require("AP/APClient")
 local ItemApply = require("AP/ItemApply")
+-- Wired at load, not from a loop: the first warding flush runs at connect, and an anchor that is
+-- only installed once the 5s maintenance loop has ticked would miss every book in it.
+ItemApply._ward_anchor = _bh.set_ward_attach
 local APConfig = require("AP/APConfig")
 local HUD = require("AP/HUD")
 local SaveIdentity = require("AP/SaveIdentity")

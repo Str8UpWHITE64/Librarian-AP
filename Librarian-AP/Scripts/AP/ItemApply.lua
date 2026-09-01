@@ -1723,6 +1723,11 @@ function M._apply_books_to_world()
                 end
             end
         end)
+        -- Assemble ward, set with the rest of the warding rather than left to the sweep. The skill
+        -- skips any book whose AttachedActor is set, and reads it before asking CanBeGrab, so the
+        -- anchor has to be in place before the first cast -- the reconcile cursor covers 20 books
+        -- every 5s and would take a quarter of an hour to reach the whole library.
+        if M._ward_anchor then pcall(M._ward_anchor, book, not should_unward) end
         -- BookSanity pile hide: teleport this book's pile instance to deep Z when locked (restore on
         -- unlock). Hides the far/rest form; the actor ward above hides the close/look form. index == Chapter.
         if hism_arr and chapter ~= nil then
@@ -1957,6 +1962,13 @@ function M.reconcile_book_actors()
                 if chapter ~= nil and M._books_unlocked[series .. "|" .. chapter] then
                     reconcile_this = true
                 end
+            end
+            -- Anchor warded books to a bookcase, clear the anchor when they become unwarded.
+            -- Assemble skips any book whose AttachedActor is set -- that is how it leaves shelved
+            -- books alone -- and it reads the field before asking CanBeGrab, so the anchor has to
+            -- already be there when the skill runs. This rolling sweep is what keeps it there.
+            if series ~= nil and M._ward_anchor then
+                pcall(M._ward_anchor, b, not reconcile_this)
             end
             if reconcile_this then
                 checked_unwarded = checked_unwarded + 1

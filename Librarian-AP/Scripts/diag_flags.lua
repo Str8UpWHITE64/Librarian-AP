@@ -71,10 +71,10 @@ return {
     -- hitting the right path. Turn off once the behaviour is settled.
     MAGIC_LEAK_TRACE = true,
 
-    -- Assemble: answer the game's own grabbable predicate with "no" for a warded book, so the skill
-    -- never takes one. Only bites if the skill consults the predicate -- MAGIC_LEAK_TRACE says
-    -- whether it does. Off = the skill can pull a hidden book into the bag, from where it can be
-    -- shelved and fire a check the run has not earned.
+    -- Assemble: anchor a warded book to a bookcase, which is the state the skill already uses to
+    -- leave shelved books alone -- it reads the attachment before asking whether the book can be
+    -- grabbed. Off = the skill can pull a hidden book into the bag, from where it can be shelved
+    -- and fire a check the run has not earned; the bag eviction is then the only thing stopping it.
     MAGIC_WARD_CANBEGRAB = true,
 
     -- Insight: ride the game's own pile write and sink a warded book's instance back to deep Z, so
