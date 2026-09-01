@@ -359,7 +359,7 @@ bookcase, 71 of them at the full goal, all replacing filler:
 A seed without room drops back a step rather than failing, and says so during
 generation, so asking for more than fits costs nothing. How much room there is
 depends on the goal and on `series_per_unlock`, so tighter configurations keep
-fewer steps: `floor_1` with `series_per_unlock: 3` tops out at 1.
+fewer steps: a `floor_1` seed with `series_per_unlock: 3` takes 2, not 3.
 
 Spares past the cap do nothing. The mod already stops applying unlocks past the
 last series and the last bookcase.
