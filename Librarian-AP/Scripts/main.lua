@@ -1835,7 +1835,7 @@ end
 -- WBP_Title.Text_Version (top-right) becomes "<Game v> | LibAP vX.YY | AP: <state>".
 -- Append "(UNTESTED)" when the game version isn't in TESTED_GAME_VERSIONS.
 
-local MOD_VERSION = "2.0.3"
+local MOD_VERSION = "3.0.0"
 local TESTED_GAME_VERSIONS = { "1.0.12", "1.0.13" }
 
 -- Hard floor, not a preference. Below this the game keeps saves as one flat file, so the slot the
@@ -3345,7 +3345,9 @@ local function on_book_shelved(which, inserted)
     -- hook also fires on pickups, and arming there ran the full bookcase walk at 2Hz for
     -- walking around, which is the hitch the rotation was split up to avoid.
     if inserted then IA._row_check_pending = true end
-    if IA._book_sanity_enabled then
+    -- by_count counts correctly shelved books from the same sweep BookSanity uses, so a
+    -- shelving event has to arm it there too or the count never moves.
+    if IA._book_sanity_enabled or IA._check_by_count then
         IA.request_full_book_scan()
     end
 end
@@ -4177,7 +4179,12 @@ end
 --- Books come from the server's checked set rather than the world, so this needs no stale-save
 --- guard: it cannot describe the previous run the way GameSaveData can.
 function _goal.book_target(sd)
-    if not (sd and sd.book_sanity == 1 and sd.goal == 1) then return nil end   -- 1 = option_custom
+    -- The check mode decides whether the goal counts books, not the unlock mode: a seed
+    -- can check per book while unlocking whole series. Older seeds carry no flag and are
+    -- book-counted exactly when BookSanity was on.
+    local by_books = sd and (sd.goal_counts_books == 1
+        or (sd.goal_counts_books == nil and sd.book_sanity == 1))
+    if not (by_books and sd.goal == 1) then return nil end   -- 1 = option_custom
     local want = tonumber(sd.goal_book_threshold)
     if not want or want <= 0 then return nil end
     local IA = package.loaded["AP/ItemApply"]

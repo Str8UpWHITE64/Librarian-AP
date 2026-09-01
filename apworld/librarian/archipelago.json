@@ -1,8 +1,6 @@
 {
 	"minimum_ap_version": "0.6.4",
-	"world_version": "2.0.3",
+	"world_version": "3.0.0",
 	"authors": ["Str8UpWHITE64"],
-	"version": 6,
-	"compatible_version": 6,
 	"game": "Librarian Tidy Up the Arcane Library"
 }

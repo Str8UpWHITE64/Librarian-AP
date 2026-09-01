@@ -81,6 +81,7 @@ class LibrarianLocationCategory(IntEnum):
     BOOK           = 9   # book_sanity: one per book. Fires when that book is
                          # placed correctly. Access rule: has(that book's item).
     BOOK_COMPLETION = 10 # book_sanity cumulative books-placed-correctly count.
+    COUNT_TICK      = 11 # check_mode=by_count: 'Shelved N Books' at a chosen interval
                          # Access rule: feasible_books(state) >= N.
 
 
@@ -279,6 +280,21 @@ _book_completion_locations: list[LibrarianLocationData] = [
 ]
 
 
+# check_mode=by_count: one location per possible cumulative book count. Names have to be
+# static for the datapackage, so every tick from 1 to the library size is defined here and a
+# seed creates only the multiples of its own check_interval. Unused names cost nothing.
+COUNT_TICK_MAX: int = 3072
+
+_count_tick_locations: list[LibrarianLocationData] = [
+    LibrarianLocationData(
+        f"Shelved {_n} Books",
+        6000 + _n,
+        LibrarianLocationCategory.COUNT_TICK,
+    )
+    for _n in range(1, COUNT_TICK_MAX + 1)
+]
+
+
 # _all_locations is the master union across ALL modes (drives the name->id map);
 # create_regions/create_items pick the active subset per option.
 _all_locations: list[LibrarianLocationData] = (
@@ -290,6 +306,7 @@ _all_locations: list[LibrarianLocationData] = (
     + _chest_locations
     + _book_locations
     + _book_completion_locations
+    + _count_tick_locations
     + _goal_locations
 )
 
@@ -302,6 +319,9 @@ location_dictionary: dict[str, LibrarianLocationData] = {
 # Location groups (for AP /track UI and option references)
 # ============================================================================
 
+# Groups name real, ID-bearing locations only. The book-placement milestones were replaced
+# by row-completion thresholds and are no longer created, and the goal is an event with no
+# ID, so neither can appear here.
 location_name_groups: dict[str, set[str]] = {
     "Shelf Rows":      {loc.name for loc in _row_locations},
     "Row Completions": {loc.name for loc in _row_completion_locations},
@@ -309,10 +329,8 @@ location_name_groups: dict[str, set[str]] = {
     "Floors":          {loc.name for loc in _floor_locations},
     "Level-Ups":       {loc.name for loc in _levelup_locations},
     "Chests":          {loc.name for loc in _chest_locations},
-    "Milestones":      {loc.name for loc in _milestone_locations},
     "Books":           {loc.name for loc in _book_locations},
     "Book Completions": {loc.name for loc in _book_completion_locations},
-    "Goal":            {loc.name for loc in _goal_locations},
 }
 
 # Per-section row groupings — useful for the World's region-building.
@@ -376,7 +394,8 @@ assert len(_book_completion_locations) == len(BOOK_COMPLETION_THRESHOLDS)
 # union includes both row-mode and book-mode locations; create_regions only
 # instantiates the active subset per option.
 _expected_real = (400 + len(ROW_COMPLETION_THRESHOLDS) + 31 + 2 + 45 + 4
-                  + len(_book_locations) + len(BOOK_COMPLETION_THRESHOLDS))
+                  + len(_book_locations) + len(BOOK_COMPLETION_THRESHOLDS)
+                  + len(_count_tick_locations))
 assert total_real_locations() == _expected_real, \
     f"Expected {_expected_real} real locations, got {total_real_locations()}"
 assert total_locations() == _expected_real + 1
@@ -400,6 +419,7 @@ for cat, lo, hi in [
     (LibrarianLocationCategory.ROW_COMPLETION, 1000, 1199),
     (LibrarianLocationCategory.BOOK,           2000, 5099),
     (LibrarianLocationCategory.BOOK_COMPLETION, 5100, 5299),
+    (LibrarianLocationCategory.COUNT_TICK,      6001, 9072),
 ]:
     for loc in _all_locations:
         if loc.category == cat:

@@ -511,6 +511,30 @@ function M.set_slot_data(slot_data)
     -- BookSanity: per-book items + per-volume checks. book_location_map ("<asset>|<chapter>" ->
     -- loc id) fires the check when that book is placed correctly; book_item_to_book ("Book: ..."
     -- -> {asset,chapter}) drives which book un-wards on receiving the item.
+    -- random_book_bundle: books arrive in fungible bundles rather than one item each. The
+    -- unlocked set is a prefix of book_order, so the client needs the order and the size --
+    -- neither can be re-derived, both are rolled at generation.
+    M._random_bundle = (slot_data.random_bundle == 1)
+    M._book_order = (type(slot_data.book_order) == "table") and slot_data.book_order or {}
+    M._books_per_bundle = tonumber(slot_data.books_per_bundle) or 1
+    -- check_mode. by_series and by_book are already what detect_completed_rows and
+    -- detect_correct_books do; by_count needs its own sender.
+    M._check_by_series = (slot_data.check_by_series == 1)
+    M._check_by_count = (slot_data.check_by_count == 1)
+    M._count_location_map = (type(slot_data.count_location_map) == "table")
+        and slot_data.count_location_map or {}
+    -- by_count has no per-book locations, so the tick count comes from the correct-book sweep
+    -- instead of the server's checked set. Scope it to this seed's own series: under a floor
+    -- goal the other floor's books are still shelvable and must not inflate the count.
+    -- How many bookcases one unlock item opens, per section. Absent on pre-3.0.0 seeds,
+    -- where the answer was always one.
+    M._bookcases_per_unlock = (type(slot_data.bookcases_per_unlock) == "table")
+        and slot_data.bookcases_per_unlock or {}
+    M._count_series = {}
+    for _, name in ipairs(slot_data.series_order or {}) do M._count_series[name] = true end
+    M._correct_count = 0
+    M._sent_count_ticks = {}
+
     M._book_sanity_enabled = (slot_data.book_sanity == 1)
     M._book_location_map = (type(slot_data.book_location_map) == "table")
         and slot_data.book_location_map or {}
@@ -737,7 +761,7 @@ function M.set_apply_safe(state)
         -- completion thresholds being late or missing. Asking here costs one fast sweep (the whole
         -- library in ~4 passes) and it still runs behind the same apply-safe gate as every other
         -- book walk, so it cannot touch a half-built actor.
-        if M._book_sanity_enabled then
+        if M._book_sanity_enabled or M._check_by_count then
             M.request_full_book_scan()
         end
     end
@@ -1000,12 +1024,24 @@ function M._recompute_state()
         end
     end
 
-    -- Shelf unlocks: per-section open_count = received count of that section's item.
+    -- Shelf unlocks: per-section open_count = received count of that section's item, times
+    -- how many bookcases one of them opens. That multiplier is 1 in the progressive mode and
+    -- the whole section under bookcase_unlocks: whole, where a section arrives as one item --
+    -- the client cannot tell the two apart from the item name, so the apworld sends it.
     local shelves_open = {}
+    local per_unlock = M._bookcases_per_unlock or {}
     for item_name, count in pairs(M._received_counts) do
         local section_id = item_name:match("^Progressive Shelf Unlock %((.+)%)$")
         if section_id then
-            shelves_open[section_id] = count
+            shelves_open[section_id] = count * (tonumber(per_unlock[section_id]) or 1)
+        else
+            section_id = item_name:match("^Section Unlock %((.+)%)$")
+            if section_id and count and count > 0 then
+                -- One item, the whole section. Fall back to the progressive count if the
+                -- seed did not send a size, so a missing key cannot leave a case shut.
+                shelves_open[section_id] = math.max(shelves_open[section_id] or 0,
+                    tonumber(per_unlock[section_id]) or 99)
+            end
         end
     end
 
@@ -1026,6 +1062,26 @@ function M._recompute_state()
         local nb = 0
         for _ in pairs(books_unlocked) do nb = nb + 1 end
         log(("[book-sanity] _books_unlocked = %d books"):format(nb))
+    end
+
+    -- random_book_bundle: the Nth bundle reveals the next books_per_bundle entries of
+    -- book_order, so the unlocked set is a prefix of that list. Same shape as the grouped
+    -- series_order walk above, and it reuses book_item_to_book to resolve each name.
+    if M._random_bundle then
+        local held = M._received_counts["Progressive Book Bundle"] or 0
+        local order = M._book_order or {}
+        local upto = held * M._books_per_bundle
+        if upto > #order then upto = #order end
+        local item_to_book = M._book_item_to_book or {}
+        for i = 1, upto do
+            local ac = item_to_book[order[i]]
+            if type(ac) == "table"
+                    and type(ac[1]) == "string" and type(ac[2]) == "number" then
+                books_unlocked[ac[1] .. "|" .. ac[2]] = true
+            end
+        end
+        log(("[bundle] %d bundle(s) x %d = %d of %d books unlocked"):format(
+            held, M._books_per_bundle, upto, #order))
     end
 
     -- Publish atomically (single reference assignment each), tables first so the snapshot below is
@@ -2978,9 +3034,11 @@ function M.request_full_book_scan()
     M._dcb_full_scan = true
 end
 function M.detect_correct_books()
-    if not M._book_sanity_enabled then return 0 end
-    local blm = M._book_location_map
-    if type(blm) ~= "table" or not next(blm) then return 0 end
+    -- by_count rides this same walk: it has no book locations to fire, but it needs the count
+    -- of correctly shelved books, and that is exactly what this sweep already establishes.
+    if not (M._book_sanity_enabled or M._check_by_count) then return 0 end
+    local blm = M._book_location_map or {}
+    if not (M._check_by_count or next(blm)) then return 0 end
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient.send_check) then return 0 end
 
@@ -3052,9 +3110,13 @@ function M.detect_correct_books()
                     if not seen[bid] then
                         local loc_id = tonumber(blm[bid])
                         if not loc_id then
-                            -- No mapped location (e.g. the other floor under a floor goal):
-                            -- mark seen so it isn't rescanned every sweep.
+                            -- No mapped location (e.g. the other floor under a floor goal, or
+                            -- by_count, where books are counted rather than checked): mark seen
+                            -- so it isn't rescanned every sweep.
                             seen[bid] = true
+                            if M._count_series and M._count_series[series_name] then
+                                M._correct_count = (M._correct_count or 0) + 1
+                            end
                         elseif APClient:send_check(loc_id) then
                             -- Marked only on an accepted send. send_check refuses while identity
                             -- is unverified, and marking first burned the check for the session.
@@ -3083,6 +3145,7 @@ function M.detect_correct_books()
     -- Thresholds ride the same sweep that counts the books: shelving is what moves the count, and
     -- waiting for the row hub would leave them unfired until a whole row happened to close.
     pcall(function() M.fire_book_completion_checks() end)
+    pcall(function() M.fire_count_ticks() end)
     return sent
 end
 
@@ -3428,6 +3491,7 @@ function M.fire_completion_passes()
         end
     end)
     pcall(function() M.fire_book_completion_checks() end)
+    pcall(function() M.fire_count_ticks() end)
     pcall(function() M.fire_section_completions() end)
     pcall(function() M.fire_floor_completions() end)
 end
@@ -3480,6 +3544,38 @@ function M.count_correct_books()
         if sent[ids[i]] then n = n + 1 end
     end
     return n
+end
+
+--- Fire "Shelved N Books" for every tick the run has reached. check_mode=by_count only.
+---
+--- The count comes from detect_correct_books' sweep, not from the server's checked set: in this
+--- mode there are no per-book locations to count from. That makes the figure session-local until
+--- the sweep has walked the library once, so a resumed run fires its ticks a lap late rather than
+--- early. Late is recoverable; early would hand out checks nobody earned.
+function M.fire_count_ticks()
+    if not M._check_by_count then return 0 end
+    local map = M._count_location_map
+    if type(map) ~= "table" then return 0 end
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient.send_check) then return 0 end
+
+    local count = M._correct_count or 0
+    local sent = 0
+    for key, loc_id in pairs(map) do
+        local n = tonumber(key)
+        local lid = tonumber(loc_id)
+        if n and lid and count >= n and not M._sent_count_ticks[n] then
+            -- Marked only on an accepted send, per send_check's contract: a refusal while
+            -- identity is unverified is temporary, and marking through one loses the tick.
+            if APClient:send_check(lid) then
+                M._sent_count_ticks[n] = true
+                sent = sent + 1
+                log(("[count-tick] %d books shelved -> loc %d ('Shelved %d Books')")
+                    :format(count, lid, n))
+            end
+        end
+    end
+    return sent
 end
 
 --- Fire "Correctly shelve N books" for every threshold the run has reached.

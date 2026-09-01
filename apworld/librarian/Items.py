@@ -60,6 +60,8 @@ class LibrarianItemCategory(IntEnum):
     TRAP        = 7   # Fatigue: a timed debuff on a skill
     SERIES_INDIV = 8  # per-series unlock items (individual_series_items)
     BOOK        = 9   # per-book items (book_sanity)
+    BOOK_BUNDLE = 10  # Progressive Book Bundle (N random books each)
+    SECTION     = 11  # Section Unlock: <SectionId> (opens all of a section's bookcases)
 
 
 class LibrarianItemData(NamedTuple):
@@ -91,6 +93,13 @@ _series_items: list[LibrarianItemData] = [
         "Progressive Series Unlock", 2,
         LibrarianItemCategory.SERIES, ItemClassification.progression,
     ),
+    # random_book_bundle: each copy reveals the next books_per_bundle books from the
+    # seed's shuffled book_order. One name however large the bundle, so the bundle size
+    # stays a slot_data number rather than something the datapackage has to enumerate.
+    LibrarianItemData(
+        "Progressive Book Bundle", 3,
+        LibrarianItemCategory.BOOK_BUNDLE, ItemClassification.progression,
+    ),
 ]
 
 # 31 unique shelf-unlock items, one per section. Holding ≥1 of these for a
@@ -101,6 +110,19 @@ _shelf_items: list[LibrarianItemData] = [
         f"Progressive Shelf Unlock ({section.id})",
         100 + idx,
         LibrarianItemCategory.SHELF,
+        ItemClassification.progression,
+    )
+    for idx, section in enumerate(data.SECTIONS)
+]
+
+# 31 whole-section unlocks, the coarse alternative to the progressive shelf items above:
+# one item opens every bookcase in its section. Both sets always exist in the datapackage
+# (it is static per game); a seed uses whichever its bookcase_unlocks setting calls for.
+_section_items: list[LibrarianItemData] = [
+    LibrarianItemData(
+        f"Section Unlock ({section.id})",
+        131 + idx,
+        LibrarianItemCategory.SECTION,
         ItemClassification.progression,
     )
     for idx, section in enumerate(data.SECTIONS)
@@ -207,6 +229,7 @@ _fatigue_items: list[LibrarianItemData] = [
 _all_items: list[LibrarianItemData] = (
     _series_items
     + _shelf_items
+    + _section_items
     + _major_skill_items
     + _attunement_items
     + _bag_items
@@ -253,6 +276,13 @@ ITEM_QUANTITIES: dict[str, int] = {
         for s in data.SECTIONS
     },
 
+    # One per section, used instead of the per-bookcase items above when
+    # bookcase_unlocks is "whole".
+    **{
+        f"Section Unlock ({s.id})": 1
+        for s in data.SECTIONS
+    },
+
     # Major Magic — quantity = max level for that skill
     "Progressive Sort":          data.SKILL_MAX_LEVELS[data.UpgradeAbility.SORT_BOOKS],          # 5
     "Progressive Shelf Guide":   data.SKILL_MAX_LEVELS[data.UpgradeAbility.SHOW_MATCHING_SHELF],  # 10
@@ -277,7 +307,9 @@ assert len(_names) == len(set(_names)), "Duplicate item name detected"
 # Item ID ranges shouldn't overlap categories
 for cat, lo, hi in [
     (LibrarianItemCategory.SERIES,       2,   2),
-    (LibrarianItemCategory.SHELF,        100, 199),
+    (LibrarianItemCategory.BOOK_BUNDLE,  3,   3),
+    (LibrarianItemCategory.SHELF,        100, 130),
+    (LibrarianItemCategory.SECTION,      131, 199),
     (LibrarianItemCategory.MAJOR_SKILL,  200, 299),
     (LibrarianItemCategory.USEFUL,       300, 306),
     (LibrarianItemCategory.TRAP,         307, 311),

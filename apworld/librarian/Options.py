@@ -16,14 +16,13 @@ class Goal(Choice):
     full    -- Complete the whole library, both floors (default).
     floor_1 -- Complete Floor 1 only (1A-1N); Floor 2 leaves the pool.
     floor_2 -- Complete Floor 2 only (2A-2Q); Floor 1 leaves the pool.
-    custom  -- Win after a count you choose: custom_goal_row_count rows, or
-               custom_goal_book_count books under booksanity. Works in all three
-               unlock modes. The seed is trimmed to about what that goal needs, plus
-               spare_book_item_percent slack -- sections past it leave the pool rather
-               than sitting there holding items nobody will collect.
+    custom  -- Win after a number you choose. Set that number in
+               custom_goal_row_count or custom_goal_book_count, whichever your
+               check_mode counts in. Sections past your goal leave the seed, so you
+               are not waiting on items you will never need.
 
-    For booksanity, a floor or custom goal is recommended: the full goal has ~3072
-    book items and takes noticeably longer to generate."""
+    individual_book_unlocks is slow to generate on the full goal. Pick a floor or a
+    custom goal there."""
     display_name = "Goal"
 
     option_full = 0
@@ -36,28 +35,31 @@ class Goal(Choice):
 class UnlockMode(Choice):
     """Choose how book series are unlocked.
 
-    progressive_unlocks (default) -- series unlock in fungible groups: each
-        Progressive Series Unlock item reveals series_per_unlock series, and
-        bookcases unlock progressively. The classic, most compact item pool.
-    individual_series_unlocks -- every one of the ~400 series is its own unlock
-        item. More granular and a larger pool; every bookcase starts open.
-    booksanity -- every individual book (~3072) is its own item AND its own check,
-        the most granular option. Every bookcase starts open. A floor goal is
-        recommended (the full goal is slow to generate at this size)."""
+    progressive_unlocks (default) -- each unlock item opens the next
+        series_per_unlock series. Bookcases open a few at a time as well. The
+        smallest item pool, and the classic setup.
+    individual_series_unlocks -- one unlock item per series, about 400 of them.
+        Every bookcase is open from the start.
+    random_book_bundle -- each unlock item hands you books_per_bundle books from
+        anywhere in the library, ignoring series. Bookcases open a few at a time.
+        Needs check_mode: booksanity or count.
+    individual_book_unlocks -- one unlock item per book, about 3000 of them. Every
+        bookcase is open from the start. Much the biggest pool: it only works with
+        check_mode: booksanity, and it is slow to generate on the full goal."""
     display_name = "Unlock Mode"
 
     option_progressive_unlocks = 0
     option_individual_series_unlocks = 1
-    option_booksanity = 2
+    option_individual_book_unlocks = 2
+    option_random_book_bundle = 3
     default = 0
 
 
 class CustomGoalRowCount(Range):
-    """Rows needed to win when goal = custom. Ignored for every other goal.
+    """How many rows to finish to win, when goal = custom and check_mode = series.
 
-    Used by progressive_unlocks and individual_series_unlocks. In booksanity the
-    goal counts books instead, so custom_goal_book_count applies there and this is
-    ignored. Accepts 'random', 'random-low', 'random-high' in your yaml."""
+    Ignored otherwise: the other two check modes count books, through
+    custom_goal_book_count. Accepts 'random', 'random-low', 'random-high'."""
     display_name = "Custom Goal Row Count"
     range_start = 1
     range_end = 400
@@ -65,13 +67,14 @@ class CustomGoalRowCount(Range):
 
 
 class CustomGoalBookCount(Range):
-    """Books needed to win when goal = custom and unlock_mode = booksanity.
+    """How many books to shelve to win, when goal = custom and check_mode is
+    booksanity or count.
 
-    Ignored for every other goal and unlock mode -- the other two modes count rows,
-    via custom_goal_row_count. The library holds 3072 books across 400 rows, so a
-    row-shaped number here is a much shorter run than it looks; the default is about
-    half the library, which lands near the size of a floor goal. Accepts 'random',
-    'random-low', 'random-high' in your yaml."""
+    Ignored otherwise: check_mode series counts rows, through custom_goal_row_count.
+    The library holds 3072 books in 400 rows, so a number that sounds big here is a
+    shorter run than you might expect. The default is about half the library, which is
+    close to the length of a floor goal. Accepts 'random', 'random-low',
+    'random-high'."""
     display_name = "Custom Goal Book Count"
     range_start = 1
     range_end = 3072
@@ -101,6 +104,61 @@ class SpareShelfItems(Range):
     range_start = 0
     range_end = 3
     default = 0
+
+
+class BookcaseUnlocks(Choice):
+    """How the bookcases open up.
+
+    progressive (default) -- one item per bookcase, so a section opens a few shelves
+        at a time.
+    whole -- one item per section, opening all of its bookcases at once.
+    unlocked -- every bookcase is open from the start.
+
+    The two individual unlock modes are always unlocked."""
+    display_name = "Bookcase Unlocks"
+    option_progressive = 0
+    option_whole = 1
+    option_unlocked = 2
+    default = 0
+
+
+class CheckMode(Choice):
+    """Choose what earns you a check.
+
+    series (default) -- finishing a whole row.
+    booksanity -- shelving any single book correctly.
+    count -- every check_interval books you shelve.
+
+    Not every pairing works: individual_book_unlocks needs booksanity, and
+    random_book_bundle needs booksanity or count. Generation will tell you if the
+    pair you picked cannot be built."""
+    display_name = "Check Mode"
+    option_series = 0
+    option_booksanity = 1
+    option_count = 2
+    default = 0
+
+
+class CheckInterval(Range):
+    """How many books you shelve between checks, when check_mode = count.
+
+    Lower means more checks, each worth less. Lowered automatically if the seed needs
+    more checks than your interval would give it."""
+    display_name = "Check Interval"
+    range_start = 1
+    range_end = 100
+    default = 10
+
+
+class BooksPerBundle(Range):
+    """How many books arrive in each bundle. random_book_bundle only.
+
+    Higher means fewer, bigger deliveries. Raised automatically if the seed would need
+    more bundles than it has checks to put them in."""
+    display_name = "Books Per Bundle"
+    range_start = 1
+    range_end = 50
+    default = 10
 
 
 class StartingSeriesCount(Range):
@@ -155,15 +213,14 @@ class LocalFiller(DefaultOnToggle):
 
 
 class OnlyUnwardShelfableBooks(DefaultOnToggle):
-    """Require both the series unlock AND its bookcase before a book is pickable.
+    """Require both the series unlock and its bookcase before a book can be picked up.
 
-    On (default): a book stays hidden until its series and its bookcase are
-    both open.  Default option to avoid having to shuffle series around.
+    On (default): a book stays hidden until its series and its bookcase are both open,
+    so every book you are holding has a shelf waiting for it.
 
-    Off: books are unhidden and grabbable once they are sent to you. This means you
-    can place books on shelves 'out of order'.  This may lead you to need to
-    shelf a series and then replace it with a different series on the same
-    shelf in order to get all available checks."""
+    Off: a book is grabbable as soon as it is sent to you, and can go on any shelf you
+    have. Getting every check may then mean shelving a series, taking it back off, and
+    cycling another one through the same shelf."""
     display_name = "Only Unward Shelfable Books"
 
 
@@ -171,6 +228,10 @@ class OnlyUnwardShelfableBooks(DefaultOnToggle):
 class LibrarianOptions(PerGameCommonOptions):
     goal: Goal
     unlock_mode: UnlockMode
+    check_mode: CheckMode
+    bookcase_unlocks: BookcaseUnlocks
+    check_interval: CheckInterval
+    books_per_bundle: BooksPerBundle
     custom_goal_row_count: CustomGoalRowCount
     custom_goal_book_count: CustomGoalBookCount
     spare_book_item_percent: SpareBookItemPercent
