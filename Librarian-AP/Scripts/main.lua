@@ -205,7 +205,7 @@ end
 --- would hand out checks the run has not earned.
 local function _bh_book_unlocked(book_obj, series)
     local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA._book_sanity_enabled and series) then return false end
+    if not (IA and IA._per_book_unlocks and series) then return false end
     local bu = IA._books_unlocked
     if not bu then return false end
     local chapter = nil
@@ -249,6 +249,39 @@ local function _bh_book_is_warded(book_obj)
     local unlocked = _bh_book_unlocked(book_obj, series)
     if unlocked == nil then return nil end   -- unreadable book: leave it alone, per the rule above
     return not unlocked
+end
+
+--- Take the force field down so the player can reach the ending door.
+---
+--- Its own handler ignores the count it is handed and re-asks the game, which still says the
+--- library is unfinished, so the fade cannot be driven honestly. Faking that count is not an
+--- option: CurrentFinishedRowNum is what our row checks read. Hiding it and dropping its
+--- collision is what actually lets the player through, and both are reversible.
+--- Re-asserted rather than run once: a level load brings a fresh barrier back, and a player
+--- who reloads after reaching the goal would otherwise be walled off from their own ending.
+--- Each actor is checked before it is touched, so the repeat costs nothing and stays silent.
+function _bh.drop_end_barrier()
+    local barriers
+    pcall(function() barriers = FindAllOf("BP_M01_Barrier_01_C") end)
+    local n = 0
+    if barriers then pcall(function() n = #barriers end) end
+    local hid = 0
+    for i = 1, n do
+        local b = barriers[i]
+        local alive = false; pcall(function() alive = b and b:IsValid() end)
+        local down = false; pcall(function() down = b.bHidden end)
+        if alive and not down then
+            pcall(function() b.FadingEffect:PlayFromStart() end)
+            pcall(function() b:SetActorHiddenInGame(true) end)
+            pcall(function() b:SetActorEnableCollision(false) end)
+            hid = hid + 1
+        end
+    end
+    if hid == 0 then return end
+    -- The door is deliberately left shut. Reaching the goal clears the way to it; opening it
+    -- is the player's own move, and the ending follows from that.
+    _bh.barrier_dropped = true
+    log(("[end-door] barrier down (%d), door left for the player"):format(hid))
 end
 
 function _bh.set_ward_attach(b, warded)
@@ -898,7 +931,7 @@ end
 local function _magic_evict_bag()
     if not diag_on("MAGIC_WARD_BAG_EVICT") then return end
     local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA._book_sanity_enabled) then return end
+    if not (IA and IA._per_book_unlocks) then return end
     pcall(function()
         local pawn = FindFirstOf("BP_LibrarianCharacter_C")
         if not (pawn and pawn:IsValid()) then return end
@@ -1061,7 +1094,7 @@ local function try_register_magic_hooks()
         mreg(HISM_MGR_BP .. ":UpdateInstance", "UpdateInstance", function(self, info, transform)
             if not diag_on("BOOK_EVENT_HOOKS") then return end
             local IA = package.loaded["AP/ItemApply"]
-            if not (IA and IA._book_sanity_enabled and IA._book_inst_state) then return end
+            if not (IA and IA._per_book_unlocks and IA._book_inst_state) then return end
             local ok, aidx, chap = pcall(inst_key, info)
             if not (ok and aidx and chap) then return end
             local st = IA._book_inst_state[aidx .. "|" .. chap]
@@ -1115,6 +1148,36 @@ local function try_register_magic_hooks()
             if warded == true then _magic_bag_dirty = true end
         end)
 
+        -- The game's own ending. Which call the player takes to commit, and which marks the
+        -- cutscene starting, is where a goal send belongs -- the threshold fires long before
+        -- the player has actually finished anything.
+        -- ConfirmLeave is the commit: the player has chosen to finish and the cutscene is
+        -- starting. That is the moment the run is really over, so the goal hangs off it.
+        -- The door refuses until the game's own count says the library is finished, and that
+        -- count is not ours to fake: CurrentFinishedRowNum is what our row checks read. Writing
+        -- GameClear does not help either -- it is a separate flag the checks below ignore.
+        --
+        -- ConfirmLeave, though, starts the ending whatever the game thinks. So the player's
+        -- interaction still drives it: they walk to the door and use it, and once the AP goal
+        -- is reached we answer for the prompt they would otherwise be refused.
+        mreg("/Game/Librarian/Environment/M01_Library/Meshes/BP_M01_Door_01.BP_M01_Door_01_C" .. ":Interact", "Door.InteractGoal", function(self)
+            if not _bh.goal_reached then return end
+            local d; pcall(function() d = self:get() end)
+            local ok = false; pcall(function() ok = d and d:IsValid() end)
+            if not ok then return end
+            log("[end-door] goal reached and the player used the door -- starting the ending")
+            -- The sequence opens the door itself, so leave it alone: calling OpenDoor here just
+            -- snapped it open a frame before the cutscene did the same thing properly.
+            pcall(function() d:ConfirmLeave() end)
+        end)
+
+        mreg("/Game/Librarian/Environment/M01_Library/Meshes/BP_M01_Door_01.BP_M01_Door_01_C" .. ":ConfirmLeave", "Door.ConfirmLeave", function()
+            -- _goal is declared further down the file, so naming it here would read a nil
+            -- global rather than the local. _bh exists by now, so the goal code hangs its
+            -- entry point there.
+            log("[end-door] player confirmed the ending")
+            if _bh.goal_reached and _bh.arm_victory then _bh.arm_victory() end
+        end)
         -- Insight ending. Zero-latency edge for the existing resweep, which otherwise waits for the
         -- 3s poll to notice -- a fatigued Insight can be shorter than that and be missed entirely.
         mreg(CHAR_NATIVE .. ":HideSameTypeBook", "HideSameTypeBook", function()
@@ -1268,7 +1331,7 @@ local function apply_book_visibility()
     -- every pile removes the backfill the game's actor<->pile toggle relies on (unlocked books then
     -- flicker/vanish). Leave the piles visible here; locked books are hidden per-instance by
     -- teleporting their pile instance to deep Z. Skip the series mask.
-    if IA._book_sanity_enabled then return end
+    if IA._per_book_unlocks then return end
     -- Snapshot the world epoch (bumped by reset_hism_state each LoadMap). The game-thread chunk
     -- re-checks it before touching the captured HISM array: if the world reloaded, the freed
     -- arr[hi] is a native AV pcall can't catch (the main-menu teardown crash).
@@ -2712,7 +2775,7 @@ end)
 gt_loop("magic_bag_watch", 1000, function()
     if not diag_on("MAGIC_LEAK_TRACE") then return false end
     local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA._gameplay_active and IA._book_sanity_enabled) then return false end
+    if not (IA and IA._gameplay_active and IA._per_book_unlocks) then return false end
     -- Re-anchor the books we evicted, a second after the drop cleared the field. The rolling
     -- reconcile sweep gets there on its own, but a book dropped at the player's feet is the one
     -- most likely to be grabbed again before the cursor comes back around.
@@ -3072,7 +3135,7 @@ gt_loop("ready_gate", 250, function()
     -- still being hidden. Only wait for it in the modes that actually run it -- BookSanity masks per
     -- book elsewhere and stacks mode never hides piles, and in both this pass returns immediately
     -- without ever stamping, so waiting on it there would stall until the timeout.
-    local l3_needed = not IA._book_sanity_enabled and IA._book_hide_mode ~= false
+    local l3_needed = not IA._per_book_unlocks and IA._book_hide_mode ~= false
     local l3_done = (not l3_needed)
         or (not _b2_running and _b2_state.applied_epoch == (IA._world_epoch or 0))
 
@@ -3347,7 +3410,7 @@ local function on_book_shelved(which, inserted)
     if inserted then IA._row_check_pending = true end
     -- by_count counts correctly shelved books from the same sweep BookSanity uses, so a
     -- shelving event has to arm it there too or the count never moves.
-    if IA._book_sanity_enabled or IA._check_by_count then
+    if IA._per_book_checks or IA._check_by_count then
         IA.request_full_book_scan()
     end
 end
@@ -4213,13 +4276,54 @@ function _goal.send(rows)
     end
     if not (have and want) or want <= 0 or have < want then return end
 
-    _goal.sent = true
-    log(("[AP] %d/%d %s — sending STATUS_GOAL (goal=%s)"):format(
+    -- Reaching the target opens the way out rather than ending the run outright: the library
+    -- has its own ending, and firing the goal here skipped it entirely. The barrier comes down,
+    -- the door stays shut, and the player walks to it when they are ready.
+    _goal.reached = true
+    _bh.goal_reached = true
+    log(("[AP] %d/%d %s: goal reached; opening the way out (goal=%s)"):format(
         have, want, unit, tostring(sd.goal)))
     local HUD_mod = package.loaded["AP/HUD"]
     if HUD_mod and HUD_mod.notify then
-        HUD_mod.notify(("Goal complete! (%d %s)"):format(want, unit:match("^(%a+)")), 10.0)
+        HUD_mod.notify(("Goal complete! (%d %s). The way out is open"):format(
+            want, unit:match("^(%a+)")), 12.0)
     end
+    _bh.drop_end_barrier()
+end
+
+--- Send the goal a beat after the ending starts, not on the same frame.
+---
+--- The server releases the rest of the seed the moment the goal lands, and taking three
+--- thousand items in one frame froze the game just as the cutscene began. Counted in ticks of
+--- the 1s loop below rather than a clock: os.clock is not safe in this UE4SS build.
+function _goal.arm_victory()
+    if _goal.sent or _goal.victory_ticks then return end
+    _goal.victory_ticks = 10
+    log("[AP] ending started; goal follows in ~10s so the item flood lands well clear of it")
+end
+
+_bh.arm_victory = function() _goal.arm_victory() end
+
+function _goal.tick_victory()
+    if _goal.sent then return end
+    if not _goal.victory_ticks then
+        -- The ending is the goal, but it should not be the only way to claim one. A player who
+        -- reaches their target and wanders off would otherwise sit finished-but-unsent forever,
+        -- so after five minutes send it anyway. Counted in ticks of this loop, which only runs
+        -- during gameplay, so a long pause or a trip to the menu does not spend the clock.
+        if not _goal.reached then return end
+        _goal.idle_ticks = (_goal.idle_ticks or 0) + 1
+        if _goal.idle_ticks < 300 then return end   -- ticks of the 1s loop
+        _goal.sent = true
+        log("[AP] goal reached and the ending untaken for 5 minutes; sending STATUS_GOAL")
+        ap_send_goal()
+        return
+    end
+    _goal.victory_ticks = _goal.victory_ticks - 1
+    if _goal.victory_ticks > 0 then return end
+    _goal.victory_ticks = nil
+    _goal.sent = true
+    log("[AP] sending STATUS_GOAL")
     ap_send_goal()
 end
 
@@ -4253,13 +4357,13 @@ end)
 RegisterHook("/Script/Librarian.LibrarianGameMode:EndGame", function(self)
     if not diag_on("NAMED_HOOKS") then return end
     log(">> EndGame  (GAME COMPLETE)")
-    if _goal.sent then
-        log("[AP] STATUS_GOAL already sent (threshold reached earlier); skipping")
-        return
-    end
-    _goal.sent = true
-    log("[AP] sending STATUS_GOAL")
-    ap_send_goal()
+end)
+
+-- Backstop for an ending that starts without passing through the door's ConfirmLeave. Gated on
+-- the AP goal, not on the game's: finishing the library early is not a goal, and sending one
+-- from here would end the run for a player who never met their own target.
+RegisterHook("/Script/Librarian.LibrarianGameMode:EndGame", function()
+    if _goal.reached and not _goal.sent then _goal.arm_victory() end
 end)
 
 -- Goal catch-up. FinishRow announces a row as it completes and nothing re-announces it, so a run
@@ -4267,7 +4371,17 @@ end)
 -- trigger again however long it played. The save's own counter is the durable record of the same
 -- fact, so re-read it on a slow timer. Cheap, and the latch makes it a no-op the moment the goal
 -- is out; it deliberately does NOT unregister on success, so a second connection can still fire.
+gt_loop("goal_victory", 1000, function()
+    _goal.tick_victory()
+    return false
+end)
+
 gt_loop("goal_catchup", 5000, function()
+    if _goal.reached then
+        -- Keep the way out open across level loads; silent once the barrier is already down.
+        pcall(_bh.drop_end_barrier)
+        return false
+    end
     if _goal.sent then return false end
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._gameplay_active and IA._apply_safe) then return false end
@@ -4486,9 +4600,12 @@ APClient.on_slot_connected = function(slot_data)
             "ok")
         _G._librarian_menu.hide()
     end
-    -- Reset goal latch so this fresh connection can fire STATUS_GOAL again.
-    _goal.sent = false
+    -- Reset goal latch so this fresh connection can fire STATUS_GOAL again. `reached` gates the
+    -- catch-up loop, so leaving it set would stop a new seed ever re-opening the way out.
+    _goal.sent, _goal.reached = false, false
     _goal.milestones = {}
+    _bh.goal_reached, _bh.barrier_dropped = false, false
+    _goal.idle_ticks = 0
 
     -- Persist working connection info so next launch auto-fills.
     pcall(function()
@@ -4642,8 +4759,10 @@ end
 APClient.on_disconnected = function()
     log("[AP] disconnected")
     restore_save_slot()
-    _goal.sent = false
+    _goal.sent, _goal.reached = false, false
     _goal.milestones = {}
+    _bh.goal_reached, _bh.barrier_dropped = false, false
+    _goal.idle_ticks = 0
     -- Clear pre-apply state so a reconnect starts fresh (else buttons enable early / settle thinks
     -- it's done).
     local IA = package.loaded["AP/ItemApply"]

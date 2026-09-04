@@ -1,14 +1,22 @@
 """
 Librarian: Tidy Up the Arcane Library -- Archipelago options.
 
-Options match yaml keys by name, so the order here drives the template layout:
-goal -> unlock shape -> starting amounts -> visibility / quality-of-life -> niche.
+Grouped the way they are read: the mode first, then the settings that only mean
+something under it. option_groups at the bottom is what the template and the web
+options page lay out from, so the class order here follows it.
 """
 
 from dataclasses import dataclass
+from typing import Union
 
-from Options import Choice, Range, Toggle, DefaultOnToggle, PerGameCommonOptions
+from Options import (Choice, Range, Toggle, DefaultOnToggle, OptionGroup,
+                     OptionSet, PerGameCommonOptions)
+from settings import Bool, Group
 
+
+# --------------------------------------------------------------------------
+# Goal
+# --------------------------------------------------------------------------
 
 class Goal(Choice):
     """How much of the library must be tidied to win.
@@ -21,8 +29,9 @@ class Goal(Choice):
                check_mode counts in. Sections past your goal leave the seed, so you
                are not waiting on items you will never need.
 
-    individual_book_unlocks is slow to generate on the full goal. Pick a floor or a
-    custom goal there."""
+    individual_book_unlocks on the full goal is slow to generate and is off unless the
+    host allows it (allow_individual_book_unlocks in host.yaml). A floor or custom
+    goal there needs no permission."""
     display_name = "Goal"
 
     option_full = 0
@@ -32,36 +41,13 @@ class Goal(Choice):
     default = 0
 
 
-class UnlockMode(Choice):
-    """Choose how book series are unlocked.
-
-    progressive_unlocks (default) -- each unlock item opens the next
-        series_per_unlock series. Bookcases open a few at a time as well. The
-        smallest item pool, and the classic setup.
-    individual_series_unlocks -- one unlock item per series, about 400 of them.
-        Every bookcase is open from the start.
-    random_book_bundle -- each unlock item hands you books_per_bundle books from
-        anywhere in the library, ignoring series. Bookcases open a few at a time.
-        Needs check_mode: booksanity or count.
-    individual_book_unlocks -- one unlock item per book, about 3000 of them. Every
-        bookcase is open from the start. Much the biggest pool: it only works with
-        check_mode: booksanity, and it is slow to generate on the full goal."""
-    display_name = "Unlock Mode"
-
-    option_progressive_unlocks = 0
-    option_individual_series_unlocks = 1
-    option_individual_book_unlocks = 2
-    option_random_book_bundle = 3
-    default = 0
-
-
 class CustomGoalRowCount(Range):
     """How many rows to finish to win, when goal = custom and check_mode = series.
 
     Ignored otherwise: the other two check modes count books, through
     custom_goal_book_count. Accepts 'random', 'random-low', 'random-high'."""
     display_name = "Custom Goal Row Count"
-    range_start = 1
+    range_start = 25
     range_end = 400
     default = 200
 
@@ -76,34 +62,80 @@ class CustomGoalBookCount(Range):
     close to the length of a floor goal. Accepts 'random', 'random-low',
     'random-high'."""
     display_name = "Custom Goal Book Count"
-    range_start = 1
+    range_start = 100
     range_end = 3072
     default = 1500
 
 
-class SpareBookItemPercent(Range):
-    """Spare Progressive Series Unlock copies, as a percentage, so you do not need
-    every one of them to finish.
 
-    On goal: custom it sets how much of the library the seed keeps past your goal.
-    A goal of 200 rows and 10% spare leads to at least 220 series in the pool.
-    A BookSanity goal of 1500 books and 10% spare has at least 1650 books in it."""
-    display_name = "Spare Book Item Percent"
-    range_start = 0
-    range_end = 20
+# --------------------------------------------------------------------------
+# Unlocks
+# --------------------------------------------------------------------------
+
+class UnlockMode(Choice):
+    """Choose how book series are unlocked.
+
+    progressive_unlocks (default) -- each unlock item opens the next
+        series_per_unlock series. The smallest item pool, and the classic setup.
+    individual_series_unlocks -- one unlock item per series, about 400 of them.
+        Every bookcase is open from the start.
+    random_book_bundle -- each unlock item hands you books_per_bundle books from
+        anywhere in the library, ignoring series. With check_mode: series the
+        bundles are ordered so that a series finishes at a steady rate.
+    individual_book_unlocks -- one unlock item per book, about 3000 of them. Every
+        bookcase is open from the start. Much the biggest pool: with check_mode:
+        series it is switched to booksanity, since 3000 items cannot sit in 400 row
+        checks, and on the full goal it needs the host's permission
+        (allow_individual_book_unlocks in host.yaml) because it is slow to generate."""
+    display_name = "Unlock Mode"
+
+    option_progressive_unlocks = 0
+    option_individual_series_unlocks = 1
+    option_individual_book_unlocks = 2
+    option_random_book_bundle = 3
+    default = 0
+
+
+class SeriesPerUnlock(Range):
+    """How many series each Progressive Series Unlock reveals. Lower means more
+    unlocks with smaller impact; higher means fewer, bigger ones. (Below 3 makes a
+    long unlock chain that's hard to place in tight seeds, so 3 is the minimum.)
+
+    Only applies to the progressive_unlocks mode; the other three hand out series
+    or books directly, so they ignore it. With check_mode: count, values below 5
+    are raised to 5."""
+    display_name = "Series Per Unlock"
+    range_start = 3
+    range_end = 10
+    default = 5
+
+
+class BooksPerBundle(Range):
+    """How many books arrive in each bundle. random_book_bundle only.
+
+    Higher means fewer, bigger deliveries. Raised automatically if the seed would need
+    more bundles than it has checks to put them in, and a little further with
+    check_mode: series so the rows stay fillable."""
+    display_name = "Books Per Bundle"
+    range_start = 2
+    range_end = 50
     default = 10
 
 
-class SpareShelfItems(Range):
-    """Spare Progressive Shelf Unlock copies, as a count per bookcase, so you do not
-    need every one of them to open a section.
+class StartingSeriesCount(Range):
+    """How many series you begin with unlocked. Always includes at least one whose
+    row is on the starting bookcase, so your first check is available right away.
 
-    Full and floor goals with progressive_unlocks. A seed with no room for the number
-    you pick uses fewer and says so during generation."""
-    display_name = "Spare Shelf Items"
-    range_start = 0
-    range_end = 3
-    default = 0
+    progressive_unlocks / individual_series_unlocks: that many series.
+    random_book_bundle: enough bundles to cover that many series, so what you
+    actually start with depends on books_per_bundle.
+    individual_book_unlocks: that many series' worth of random books -- each count
+    rolls a series size (3, 5, or 10 volumes), so e.g. 5 starts you with roughly
+    15-50 random individual books, not whole series."""
+    display_name = "Starting Series Count"
+    range_start = 5
+    range_end = 25
+    default = 10
 
 
 class BookcaseUnlocks(Choice):
@@ -122,6 +154,38 @@ class BookcaseUnlocks(Choice):
     default = 0
 
 
+class SpareBookItemPercent(Range):
+    """Spare Progressive Series Unlock copies, as a percentage, so you do not need
+    every one of them to finish.
+
+    On goal: custom it sets how much of the library the seed keeps past your goal.
+    A goal of 200 rows and 10% spare leads to at least 220 series in the pool.
+    A book-counted goal of 1500 books and 10% spare has at least 1650 books in it."""
+    display_name = "Spare Book Item Percent"
+    range_start = 0
+    range_end = 20
+    default = 10
+
+
+class SpareShelfItems(Range):
+    """Spare Progressive Shelf Unlock copies, as a count per bookcase, so you do not
+    need every one of them to open a section.
+
+    Full and floor goals with progressive_unlocks and bookcase_unlocks: progressive.
+    The other bookcase settings hand out whole sections or none at all, so there is
+    nothing for a spare copy to open. A seed with no room for the number you pick uses
+    fewer and says so during generation."""
+    display_name = "Spare Shelf Items"
+    range_start = 0
+    range_end = 3
+    default = 0
+
+
+
+# --------------------------------------------------------------------------
+# Checks
+# --------------------------------------------------------------------------
+
 class CheckMode(Choice):
     """Choose what earns you a check.
 
@@ -129,9 +193,9 @@ class CheckMode(Choice):
     booksanity -- shelving any single book correctly.
     count -- every check_interval books you shelve.
 
-    Not every pairing works: individual_book_unlocks needs booksanity, and
-    random_book_bundle needs booksanity or count. Generation will tell you if the
-    pair you picked cannot be built."""
+    One pairing cannot be built: individual_book_unlocks with series, since 3000
+    book items cannot sit in 400 row checks. It is switched to booksanity, and
+    generation says so."""
     display_name = "Check Mode"
     option_series = 0
     option_booksanity = 1
@@ -143,50 +207,44 @@ class CheckInterval(Range):
     """How many books you shelve between checks, when check_mode = count.
 
     Lower means more checks, each worth less. Lowered automatically if the seed needs
-    more checks than your interval would give it."""
+    more checks than the selected interval; with individual_book_unlocks that is every
+    book, so the interval becomes 1."""
     display_name = "Check Interval"
     range_start = 1
     range_end = 100
     default = 10
 
 
-class BooksPerBundle(Range):
-    """How many books arrive in each bundle. random_book_bundle only.
 
-    Higher means fewer, bigger deliveries. Raised automatically if the seed would need
-    more bundles than it has checks to put them in."""
-    display_name = "Books Per Bundle"
-    range_start = 1
-    range_end = 50
-    default = 10
+# --------------------------------------------------------------------------
+# Item Pool
+# --------------------------------------------------------------------------
 
+class MagicSkillsEnabled(OptionSet):
+    """Which magic skills can turn up. Take out any you would rather not be given.
 
-class StartingSeriesCount(Range):
-    """How many series you begin with unlocked. Always includes at least one whose
-    row is on the starting bookcase, so your first check is available right away.
-
-    progressive_unlocks / individual_series_unlocks: that many series.
-    booksanity: that many series' worth of random books -- each count rolls a series
-    size (3, 5, or 10 volumes), so e.g. 5 starts you with roughly 15-50 random
-    individual books (not whole series)."""
-    display_name = "Starting Series Count"
-    range_start = 5
-    range_end = 25
-    default = 10
+    Dropping a skill also drops its Mastery and its Fatigue trap. What it held becomes
+    filler, and nothing in logic needs magic, so a shorter list only changes what you find."""
+    display_name = "Magic Skills Enabled"
+    valid_keys = ("Sort", "Shelf Guide", "Insight", "Auto-Shelving", "Assemble")
+    default = frozenset(valid_keys)
 
 
-class SeriesPerUnlock(Range):
-    """How many series each Progressive Series Unlock reveals. Lower means more
-    unlocks with smaller impact; higher means fewer, bigger ones. (Below 3 makes a
-    long unlock chain that's hard to place in tight seeds, so 3 is the minimum.)
+class LocalFiller(DefaultOnToggle):
+    """Keep this game's filler items in your own world.
 
-    Only applies to the progressive_unlocks mode; ignored for
-    individual_series_unlocks and booksanity."""
-    display_name = "Series Per Unlock"
-    range_start = 3
-    range_end = 10
-    default = 5
+    On (default): Librarian filler fills your own locations instead of scattering
+    into other players' worlds; your meaningful items still circulate. Recommended,
+    since Librarian adds a lot of checks.
+    Off: filler is distributed across the multiworld like anything else.
+    Has no effect in a solo game."""
+    display_name = "Local Filler"
 
+
+
+# --------------------------------------------------------------------------
+# The Library
+# --------------------------------------------------------------------------
 
 class BookVisibility(Choice):
     """How books from locked series look before you unlock them.
@@ -199,17 +257,6 @@ class BookVisibility(Choice):
     option_hidden = 0
     option_stacks = 1
     default = 0
-
-
-class LocalFiller(DefaultOnToggle):
-    """Keep this game's filler items in your own world.
-
-    On (default): Librarian filler fills your own locations instead of scattering
-    into other players' worlds; your meaningful items still circulate. Recommended,
-    since Librarian adds a lot of checks.
-    Off: filler is distributed across the multiworld like anything else.
-    Has no effect in a solo game."""
-    display_name = "Local Filler"
 
 
 class OnlyUnwardShelfableBooks(DefaultOnToggle):
@@ -227,17 +274,55 @@ class OnlyUnwardShelfableBooks(DefaultOnToggle):
 @dataclass
 class LibrarianOptions(PerGameCommonOptions):
     goal: Goal
-    unlock_mode: UnlockMode
-    check_mode: CheckMode
-    bookcase_unlocks: BookcaseUnlocks
-    check_interval: CheckInterval
-    books_per_bundle: BooksPerBundle
     custom_goal_row_count: CustomGoalRowCount
     custom_goal_book_count: CustomGoalBookCount
+    unlock_mode: UnlockMode
+    series_per_unlock: SeriesPerUnlock
+    books_per_bundle: BooksPerBundle
+    starting_series_count: StartingSeriesCount
+    bookcase_unlocks: BookcaseUnlocks
     spare_book_item_percent: SpareBookItemPercent
     spare_shelf_items: SpareShelfItems
-    starting_series_count: StartingSeriesCount
-    series_per_unlock: SeriesPerUnlock
-    book_visibility: BookVisibility
+    check_mode: CheckMode
+    check_interval: CheckInterval
+    magic_skills_enabled: MagicSkillsEnabled
     local_filler: LocalFiller
+    book_visibility: BookVisibility
     only_unward_shelfable_books: OnlyUnwardShelfableBooks
+
+
+class LibrarianSettings(Group):
+    """host.yaml settings for the machine that generates. The player's YAML cannot turn
+    these on; only whoever runs generation can, which is the point: some option shapes
+    make the whole multiworld's generation slow, and that cost lands on the host."""
+
+    class AllowIndividualBookUnlocks(Bool):
+        """Allow unlock_mode: individual_book_unlocks on the full goal. Its 3072 book items
+        make the spoiler's playthrough step slow for the whole multiworld: about a minute
+        solo, and it grows faster than the player count."""
+
+    allow_individual_book_unlocks: Union[AllowIndividualBookUnlocks, bool] = False
+
+
+option_groups = [
+    OptionGroup(
+        "Goal",
+        [Goal, CustomGoalRowCount, CustomGoalBookCount],
+    ),
+    OptionGroup(
+        "Unlocks",
+        [UnlockMode, SeriesPerUnlock, BooksPerBundle, StartingSeriesCount, BookcaseUnlocks, SpareBookItemPercent, SpareShelfItems],
+    ),
+    OptionGroup(
+        "Checks",
+        [CheckMode, CheckInterval],
+    ),
+    OptionGroup(
+        "Item Pool",
+        [MagicSkillsEnabled, LocalFiller],
+    ),
+    OptionGroup(
+        "The Library",
+        [BookVisibility, OnlyUnwardShelfableBooks],
+    ),
+]

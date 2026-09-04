@@ -8,9 +8,11 @@ items. As you complete shelves and milestones, the game sends location
 checks to the Archipelago server; in return, you receive item unlocks that
 open up new series and bookcases.
 
-If you want something far more granular, **BookSanity** turns every one of
-the ~3,072 individual books into its own item and its own check. See
-`unlock_mode` below.
+Two independent settings shape a run: `unlock_mode` decides how books reach
+you, and `check_mode` decides what earns a check. At the granular end,
+**BookSanity** sends a check for every one of the ~3,072 individual books, and
+`individual_book_unlocks` makes every one of them an item as well. See YAML
+options below.
 
 ---
 
@@ -223,6 +225,11 @@ or host it locally.
    world is ready, so you never walk into a library mid-setup.
 5. Play normally. As you complete shelves, the mod sends location checks
    to Archipelago; received items unlock more series and shelves.
+6. When you reach your goal, the barrier at the far end of the library comes
+   down and the way out opens. Walk to the door and use it to play the game's
+   own ending; your victory reaches Archipelago a few seconds after the
+   cutscene starts. If you would rather not walk over, it is sent on its own
+   five minutes later.
 
 ### Tips
 
@@ -244,72 +251,181 @@ or host it locally.
 
 ## YAML options
 
-All options go under your `Librarian:` section in the YAML.
+All options go under your `Librarian:` section in the YAML. The generated
+template groups them the same way this section does: Goal, Unlocks, Checks,
+Item pool, and The library.
 
-### `unlock_mode`
+3.0.0 reshapes the option set, so generate a fresh template rather than
+reusing a 2.x YAML.
 
-How books become available. This is the biggest choice in the YAML: it
-changes the size and shape of the item pool, and what the other options
-mean.
+Two settings shape everything else, and in 3.0.0 they are independent of each
+other:
 
-| Value                       | Meaning                                                                  |
-|-----------------------------|--------------------------------------------------------------------------|
-| `progressive_unlocks`       | (Default) Series unlock in groups of `series_per_unlock`. Smallest pool. |
-| `individual_series_unlocks` | Each of the ~400 series is its own item. Every bookcase starts open.     |
-| `booksanity`                | Every one of the ~3,072 books is its own item **and** its own check.     |
+- **`unlock_mode`** decides how books reach you.
+- **`check_mode`** decides what earns a check.
 
-In `booksanity`, every bookcase starts open and you send a check for each
-book you place correctly. Items arrive as `Book: <Series> Vol N`; the
-matching checks read `Book: <Section> - <Series> Vol N`. A floor goal is
-recommended, since the full goal is slow to generate at that size.
+Every pairing but one can be built. The one that cannot is switched to
+`booksanity` at generation, and the generation log says so:
+
+| `unlock_mode` \ `check_mode` | `series`       | `booksanity` | `count` |
+|-----------------------------|----------------|--------------|---------|
+| `progressive_unlocks`       | yes            | yes          | yes     |
+| `individual_series_unlocks` | yes            | yes          | yes     |
+| `random_book_bundle`        | yes            | yes          | yes     |
+| `individual_book_unlocks`   | to booksanity  | yes          | yes     |
+
+`individual_book_unlocks` puts ~3,072 items in the pool, which cannot sit in
+~400 row checks. With `count` its interval becomes 1, so every book is a
+check there too. `random_book_bundle` with `series` orders the bundles so
+that a series finishes at a steady rate; each bundle still draws from across
+the library.
 
 Locked books can't be taken in any mode, including by the magic skills:
 Assemble won't pull one into your bag, and Insight won't reveal one.
 
-### `goal`
+---
+
+### Host settings
+
+One setting lives in the generating machine's `host.yaml`, not in any player's
+YAML, under `librarian_options`:
+
+```yaml
+librarian_options:
+  allow_individual_book_unlocks: false
+```
+
+`individual_book_unlocks` on the `full` goal puts 3,072 progression items in
+the pool, and Archipelago's spoiler playthrough step slows down faster than
+that number grows: about a minute for one such player on their own, three and
+a half for two, seven and a half for three. Every player in the lobby waits on it, so the
+decision belongs to whoever runs generation. With it `false` (the default) a
+YAML asking for that shape is refused with a message naming this setting;
+set it `true` to allow it. Floor and custom goals in that mode are fine and
+need nothing.
+
+Archipelago writes the key into `host.yaml` the first time it loads the
+apworld, so look there after one generation.
+
+---
+
+### Goal
+
+#### `goal`
 
 How much of the library must be tidied to win.
 
-| Value      | Meaning                                                       |
-|------------|---------------------------------------------------------------|
-| `full`     | (Default) Complete both floors — game ends naturally          |
-| `floor_1`  | Complete Floor 1 only (~176 rows). Floor 2 removed from pool  |
-| `floor_2`  | Complete Floor 2 only (~224 rows). Floor 1 removed from pool  |
-| `custom`   | A count you choose — see below. Works in all three unlock modes |
+| Value      | Meaning                                                      |
+|------------|--------------------------------------------------------------|
+| `full`     | (Default) Complete both floors                               |
+| `floor_1`  | Complete Floor 1 only (~176 rows). Floor 2 removed from pool |
+| `floor_2`  | Complete Floor 2 only (~224 rows). Floor 1 removed from pool |
+| `custom`   | A count you choose, see below                                |
 
 With `custom`, the seed is trimmed to roughly what your goal needs plus
 `spare_book_item_percent` slack. Sections past that leave the pool entirely,
 rather than remaining as checks holding items nobody will collect.
 
-### `custom_goal_row_count`
+Whichever goal you pick, reaching it opens the way out rather than ending the
+run on the spot. The library has its own ending, and the mod leaves it to you.
 
-When `goal: custom`, the number of rows needed to win. Range 1–400.
-Supports `random`, `random-low`, `random-high`. Default 200.
+`individual_book_unlocks` on the `full` goal is slow to generate, so it is off
+unless the host allows it; see Host settings below. A floor or custom goal
+there needs no permission.
 
-Used by `progressive_unlocks` and `individual_series_unlocks`. In
-`booksanity` the goal counts books instead, so `custom_goal_book_count`
-applies there and this is ignored.
+#### `custom_goal_row_count`
 
-### `custom_goal_book_count`
+When `goal: custom` **and** `check_mode: series`, the number of rows needed to
+win. Range 25-400. Supports `random`, `random-low`, `random-high`. Default 200.
 
-When `goal: custom` **and** `unlock_mode: booksanity`, the number of
-correctly shelved books needed to win. Range 1–3072. Default 1500.
-Supports `random`, `random-low`, `random-high`. Ignored for every other
-goal and unlock mode.
+The other two check modes count books, through `custom_goal_book_count`, and
+ignore this.
 
-Note the scale: the library holds 3072 books across 400 rows, so a
-row-shaped number here is a far shorter run than it looks. The default of
-1500 is about half the library, which lands near the size of a floor goal.
+#### `custom_goal_book_count`
 
-A custom book goal is also the fastest way to play BookSanity — it
-sidesteps the full goal's slow generation entirely.
+When `goal: custom` **and** `check_mode` is `booksanity` or `count`, the number
+of correctly shelved books needed to win. Range 100-3072. Default 1500.
+Supports `random`, `random-low`, `random-high`.
 
-### `spare_book_item_percent`
+Note the scale: the library holds 3072 books across 400 rows, so a row-shaped
+number here is a far shorter run than it looks. The default of 1500 is about
+half the library, which lands near the size of a floor goal.
 
-Range 0-20. Default 10. `progressive_unlocks` only.
+A custom book goal is also the fastest way to play the book-heavy modes, since
+it sidesteps the full goal's slow generation entirely.
 
-**Renamed from `extra_series_percent` in 2.0.3. Regenerate your YAML to update
-the name.**
+---
+
+### Unlocks
+
+#### `unlock_mode`
+
+How books become available. This changes the size and shape of the item pool,
+and what several of the other options mean.
+
+| Value                       | Meaning                                                                      |
+|-----------------------------|------------------------------------------------------------------------------|
+| `progressive_unlocks`       | (Default) Series unlock in groups of `series_per_unlock`. Smallest pool.     |
+| `individual_series_unlocks` | Each of the ~400 series is its own item. Every bookcase starts open.         |
+| `random_book_bundle`        | Each item hands you `books_per_bundle` books from anywhere, ignoring series. |
+| `individual_book_unlocks`   | Each of the ~3,072 books is its own item. Every bookcase starts open. Full goal needs host permission. |
+
+In the two individual modes every bookcase starts open, so `bookcase_unlocks`
+does not apply to them.
+
+`random_book_bundle` items arrive as a single repeated `Progressive Book
+Bundle`; which books each one carries is fixed by the seed, so the same seed
+always hands them out in the same order.
+
+#### `series_per_unlock`
+
+How many series each `Progressive Series Unlock` item grants. Range 3-10.
+Default 5. Lower values mean more items in the pool, each with smaller impact;
+higher values mean fewer items, each more impactful.
+
+Only applies to `progressive_unlocks`; the other three hand out series or books
+directly. With `check_mode: count`, values below 5 are raised to 5.
+
+#### `books_per_bundle`
+
+How many books arrive in each `Progressive Book Bundle`. Range 2-50. Default
+10. `random_book_bundle` only.
+
+Higher means fewer, larger deliveries. Raised automatically if the seed would
+need more bundles than it has checks to put them in, and a little further with
+`check_mode: series` so the rows stay fillable, so a small number on a large
+goal is a request rather than a guarantee.
+
+#### `starting_series_count`
+
+How many series you begin with unlocked. Range 5-25. Default 10. The starting
+set is randomized per seed but always includes at least one series whose shelf
+row is on the starting bookcase, so your first check is always reachable.
+
+What the number buys depends on the unlock mode:
+
+| `unlock_mode` | what you start with |
+|---|---|
+| `progressive_unlocks`, `individual_series_unlocks` | That many series. |
+| `random_book_bundle` | Enough bundles to cover that many series, so the real amount depends on `books_per_bundle`. |
+| `individual_book_unlocks` | That many series' *worth* of books. Each one rolls a series size (3, 5 or 10 volumes), so 5 starts you with roughly 15 to 50 individual books. |
+
+#### `bookcase_unlocks`
+
+How the 31 sections' bookcases open up.
+
+| Value         | Meaning                                                                      |
+|---------------|------------------------------------------------------------------------------|
+| `progressive` | (Default) One item per bookcase, so a section opens a few shelves at a time. |
+| `whole`       | One `Section Unlock` item per section, opening all of its bookcases at once. |
+| `unlocked`    | Every bookcase is open from the start.                                       |
+
+Pick `unlocked` if you would rather the run be only about books. The two
+individual unlock modes are always `unlocked` regardless of what you set here.
+
+#### `spare_book_item_percent`
+
+Range 0-20. Default 10.
 
 How much slack to leave beyond what your goal actually needs. A goal that needs
 every last unlock is fragile in a multiworld: one item sitting in a stalled or
@@ -331,18 +447,20 @@ The cap is 20. Past that it starts costing `spare_shelf_items` whole steps, and
 on a custom goal a bigger margin mostly just re-adds the surplus checks the trim
 exists to remove.
 
-In `individual_series_unlocks` and `booksanity` every series or book is its own
-specific item, so a duplicate unlocks nothing and the spare-copy half does
-nothing. A `custom` goal there still trims the seed by this percentage.
+The spare-copy half is `progressive_unlocks` only. Everywhere else each series
+or book is its own specific item, or bundles are handed out to a fixed count, so
+a duplicate unlocks nothing. A `custom` goal in any mode still trims the seed by
+this percentage.
 
-### `spare_shelf_items`
+#### `spare_shelf_items`
 
-Range 0-3. Default 0. Full and floor goals, `progressive_unlocks` only.
+Range 0-3. Default 0. Full and floor goals, with `progressive_unlocks` and
+`bookcase_unlocks: progressive`.
 
-The same for bookcases, as a count per bookcase rather than a percentage, since
-sections hold as few as three. It adds an extra N `Progressive Shelf Unlock`
-items for each section, so any section can lose that many copies to a stalled
-game and still open fully.
+The same idea for bookcases, as a count per bookcase rather than a percentage,
+since sections hold as few as three. It adds an extra N `Progressive Shelf
+Unlock` items for each section, so any section can lose that many copies to a
+stalled game and still open fully.
 
 This is the most expensive setting in the YAML. Every step is one item slot per
 bookcase, 71 of them at the full goal, all replacing filler:
@@ -354,7 +472,8 @@ bookcase, 71 of them at the full goal, all replacing filler:
 | 2 | 211 | 102 |
 | 3 | 282 | 31 |
 
-*(full goal, `series_per_unlock: 5`, `spare_book_item_percent: 0`)*
+*(full goal, `series_per_unlock: 5`, `spare_book_item_percent: 0`,
+`bookcase_unlocks: progressive`)*
 
 A seed without room drops back a step rather than failing, and says so during
 generation, so asking for more than fits costs nothing. How much room there is
@@ -364,60 +483,92 @@ fewer steps: a `floor_1` seed with `series_per_unlock: 3` takes 2, not 3.
 Spares past the cap do nothing. The mod already stops applying unlocks past the
 last series and the last bookcase.
 
-Ignored in `individual_series_unlocks` and `booksanity`, which start with every
-bookcase already open.
+The other `bookcase_unlocks` settings hand out whole sections or none at all, so
+there is nothing for a spare copy to open, and this is ignored there.
 
-### `starting_series_count`
+---
 
-How many series the player begins with unlocked. Range 5–25. Default 10.
-The starting set is randomized per seed but always includes at least one
-series whose shelf row is on the starting bookcase, so the first check
-is always reachable.
+### Checks
 
-In `booksanity` this counts series' *worth* of books rather than whole
-series: each one rolls a series size (3, 5 or 10 volumes), so a count of 5
-starts you with roughly 15 to 50 individual books.
+#### `check_mode`
 
-### `series_per_unlock`
+What earns you a check.
 
-How many series each `Progressive Series Unlock` item grants. Range 3–10.
-Default 5. Lower values mean more items in the pool, each with smaller
-impact; higher values mean fewer items, each more impactful.
+| Value        | Meaning                                            |
+|--------------|----------------------------------------------------|
+| `series`     | (Default) Finishing a whole row.                   |
+| `booksanity` | Shelving any single book correctly. ~3,072 checks. |
+| `count`      | Every `check_interval` books you shelve.           |
 
-Only applies to `progressive_unlocks`; the other unlock modes hand out
-series or books individually.
+In `booksanity` the checks read `Book: <Section> - <Series> Vol N`. In `count`
+they read as running totals, so the run is paced by how much shelving you do
+rather than by which shelves you finish.
 
-### `book_visibility`
+#### `check_interval`
+
+How many books you shelve between checks. Range 1-100. Default 10.
+`check_mode: count` only.
+
+Lower means more checks, each worth less. Lowered automatically if the seed
+needs more checks than the selected interval.
+
+---
+
+### Item pool
+
+#### `magic_skills_enabled`
+
+Which magic skills can turn up. A list; take out any you would rather not be
+given. All five are included by default:
+
+```yaml
+  magic_skills_enabled:
+    - Sort
+    - Shelf Guide
+    - Insight
+    - Auto-Shelving
+    - Assemble
+```
+
+Dropping a skill also drops its Mastery upgrades and its Fatigue trap. What they
+held becomes filler. Nothing in logic needs magic, so a shorter list only
+changes what you find, never whether the seed is winnable.
+
+#### `local_filler`
+
+Toggle (default `true`). Keeps this game's filler items in your own world
+instead of scattering them across the multiworld. Your meaningful items still
+circulate normally. Recommended, since Librarian adds a lot of checks. No effect
+in a solo game.
+
+---
+
+### The library
+
+#### `book_visibility`
 
 What locked books look like before you unlock them.
 
-| Value    | Meaning                                                                  |
-|----------|--------------------------------------------------------------------------|
-| `hidden` | (Default) Locked books are invisible. The library fills in as you unlock. |
-| `stacks` | Locked books stay visible but can't be taken; you walk through them.      |
+| Value    | Meaning                                                                   |
+|----------|---------------------------------------------------------------------------|
+| `hidden` | (Default) Locked books are invisible. The library fills in as you unlock.  |
+| `stacks` | Locked books stay visible but can't be taken; you walk through them.       |
 
 `stacks` keeps the shelves looking full, and avoids the hidden-book display
 glitch noted under Known issues.
 
-### `local_filler`
-
-Toggle (default `true`). Keeps this game's filler items in your own world
-instead of scattering them across the multiworld. Your meaningful items
-still circulate normally. Recommended, since Librarian adds a lot of
-checks. No effect in a solo game.
-
-### `only_unward_shelfable_books`
+#### `only_unward_shelfable_books`
 
 Toggle (default `true`). Controls how strictly books are gated by
 shelf unlocks.
 
-**On (default)** — A book stays hidden until its series **and** its bookcase are
+**On (default)** - A book stays hidden until its series **and** its bookcase are
 both open. This is the default so you never have to shuffle series around: you
-need **both** the series unlock **and** enough Progressive Shelf Unlocks for that
-section to reach the series's home bookcase. No visibility floor — if a section
-has zero bookcases open, none of its series are pickable.
+need **both** the series unlock **and** the bookcase unlocks that reach the
+series's home bookcase. No visibility floor: if a section has zero bookcases
+open, none of its series are pickable.
 
-**Off** — Books are unhidden and grabbable as soon as they are sent to you,
+**Off** - Books are unhidden and grabbable as soon as they are sent to you,
 **regardless of whether their bookcase is open yet**. This means you can place
 books on shelves "out of order".
 
@@ -438,7 +589,7 @@ When you launch the game, the UE4SS log
 (`<Game>\Librarian\Binaries\Win64\UE4SS.log`) should include lines like:
 
 ```
-[Lua] [LibrarianAP] LibAP v2.0.0 — Game v1.0.13 (verified compatible)
+[Lua] [LibrarianAP] LibAP v3.0.0 — Game v1.0.13 (verified compatible)
 [Lua] [BPModLoaderMod] Actor: ModActor_C /Game/Librarian/Map/...
 [Lua] [LibrarianAP] Press F4 to toggle the connection menu.
 [Lua] [LibrarianAP] Press F12 to connect to Archipelago.

@@ -22,7 +22,9 @@ Access rules enforce solvability; AP's generator places progression items
 in spheres that satisfy the rules.
 """
 
-from typing import Any
+from typing import Any, ClassVar
+import bisect
+from bisect import bisect_right as _bisect_right
 import math
 
 from BaseClasses import MultiWorld, Region, Tutorial, ItemClassification, CollectionState
@@ -64,7 +66,7 @@ from .Locations import (
     _book_completion_locations,
     _goal_locations,
 )
-from .Options import LibrarianOptions
+from .Options import LibrarianOptions, LibrarianSettings, option_groups
 
 # Item names used as constants below (avoids typos)
 ITEM_PROG_SERIES  = "Progressive Series Unlock"
@@ -203,6 +205,7 @@ VICTORY_ITEM_NAME = "Victory"
 
 class LibrarianWeb(WebWorld):
     theme = "stone"
+    option_groups = option_groups
     setup_en = Tutorial(
         "Multiworld Setup Guide",
         "A guide to setting up the Archipelago Librarian randomizer on your computer.",
@@ -231,6 +234,7 @@ class LibrarianWorld(World):
     game = "Librarian Tidy Up the Arcane Library"
     options_dataclass = LibrarianOptions
     options: LibrarianOptions
+    settings: ClassVar[LibrarianSettings]
     web = LibrarianWeb()
     topology_present = True
     required_client_version = (0, 5, 0)
@@ -273,6 +277,40 @@ class LibrarianWorld(World):
     # one floor; everything else (full / custom) keeps all 31 sections.
     # If we're in UT regen mode, the goal comes from passthrough slot_data
     # (options are defaults at that point).
+    @property
+    def enabled_skills(self) -> tuple:
+        """Magic skills this seed may hand out, in the canonical order.
+
+        Ordered, never a set: what survives here decides pool contents, and set order is
+        not stable between processes. UT-aware, since options hold defaults on a re-gen."""
+        pt = self._ut_passthrough()
+        if pt and "magic_skills_enabled" in pt:
+            keep = set(pt["magic_skills_enabled"])
+        else:
+            keep = set(self.options.magic_skills_enabled.value)
+        return tuple(n for n in _SKILL_NAMES if n in keep)
+
+    def _optional_quantities(self) -> dict:
+        """The buff/trap block, minus anything belonging to a skill that is turned off."""
+        return self._drop_disabled_skills(dict(_buffs_traps_quantities()))
+
+    def _enabled_magic_names(self) -> tuple:
+        """Progressive item names for the skills this seed keeps."""
+        return tuple(f"Progressive {n}" for n in self.enabled_skills)
+
+    def _drop_disabled_skills(self, quantities: dict) -> dict:
+        """Strip every item belonging to a skill the player turned off.
+
+        Magic is useful and never gates anything, so this cannot affect logic; each pool
+        builder pads back to the location count with filler afterwards."""
+        keep = self.enabled_skills
+        for name in _SKILL_NAMES:
+            if name in keep:
+                continue
+            for item in (f"Progressive {name}", f"{name} Mastery", f"Fatigue: {name}"):
+                quantities.pop(item, None)
+        return quantities
+
     @property
     def goal_value(self) -> int:
         """The goal this seed was built with.
@@ -418,6 +456,19 @@ class LibrarianWorld(World):
             return self.options.bookcase_unlocks.option_unlocked
         return int(self._ut_opt("bookcase_unlocks", self.options.bookcase_unlocks))
 
+    def _slow_to_generate(self) -> str:
+        """Name the option shape that makes generation slow, or "" if this one is fine.
+
+        Measured with the spoiler on (the default): individual_book_unlocks on the full
+        goal is about 70s solo, and the paring step grows faster than the player count.
+        The other big pools are not the problem -- individual series with booksanity is
+        11s solo and 12s for three players -- because the cost follows the number of
+        advancement items, and only this shape has 3072 of them."""
+        if (self.book_sanity
+                and self.options.goal.value == self.options.goal.option_full):
+            return "unlock_mode: individual_book_unlocks on goal: full"
+        return ""
+
     def _shelf_gate(self, sid: str, series_name: str) -> tuple[str, int]:
         """The item and count that open the bookcase holding one row.
 
@@ -504,8 +555,18 @@ class LibrarianWorld(World):
                 if nm.startswith("Progressive Shelf Unlock (")
                 and nm[nm.index("(") + 1:-1] in self.active_section_ids)
         need = (unlocks
-                + sum(_buffs_traps_quantities().values())
+                + sum(self._optional_quantities().values())
                 + len(_MAJOR_MAGIC_NAMES) * 10)
+        # Fitting the pool is not enough when the unlocks are a chain. Every rung of the
+        # ladder needs series (or bundles) AND their bookcases, so the chain of paired
+        # items is deep, and a deep chain against a ladder with no slack deadlocks the
+        # fill: the early links end up with no reachable rung left to sit on. Measured on
+        # the full goal at series_per_unlock 3 and 4, seeds fail below about 2.1 ticks
+        # per chain item and pass from 2.5; bundles at 8 per item failed 7 of 20 at 1.4.
+        # The individual modes hand out one specific item per series or book, no chain,
+        # so they keep the plain fit.
+        if not (self.individual or self.book_sanity):
+            need = max(need, math.ceil(unlocks * 2.5))
         step = min(step, max(1, total // max(1, need)))
         return list(range(step, total + 1, step))
 
@@ -743,6 +804,8 @@ class LibrarianWorld(World):
             start = {self.starting_section, self.starting_section_b} - {None}
             self.book_order = ([b for sid, b in shuffled if sid in start]
                                + [b for sid, b in shuffled if sid not in start])
+            if self.check_by_series:
+                self.book_order = self._spread_series_completions(rng, start)
 
         self.starting_book_names = []
         if self.book_sanity:
@@ -752,6 +815,43 @@ class LibrarianWorld(World):
                          for (_ai, ch, _sid, name) in self.active_books]
             rng.shuffle(all_books)
             self.starting_book_names = all_books[:min(n_books, len(all_books))]
+
+    def _spread_series_completions(self, rng, start_sections) -> list[str]:
+        """Bundle order for bundle+series: series finish at a steady rate.
+
+        A row check needs every volume of its series, so under bundles a row opens when
+        its LAST volume arrives. In a plain shuffle the last of 3 to 10 volumes sits near
+        the end for almost every series, so almost every row needs almost every bundle and
+        the fill has nowhere to put the first two hundred items. This keeps each bundle
+        library-wide but schedules the closing volume of each series at an even spacing
+        through the order, with its other volumes anywhere before it: the k-th row opens
+        around the k-th share of the bundles, the shape the progressive chain already has.
+        Starting sections' series go first so sphere 0 has rows to open."""
+        series = [(sec.id, ser) for sec in self.active_sections for ser in sec.series]
+        rng.shuffle(series)
+        series.sort(key=lambda t: t[0] not in start_sections)   # stable: keeps the shuffle
+        n_books = sum(ser.volumes for _sid, ser in series)
+        order: list = [None] * n_books
+        free = list(range(n_books))          # free slot indices, ascending
+        n_series = len(series)
+        for i, (_sid, ser) in enumerate(series):
+            close_at = min(n_books - 1, int((i + 1) * n_books / n_series) - 1)
+            # closing volume at the nearest free slot at or before its scheduled point
+            # (or the first free one after, if the run-up is already full)
+            k = _bisect_right(free, close_at) - 1
+            if k < 0:
+                k = 0
+            close_slot = free.pop(k)
+            vols = list(range(ser.volumes))
+            rng.shuffle(vols)
+            order[close_slot] = book_item_name(ser.name, vols[0])
+            for ch in vols[1:]:
+                # anywhere earlier: an uneven spread here keeps the bundles mixed
+                upto = _bisect_right(free, close_slot)
+                j = rng.randrange(upto) if upto > 0 else 0
+                order[free.pop(j)] = book_item_name(ser.name, ch)
+        assert None not in order
+        return order
 
     def _keep_row_completions(self) -> bool:
         """Whether to create the 72 'Complete N Rows' checks this seed.
@@ -773,37 +873,52 @@ class LibrarianWorld(World):
     # ------------------------------------------------------------------
 
     def _validate_modes(self) -> None:
-        """Reject the pairings that cannot be filled, and fix the one that can.
+        """Settle the option shapes that cannot generate as asked.
 
-        Items must never outnumber locations. Every book being its own item is the only
-        unlock mode dense enough to break that on its own, so it is the only one with
-        pairings to refuse -- and refusing loudly here beats the fill failing later with
-        nothing pointing at the option that caused it.
+        Pairings that cannot be filled are switched to the check mode that can hold them
+        and say so, the way the interval and the bundle size already adjust; a YAML should
+        generate rather than bounce for a pairing the seed can settle itself. Only two
+        things still refuse: a pool no goal can hold, and a shape the host has not allowed.
 
         A UT re-gen reads its shape from slot_data, which by definition already generated,
         so it is not re-validated."""
         if self._ut_passthrough():
             return
-        if self.book_sanity and (self.check_by_series or self.check_by_count):
-            books = sum(s.volume_count for s in self.active_sections)
-            if self.check_by_series:
-                have, what = sum(len(s.series) for s in self.active_sections), "row checks"
-            else:
-                have, what = len(self.count_ticks), "count checks"
+        # Shapes that are slow to generate are the host's call, not the player's: the
+        # spoiler's playthrough paring grows faster than linearly in advancement items,
+        # and every player in the lobby waits on it. The gate lives in host.yaml under
+        # librarian_options, so a host who is fine with the wait can lift it.
+        if (self._slow_to_generate()
+                and not getattr(self.settings, "allow_individual_book_unlocks", False)):
             raise OptionError(
-                f"[Librarian - '{self.player_name}'] unlock_mode: booksanity gives every book "
-                f"its own item ({books} of them), which cannot fit into {have} "
-                f"{what}. Pair booksanity with check_mode: by_book, or keep this check_mode "
-                f"and use unlock_mode: random_book_bundle, which unlocks books in groups."
+                f"[Librarian - '{self.player_name}'] {self._slow_to_generate()} is slow to "
+                f"generate and is off by default. The host can allow it by setting "
+                f"librarian_options: allow_individual_book_unlocks: true in host.yaml. "
+                f"Otherwise pick a floor or custom goal, or a different unlock mode."
             )
-        if self.random_bundle and self.check_by_series:
-            raise OptionError(
-                f"[Librarian - '{self.player_name}'] unlock_mode: random_book_bundle draws "
-                f"books from anywhere in the library, so a row fills only once nearly every "
-                f"bundle has arrived and the seed cannot be filled. Pair it with check_mode: "
-                f"by_book or by_count, or use one of the series unlock modes, which is what "
-                f"bundling a whole series at a time already is."
-            )
+        # Every book its own item only fits when every book is also a check: ~3072 items
+        # cannot go into ~400 rows or a few hundred count ticks. Bundles are drawn from
+        # the whole library, so a row fills only once nearly every bundle has arrived and
+        # the fill cannot route it. Both settle to booksanity, the check mode built for
+        # book-shaped unlocks.
+        opt = self.options.check_mode
+        if self.book_sanity and self.check_by_series:
+            print(f"[Librarian - '{self.player_name}'] unlock_mode: individual_book_unlocks "
+                  f"gives every book its own item, and ~3072 items cannot sit in ~400 row "
+                  f"checks; using check_mode: booksanity instead of series.")
+            opt.value = opt.option_booksanity
+        # The count ladder with a deep series chain. Every rung needs series and their
+        # bookcases together, and at series_per_unlock 3 or 4 on the full library the fill
+        # deadlocks on a share of seeds however dense the ladder is made (measured: 4/50 at
+        # 2.5 ticks per chain item, 2/50 at 3), while 5 is 50 for 50. So count mode reads
+        # the option as "at least 5": the seed adjusts, the way it adjusts the interval
+        # and the bundle size, and the option's text says so. Done here, before anything
+        # derives from the value, so slot_data and the tracker see the clamped number.
+        if self.check_by_count and self.options.series_per_unlock.value < 5:
+            print(f"[Librarian - '{self.player_name}'] check_mode: count needs "
+                  f"series_per_unlock of at least 5; using 5 instead of "
+                  f"{self.options.series_per_unlock.value}.")
+            self.options.series_per_unlock.value = 5
 
     def create_regions(self) -> None:
         menu = Region("Menu", self.player, self.multiworld)
@@ -1107,7 +1222,7 @@ class LibrarianWorld(World):
             # or the estimate reads ~46 slots richer than the seed really is.
             def _free_slots():
                 return (target - sum(quantities.values())
-                        - sum(_buffs_traps_quantities().values()))
+                        - sum(self._optional_quantities().values()))
 
             spare_pct = self._ut_opt("spare_book_item_percent",
                                      self.options.spare_book_item_percent)
@@ -1178,11 +1293,7 @@ class LibrarianWorld(World):
         # self-limits for floor/custom goals, and the excess-drop below trims
         # the pool down to it; filler fills the freed slots to keep per-player
         # |items| == |locations|.
-        major_magic_names = (
-            "Progressive Sort", "Progressive Shelf Guide",
-            "Progressive Insight", "Progressive Auto-Shelving",
-            "Progressive Assemble",
-        )
+        major_magic_names = self._enabled_magic_names()
         levels_kept = self._levels_kept(self.max_reachable_rows)
         max_major_magic_needed = levels_kept
         total_major_magic = sum(quantities.get(n, 0) for n in major_magic_names)
@@ -1203,7 +1314,7 @@ class LibrarianWorld(World):
         # other players); per-skill Mastery gating lives in the helper. In individual/book mode
         # these useful/trap items back-fill the count-gated locations (kept off the progression
         # fill by the item-rule ban). BookSanity injects its own copy in _create_items_book.
-        for _bt_name, _bt_qty in _buffs_traps_quantities().items():
+        for _bt_name, _bt_qty in self._optional_quantities().items():
             quantities[_bt_name] = _bt_qty
 
         # Pool-overshoot guard. Triggers on combinations like
@@ -1252,13 +1363,12 @@ class LibrarianWorld(World):
                         quantities[name] -= take
                         excess -= take
             if excess > 0:
-                raise ValueError(
-                    f"Pool overshoots target locations ({target}) by {excess} "
-                    f"even after lifting Series Unlocks and dropping optional "
-                    f"buffs. This config is fundamentally impossible — use a "
-                    f"less restrictive goal."
-                )
+                raise OptionError(
+                    f"Librarian: the item pool overshoots this goal's {target} checks "
+                    f"by {excess} even after lifting Series Unlocks into the start and "
+                    f"dropping optional items. Raise the custom goal.")
 
+        self._drop_disabled_skills(quantities)   # magic the player turned off
         pool_items: list[LibrarianItem] = []
         for name, qty in quantities.items():
             for _ in range(qty):
@@ -1409,7 +1519,7 @@ class LibrarianWorld(World):
                 or nm.startswith("Section Unlock (")
                 and self.bookcase_unlocks == self.options.bookcase_unlocks.option_whole)
             and nm[nm.index("(") + 1:-1] in self.active_section_ids)
-        head_room = (target - sum(_buffs_traps_quantities().values())
+        head_room = (target - sum(self._optional_quantities().values())
                      - len(_MAJOR_MAGIC_NAMES) * 10 - shelf_pool)
         # Two ceilings. The pool has to fit the checks, and -- when the bookcases are gated
         # too -- the bundle chain has to stay short enough to interleave with them. Books
@@ -1417,7 +1527,12 @@ class LibrarianWorld(World):
         # bundle sizes that conjunction leaves the fill with nowhere reachable to place the
         # next item. Measured: with bookcases open every size fills, with them gated the
         # small sizes fail, seed-dependently rather than at a clean threshold.
-        chain_cap = (max(1, target // 3)
+        # Rows as the checks need a shorter chain still: a row opens on its closing
+        # volume, so the bundle chain and the bookcase chain interleave at every row.
+        # Measured on the full goal with progressive bookcases: 154 bundles fail 4 of
+        # 10, 110 or fewer fill 10 of 10.
+        chain_div = 5 if self.check_by_series else 3
+        chain_cap = (max(1, target // chain_div)
                      if self.bookcase_unlocks != self.options.bookcase_unlocks.option_unlocked
                      else n_books)
         while per < n_books and (math.ceil(n_books / per) > max(1, head_room)
@@ -1456,10 +1571,10 @@ class LibrarianWorld(World):
             elif is_shelf and bmode == bopt.option_unlocked:
                 for _ in range(_qty):
                     mw.push_precollected(self.create_item(_name))
-        for bt_name, bt_qty in _buffs_traps_quantities().items():
+        for bt_name, bt_qty in self._optional_quantities().items():
             quantities[bt_name] = bt_qty
         magic_keep = self._levels_kept(self.max_reachable_rows)
-        for nm in _MAJOR_MAGIC_NAMES:
+        for nm in self._enabled_magic_names():
             quantities[nm] = min(ITEM_QUANTITIES.get(nm, 0), magic_keep)
 
         # Start the player off so sphere 0 is not empty: starting_series_count bundles.
@@ -1483,6 +1598,7 @@ class LibrarianWorld(World):
                     quantities[nm] -= 1
                     mw.push_precollected(self.create_item(nm))
 
+        self._drop_disabled_skills(quantities)   # magic the player turned off
         pool_items: list[LibrarianItem] = []
         for name, qty in quantities.items():
             for _ in range(max(0, qty)):
@@ -1490,9 +1606,9 @@ class LibrarianWorld(World):
 
         filler_needed = target - len(pool_items)
         if filler_needed < 0:
-            raise ValueError(
-                f"Librarian: random_book_bundle pool overshoots target by "
-                f"{-filler_needed}. Raise books_per_bundle.")
+            raise OptionError(
+                f"Librarian: random_book_bundle pool overshoots this goal's checks by "
+                f"{-filler_needed}. Raise books_per_bundle or the custom goal.")
         for i in range(filler_needed):
             pool_items.append(self.create_item(_filler_items[i % len(_filler_items)].name))
         mw.itempool.extend(pool_items)
@@ -1541,10 +1657,11 @@ class LibrarianWorld(World):
         # path; the goal requires mm >= levels_kept so none is redundant.
         levels_kept = self._levels_kept(self.max_reachable_rows)
         max_major_magic = levels_kept
-        magic_q = {n: ITEM_QUANTITIES.get(n, 0) for n in _MAJOR_MAGIC_NAMES}
+        kept_magic = self._enabled_magic_names()
+        magic_q = {n: ITEM_QUANTITIES.get(n, 0) for n in kept_magic}
         excess = sum(magic_q.values()) - max_major_magic
-        while excess > 0:
-            drop = max(_MAJOR_MAGIC_NAMES, key=lambda n: magic_q.get(n, 0))
+        while excess > 0 and kept_magic:
+            drop = max(kept_magic, key=lambda n: magic_q.get(n, 0))
             if magic_q.get(drop, 0) <= 0:
                 break
             magic_q[drop] -= 1
@@ -1555,7 +1672,7 @@ class LibrarianWorld(World):
 
         # Buffs + traps, same as the other modes (replaces filler). Mastery gated on the capped
         # magic counts above.
-        for bt_name, bt_qty in _buffs_traps_quantities().items():
+        for bt_name, bt_qty in self._optional_quantities().items():
             for _ in range(bt_qty):
                 pool_items.append(self.create_item(bt_name))
 
@@ -1581,11 +1698,10 @@ class LibrarianWorld(World):
             pool_items = [it for i, it in enumerate(pool_items) if i not in remove]
             filler_needed = target - len(pool_items)
             if filler_needed < 0:
-                raise ValueError(
-                    f"Librarian: book_sanity pool overshoots target by "
-                    f"{-filler_needed} even after dropping optional buffs "
-                    f"(target={target}, pool={len(pool_items)}). Use a less "
-                    f"restrictive goal.")
+                raise OptionError(
+                    f"Librarian: individual_book_unlocks pool overshoots this goal's "
+                    f"checks by {-filler_needed} even after dropping optional items "
+                    f"(target={target}, pool={len(pool_items)}). Raise the custom goal.")
         for i in range(filler_needed):
             f = _filler_items[i % len(_filler_items)]
             pool_items.append(self.create_item(f.name))
@@ -1876,12 +1992,49 @@ class LibrarianWorld(World):
             return max((need_at.get(book_item_name(ser.name, ch), 1)
                         for ch in range(ser.volumes)), default=1)
 
-        # Everything count-gated -- sections, floors, levels, milestones, goal -- keys off
-        # how many books are reachable, which is just bundles x per.
         total_books = sum(s.volume_count for s in active_sections)
 
+        # Everything count-gated -- count rungs, milestones, levels, the goal -- reads how
+        # many books the player can shelve, and that is NOT bundles x per: a held book only
+        # counts once its bookcase is open. Reading the bundle count alone put "shelve 400
+        # books" in logic for a player holding 57 bundles with six bookcases open and 180
+        # books shelvable. Grouped by gate (one per section, or per row tier under
+        # progressive bookcases) with the bundle positions of its books and rows sorted,
+        # so a count is one bisect per gate rather than a walk of the library, and cached
+        # on the state the way the progressive rules cache theirs.
+        gates: dict[tuple[str, int], tuple[list[int], list[int]]] = {}
+        for sec in active_sections:
+            for ser in sec.series:
+                books, rows = gates.setdefault(self._shelf_gate(sec.id, ser.name), ([], []))
+                books.extend(need_at[book_item_name(ser.name, ch)]
+                             for ch in range(ser.volumes)
+                             if book_item_name(ser.name, ch) in need_at)
+                rows.append(series_need(ser))
+        gate_list = [(item, n, sorted(b), sorted(r)) for (item, n), (b, r) in gates.items()]
+        gate_items = sorted({item for item, _, _, _ in gate_list})
+        cache_attr = f"_librarian_bundle_feasible_{p}"
+
+        def _feasible(state) -> tuple[int, int]:
+            prog = state.prog_items[p]
+            held = prog[ITEM_PROG_BUNDLE]
+            marker = (held, tuple([prog[nm] for nm in gate_items]))
+            cached = state.__dict__.get(cache_attr)
+            if cached is not None and cached[0] == marker:
+                return cached[1]
+            books = rows = 0
+            for item, n, bpos, rpos in gate_list:
+                if n and prog[item] < n:
+                    continue
+                books += bisect.bisect_right(bpos, held)
+                rows += bisect.bisect_right(rpos, held)
+            state.__dict__[cache_attr] = (marker, (books, rows))
+            return books, rows
+
         def feasible_books(state) -> int:
-            return min(state.count(ITEM_PROG_BUNDLE, p) * per, total_books)
+            return _feasible(state)[0]
+
+        def feasible_rows(state) -> int:
+            return _feasible(state)[1]
 
         # A book needs its bundle AND its bookcase. The bundle half stays a depth-1 count:
         # the chain is ordered, so "all of a series" is just its last book's position.
@@ -1905,36 +2058,27 @@ class LibrarianWorld(World):
 
         self._apply_check_locations(row_rule, book_rule, feasible_books)
 
+        # A section or floor is complete only with every one of its bookcases open, so
+        # these carry the whole-section gate on top of the bundle count.
         for sec in active_sections:
             need = max((series_need(ser) for ser in sec.series), default=1)
+            gitem, gn = self._section_gate(sec)
             mw.get_location(section_completion_name(sec.id), p).access_rule = (
-                lambda state, k=need: state.count(ITEM_PROG_BUNDLE, p) >= k)
+                lambda state, k=need, gi=gitem, gn=gn: (
+                    state.count(ITEM_PROG_BUNDLE, p) >= k and state.has(gi, p, gn)))
 
         floors: dict[int, list] = {}
         for sec in active_sections:
             floors.setdefault(sec.floor, []).append(sec)
         for fl, secs in floors.items():
             need = max((series_need(ser) for sec in secs for ser in sec.series), default=1)
+            fgates = [self._section_gate(sec) for sec in secs]
             mw.get_location(f"Floor {fl} Complete", p).access_rule = (
-                lambda state, k=need: state.count(ITEM_PROG_BUNDLE, p) >= k)
+                lambda state, k=need, gs=fgates: (
+                    state.count(ITEM_PROG_BUNDLE, p) >= k
+                    and all(state.has(gi, p, gn) for gi, gn in gs)))
 
-        # Rows finishable = series whose last book is within reach. Sorted, so the count is
-        # a binary search rather than a walk, and it is exact -- a row is not a fixed number
-        # of books, they hold 3, 5 or 10.
-        need_per_series = sorted(series_need(ser)
-                                 for sec in active_sections for ser in sec.series)
-        total_rows = len(need_per_series)
-
-        def feasible_rows(state) -> int:
-            held = state.count(ITEM_PROG_BUNDLE, p)
-            lo, hi = 0, len(need_per_series)
-            while lo < hi:                      # need_per_series is sorted
-                mid = (lo + hi) // 2
-                if need_per_series[mid] <= held:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            return lo
+        total_rows = sum(len(sec.series) for sec in active_sections)
 
         # The player levels up per ROW shelved, so the XP curve is compared against rows.
         # This used to scale it by an average books-per-row, which is the same rows-for-books
@@ -2052,13 +2196,20 @@ class LibrarianWorld(World):
         # Per-book locations (depth-1) + section completions. The rule inlines
         # has() (state.prog_items[p][n] >= 1); this lambda is evaluated a huge
         # number of times per fill, so skipping the method call is a real win.
+        # Under count mode the checks are the count rungs instead, and every held book
+        # can be shelved (all bookcases open), so a rung needs that many book items.
+        if self.check_by_count:
+            for n in self.count_ticks:
+                mw.get_location(f"Shelved {n} Books", p).access_rule = (
+                    lambda state, k=n: feasible_books(state) >= k)
         for sec in active_sections:
-            for ser in sec.series:
-                for ch in range(ser.volumes):
-                    iname = book_item_name(ser.name, ch)
-                    loc = mw.get_location(_book_name(sec.id, ser.name, ch), p)
-                    loc.access_rule = (
-                        lambda state, n=iname: state.prog_items[p][n] >= 1)
+            if not self.check_by_count:
+                for ser in sec.series:
+                    for ch in range(ser.volumes):
+                        iname = book_item_name(ser.name, ch)
+                        loc = mw.get_location(_book_name(sec.id, ser.name, ch), p)
+                        loc.access_rule = (
+                            lambda state, n=iname: state.prog_items[p][n] >= 1)
             sec_loc = mw.get_location(section_completion_name(sec.id), p)
             sec_loc.access_rule = (
                 lambda state, sid=sec.id: section_done_book(state, sid))
@@ -2095,11 +2246,12 @@ class LibrarianWorld(World):
                 lambda state, n=data.XP_CURVE[level_n - 1]:
                 feasible_rows_book(state) >= n)
 
-        for thresh in BOOK_COMPLETION_THRESHOLDS:
-            if thresh > max_books:
-                continue
-            loc = mw.get_location(f"Correctly shelve {thresh} books", p)
-            loc.access_rule = (lambda state, n=thresh: feasible_books(state) >= n)
+        if not self.check_by_count:      # count mode has rungs instead of milestones
+            for thresh in BOOK_COMPLETION_THRESHOLDS:
+                if thresh > max_books:
+                    continue
+                loc = mw.get_location(f"Correctly shelve {thresh} books", p)
+                loc.access_rule = (lambda state, n=thresh: feasible_books(state) >= n)
 
         # custom counts BOOKS here, not rows: 400 rows hold 3072 books, so a row-shaped
         # target would end the run almost immediately. Capped at the goal's own book total.
@@ -2676,6 +2828,7 @@ class LibrarianWorld(World):
             # Options hold defaults on a tracker re-gen, so this has to ride slot_data
             # or the tracker rebuilds the seed with the bookcases gated the wrong way.
             "bookcase_unlocks": int(self.bookcase_unlocks),
+            "magic_skills_enabled": list(self.enabled_skills),
             # section id -> how many bookcases one unlock item opens. 1 under the
             # progressive mode, the whole section under "whole"; the client cannot
             # tell the two apart from the item name alone.

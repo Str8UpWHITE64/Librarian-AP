@@ -86,8 +86,6 @@ return {
     -- "off". The pile sink alone was not enough -- the skill also lights the book actor, which is a
     -- separate layer and the one actually seen.
     MAGIC_WARD_SAMETYPE_FX = true,
-
-    -- DEV, DESTRUCTIVE. Arms F6 to call the Recall Stone's confirm handler, to learn what it does to
     -- books -- specifically which per-book call it makes, so that call can be aimed at just the books
     -- we displaced. It takes no arguments, so it recalls EVERY loose book, not only ours: it
     -- rearranges the world and will change the recorded book layout. Only ever turn this on for a

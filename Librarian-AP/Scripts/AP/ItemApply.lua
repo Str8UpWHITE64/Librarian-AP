@@ -536,6 +536,12 @@ function M.set_slot_data(slot_data)
     M._sent_count_ticks = {}
 
     M._book_sanity_enabled = (slot_data.book_sanity == 1)
+    -- book_sanity used to answer two different questions at once, and random_book_bundle is
+    -- the first mode where they differ: it hands out books individually (so a book is
+    -- unwarded by its OWN arrival, not its series') while its checks may be rows or counts.
+    -- Splitting them is what stops a bundle seed showing an empty library.
+    M._per_book_unlocks = M._book_sanity_enabled or M._random_bundle
+    M._per_book_checks = false   -- set below, once book_location_map is read
     M._book_location_map = (type(slot_data.book_location_map) == "table")
         and slot_data.book_location_map or {}
     M._book_item_to_book = (type(slot_data.book_item_to_book) == "table")
@@ -544,6 +550,8 @@ function M.set_slot_data(slot_data)
     M._books_correct_seen = {}
     -- Flat array of this seed's book location IDs, so the completion count can be taken against the
     -- server's checked set without walking the string-keyed map each time.
+    -- Books are the CHECKS when the seed mapped book locations, whatever hands them out.
+    M._per_book_checks = next(M._book_location_map) ~= nil
     M._book_loc_ids = {}
     for _, lid in pairs(M._book_location_map) do
         local n = tonumber(lid)
@@ -761,7 +769,7 @@ function M.set_apply_safe(state)
         -- completion thresholds being late or missing. Asking here costs one fast sweep (the whole
         -- library in ~4 passes) and it still runs behind the same apply-safe gate as every other
         -- book walk, so it cannot touch a half-built actor.
-        if M._book_sanity_enabled or M._check_by_count then
+        if M._per_book_checks or M._check_by_count then
             M.request_full_book_scan()
         end
     end
@@ -1527,6 +1535,22 @@ function M._compute_unwarded_set(only_shelfable)
     return unwarded
 end
 
+--- Series whose home bookcase is open right now, unlock state aside.
+---
+--- The per-book unlocks (bundles, individual books) reveal a book on its own item, so the
+--- series gate above never sees them: with no series unlocked its set is empty, and every
+--- bundled book came out whether or not its bookcase was open. only_unward_shelfable_books
+--- means the same thing however a book arrived, so the per-book path checks this instead.
+function M._compute_case_open_set()
+    local open = {}
+    local shelf_req_map = (M._slot_data and M._slot_data.shelf_req_map) or {}
+    for series_name, section_id in pairs(M._series_to_section) do
+        local cases_open = M._shelves_open[section_id] or 0
+        if cases_open >= (shelf_req_map[series_name] or 1) then open[series_name] = true end
+    end
+    return open
+end
+
 -- Chunked-flush tuning: books per tick, and the yield between chunks so the LoopAsync poll
 -- thread can pump c:poll(). 50ms < the 100-150ms AP heartbeat, keeping the socket alive.
 local BOOK_APPLY_CHUNK_SIZE     = M._poll_on_game_thread and 30 or 300  -- single-thread: tiny chunks/frame (spread the flush over ~100 frames, <1s even at 120fps)
@@ -1562,6 +1586,7 @@ function M._apply_books_to_world()
     local only_shelfable = M._slot_data
         and M._slot_data.only_unward_shelfable_books == 1
     local unwarded_set = M._compute_unwarded_set(only_shelfable)
+    local case_open_set = only_shelfable and M._compute_case_open_set() or nil
 
     -- MOD-thread snapshots of the Lua state tables the game-thread finalizer (_finalize_apply_books,
     -- which runs INSIDE the L1 pump closure) diffs against. The finalizer must never iterate the live
@@ -1628,7 +1653,7 @@ function M._apply_books_to_world()
     -- Each series' HISM = HISMArray[aidx+1]; the instance at index==Chapter is that volume. nil
     -- (feature off) unless book_sanity + hidden mode + the diag flag are all on.
     local hism_arr
-    if M._book_sanity_enabled and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT") then
+    if M._per_book_unlocks and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT") then
         local mgr = FindFirstOf("BP_HISM_Manager_C")
         if mgr and mgr:IsValid() then pcall(function() hism_arr = mgr.HISMArray end) end
     end
@@ -1742,14 +1767,17 @@ function M._apply_books_to_world()
         -- and the pile-instance teleport after warding. In book mode no series is unlocked, so the
         -- per-book gate (its own item arrived) is what reveals a book. Reads the atomic snapshot.
         local chapter = nil
-        if M._book_sanity_enabled and series_name then
+        if M._per_book_unlocks and series_name then
             pcall(function()
                 local info = book.ItemInfo
                 if info and info:IsValid() then chapter = tonumber(info.Chapter) end
             end)
             if not should_unward and chapter ~= nil then
                 local bu = M._books_unlocked
-                if bu and bu[series_name .. "|" .. chapter] then should_unward = true end
+                if bu and bu[series_name .. "|" .. chapter]
+                        and (not case_open_set or case_open_set[series_name]) then
+                    should_unward = true
+                end
             end
         end
         local key = book:GetFullName()
@@ -1987,6 +2015,7 @@ function M.reconcile_book_actors()
         M._recon_epoch = M._world_epoch
         local only_shelfable = M._slot_data and M._slot_data.only_unward_shelfable_books == 1
         M._recon_uw = M._compute_unwarded_set(only_shelfable)
+        M._recon_case_open = only_shelfable and M._compute_case_open_set() or nil
         if M._recon_n == 0 then return end
     end
     local books = M._recon_books
@@ -2009,13 +2038,14 @@ function M.reconcile_book_actors()
             -- SM_Book_1 on look is never undone for individually-unlocked books.
             local reconcile_this = series and unwarded[series]
             if not reconcile_this and series
-                    and M._book_sanity_enabled and M._books_unlocked then
+                    and M._per_book_unlocks and M._books_unlocked then
                 local chapter = nil
                 pcall(function()
                     local info = b.ItemInfo
                     if info and info:IsValid() then chapter = tonumber(info.Chapter) end
                 end)
-                if chapter ~= nil and M._books_unlocked[series .. "|" .. chapter] then
+                if chapter ~= nil and M._books_unlocked[series .. "|" .. chapter]
+                        and (not M._recon_case_open or M._recon_case_open[series]) then
                     reconcile_this = true
                 end
             end
@@ -3036,7 +3066,7 @@ end
 function M.detect_correct_books()
     -- by_count rides this same walk: it has no book locations to fire, but it needs the count
     -- of correctly shelved books, and that is exactly what this sweep already establishes.
-    if not (M._book_sanity_enabled or M._check_by_count) then return 0 end
+    if not (M._per_book_checks or M._check_by_count) then return 0 end
     local blm = M._book_location_map or {}
     if not (M._check_by_count or next(blm)) then return 0 end
     local APClient = package.loaded["AP/APClient"]
@@ -3587,7 +3617,7 @@ end
 --- arithmetic to keep aligned with the apworld's ordering.
 function M.fire_book_completion_checks()
     if not M._slot_data then return 0 end
-    if not M._book_sanity_enabled then return 0 end
+    if not M._per_book_checks then return 0 end
     local map = M._slot_data.book_completion_map
     if type(map) ~= "table" then return 0 end
     local APClient = package.loaded["AP/APClient"]
@@ -4650,7 +4680,7 @@ end
 --- is already down, and taking that pose as the rest pose would sink the well a second time and
 --- strand the book when it unlocks.
 function M.resink_pile(aidx, chapter)
-    if not (M._book_sanity_enabled and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT")) then return false end
+    if not (M._per_book_unlocks and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT")) then return false end
     local st = M._book_inst_state[aidx .. "|" .. chapter]
     if not (st and st.hidden and st.orig and st.orig.Translation) then return false end
     local arr = _hism_arr()
@@ -4668,7 +4698,7 @@ end
 -- only the >=0 -> -1 edge sticks. GetShowingSameTypeIdx is the gate -- it returns the shown
 -- asset-idx while the skill is up, -1 when idle. IsSkillActivated reads unlocked-ness, not firing.
 function M.resweep_book_piles()
-    if not (M._book_sanity_enabled and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT")) then return end
+    if not (M._per_book_unlocks and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT")) then return end
     if not (M._gameplay_active and M._apply_safe) then return end
     local hism_arr = _hism_arr()
     if not hism_arr then return end
