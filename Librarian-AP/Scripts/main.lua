@@ -66,6 +66,7 @@ local _gt_pending_activate = nil  -- reason string set by a title-button hook; c
 local _gt_pending_f12 = false     -- F12/F4/F6 fire on the UE4SS input thread; the binds set a
 local _gt_pending_f4  = false     -- boolean and the master tick runs the actual work
 local _gt_pending_f6  = false     -- dev: fire the Recall Stone once (MAGIC_TEST_RECALL_STONE)
+local _gt_pending_f7  = false     -- accept the loaded save as this run's (layout mismatch only)
 local _l3_resume = nil            -- L3 (book-pile HISM) chunk resume; the master scheduler advances it one chunk/frame
 local _l3c_ep, _l3c_mgr, _l3c_mat, _l3c_ready   -- L3 setup scan cache (per world epoch): HISM mgr / mask material / ready flag
 local _gt_last_epoch = -1         -- last world epoch the scheduler saw; a bump means the captured warding arrays are freed
@@ -2109,10 +2110,7 @@ local function identity_evaluate(why)
         if v == SI.REJECTED then
             pcall(function()
                 local H = package.loaded["AP/HUD"]
-                if H then
-                    H.notify(("AP: this save does not match your run - checks paused. %s")
-                        :format(SI.reason or ""), 30.0)
-                end
+                if H then H.notify(SI.reject_advice(), 45.0) end
             end)
         end
     end
@@ -2509,11 +2507,7 @@ local function start_gameplay_loops()
             if _reject_nag % 7 == 1 then   -- ~every 21s on the 3s loop
                 pcall(function()
                     local H = package.loaded["AP/HUD"]
-                    if H then
-                        H.notify(("AP: WRONG SAVE - checks are paused. %s")
-                            :format(SI.reason or "load this run's save (slot "
-                                .. tostring(SI.slot) .. ")"), 20.0)
-                    end
+                    if H then H.notify(SI.reject_advice(), 20.0) end
                 end)
             end
         elseif _reject_nag then
@@ -3995,6 +3989,21 @@ _G._librarian_gt_master_tick = function(dt_ms)
             log("[F12] already connected")
         end
     end
+    if _gt_pending_f7 then                               -- F7 pressed on the input thread
+        _gt_pending_f7 = false
+        local SI7 = package.loaded["AP/SaveIdentity"]
+        local IA7 = package.loaded["AP/ItemApply"]
+        local H7 = package.loaded["AP/HUD"]
+        local ok7, why7 = false, "save identity unavailable"
+        if SI7 then ok7, why7 = SI7.accept_loaded_save() end
+        log(("[save-id] F7 accept: %s%s"):format(tostring(ok7), ok7 and "" or (" (" .. tostring(why7) .. ")")))
+        if ok7 then
+            if H7 then H7.notify("AP: save accepted as this run's. Checks resume.", 15.0) end
+            if IA7 and IA7._gameplay_active and IA7._apply_safe then pcall(function() IA7.flush_apply() end) end
+        elseif H7 then
+            H7.notify("AP: cannot accept this save: " .. tostring(why7), 15.0)
+        end
+    end
     if _gt_pending_f6 then                               -- F6 pressed on the input thread
         _gt_pending_f6 = false
         -- Diagnostics live in dev/AP/probe_magic.lua and are attached to _dev only under
@@ -4890,7 +4899,77 @@ local function menu_set_fields(server, slot, password)
     if not ok then log("[menu] set_fields FAILED: " .. tostring(err)) end
 end
 
+-- The window is a Border in a canvas slot anchored to stretch across the screen with a fixed
+-- right margin, so its width is whatever the viewport leaves over: about 290 on a 1080p Windows
+-- screen, about 90 on a 16:10 or DPI-scaled one (the Linux reports), and the fields, plain
+-- EditableText sized to their text, clip inside that. Collapse the anchors so the panel has a
+-- real size and the fields fill it, so nothing depends on the screen. Idempotent;
+-- runs on the game thread each time the window is shown. Nested in menu_show rather than a
+-- chunk-level local: the main chunk sits at Lua's 200-local ceiling.
 local function menu_show()
+  local MENU_W, MENU_MIN_H = 480, 340
+  -- Every widget under the root, with its class name. Names are not variables on the widget
+  -- (reading one back gives an invalid wrapper, not nil), so the tree is the only way in.
+  local function menu_walk(widget, out, depth)
+    if not (widget and widget:IsValid()) or depth > 8 then return end
+    local cls, nm = "?", "?"
+    pcall(function() cls = widget:GetClass():GetFName():ToString() end)
+    pcall(function() nm = widget:GetFName():ToString() end)
+    out[#out + 1] = { w = widget, cls = cls, name = nm }
+    local n = 0
+    pcall(function() n = widget:GetChildrenCount() end)
+    for i = 0, n - 1 do
+      local c = nil
+      pcall(function() c = widget:GetChildAt(i) end)
+      menu_walk(c, out, depth + 1)
+    end
+  end
+  local function menu_fix_layout(w)
+    if not (w and w:IsValid()) then return end
+    local root = nil
+    pcall(function() root = w.WidgetTree.RootWidget end)
+    local found = {}
+    menu_walk(root, found, 0)
+    if not _G._librarian_menu_tree_logged then
+      _G._librarian_menu_tree_logged = true
+      local names = {}
+      for _, e in ipairs(found) do names[#names + 1] = e.name .. ":" .. e.cls end
+      log(("[menu] layout: tree (%d): %s"):format(#found, table.concat(names, ", ")))
+    end
+    local border = nil
+    for _, e in ipairs(found) do
+      if e.cls == "Border" then border = e.w; break end
+    end
+    if not border then log("[menu] layout: panel not found"); return end
+    local slot = border.Slot
+    local before, left, top = "?", 40, 40
+    pcall(function() local sz = slot:GetSize(); before = ("%.0fx%.0f"):format(sz.X, sz.Y) end)
+    pcall(function() local pos = slot:GetPosition(); left, top = pos.X, pos.Y end)
+    pcall(function() border:ForceLayoutPrepass() end)
+    local dw, dh = 0, 0
+    pcall(function() local d = border:GetDesiredSize(); dw, dh = d.X, d.Y end)
+    local want_w, want_h = math.max(MENU_W, dw), math.max(MENU_MIN_H, dh)
+    -- Collapse the anchors onto their own minimum corner, so Size is a size again instead of a
+    -- margin, and leave the position alone: the Blueprint places the panel relative to that
+    -- corner (it reads 36,-358), and moving the anchor to the top-left put it off screen.
+    local amin, amax = "?", "?"
+    local anchored = pcall(function()
+      local a = slot:GetAnchors()
+      amin = ("%.2f,%.2f"):format(a.Minimum.X, a.Minimum.Y)
+      amax = ("%.2f,%.2f"):format(a.Maximum.X, a.Maximum.Y)
+      slot:SetAnchors({ Minimum = { X = a.Minimum.X, Y = a.Minimum.Y },
+                        Maximum = { X = a.Minimum.X, Y = a.Minimum.Y } })
+    end)
+    local ok = pcall(function()
+      slot:SetAutoSize(false)
+      slot:SetSize({ X = want_w, Y = want_h })
+    end)
+    local after = "?"
+    pcall(function() local sz = slot:GetSize(); after = ("%.0fx%.0f"):format(sz.X, sz.Y) end)
+    log(("[menu] layout: panel slot was %s at %.0f,%.0f anchors %s..%s, desired %.0fx%.0f -> anchors %s, "
+        .. "set %.0fx%.0f (%s, reads back %s)"):format(before, left, top, amin, amax, dw, dh,
+        anchored and "collapsed" or "UNCHANGED", want_w, want_h, ok and "ok" or "FAILED", after))
+  end
     local ma = _get_mod_actor()
     if not ma then log("[menu] show: no ModActor_C"); return end
     local path = "?"
@@ -4917,6 +4996,7 @@ local function menu_show()
         end
     end)
     log("[menu] post-show: ConnectMenuRef = " .. ref_status)
+    pcall(function() menu_fix_layout(ma.ConnectMenuRef) end)
 end
 
 local function menu_hide()
@@ -4957,6 +5037,8 @@ RegisterKeyBind(Key.F4, function() _gt_pending_f4 = true end)
 -- is the corruption everything else here was rewritten to avoid.
 -- Inert unless MAGIC_TEST_RECALL_STONE is on, so a stray press cannot rearrange a real run.
 RegisterKeyBind(Key.F6, function() _gt_pending_f6 = true end)
+-- F7: vouch for the loaded save after a layout-mismatch refusal. Same input-thread discipline.
+RegisterKeyBind(Key.F7, function() _gt_pending_f7 = true end)
 
 -- DEV: feasibility probe harness (AP/probe.lua). Loads only when diag PROBE_MODE is EXPLICITLY
 -- true -- diag_on() defaults missing flags to ON, so gate on the raw table value to keep the
