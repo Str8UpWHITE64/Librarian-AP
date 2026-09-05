@@ -1022,13 +1022,27 @@ function M._recompute_state()
             end
         end
     else
-        -- Grouped (default): series_order[1..count*per_unlock].
-        local series_count = M._received_counts["Progressive Series Unlock"] or 0
+        -- Grouped (default). Numbered bundles (3.0.0 beta 2): "Series Bundle k" opens
+        -- series_order[(k-1)*per+1 .. k*per], whatever order they arrive in. Older
+        -- seeds send copies of one name, and the count is a prefix of the same order.
         local per_unlock = M._slot_data.series_per_unlock or 5
         local series_order = M._slot_data.series_order or {}
-        local total_series = math.min(series_count * per_unlock, #series_order)
-        for i = 1, total_series do
-            series_unlocked[series_order[i]] = true
+        local numbered = false
+        for item_name, count in pairs(M._received_counts) do
+            local k = tonumber(item_name:match("^Series Bundle (%d+)$"))
+            if k and count and count > 0 then
+                numbered = true
+                for i = (k - 1) * per_unlock + 1, math.min(k * per_unlock, #series_order) do
+                    series_unlocked[series_order[i]] = true
+                end
+            end
+        end
+        if not numbered then
+            local series_count = M._received_counts["Progressive Series Unlock"] or 0
+            local total_series = math.min(series_count * per_unlock, #series_order)
+            for i = 1, total_series do
+                series_unlocked[series_order[i]] = true
+            end
         end
     end
 
@@ -1076,20 +1090,38 @@ function M._recompute_state()
     -- book_order, so the unlocked set is a prefix of that list. Same shape as the grouped
     -- series_order walk above, and it reuses book_item_to_book to resolve each name.
     if M._random_bundle then
-        local held = M._received_counts["Progressive Book Bundle"] or 0
         local order = M._book_order or {}
-        local upto = held * M._books_per_bundle
-        if upto > #order then upto = #order end
+        local per = M._books_per_bundle
         local item_to_book = M._book_item_to_book or {}
-        for i = 1, upto do
-            local ac = item_to_book[order[i]]
-            if type(ac) == "table"
-                    and type(ac[1]) == "string" and type(ac[2]) == "number" then
-                books_unlocked[ac[1] .. "|" .. ac[2]] = true
+        local function unlock_slice(k)
+            for i = (k - 1) * per + 1, math.min(k * per, #order) do
+                local ac = item_to_book[order[i]]
+                if type(ac) == "table"
+                        and type(ac[1]) == "string" and type(ac[2]) == "number" then
+                    books_unlocked[ac[1] .. "|" .. ac[2]] = true
+                end
             end
         end
-        log(("[bundle] %d bundle(s) x %d = %d of %d books unlocked"):format(
-            held, M._books_per_bundle, upto, #order))
+        -- Numbered bundles (3.0.0 beta 2): "Book Bundle k" is slice k of book_order,
+        -- in whatever order they arrive. Older seeds send copies of one name; the
+        -- count is a prefix of the same order.
+        local held, numbered = 0, false
+        for item_name, count in pairs(M._received_counts) do
+            local k = tonumber(item_name:match("^Book Bundle (%d+)$"))
+            if k and count and count > 0 then
+                numbered = true
+                held = held + 1
+                unlock_slice(k)
+            end
+        end
+        if not numbered then
+            held = M._received_counts["Progressive Book Bundle"] or 0
+            for k = 1, held do unlock_slice(k) end
+        end
+        local nb = 0
+        for _ in pairs(books_unlocked) do nb = nb + 1 end
+        log(("[bundle] %d bundle(s) x %d -> %d of %d books unlocked%s"):format(
+            held, per, nb, #order, numbered and " (numbered)" or ""))
     end
 
     -- Publish atomically (single reference assignment each), tables first so the snapshot below is

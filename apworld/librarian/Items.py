@@ -62,6 +62,8 @@ class LibrarianItemCategory(IntEnum):
     BOOK        = 9   # per-book items (book_sanity)
     BOOK_BUNDLE = 10  # Progressive Book Bundle (N random books each)
     SECTION     = 11  # Section Unlock: <SectionId> (opens all of a section's bookcases)
+    SERIES_BUNDLE = 12  # Series Bundle N: the N-th group of series_per_unlock series
+    BOOK_BUNDLE_N = 13  # Book Bundle N: the N-th group of books_per_bundle books
 
 
 class LibrarianItemData(NamedTuple):
@@ -194,6 +196,37 @@ _book_items: list[LibrarianItemData] = [
     for _idx, (_asset_idx, _chapter, _sid, _series_name) in enumerate(data.ALL_BOOKS)
 ]
 
+# --- Numbered bundles ---
+#
+# A bundle is a specific item rather than one more copy of a name, so a hint or a
+# tracker can point at the one holding a given book. What the k-th bundle holds is still
+# decided per seed (slot_data carries the order); the datapackage only needs enough
+# names for the largest possible count: 400 series at 3 per bundle, 3072 books at 2.
+MAX_SERIES_BUNDLES = 134
+MAX_BOOK_BUNDLES = 1536
+
+
+def series_bundle_name(k: int) -> str:
+    return f"Series Bundle {k}"
+
+
+def book_bundle_name(k: int) -> str:
+    return f"Book Bundle {k}"
+
+
+_series_bundle_items: list[LibrarianItemData] = [
+    LibrarianItemData(series_bundle_name(_k), 1199 + _k,
+                      LibrarianItemCategory.SERIES_BUNDLE, ItemClassification.progression)
+    for _k in range(1, MAX_SERIES_BUNDLES + 1)
+]
+
+_book_bundle_items: list[LibrarianItemData] = [
+    LibrarianItemData(book_bundle_name(_k), 5999 + _k,
+                      LibrarianItemCategory.BOOK_BUNDLE_N,
+                      ItemClassification.progression_skip_balancing)
+    for _k in range(1, MAX_BOOK_BUNDLES + 1)
+]
+
 # --- Skill Mastery (useful) + Fatigue (trap) ---
 #
 # Mastery: pushes a skill one step past its real max along the game's tuning curve (lower cooldown,
@@ -237,6 +270,8 @@ _all_items: list[LibrarianItemData] = (
     + _filler_items
     + _individual_series_items
     + _book_items
+    + _series_bundle_items
+    + _book_bundle_items
 )
 
 item_dictionary: dict[str, LibrarianItemData] = {it.name: it for it in _all_items}
@@ -254,6 +289,8 @@ item_name_groups: dict[str, set[str]] = {
     "Filler":           {it.name for it in _filler_items},
     "Series Unlocks (Individual)": {it.name for it in _individual_series_items},
     "Books":            {it.name for it in _book_items},
+    "Series Bundles":   {it.name for it in _series_bundle_items},
+    "Book Bundles":     {it.name for it in _book_bundle_items},
     "Skill Mastery":    {it.name for it in _attunement_items},
     "Book Capacity":    {it.name for it in _bag_items},
     "Traps":            {it.name for it in _fatigue_items},
@@ -316,6 +353,8 @@ for cat, lo, hi in [
     (LibrarianItemCategory.FILLER,       400, 499),
     (LibrarianItemCategory.SERIES_INDIV, 700, 1199),
     (LibrarianItemCategory.BOOK,         2000, 5099),
+    (LibrarianItemCategory.SERIES_BUNDLE, 1200, 1399),
+    (LibrarianItemCategory.BOOK_BUNDLE_N, 6000, 7599),
 ]:
     for it in _all_items:
         if it.category == cat:

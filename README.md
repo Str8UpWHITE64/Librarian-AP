@@ -269,7 +269,7 @@ Every pairing but one can be built. The one that cannot is switched to
 
 | `unlock_mode` \ `check_mode` | `series`       | `booksanity` | `count` |
 |-----------------------------|----------------|--------------|---------|
-| `progressive_unlocks`       | yes            | yes          | yes     |
+| `random_series_bundles`       | yes            | yes          | yes     |
 | `individual_series_unlocks` | yes            | yes          | yes     |
 | `random_book_bundle`        | yes            | yes          | yes     |
 | `individual_book_unlocks`   | to booksanity  | yes          | yes     |
@@ -293,6 +293,7 @@ YAML, under `librarian_options`:
 ```yaml
 librarian_options:
   allow_individual_book_unlocks: false
+  allow_numbered_book_bundles: false
 ```
 
 `individual_book_unlocks` on the `full` goal puts 3,072 progression items in
@@ -304,7 +305,10 @@ YAML asking for that shape is refused with a message naming this setting;
 set it `true` to allow it. Floor and custom goals in that mode are fine and
 need nothing.
 
-Archipelago writes the key into `host.yaml` the first time it loads the
+`allow_numbered_book_bundles` gates `numbered_book_bundles` the same way; see
+that option under Unlocks for what it costs.
+
+Archipelago writes the keys into `host.yaml` the first time it loads the
 apworld, so look there after one generation.
 
 ---
@@ -365,7 +369,7 @@ and what several of the other options mean.
 
 | Value                       | Meaning                                                                      |
 |-----------------------------|------------------------------------------------------------------------------|
-| `progressive_unlocks`       | (Default) Series unlock in groups of `series_per_unlock`. Smallest pool.     |
+| `random_series_bundles`       | (Default) Series unlock in groups of `series_per_unlock`. Smallest pool.     |
 | `individual_series_unlocks` | Each of the ~400 series is its own item. Every bookcase starts open.         |
 | `random_book_bundle`        | Each item hands you `books_per_bundle` books from anywhere, ignoring series. |
 | `individual_book_unlocks`   | Each of the ~3,072 books is its own item. Every bookcase starts open. Full goal needs host permission. |
@@ -373,28 +377,56 @@ and what several of the other options mean.
 In the two individual modes every bookcase starts open, so `bookcase_unlocks`
 does not apply to them.
 
-`random_book_bundle` items arrive as a single repeated `Progressive Book
-Bundle`; which books each one carries is fixed by the seed, so the same seed
-always hands them out in the same order.
+Series bundles are numbered items, `Series Bundle 12`, so a hint can be asked
+for the exact one; they arrive in any order. Book bundles are copies of one
+item, `Progressive Book Bundle`, that open the seed's order in sequence,
+unless `numbered_book_bundles` is on (see below). Which books a bundle carries
+is fixed by the seed either way.
+
+**Which bundle has a book in it?** Ask Universal Tracker. Its
+`/get_logical_path` command answers for any book or row check, for example:
+
+```
+Book: 2L - Alchemy Tomes Vol 3 -- not in logic yet. Book Bundle 12: not yet
+received; bookcase: Progressive Shelf Unlock (2L) x2 (you hold 1).
+```
+
+The tracker autofills location names into that command, so pick the book from
+its list. Under series bundles it names the `Series Bundle` instead; with
+plain book bundles it says which copy ("the 12th Progressive Book Bundle: you
+hold 7, 5 more to go"); a row under book bundles lists every bundle holding
+one of its volumes. The same bundle names show up in the tracker's region
+path for the check.
+
+#### `numbered_book_bundles`
+
+Toggle (default `false`). `random_book_bundle` only. Makes every book bundle
+its own item, `Book Bundle 1`, `Book Bundle 2`, ..., so a hint can target the
+exact one; they then arrive in any order. Needs the host's permission
+(`allow_numbered_book_bundles` in `host.yaml`), because numbered book bundles
+make the fill work much harder: about three times the generation time with
+`check_mode: count`, growing steeply with the lobby size, and it can fail to
+generate with unlocked bookcases and series checks. Off, the tracker still
+answers which bundle holds a book.
 
 #### `series_per_unlock`
 
-How many series each `Progressive Series Unlock` item grants. Range 3-10.
+How many series each `Series Bundle` item grants. Range 3-10.
 Default 5. Lower values mean more items in the pool, each with smaller impact;
 higher values mean fewer items, each more impactful.
 
-Only applies to `progressive_unlocks`; the other three hand out series or books
-directly. With `check_mode: count`, values below 5 are raised to 5.
+Only applies to `random_series_bundles`; the other three hand out series or books
+directly.
 
 #### `books_per_bundle`
 
-How many books arrive in each `Progressive Book Bundle`. Range 2-50. Default
+How many books arrive in each `Book Bundle`. Range 2-50. Default
 10. `random_book_bundle` only.
 
 Higher means fewer, larger deliveries. Raised automatically if the seed would
 need more bundles than it has checks to put them in, and a little further with
-`check_mode: series` so the rows stay fillable, so a small number on a large
-goal is a request rather than a guarantee.
+`check_mode: series` or `count` so the checks stay fillable, so a small number
+on a large goal is a request rather than a guarantee.
 
 #### `starting_series_count`
 
@@ -406,7 +438,7 @@ What the number buys depends on the unlock mode:
 
 | `unlock_mode` | what you start with |
 |---|---|
-| `progressive_unlocks`, `individual_series_unlocks` | That many series. |
+| `random_series_bundles`, `individual_series_unlocks` | That many series. |
 | `random_book_bundle` | Enough bundles to cover that many series, so the real amount depends on `books_per_bundle`. |
 | `individual_book_unlocks` | That many series' *worth* of books. Each one rolls a series size (3, 5 or 10 volumes), so 5 starts you with roughly 15 to 50 individual books. |
 
@@ -438,7 +470,7 @@ It does that two ways, depending on the goal:
 | goal | what it does |
 |---|---|
 | `custom` | Grows the trimmed seed. A 200-row goal at 10 keeps about 220 rows instead of 200, and the extra rows bring extra unlocks with them. |
-| `full` / `floor_1` / `floor_2` | The seed already holds everything, so there is nothing to grow. It adds that percentage of extra `Progressive Series Unlock` items to the pool instead, replacing filler. |
+| `full` / `floor_1` / `floor_2` | The seed already holds everything, so there is nothing to grow. It adds that percentage of extra `Series Bundle` items to the pool instead, replacing filler. |
 
 On a 200-row custom goal: 0 gives no margin, 10 gives about three spare unlocks,
 20 gives about eight.
@@ -447,14 +479,14 @@ The cap is 20. Past that it starts costing `spare_shelf_items` whole steps, and
 on a custom goal a bigger margin mostly just re-adds the surplus checks the trim
 exists to remove.
 
-The spare-copy half is `progressive_unlocks` only. Everywhere else each series
+The spare-copy half is `random_series_bundles` only. Everywhere else each series
 or book is its own specific item, or bundles are handed out to a fixed count, so
 a duplicate unlocks nothing. A `custom` goal in any mode still trims the seed by
 this percentage.
 
 #### `spare_shelf_items`
 
-Range 0-3. Default 0. Full and floor goals, with `progressive_unlocks` and
+Range 0-3. Default 0. Full and floor goals, with `random_series_bundles` and
 `bookcase_unlocks: progressive`.
 
 The same idea for bookcases, as a count per bookcase rather than a percentage,

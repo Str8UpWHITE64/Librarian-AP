@@ -44,6 +44,8 @@ from .Items import (
     _filler_items,
     series_unlock_item_name,
     book_item_name,
+    series_bundle_name,
+    book_bundle_name,
 )
 from .Locations import (
     LibrarianLocation,
@@ -271,6 +273,14 @@ class LibrarianWorld(World):
         # individual mode: O(1) count of held series items (== feasible_rows, since
         # all shelves are precollected so has(shelf) is always true).
         self._seriescount_key = f"_librarian_seriescount_{player}"
+        # Held series groups / book bundles, as frozensets replaced on every change so
+        # the copy hook can carry them by reference. A fungible copy counts as "the next
+        # group", a numbered bundle as its own number, so one set serves both shapes.
+        self._sgroups_key = f"_librarian_sgroups_{player}"
+        self._bbundles_key = f"_librarian_bbundles_{player}"
+        self._bgate_key = f"_librarian_bgate_{player}"
+        self._bser_key = f"_librarian_bser_{player}"
+        self._brow_key = f"_librarian_brow_{player}"
         self._is_book_sanity = False  # set in generate_early
 
     # Sections in the active goal scope. Floor goals filter the pool to
@@ -469,6 +479,48 @@ class LibrarianWorld(World):
             return "unlock_mode: individual_book_unlocks on goal: full"
         return ""
 
+    @property
+    def distinct_bundles(self) -> bool:
+        """Numbered Series Bundle items rather than copies of one name.
+
+        A tracker re-gen of a seed made before this reads the old shape from slot_data,
+        so both shapes stay buildable; new seeds always number their series bundles."""
+        pt = self._ut_passthrough()
+        if pt:
+            return bool(pt.get("bundle_items", 0))
+        return True
+
+    @property
+    def numbered_book_bundles(self) -> bool:
+        """Book Bundle k items instead of copies of Progressive Book Bundle.
+
+        Off by default: measured, numbering the book bundles costs about three times
+        the generation time under count checks, where the series bundles cost nothing.
+        So it is an option, and one the host has to allow. With row checks the fill
+        needs the order fill_hook gives it; see there."""
+        pt = self._ut_passthrough()
+        if pt:
+            return bool(pt.get("numbered_books", 0))
+        return bool(self.options.numbered_book_bundles.value)
+
+    def _series_group_req(self, k: int) -> tuple[str, int]:
+        """The item and count that open the k-th group of series."""
+        if self.distinct_bundles:
+            return series_bundle_name(k), 1
+        return ITEM_PROG_SERIES, k
+
+    def _book_bundle_req(self, k: int) -> tuple[str, int]:
+        """The item and count that open the k-th book bundle."""
+        if self.numbered_book_bundles:
+            return book_bundle_name(k), 1
+        return ITEM_PROG_BUNDLE, k
+
+    def _series_group_names(self, lo: int, hi: int) -> list[str]:
+        """Item names that open groups lo..hi inclusive, in the current shape."""
+        if self.distinct_bundles:
+            return [series_bundle_name(k) for k in range(lo, hi + 1)]
+        return [ITEM_PROG_SERIES] * max(0, hi - lo + 1)
+
     def _shelf_gate(self, sid: str, series_name: str) -> tuple[str, int]:
         """The item and count that open the bookcase holding one row.
 
@@ -565,7 +617,11 @@ class LibrarianWorld(World):
         # per chain item and pass from 2.5; bundles at 8 per item failed 7 of 20 at 1.4.
         # The individual modes hand out one specific item per series or book, no chain,
         # so they keep the plain fit.
-        if not (self.individual or self.book_sanity):
+        # Numbered series bundles are specific items, not an ordered chain, and measured
+        # 10/10 at series_per_unlock 3 without any slack. Book bundles still need it:
+        # 1/10 without, 10/10 with, on the full goal at 10 per bundle.
+        if self.random_bundle or (not (self.individual or self.book_sanity)
+                                  and not self.distinct_bundles):
             need = max(need, math.ceil(unlocks * 2.5))
         step = min(step, max(1, total // max(1, need)))
         return list(range(step, total + 1, step))
@@ -846,9 +902,16 @@ class LibrarianWorld(World):
             rng.shuffle(vols)
             order[close_slot] = book_item_name(ser.name, vols[0])
             for ch in vols[1:]:
-                # anywhere earlier: an uneven spread here keeps the bundles mixed
+                # Fungible: anywhere earlier, an uneven spread keeps the bundles mixed.
+                # Numbered: the slots just before, so a row spans at most two adjacent
+                # bundles; scattered ones strand the reverse fill (see fill_hook).
                 upto = _bisect_right(free, close_slot)
-                j = rng.randrange(upto) if upto > 0 else 0
+                if upto <= 0:
+                    j = 0
+                elif self.numbered_book_bundles:
+                    j = upto - 1
+                else:
+                    j = rng.randrange(upto)
                 order[free.pop(j)] = book_item_name(ser.name, ch)
         assert None not in order
         return order
@@ -888,6 +951,14 @@ class LibrarianWorld(World):
         # spoiler's playthrough paring grows faster than linearly in advancement items,
         # and every player in the lobby waits on it. The gate lives in host.yaml under
         # librarian_options, so a host who is fine with the wait can lift it.
+        if (self.random_bundle and self.options.numbered_book_bundles.value
+                and not getattr(self.settings, "allow_numbered_book_bundles", False)):
+            raise OptionError(
+                f"[Librarian - '{self.player_name}'] numbered_book_bundles makes generation "
+                f"slow and is off by default. The host can allow it by setting "
+                f"librarian_options: allow_numbered_book_bundles: true in host.yaml, or "
+                f"turn the option off: the tracker still says which bundle holds a book."
+            )
         if (self._slow_to_generate()
                 and not getattr(self.settings, "allow_individual_book_unlocks", False)):
             raise OptionError(
@@ -914,7 +985,8 @@ class LibrarianWorld(World):
         # the option as "at least 5": the seed adjusts, the way it adjusts the interval
         # and the bundle size, and the option's text says so. Done here, before anything
         # derives from the value, so slot_data and the tracker see the clamped number.
-        if self.check_by_count and self.options.series_per_unlock.value < 5:
+        if (self.check_by_count and self.options.series_per_unlock.value < 5
+                and not self.distinct_bundles):
             print(f"[Librarian - '{self.player_name}'] check_mode: count needs "
                   f"series_per_unlock of at least 5; using 5 instead of "
                   f"{self.options.series_per_unlock.value}.")
@@ -934,6 +1006,7 @@ class LibrarianWorld(World):
         if self.book_checks:
             self._create_regions_book(library)
             return
+        deferred_rows: list = []
 
         # Per-section regions — only for active sections (floor goals
         # exclude the other floor entirely from the location pool).
@@ -942,14 +1015,22 @@ class LibrarianWorld(World):
             self.multiworld.regions.append(region)
             library.connect(region, f"Open Section {section.id}")
 
-            # Row locations for this section.
+            # Row locations for this section. Under grouped unlocks a row sits in the
+            # region of the bundle that opens its series, so the path to it names the
+            # bundle; the bookcase gate stays on the location itself.
             for series in section.series:
+                if self.random_bundle:
+                    deferred_rows.append((section, series))
+                    continue
                 loc_name = f"Shelf: {section.id} - {series.name}"
+                home = (self._bundle_region(library, "Series Bundle",
+                                            self.series_req[series.name])
+                        if self._grouped_series else region)
                 loc = LibrarianLocation(
                     self.player, loc_name,
-                    self.location_name_to_id.get(loc_name), region,
+                    self.location_name_to_id.get(loc_name), home,
                 )
-                region.locations.append(loc)
+                home.locations.append(loc)
 
             # Section completion location
             sec_name = section_completion_name(section.id)
@@ -999,9 +1080,45 @@ class LibrarianWorld(World):
         # Goal event location (no AP id; carries the Victory event item)
         goal_loc = LibrarianLocation(self.player, GOAL_LOCATION_NAME, None, library)
         library.locations.append(goal_loc)
+
+        if deferred_rows:
+            # A row opens on its closing volume, so it lives in that bundle's region.
+            have = sum(len(r.locations) for r in self.multiworld.regions
+                       if r.player == self.player)
+            per = self._settle_bundle_size(have + len(deferred_rows) - 1)
+            need_at = {name: (idx // per) + 1 for idx, name in enumerate(self.book_order)}
+            for section, series in deferred_rows:
+                k = max(need_at.get(book_item_name(series.name, ch), 1)
+                        for ch in range(series.volumes))
+                home = self._bundle_region(library, "Book Bundle", k)
+                loc_name = f"Shelf: {section.id} - {series.name}"
+                home.locations.append(LibrarianLocation(
+                    self.player, loc_name,
+                    self.location_name_to_id.get(loc_name), home))
         goal_loc.place_locked_item(LibrarianItem(
             VICTORY_ITEM_NAME, ItemClassification.progression, None, self.player
         ))
+
+    @property
+    def _grouped_series(self) -> bool:
+        """The grouped series path: not individual series, not bundles, not books."""
+        return not (self.individual or self.random_bundle or self.book_sanity)
+
+    def _bundle_region(self, library, kind: str, k: int):
+        """The region for bundle k of the given kind, made on first use.
+
+        Entered from the library through "Open <kind> k"; set_rules puts the bundle
+        requirement on that entrance. Tracker paths then read "... > Series Bundle 4 >
+        Shelf: 2L - ...", which is the answer to "which unlock has this book in it"."""
+        cache = self.__dict__.setdefault("_bundle_regions", {})
+        key = (kind, k)
+        region = cache.get(key)
+        if region is None:
+            region = Region(f"{kind} {k}", self.player, self.multiworld)
+            self.multiworld.regions.append(region)
+            library.connect(region, f"Open {kind} {k}")
+            cache[key] = region
+        return region
 
     def _create_regions_count(self, library) -> None:
         """check_mode=by_count layout: no per-book or per-row checks, just the cumulative
@@ -1047,20 +1164,31 @@ class LibrarianWorld(World):
     def _create_regions_book(self, library) -> None:
         """BookSanity region layout: one BOOK location per volume (gated on its
         own book item), plus section/floor/level-up/chest/book-completion and
-        the goal. Mirrors create_regions but at book granularity."""
+        the goal. Mirrors create_regions but at book granularity.
+
+        Under bundles the books go last, into "Book Bundle k" regions: the bundle size
+        is settled against the location count, which has to exist first."""
         mw = self.multiworld
         max_books = self.max_reachable_books
+        deferred_books: list = []
 
         for section in self.active_sections:
             region = Region(f"Section {section.id}", self.player, mw)
             mw.regions.append(region)
             library.connect(region, f"Open Section {section.id}")
             for series in section.series:
+                if self.random_bundle:
+                    deferred_books.append((section, series))
+                    continue
+                # Grouped unlocks: the bundle's region, so the path names the bundle.
+                home = (self._bundle_region(library, "Series Bundle",
+                                            self.series_req[series.name])
+                        if self._grouped_series else region)
                 for chapter in range(series.volumes):
                     loc_name = _book_name(section.id, series.name, chapter)
-                    region.locations.append(LibrarianLocation(
+                    home.locations.append(LibrarianLocation(
                         self.player, loc_name,
-                        self.location_name_to_id.get(loc_name), region))
+                        self.location_name_to_id.get(loc_name), home))
             sec_name = section_completion_name(section.id)
             region.locations.append(LibrarianLocation(
                 self.player, sec_name,
@@ -1090,6 +1218,20 @@ class LibrarianWorld(World):
 
         goal_loc = LibrarianLocation(self.player, GOAL_LOCATION_NAME, None, library)
         library.locations.append(goal_loc)
+
+        if deferred_books:
+            n_books = sum(ser.volumes for _sec, ser in deferred_books)
+            have = sum(len(r.locations) for r in mw.regions if r.player == self.player)
+            per = self._settle_bundle_size(have + n_books - 1)
+            need_at = {name: (idx // per) + 1 for idx, name in enumerate(self.book_order)}
+            for section, series in deferred_books:
+                for chapter in range(series.volumes):
+                    k = need_at.get(book_item_name(series.name, chapter), 1)
+                    home = self._bundle_region(library, "Book Bundle", k)
+                    loc_name = _book_name(section.id, series.name, chapter)
+                    home.locations.append(LibrarianLocation(
+                        self.player, loc_name,
+                        self.location_name_to_id.get(loc_name), home))
         goal_loc.place_locked_item(LibrarianItem(
             VICTORY_ITEM_NAME, ItemClassification.progression, None, self.player
         ))
@@ -1157,7 +1299,7 @@ class LibrarianWorld(World):
                     _sid = _name[len("Progressive Shelf Unlock ("):-1]
                     if _sid in active_ids:
                         precollect_names.extend([_name] * _qty)
-            precollect_names.extend([ITEM_PROG_SERIES] * starting_unlock_count)
+            precollect_names.extend(self._series_group_names(1, starting_unlock_count))
         else:
             # One opened section to start, whichever item shape opens it.
             precollect_names.append(self._section_gate(
@@ -1166,7 +1308,7 @@ class LibrarianWorld(World):
                 precollect_names.append(self._section_gate(
                     next(s for s in self.active_sections
                          if s.id == self.starting_section_b))[0])
-            precollect_names.extend([ITEM_PROG_SERIES] * starting_unlock_count)
+            precollect_names.extend(self._series_group_names(1, starting_unlock_count))
 
         for name in precollect_names:
             self.multiworld.push_precollected(self.create_item(name))
@@ -1181,7 +1323,14 @@ class LibrarianWorld(World):
                     continue  # grouped item unused; per-series items added below
                 # Need ceil(active_series_count / per_unlock) Progressive
                 # Series Unlocks to cover all series in the active scope.
-                quantities[name] = math.ceil(active_series_count / per_unlock)
+                n_groups = math.ceil(active_series_count / per_unlock)
+                if self.distinct_bundles:
+                    # The starting groups are already in hand, so they are not in the
+                    # pool at all; with copies of one name they were extra copies.
+                    for k in range(starting_unlock_count + 1, n_groups + 1):
+                        quantities[series_bundle_name(k)] = 1
+                else:
+                    quantities[name] = n_groups
             elif name.startswith("Progressive Shelf Unlock ("):
                 # Match on section id; drop if not in active set, or if this seed opens
                 # bookcases some other way and these would be dead copies.
@@ -1226,7 +1375,15 @@ class LibrarianWorld(World):
 
             spare_pct = self._ut_opt("spare_book_item_percent",
                                      self.options.spare_book_item_percent)
-            if spare_pct > 0 and quantities.get(ITEM_PROG_SERIES, 0) > 0:
+            pooled_groups = sorted(int(n[14:]) for n in quantities if n.startswith("Series Bundle "))
+            if spare_pct > 0 and self.distinct_bundles and pooled_groups:
+                # A spare is a second copy of a specific bundle: either copy opens it,
+                # which is the same protection the fungible spares gave.
+                extra = min(math.ceil(len(pooled_groups) * spare_pct / 100),
+                            max(0, _free_slots()))
+                for k in self.random.sample(pooled_groups, min(extra, len(pooled_groups))):
+                    quantities[series_bundle_name(k)] += 1
+            elif spare_pct > 0 and quantities.get(ITEM_PROG_SERIES, 0) > 0:
                 base = quantities[ITEM_PROG_SERIES]
                 # Clamped like the shelf side. At the capped 20% this has never bound in
                 # testing, but overshooting does not fail loudly -- the guard quietly lifts
@@ -1329,13 +1486,23 @@ class LibrarianWorld(World):
         total = sum(quantities.values())
         if total > target:
             excess = total - target
-            series_qty = quantities.get(ITEM_PROG_SERIES, 0)
+            pooled = sorted(int(n[14:]) for n in quantities if n.startswith("Series Bundle "))
+            series_qty = len(pooled) if self.distinct_bundles else quantities.get(ITEM_PROG_SERIES, 0)
             lift = min(series_qty, excess)
             if lift > 0:
-                quantities[ITEM_PROG_SERIES] = series_qty - lift
-                for _ in range(lift):
-                    self.multiworld.push_precollected(
-                        self.create_item(ITEM_PROG_SERIES))
+                if self.distinct_bundles:
+                    # The lowest numbers first: they are the groups nearest the start.
+                    for k in pooled[:lift]:
+                        nm = series_bundle_name(k)
+                        quantities[nm] -= 1
+                        if quantities[nm] <= 0:
+                            del quantities[nm]
+                        self.multiworld.push_precollected(self.create_item(nm))
+                else:
+                    quantities[ITEM_PROG_SERIES] = series_qty - lift
+                    for _ in range(lift):
+                        self.multiworld.push_precollected(
+                            self.create_item(ITEM_PROG_SERIES))
                 excess -= lift
                 extra_series = lift * self.options.series_per_unlock.value
                 print(f"[Librarian] pool-overshoot guard lifted {lift} "
@@ -1396,6 +1563,36 @@ class LibrarianWorld(World):
         LibrarianLocationCategory.FLOOR,
     ))
 
+    def fill_hook(self, progitempool, usefulitempool, filleritempool, fill_locations) -> None:
+        """Numbered book bundles with row checks: an order AP's fill can finish.
+
+        Every bundle is its own item and a row needs the one or two bundles holding its
+        volumes, so the reverse fill can strand itself: bundle k on a row that needs j,
+        j on a row that needs k, both dead. Pulling the highest bundle first and offering
+        the deepest rows first keeps every placement pointing downward, so no cycle forms;
+        the chests, the only checks needing no bundle, stay free for the last one. Only
+        this world's entries move, in the slots they already hold."""
+        if not (self.random_bundle and self.numbered_book_bundles and self.check_by_series):
+            return
+        p = self.player
+        prefix = "Book Bundle "
+        slots = [i for i, it in enumerate(progitempool)
+                 if it.player == p and it.name.startswith(prefix)]
+        ours = sorted((progitempool[i] for i in slots), key=lambda it: int(it.name[len(prefix):]))
+        for i, it in zip(slots, ours):
+            progitempool[i] = it          # ascending: the fill pops the highest first
+
+        def depth(loc) -> int:
+            rname = loc.parent_region.name
+            if rname.startswith(prefix):
+                return int(rname[len(prefix):])
+            return -1 if loc.name.startswith("Chest") else 0
+
+        lslots = [i for i, loc in enumerate(fill_locations) if loc.player == p]
+        ordered = sorted((fill_locations[i] for i in lslots), key=depth, reverse=True)
+        for i, loc in zip(lslots, ordered):
+            fill_locations[i] = loc
+
     def pre_fill(self) -> None:
         """Keep this world's filler in-world before the cross-player fill.
 
@@ -1452,15 +1649,25 @@ class LibrarianWorld(World):
         # depth is its series' unlock order (later series = deeper). Ties broken
         # deterministically so a seed is reproducible.
         rng_key = {loc: i for i, loc in enumerate(sorted(own_unfilled, key=lambda l: l.name))}
+        # Depth: the bundle region's k, else a count rung's N or a grouped row's series
+        # group; other count-gated checks are deepest. Books must not land there with a
+        # random tiebreak, or the filler takes the sphere-0 books the bundles need.
         def _depth(loc):
+            rname = loc.parent_region.name if loc.parent_region is not None else ""
+            if rname.startswith("Book Bundle ") or rname.startswith("Series Bundle "):
+                return (0, int(rname.rsplit(" ", 1)[1]), rng_key[loc])
             cat = (location_dictionary[loc.name].category
                    if loc.name in location_dictionary else None)
             if cat == LibrarianLocationCategory.ROW:
                 series = loc.name.split(" - ", 1)[-1]
                 return (0, self.series_req.get(series, 0), rng_key[loc])
+            if cat == LibrarianLocationCategory.BOOK:
+                return (0, 0, rng_key[loc])           # its own item: shallow
             if cat == LibrarianLocationCategory.CHEST:
                 return (0, -1, rng_key[loc])          # chests: shallowest
-            return (1, 0, rng_key[loc])               # count-gated: deepest
+            if loc.name.startswith("Shelved ") and loc.name.endswith(" Books"):
+                return (1, int(loc.name.split()[1]), rng_key[loc])   # rungs in order
+            return (1, 10 ** 6, rng_key[loc])         # completions, levels: deepest
         own_unfilled.sort(key=_depth, reverse=True)   # deepest first
         # Keep the shallowest (own progression + 20% headroom) OPEN for the fill.
         keep_open = min(len(own_unfilled), n_prog + len(own_unfilled) // 5)
@@ -1479,35 +1686,21 @@ class LibrarianWorld(World):
         LibrarianLocationCategory.FLOOR,
     ))
 
-    def _create_items_bundle(self) -> None:
-        """random_book_bundle pool: fungible Progressive Book Bundle items, one per
-        books_per_bundle books in scope, plus the usual optional block and filler.
+    def _settle_bundle_size(self, target: int) -> int:
+        """The bundle size this seed uses, clamped up until the pool fits the checks.
 
-        Deliberately the same shape as the grouped series chain -- one repeated item, a
-        count gate on the locations -- because that is the shape AP's fill handles best and
-        the one this world already proves at 400 locations. The only difference is that it
-        gates ~3000 book checks instead of 400 row checks.
-        """
-        mw = self.multiworld
-        target = sum(len(r.locations) for r in mw.regions
-                     if r.player == self.player) - 1
-
+        Called from region creation (the bundle regions need it) and again from item
+        creation; the first answer is kept, so both see the same size. A tracker re-gen
+        reads the size the seed used from slot_data."""
+        settled = getattr(self, "books_per_bundle_effective", None)
+        if settled:
+            return settled
         n_books = len(self.book_order)
         per = max(1, self._ut_opt("books_per_bundle", self.options.books_per_bundle))
-
-        # Clamp the bundle size UP until the pool fits the checks this seed offers. A small
-        # bundle wants more items than a by_series seed has room for -- 3072 books at 5 per
-        # bundle is 615 items against ~554 row checks -- and the size is a preference, not a
-        # constraint worth failing generation over.
-        # A tracker re-gen already knows the answer: slot_data carries the size the seed
-        # actually used. Re-deriving it here can land somewhere else and rebuild a world
-        # handing out books in different groups than the one being tracked.
         pt = self._ut_passthrough()
         if pt and "books_per_bundle" in pt:
             self.books_per_bundle_effective = per
-            self._finish_bundle_pool(per, math.ceil(n_books / per), target)
-            return
-
+            return per
         asked = per
         # The bookcase unlocks share this pool, so they come out of the head room too --
         # without them the clamp lets books_per_bundle sit low enough that bundles plus
@@ -1531,7 +1724,8 @@ class LibrarianWorld(World):
         # volume, so the bundle chain and the bookcase chain interleave at every row.
         # Measured on the full goal with progressive bookcases: 154 bundles fail 4 of
         # 10, 110 or fewer fill 10 of 10.
-        chain_div = 5 if self.check_by_series else 3
+        chain_div = 5 if (self.check_by_series
+                          or (self.check_by_count and self.numbered_book_bundles)) else 3
         chain_cap = (max(1, target // chain_div)
                      if self.bookcase_unlocks != self.options.bookcase_unlocks.option_unlocked
                      else n_books)
@@ -1543,6 +1737,23 @@ class LibrarianWorld(World):
                   f"{math.ceil(n_books / asked)} bundles, more than this seed can place "
                   f"alongside its bookcase unlocks; using {per}.")
         self.books_per_bundle_effective = per
+        return per
+
+    def _create_items_bundle(self) -> None:
+        """random_book_bundle pool: fungible Progressive Book Bundle items, one per
+        books_per_bundle books in scope, plus the usual optional block and filler.
+
+        Deliberately the same shape as the grouped series chain -- one repeated item, a
+        count gate on the locations -- because that is the shape AP's fill handles best and
+        the one this world already proves at 400 locations. The only difference is that it
+        gates ~3000 book checks instead of 400 row checks.
+        """
+        mw = self.multiworld
+        target = sum(len(r.locations) for r in mw.regions
+                     if r.player == self.player) - 1
+
+        n_books = len(self.book_order)
+        per = self._settle_bundle_size(target)
         self._finish_bundle_pool(per, math.ceil(n_books / per), target)
 
     def _finish_bundle_pool(self, per: int, needed: int, target: int) -> None:
@@ -1581,9 +1792,17 @@ class LibrarianWorld(World):
         start_bundles = max(1, self._ut_opt("starting_series_count",
                                             self.options.starting_series_count) // per)
         start_bundles = min(start_bundles, needed)
-        for _ in range(start_bundles):
-            mw.push_precollected(self.create_item(ITEM_PROG_BUNDLE))
-        quantities[ITEM_PROG_BUNDLE] = needed - start_bundles
+        if self.numbered_book_bundles:
+            # Numbered: the first bundles are in hand, the rest are each their own item.
+            del quantities[ITEM_PROG_BUNDLE]
+            for k in range(1, start_bundles + 1):
+                mw.push_precollected(self.create_item(book_bundle_name(k)))
+            for k in range(start_bundles + 1, needed + 1):
+                quantities[book_bundle_name(k)] = 1
+        else:
+            for _ in range(start_bundles):
+                mw.push_precollected(self.create_item(ITEM_PROG_BUNDLE))
+            quantities[ITEM_PROG_BUNDLE] = needed - start_bundles
         # Open the starting sections COMPLETELY, not just their first bookcase. Bundles
         # draw library-wide, so the early ones hand out books from everywhere; with only
         # one bookcase open there is almost nowhere to put them and the fill runs out of
@@ -1749,7 +1968,87 @@ class LibrarianWorld(World):
                     sd[sc] = sd.get(sc, 0) + 1
                     bk = self._bookcount_key
                     sd[bk] = sd.get(bk, 0) + self._series_item_volumes.get(name, 0)
+                elif name.startswith("Series Bundle "):
+                    self._held_add(sd, self._sgroups_key, int(name[14:]))
+                elif name == ITEM_PROG_SERIES:
+                    self._held_add(sd, self._sgroups_key, state.prog_items[self.player][name])
+                elif name.startswith("Book Bundle "):
+                    k = int(name[12:])
+                    self._held_add(sd, self._bbundles_key, k)
+                    self._bundle_delta(sd, k, +1)
+                elif name == ITEM_PROG_BUNDLE:
+                    # Fungible copies: the count is the state, the prefix count below
+                    # reads it directly, so no per-collect bookkeeping is needed.
+                    pass
         return changed
+
+    def _bundle_tables(self):
+        """Per bundle k: the gates of its books, and the series it touches; per series:
+        how many volumes it has and its gate. Built once, from book_order and the settled
+        bundle size, so collect/remove can keep running counts instead of re-walking."""
+        tables = self.__dict__.get("_b2_tables")
+        if tables is not None:
+            return tables
+        per = getattr(self, "books_per_bundle_effective", None) or max(
+            1, self._ut_opt("books_per_bundle", self.options.books_per_bundle))
+        pos = {name: i for i, name in enumerate(self.book_order)}
+        bundle_gates: dict[int, list[tuple[tuple[str, int], int]]] = {}
+        bundle_series: dict[int, list[int]] = {}
+        series_info: list[tuple[int, tuple[str, int]]] = []   # (volumes held in order, gate)
+        for sec in self.active_sections:
+            for ser in sec.series:
+                gate = self._shelf_gate(sec.id, ser.name)
+                si = len(series_info)
+                n = 0
+                per_bundle: dict[int, int] = {}
+                for ch in range(ser.volumes):
+                    i = pos.get(book_item_name(ser.name, ch))
+                    if i is None:
+                        continue
+                    n += 1
+                    k = i // per + 1
+                    per_bundle[k] = per_bundle.get(k, 0) + 1
+                series_info.append((n, gate))
+                for k, cnt in per_bundle.items():
+                    bundle_gates.setdefault(k, []).append((gate, cnt))
+                    bundle_series.setdefault(k, []).extend([si] * cnt)
+        tables = (bundle_gates, bundle_series, series_info)
+        self.__dict__["_b2_tables"] = tables
+        return tables
+
+    def _bundle_delta(self, sd: dict, k: int, sign: int) -> None:
+        """Apply bundle k arriving (+1) or leaving (-1) to the running counts."""
+        bundle_gates, bundle_series, series_info = self._bundle_tables()
+        if k not in bundle_gates:
+            return
+        bg = dict(sd.get(self._bgate_key) or {})
+        for gate, cnt in bundle_gates[k]:
+            bg[gate] = bg.get(gate, 0) + sign * cnt
+        sd[self._bgate_key] = bg
+        bs = dict(sd.get(self._bser_key) or {})
+        br = dict(sd.get(self._brow_key) or {})
+        for si in bundle_series[k]:
+            need, gate = series_info[si]
+            before = bs.get(si, 0)
+            after = before + sign
+            bs[si] = after
+            if sign > 0 and after == need:
+                br[gate] = br.get(gate, 0) + 1
+            elif sign < 0 and before == need:
+                br[gate] = br.get(gate, 0) - 1
+        sd[self._bser_key] = bs
+        sd[self._brow_key] = br
+
+    @staticmethod
+    def _held_add(sd: dict, key: str, k: int) -> None:
+        cur = sd.get(key)
+        sd[key] = (cur | {k}) if cur else frozenset((k,))
+
+    @staticmethod
+    def _held_drop(sd: dict, key: str, k: int) -> None:
+        cur = sd.get(key)
+        if cur and k in cur:
+            sd[key] = cur - {k}
 
     def remove(self, state, item, *args, **kwargs) -> bool:
         changed = super().remove(state, item, *args, **kwargs)
@@ -1768,6 +2067,18 @@ class LibrarianWorld(World):
                     sd[sc] = sd.get(sc, 0) - 1
                     bk = self._bookcount_key
                     sd[bk] = sd.get(bk, 0) - self._series_item_volumes.get(name, 0)
+                elif name.startswith("Series Bundle "):
+                    self._held_drop(sd, self._sgroups_key, int(name[14:]))
+                elif name == ITEM_PROG_SERIES:
+                    # the copy that just left was the highest-numbered group held
+                    self._held_drop(sd, self._sgroups_key,
+                                    state.prog_items[self.player][name] + 1)
+                elif name.startswith("Book Bundle "):
+                    k = int(name[12:])
+                    self._held_drop(sd, self._bbundles_key, k)
+                    self._bundle_delta(sd, k, -1)
+                elif name == ITEM_PROG_BUNDLE:
+                    pass
         return changed
 
     # ------------------------------------------------------------------
@@ -2002,32 +2313,72 @@ class LibrarianWorld(World):
         # progressive bookcases) with the bundle positions of its books and rows sorted,
         # so a count is one bisect per gate rather than a walk of the library, and cached
         # on the state the way the progressive rules cache theirs.
-        gates: dict[tuple[str, int], tuple[list[int], list[int]]] = {}
+        # Per bundle: the bookcase gate of each book in it. Per series: the bundles that
+        # hold its volumes and its gate. A held SET rather than a count, since numbered
+        # bundles arrive in any order (a fungible copy counts as the next number).
+        bundle_books: dict[int, list[tuple[str, int]]] = {}
+        series_needs: list[tuple[frozenset, str, int]] = []
         for sec in active_sections:
             for ser in sec.series:
-                books, rows = gates.setdefault(self._shelf_gate(sec.id, ser.name), ([], []))
-                books.extend(need_at[book_item_name(ser.name, ch)]
-                             for ch in range(ser.volumes)
-                             if book_item_name(ser.name, ch) in need_at)
-                rows.append(series_need(ser))
-        gate_list = [(item, n, sorted(b), sorted(r)) for (item, n), (b, r) in gates.items()]
-        gate_items = sorted({item for item, _, _, _ in gate_list})
+                gname, gn = self._shelf_gate(sec.id, ser.name)
+                ks = set()
+                for ch in range(ser.volumes):
+                    k = need_at.get(book_item_name(ser.name, ch))
+                    if k is None:
+                        continue
+                    ks.add(k)
+                    bundle_books.setdefault(k, []).append((gname, gn))
+                if ks:
+                    series_needs.append((frozenset(ks), gname, gn))
+        bbundles_key = self._bbundles_key
+        bgate_key, brow_key = self._bgate_key, self._brow_key
+        stamp_key = self._stamp_key
+        empty: frozenset = frozenset()
         cache_attr = f"_librarian_bundle_feasible_{p}"
+        numbered = self.numbered_book_bundles
+        if numbered:
+            self._bundle_tables()   # built now, before any state collects a bundle
+        else:
+            # Fungible: the k-th copy opens the k-th slice, so what is shelvable is a
+            # prefix of book_order, and a count per gate is a bisect over sorted
+            # positions. No per-collect bookkeeping, which is what keeps this shape
+            # cheap at 1536 bundles.
+            gates: dict[tuple[str, int], tuple[list[int], list[int]]] = {}
+            for sec in active_sections:
+                for ser in sec.series:
+                    gb, gr = gates.setdefault(self._shelf_gate(sec.id, ser.name), ([], []))
+                    ks = [need_at[book_item_name(ser.name, ch)] for ch in range(ser.volumes)
+                          if book_item_name(ser.name, ch) in need_at]
+                    gb.extend(ks)
+                    if ks:
+                        gr.append(max(ks))
+            gate_list = [(g, n, sorted(b), sorted(r)) for (g, n), (b, r) in gates.items()]
 
         def _feasible(state) -> tuple[int, int]:
-            prog = state.prog_items[p]
-            held = prog[ITEM_PROG_BUNDLE]
-            marker = (held, tuple([prog[nm] for nm in gate_items]))
-            cached = state.__dict__.get(cache_attr)
+            # Keyed on the change stamp: every collect or remove of this player's items
+            # bumps it, and comparing the held set itself is O(n) per rung.
+            sd = state.__dict__
+            marker = sd.get(stamp_key, 0)
+            cached = sd.get(cache_attr)
             if cached is not None and cached[0] == marker:
                 return cached[1]
+            prog = state.prog_items[p]
             books = rows = 0
-            for item, n, bpos, rpos in gate_list:
-                if n and prog[item] < n:
-                    continue
-                books += bisect.bisect_right(bpos, held)
-                rows += bisect.bisect_right(rpos, held)
-            state.__dict__[cache_attr] = (marker, (books, rows))
+            if numbered:
+                for (gname, gn), cnt in (sd.get(bgate_key) or {}).items():
+                    if gn == 0 or prog[gname] >= gn:
+                        books += cnt
+                for (gname, gn), cnt in (sd.get(brow_key) or {}).items():
+                    if gn == 0 or prog[gname] >= gn:
+                        rows += cnt
+            else:
+                held = prog[ITEM_PROG_BUNDLE]
+                for gname, gn, bpos, rpos in gate_list:
+                    if gn and prog[gname] < gn:
+                        continue
+                    books += bisect.bisect_right(bpos, held)
+                    rows += bisect.bisect_right(rpos, held)
+            sd[cache_attr] = (marker, (books, rows))
             return books, rows
 
         def feasible_books(state) -> int:
@@ -2045,37 +2396,56 @@ class LibrarianWorld(World):
 
         def row_rule(sec, ser):
             sname, sn = self._shelf_gate(sec.id, ser.name)
-            return lambda state, k=series_need(ser), sname=sname, sn=sn: (
-                state.count(ITEM_PROG_BUNDLE, p) >= k and state.has(sname, p, sn))
+            reqs = tuple(self._book_bundle_req(k) for k in sorted(
+                {need_at.get(book_item_name(ser.name, ch), 1) for ch in range(ser.volumes)}))
+            return lambda state, reqs=reqs, sname=sname, sn=sn: (
+                state.has(sname, p, sn) and all(state.has(gi, p, gc) for gi, gc in reqs))
 
         def book_rule(sec, ser, ch):
             n = need_at.get(book_item_name(ser.name, ch))
             if n is None:
                 return None
             sname, sn = self._shelf_gate(sec.id, ser.name)
-            return lambda state, k=n, sname=sname, sn=sn: (
-                state.count(ITEM_PROG_BUNDLE, p) >= k and state.has(sname, p, sn))
+            gi, gc = self._book_bundle_req(n)
+            return lambda state, gi=gi, gc=gc, sname=sname, sn=sn: (
+                state.has(gi, p, gc) and state.has(sname, p, sn))
 
         self._apply_check_locations(row_rule, book_rule, feasible_books)
 
-        # A section or floor is complete only with every one of its bookcases open, so
-        # these carry the whole-section gate on top of the bundle count.
+        for k in sorted(bundle_books):
+            try:
+                ent = mw.get_entrance(f"Open Book Bundle {k}", p)
+            except KeyError:
+                continue          # count mode keeps its rungs in the library
+            gi, gc = self._book_bundle_req(k)
+            ent.access_rule = (lambda state, gi=gi, gc=gc: state.has(gi, p, gc))
+
+        # A section or floor is complete with every bundle holding its books in hand and
+        # every one of its bookcases open.
+        section_bundles = {
+            sec.id: frozenset(need_at.get(book_item_name(ser.name, ch), 1)
+                              for ser in sec.series for ch in range(ser.volumes))
+            for sec in active_sections}
+        def bundles_held(state, ks: frozenset) -> bool:
+            if numbered:
+                return ks <= (state.__dict__.get(bbundles_key) or empty)
+            return state.prog_items[p][ITEM_PROG_BUNDLE] >= max(ks) if ks else True
+
         for sec in active_sections:
-            need = max((series_need(ser) for ser in sec.series), default=1)
             gitem, gn = self._section_gate(sec)
             mw.get_location(section_completion_name(sec.id), p).access_rule = (
-                lambda state, k=need, gi=gitem, gn=gn: (
-                    state.count(ITEM_PROG_BUNDLE, p) >= k and state.has(gi, p, gn)))
+                lambda state, ks=section_bundles[sec.id], gi=gitem, gn=gn: (
+                    bundles_held(state, ks) and state.has(gi, p, gn)))
 
         floors: dict[int, list] = {}
         for sec in active_sections:
             floors.setdefault(sec.floor, []).append(sec)
         for fl, secs in floors.items():
-            need = max((series_need(ser) for sec in secs for ser in sec.series), default=1)
+            fks = frozenset().union(*(section_bundles[sec.id] for sec in secs))
             fgates = [self._section_gate(sec) for sec in secs]
             mw.get_location(f"Floor {fl} Complete", p).access_rule = (
-                lambda state, k=need, gs=fgates: (
-                    state.count(ITEM_PROG_BUNDLE, p) >= k
+                lambda state, ks=fks, gs=fgates: (
+                    bundles_held(state, ks)
                     and all(state.has(gi, p, gn) for gi, gn in gs)))
 
         total_rows = sum(len(sec.series) for sec in active_sections)
@@ -2300,13 +2670,16 @@ class LibrarianWorld(World):
         }
         # Under "whole" a section is one item, so every row in it needs one copy and the
         # table below only has to model 0 or 1 -- the same shape, one bookcase wide.
-        section_row_reqs = {
-            sec.id: [
-                (self._shelf_gate(sec.id, s.name)[1], series_req[s.name])
-                for s in sec.series
-            ]
-            for sec in active_sections
-        }
+        section_groups = {sec.id: frozenset(section_series_reqs[sec.id])
+                          for sec in active_sections}
+        sgroups_key = self._sgroups_key
+        empty: frozenset = frozenset()
+        # group index -> (gate item, gate count, volumes) per series it opens
+        group_series: dict[int, list[tuple[str, int, int]]] = {}
+        for sec in active_sections:
+            for ser in sec.series:
+                gname, gn = self._shelf_gate(sec.id, ser.name)
+                group_series.setdefault(series_req[ser.name], []).append((gname, gn, ser.volumes))
         # How many copies of the gate item a section can absorb: its bookcase count when
         # they arrive one at a time, one when the whole section is a single item.
         section_caps = {sec.id: self._section_gate(sec)[1] for sec in active_sections}
@@ -2323,59 +2696,6 @@ class LibrarianWorld(World):
         # 2D list lookup — ~62 dict ops total, no string formatting, no
         # state.count calls. Level-up + row-completion rules fire ~250x
         # per state during fill sweeps, so the precompute pays for itself.
-        max_series_idx = len(self.series_order)
-        section_reach: dict[str, list[list[int]]] = {}
-        # The same table counting BOOKS instead of rows, for check_mode by_count. Rows hold
-        # 3, 5 or 10 volumes, so scaling a row count by an average is wrong in both
-        # directions -- that guesswork is what put the level-up rules out by a wide margin.
-        # Summing the real volume counts here costs one more precomputed table and nothing
-        # per call.
-        section_reach_books: dict[str, list[list[int]]] = {}
-        for sec in active_sections:
-            bc_count = section_caps[sec.id]
-            row_reqs = section_row_reqs[sec.id]
-            volumes = [ser.volumes for ser in sec.series]
-            table_2d: list[list[int]] = []
-            table_books: list[list[int]] = []
-            for shelf_count in range(bc_count + 1):
-                row_for_shelves: list[int] = [0] * (max_series_idx + 1)
-                book_for_shelves: list[int] = [0] * (max_series_idx + 1)
-                # Pass 1: per series_count, count how many series reqs
-                # are met. Incremental — sort by series_n and run a
-                # cumulative count.
-                ready_at: list[tuple[int, int]] = []  # (series_n, volumes) that pass shelf
-                for (shelf_n, series_n), vol in zip(row_reqs, volumes):
-                    if shelf_count >= shelf_n:
-                        ready_at.append((series_n, vol))
-                ready_at.sort()
-                idx = 0
-                count_so_far = 0
-                books_so_far = 0
-                for series_count in range(max_series_idx + 1):
-                    while idx < len(ready_at) and ready_at[idx][0] <= series_count:
-                        count_so_far += 1
-                        books_so_far += ready_at[idx][1]
-                        idx += 1
-                    row_for_shelves[series_count] = count_so_far
-                    book_for_shelves[series_count] = books_so_far
-                table_2d.append(row_for_shelves)
-                table_books.append(book_for_shelves)
-            section_reach[sec.id] = table_2d
-            section_reach_books[sec.id] = table_books
-
-        # Same idea, but flatten the per-section lookup into a flat list
-        # of (shelf_unlock_name, table_2d, bc_count) tuples. The
-        # feasible_rows hot loop iterates this list directly instead of
-        # going through active_sections + dict[sec.id] every call.
-        section_reach_list: list[tuple[str, list[list[int]], int]] = [
-            (shelf_names[sec.id], section_reach[sec.id], section_caps[sec.id])
-            for sec in active_sections
-        ]
-        section_books_list: list[tuple[str, list[list[int]], int]] = [
-            (shelf_names[sec.id], section_reach_books[sec.id], section_caps[sec.id])
-            for sec in active_sections
-        ]
-
         # Helper: state-only check for "section X is fully cleared"
         # — every bookcase opened (= bookcase_count shelf unlocks for X),
         # every series in X unlocked.
@@ -2385,11 +2705,7 @@ class LibrarianWorld(World):
         def section_done(state, sec) -> bool:
             if not state.has(shelf_names[sec.id], p, section_caps[sec.id]):
                 return False
-            series_unlocked = state.count(ITEM_PROG_SERIES, p)
-            for needed in section_series_reqs[sec.id]:
-                if series_unlocked < needed:
-                    return False
-            return True
+            return section_groups[sec.id] <= (state.__dict__.get(sgroups_key) or empty)
 
         # How many distinct rows can the player FINISH right now? Powered
         # by section_reach — O(active sections) direct-dict lookups, no
@@ -2404,74 +2720,44 @@ class LibrarianWorld(World):
         # tracked-item increment invalidates the marker, so stale reads
         # are impossible. State.copy() carries the attribute, and new
         # states post-collect get a different marker → refresh.
+        # Rows and books the state can shelve: walk the held groups, count the series
+        # whose bookcase is open. Cached on the state under a marker of the held set and
+        # the shelf counts, the way the old prefix table was; the table cannot express a
+        # held SET, and numbered bundles arrive in any order.
         cache_attr = f"_librarian_feasible_{p}"
-        shelf_names_only = [name for name, _, _ in section_reach_list]
+        stamp_key = self._stamp_key
+
+        def _feasible(state) -> tuple[int, int]:
+            # Keyed on the change stamp (bumped by every collect/remove of this player's
+            # items): O(1), where comparing the held set is O(n) per rung.
+            sd = state.__dict__
+            marker = sd.get(stamp_key, 0)
+            cached = sd.get(cache_attr)
+            if cached is not None and cached[0] == marker:
+                return cached[1]
+            prog = state.prog_items[p]
+            held = sd.get(sgroups_key) or empty
+            rows = books = 0
+            for k in held:
+                for gname, gn, vols in group_series.get(k, ()):
+                    if gn == 0 or prog[gname] >= gn:
+                        rows += 1
+                        books += vols
+            state.__dict__[cache_attr] = (marker, (rows, books))
+            return rows, books
 
         def feasible_rows(state) -> int:
-            prog = state.prog_items[p]
-            series_count = prog[ITEM_PROG_SERIES]
-            # Cheap freshness marker: (series count, sum of shelf counts).
-            # Any state mutation that affects feasible_rows must change at
-            # least one of these — they all feed into the lookup table.
-            # Construction is ~32 dict reads vs ~31 table lookups + adds
-            # in the full path, so cache hits save ~2/3 of the work.
-            # Per-section counts, not their SUM. A sum is not a key: holding two unlocks
-            # for one section and none for another has the same total as one each, and
-            # those reach different rows. The stale answer that collision returns depends
-            # on which state was cached first, which is how a seed with a fixed seed
-            # number still came out different run to run.
-            marker = (series_count, tuple([prog[sn] for sn in shelf_names_only]))
-            cached = state.__dict__.get(cache_attr)
-            if cached is not None and cached[0] == marker:
-                return cached[1]
-
-            # Cache miss — compute fully.
-            if series_count > max_series_idx:
-                series_count = max_series_idx
-            total = 0
-            for shelf_name, table_2d, bc_count in section_reach_list:
-                shelf_count = prog[shelf_name]
-                if shelf_count > bc_count:
-                    shelf_count = bc_count
-                total += table_2d[shelf_count][series_count]
-            state.__dict__[cache_attr] = (marker, total)
-            return total
-
-        books_attr = f"_librarian_feasbooks_{p}"
+            return _feasible(state)[0]
 
         def feasible_books(state) -> int:
-            """Books the state can already shelve, from the volume table above.
+            return _feasible(state)[1]
 
-            Same shape and same marker as feasible_rows -- only the table differs."""
-            prog = state.prog_items[p]
-            series_count = prog[ITEM_PROG_SERIES]
-            # Per-section counts, not their SUM. A sum is not a key: holding two unlocks
-            # for one section and none for another has the same total as one each, and
-            # those reach different rows. The stale answer that collision returns depends
-            # on which state was cached first, which is how a seed with a fixed seed
-            # number still came out different run to run.
-            marker = (series_count, tuple([prog[sn] for sn in shelf_names_only]))
-            cached = state.__dict__.get(books_attr)
-            if cached is not None and cached[0] == marker:
-                return cached[1]
-            if series_count > max_series_idx:
-                series_count = max_series_idx
-            total = 0
-            for shelf_name, table_2d, bc_count in section_books_list:
-                shelf_count = prog[shelf_name]
-                if shelf_count > bc_count:
-                    shelf_count = bc_count
-                total += table_2d[shelf_count][series_count]
-            state.__dict__[books_attr] = (marker, total)
-            return total
 
-        # A row costs its bookcase unlocks plus its series unlock. Series modes have no
-        # per-book gate, so a book costs exactly what its row costs -- which is what makes
-        # by_book a change of granularity rather than a change of logic.
         def row_rule(sec, ser):
             sname, sn = self._shelf_gate(sec.id, ser.name)
-            return lambda state, sname=sname, sn=sn, sni=series_req[ser.name]: (
-                state.has(sname, p, sn) and state.has(ITEM_PROG_SERIES, p, sni))
+            gitem, gcount = self._series_group_req(series_req[ser.name])
+            return lambda state, sname=sname, sn=sn, gi=gitem, gc=gcount: (
+                state.has(sname, p, sn) and state.has(gi, p, gc))
 
         def book_rule(sec, ser, _ch):
             return row_rule(sec, ser)
@@ -2481,6 +2767,13 @@ class LibrarianWorld(World):
         # Section region access — gated by ≥1 Progressive Shelf Unlock for X.
         # Capture the precomputed shelf-unlock name string in the lambda
         # closure so the rule doesn't re-format the section id every call.
+        for k in sorted(group_series):
+            try:
+                ent = mw.get_entrance(f"Open Series Bundle {k}", p)
+            except KeyError:
+                continue          # count mode has no per-row or per-book locations
+            gitem, gcount = self._series_group_req(k)
+            ent.access_rule = (lambda state, gi=gitem, gc=gcount: state.has(gi, p, gc))
         for section in active_sections:
             entrance = mw.get_entrance(f"Open Section {section.id}", p)
             entrance.access_rule = (
@@ -2503,13 +2796,12 @@ class LibrarianWorld(World):
 
             def make_floor_rule(secs):
                 def rule(state):
-                    series_unlocked = state.count(ITEM_PROG_SERIES, p)
+                    held = state.__dict__.get(sgroups_key) or empty
                     for s in secs:
                         if not state.has(shelf_names[s.id], p, section_caps[s.id]):
                             return False
-                        for needed in section_series_reqs[s.id]:
-                            if series_unlocked < needed:
-                                return False
+                        if not section_groups[s.id] <= held:
+                            return False
                     return True
                 return rule
             floor_loc.access_rule = make_floor_rule(sections_in_floor)
@@ -2579,13 +2871,12 @@ class LibrarianWorld(World):
             # series-unlock count once per rule call rather than per
             # section (saves 30 lookups on full goal).
             def goal_rule(state):
-                series_unlocked = state.count(ITEM_PROG_SERIES, p)
+                held = state.__dict__.get(sgroups_key) or empty
                 for s in active_sections:
                     if not state.has(shelf_names[s.id], p, section_caps[s.id]):
                         return False
-                    for needed in section_series_reqs[s.id]:
-                        if series_unlocked < needed:
-                            return False
+                    if not section_groups[s.id] <= held:
+                        return False
                 return True
             goal.access_rule = goal_rule
 
@@ -2594,6 +2885,88 @@ class LibrarianWorld(World):
     # ------------------------------------------------------------------
     # fill_slot_data — sent to the Lua client at slot-connect time
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Universal Tracker: /get_logical_path <location>
+    # ------------------------------------------------------------------
+
+    def get_logical_path(self, dest_name: str, state) -> list | None:
+        """Answer "which unlock has this book in it" for the tracker.
+
+        UT calls this before walking regions. For a book or row check it names the
+        bundle (or series unlock) that carries it, says whether that is in hand, and
+        what the bookcase still needs; anything else returns None so UT falls back to
+        its own path walk."""
+        try:
+            loc = self.multiworld.get_location(dest_name, self.player)
+        except KeyError:
+            return None
+        name = loc.name
+        if name.startswith("Book: "):
+            head, vol = name[6:].rsplit(" Vol ", 1)
+            sid, series = head.split(" - ", 1)
+            chapter = int(vol) - 1
+        elif name.startswith("Shelf: "):
+            sid, series = name[7:].split(" - ", 1)
+            chapter = None
+        else:
+            return None
+        sec = next((x for x in self.active_sections if x.id == sid), None)
+        ser = next((x for x in sec.series if x.name == series), None) if sec else None
+        if ser is None:
+            return None
+        prog = state.prog_items[self.player]
+
+        def ordinal(k: int) -> str:
+            suf = "th" if 10 <= k % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(k % 10, "th")
+            return f"{k}{suf}"
+
+        lines: list[str] = []
+        if self.random_bundle:
+            per = getattr(self, "books_per_bundle_effective", None) or max(
+                1, self._ut_opt("books_per_bundle", self.options.books_per_bundle))
+            pos = {bname: i for i, bname in enumerate(self.book_order)}
+            chapters = [chapter] if chapter is not None else list(range(ser.volumes))
+            ks = sorted({pos[book_item_name(series, ch)] // per + 1
+                         for ch in chapters if book_item_name(series, ch) in pos})
+            for k in ks:
+                item, n = self._book_bundle_req(k)
+                if self.numbered_book_bundles:
+                    have = prog[item] >= 1
+                    lines.append(f"{item}: {'in hand' if have else 'not yet received'}")
+                else:
+                    held = prog[item]
+                    lines.append(f"the {ordinal(k)} {item}: you hold {held}"
+                                 + ("" if held >= k else f", {k - held} more to go"))
+        elif self.individual:
+            item = series_unlock_item_name(series)
+            lines.append(f"{item}: {'in hand' if prog[item] >= 1 else 'not yet received'}")
+        elif self.book_sanity:
+            chapters = [chapter] if chapter is not None else list(range(ser.volumes))
+            for ch in chapters:
+                item = book_item_name(series, ch)
+                lines.append(f"{item}: {'in hand' if prog[item] >= 1 else 'not yet received'}")
+        else:
+            k = self.series_req.get(series)
+            if k is None:
+                return None
+            item, n = self._series_group_req(k)
+            if self.distinct_bundles:
+                lines.append(f"{item}: {'in hand' if prog[item] >= 1 else 'not yet received'}")
+            else:
+                held = prog[item]
+                lines.append(f"the {ordinal(k)} {item}: you hold {held}"
+                             + ("" if held >= k else f", {k - held} more to go"))
+        gname, gn = self._shelf_gate(sid, series)
+        if gn > 0:
+            held = prog[gname]
+            lines.append(f"bookcase: {gname} x{gn} (you hold {held})")
+        else:
+            lines.append("bookcase: open from the start")
+        reach = loc.can_reach(state)
+        text = (f"{name} -- {'in logic now' if reach else 'not in logic yet'}. "
+                + "; ".join(lines) + ".")
+        return [{"text": text}]
 
     def fill_slot_data(self) -> dict[str, Any]:
         # (section_id|series_name) → location_id. Lua resolves the AP
@@ -2749,6 +3122,10 @@ class LibrarianWorld(World):
             "spare_book_item_percent": self.options.spare_book_item_percent.value,
             "spare_shelf_items": self.options.spare_shelf_items.value,
             "series_per_unlock": self.options.series_per_unlock.value,
+            # 1: unlocks are numbered items (Series Bundle k / Book Bundle k). Absent or 0:
+            # copies of one name, the shape before 3.0.0 beta 2.
+            "bundle_items": 1 if self.distinct_bundles else 0,
+            "numbered_books": 1 if self.numbered_book_bundles else 0,
             "series_order": self.series_order,
             # Derived from unlock_mode for the Lua client (unchanged contract).
             # When 1, each series is its own item and the client resolves an

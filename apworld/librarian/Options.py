@@ -75,13 +75,16 @@ class CustomGoalBookCount(Range):
 class UnlockMode(Choice):
     """Choose how book series are unlocked.
 
-    progressive_unlocks (default) -- each unlock item opens the next
-        series_per_unlock series. The smallest item pool, and the classic setup.
+    random_series_bundles (default) -- each Series Bundle item opens a group of
+        series_per_unlock series. Bundles are numbered and arrive in any order. The
+        smallest item pool, and the classic setup.
     individual_series_unlocks -- one unlock item per series, about 400 of them.
         Every bookcase is open from the start.
-    random_book_bundle -- each unlock item hands you books_per_bundle books from
-        anywhere in the library, ignoring series. With check_mode: series the
-        bundles are ordered so that a series finishes at a steady rate.
+    random_book_bundle -- each Progressive Book Bundle hands you the next
+        books_per_bundle books of the seed's order, drawn from anywhere in the
+        library, ignoring series. With check_mode: series the order is laid out so
+        that a series finishes at a steady rate. numbered_book_bundles makes each
+        bundle its own item instead.
     individual_book_unlocks -- one unlock item per book, about 3000 of them. Every
         bookcase is open from the start. Much the biggest pool: with check_mode:
         series it is switched to booksanity, since 3000 items cannot sit in 400 row
@@ -89,7 +92,7 @@ class UnlockMode(Choice):
         (allow_individual_book_unlocks in host.yaml) because it is slow to generate."""
     display_name = "Unlock Mode"
 
-    option_progressive_unlocks = 0
+    option_random_series_bundles = 0
     option_individual_series_unlocks = 1
     option_individual_book_unlocks = 2
     option_random_book_bundle = 3
@@ -97,13 +100,12 @@ class UnlockMode(Choice):
 
 
 class SeriesPerUnlock(Range):
-    """How many series each Progressive Series Unlock reveals. Lower means more
+    """How many series each Series Bundle holds. Lower means more
     unlocks with smaller impact; higher means fewer, bigger ones. (Below 3 makes a
     long unlock chain that's hard to place in tight seeds, so 3 is the minimum.)
 
-    Only applies to the progressive_unlocks mode; the other three hand out series
-    or books directly, so they ignore it. With check_mode: count, values below 5
-    are raised to 5."""
+    Only applies to the random_series_bundles mode; the other three hand out series
+    or books directly, so they ignore it."""
     display_name = "Series Per Unlock"
     range_start = 3
     range_end = 10
@@ -115,18 +117,30 @@ class BooksPerBundle(Range):
 
     Higher means fewer, bigger deliveries. Raised automatically if the seed would need
     more bundles than it has checks to put them in, and a little further with
-    check_mode: series so the rows stay fillable."""
+    check_mode: series or count so the checks stay fillable."""
     display_name = "Books Per Bundle"
     range_start = 2
     range_end = 50
     default = 10
 
 
+class NumberedBookBundles(Toggle):
+    """Give every Book Bundle its own number (Book Bundle 1, Book Bundle 2, ...) so a hint
+    can target the exact one. random_book_bundle only.
+
+    Off (default): bundles are copies of one item, Progressive Book Bundle, that open the
+    seed's book order in sequence. The tracker still tells you which bundle holds a book.
+    On: each bundle is its own item and they arrive in any order. This makes generation
+    noticeably slower with check_mode: count, so the host has to allow it
+    (allow_numbered_book_bundles in host.yaml)."""
+    display_name = "Numbered Book Bundles"
+
+
 class StartingSeriesCount(Range):
     """How many series you begin with unlocked. Always includes at least one whose
     row is on the starting bookcase, so your first check is available right away.
 
-    progressive_unlocks / individual_series_unlocks: that many series.
+    random_series_bundles / individual_series_unlocks: that many series.
     random_book_bundle: enough bundles to cover that many series, so what you
     actually start with depends on books_per_bundle.
     individual_book_unlocks: that many series' worth of random books -- each count
@@ -155,8 +169,8 @@ class BookcaseUnlocks(Choice):
 
 
 class SpareBookItemPercent(Range):
-    """Spare Progressive Series Unlock copies, as a percentage, so you do not need
-    every one of them to finish.
+    """Spare Series Bundle copies, as a percentage, so you do not need every one of
+    them to finish.
 
     On goal: custom it sets how much of the library the seed keeps past your goal.
     A goal of 200 rows and 10% spare leads to at least 220 series in the pool.
@@ -171,7 +185,7 @@ class SpareShelfItems(Range):
     """Spare Progressive Shelf Unlock copies, as a count per bookcase, so you do not
     need every one of them to open a section.
 
-    Full and floor goals with progressive_unlocks and bookcase_unlocks: progressive.
+    Full and floor goals with random_series_bundles and bookcase_unlocks: progressive.
     The other bookcase settings hand out whole sections or none at all, so there is
     nothing for a spare copy to open. A seed with no room for the number you pick uses
     fewer and says so during generation."""
@@ -279,6 +293,7 @@ class LibrarianOptions(PerGameCommonOptions):
     unlock_mode: UnlockMode
     series_per_unlock: SeriesPerUnlock
     books_per_bundle: BooksPerBundle
+    numbered_book_bundles: NumberedBookBundles
     starting_series_count: StartingSeriesCount
     bookcase_unlocks: BookcaseUnlocks
     spare_book_item_percent: SpareBookItemPercent
@@ -301,7 +316,13 @@ class LibrarianSettings(Group):
         make the spoiler's playthrough step slow for the whole multiworld: about a minute
         solo, and it grows faster than the player count."""
 
+    class AllowNumberedBookBundles(Bool):
+        """Allow numbered_book_bundles. Numbered bundles make the fill search harder:
+        about three times the generation time with check_mode: count, and it can fail
+        to generate with bookcases unlocked and series checks."""
+
     allow_individual_book_unlocks: Union[AllowIndividualBookUnlocks, bool] = False
+    allow_numbered_book_bundles: Union[AllowNumberedBookBundles, bool] = False
 
 
 option_groups = [
@@ -311,7 +332,7 @@ option_groups = [
     ),
     OptionGroup(
         "Unlocks",
-        [UnlockMode, SeriesPerUnlock, BooksPerBundle, StartingSeriesCount, BookcaseUnlocks, SpareBookItemPercent, SpareShelfItems],
+        [UnlockMode, SeriesPerUnlock, BooksPerBundle, NumberedBookBundles, StartingSeriesCount, BookcaseUnlocks, SpareBookItemPercent, SpareShelfItems],
     ),
     OptionGroup(
         "Checks",
