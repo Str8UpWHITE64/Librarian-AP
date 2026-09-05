@@ -139,6 +139,20 @@ function Client:connect()
     log("Connecting...")
 end
 
+--- End the session on purpose. apclientpp has no close: dropping the native client ends it, and
+--- the next connect() creates a fresh one. Never call this from inside one of the client's own
+--- handlers (they run within poll); defer it to the next tick. Fires on_disconnected so the title
+--- and the connect window show the state, as a socket drop would.
+function Client:disconnect(why)
+    log("Disconnecting" .. (why and (": " .. tostring(why)) or ""))
+    local c = self._client
+    self._client = nil
+    self._deferred_init = false
+    self._connected, self._slot_connected = false, false
+    if c then pcall(function() if c.reset then c:reset() end end) end
+    if self.on_disconnected then pcall(self.on_disconnected) end
+end
+
 -- Per-tick body: (first tick) create the client, then poll + drain outgoing + apply pending items.
 -- Runs on EXACTLY ONE thread at a time: the async LoopAsync below when _poll_on_game_thread is off
 -- (legacy), or the game-thread pawn tick (main.lua BP_LibrarianCharacter_C:ReceiveTick) when on.

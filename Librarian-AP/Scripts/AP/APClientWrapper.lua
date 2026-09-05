@@ -85,6 +85,7 @@ function APClientWrapper.new(uuid, game_name, server)
     end
 
     function wrapped:poll()                              safe_call("poll") end
+    function wrapped:reset()                             safe_call("reset") end   -- drop the socket and state
     function wrapped:get_state()                         return safe_call("get_state") end
     function wrapped:ConnectSlot(slot, password, items_handling, tags, version)
         print(string.format("%s ConnectSlot(slot='%s', items_handling=%d)", LOG_PREFIX, slot, items_handling))

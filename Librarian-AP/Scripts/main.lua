@@ -1820,7 +1820,10 @@ local function update_title_buttons()
 
     local enable_continue, enable_start = false, false
 
-    if connected then
+    local SIf = package.loaded["AP/SaveIdentity"]
+    if connected and SIf and SIf.slots_full then
+        log("[title-buttons] connected; AP save slots full -> both gameplay buttons disabled")
+    elseif connected then
         local IA = package.loaded["AP/ItemApply"]
         -- Keep Continue/New Game disabled until the world is fully READY: items pre-applied
         -- (_pre_apply_complete) AND the bookcases finished streaming + warding (_ward_settled). Entering
@@ -3065,6 +3068,7 @@ gt_loop("autonew", 500, function()
     local AC = package.loaded["AP/APClient"]
     if not (SI and IA and AC) then return false end
     if SI.disabled then return true end   -- vanilla: the mod does not touch the buttons at all
+    if SI.slots_full then return false end
     if SI.autonew_done or SI.autoload_done or IA._gameplay_active then return false end
     if not (AC._slot_connected and SI.slot_resolved and SI.start_enabled) then return false end
     -- No slot recorded at all: this seed has genuinely never been started. A run that HAS a record
@@ -3189,13 +3193,14 @@ gt_loop("claim_slot", 1000, function()
 
     local slot = SI.first_free_slot()
     if not slot then
+        -- Normally caught at connect time; this is the world that got away (a slot filled between
+        -- connecting and settling, or a probe that could not answer then). Same refusal, and the
+        -- connection goes with it so nothing from this unsaved world is sent.
         SI.pending_fresh = false
         log(("[save-id] no free slot in %d-%d — cannot claim"):format(SI.SLOT_MIN, SI.SLOT_MAX))
-        pcall(function()
-            local H = package.loaded["AP/HUD"]
-            if H then H.notify(("AP: no free save slot in %d-%d. Free one and reconnect.")
-                :format(SI.SLOT_MIN, SI.SLOT_MAX), 30.0) end
-        end)
+        SI.refuse_slots_full("claim")
+        local AC0 = package.loaded["AP/APClient"]
+        if AC0 then gt_defer(50, function() AC0:disconnect("no free AP save slot") end) end
         return false
     end
 
@@ -3980,7 +3985,10 @@ _G._librarian_gt_master_tick = function(dt_ms)
     -- declared further down the file, so a closure built here would only see nil globals.
     if _gt_pending_f12 then                              -- F12 pressed on the input thread
         _gt_pending_f12 = false
-        if not c._slot_connected then
+        local SIc = package.loaded["AP/SaveIdentity"]
+        if SIc and SIc.slots_full then
+            SIc.refuse_slots_full("F12")
+        elseif not c._slot_connected then
             log("[F12] connecting to AP...")
             pcall(function() c:connect() end)
         else
@@ -4155,6 +4163,11 @@ register_bp_hooks_once = function()
             local c = package.loaded["AP/APClient"]
             if not c then
                 log("[menu] APClient module not loaded; cannot connect")
+                return
+            end
+            local SIm = package.loaded["AP/SaveIdentity"]
+            if SIm and SIm.slots_full then
+                SIm.refuse_slots_full("menu")
                 return
             end
             if c._slot_connected then
@@ -4720,6 +4733,14 @@ APClient.on_slot_connected = function(slot_data)
         end
         log("[save-id] " .. SaveIdentity.describe())
 
+        -- A fresh run needs a slot of its own. With every mod slot taken the game would still start
+        -- a New Game and save it wherever it likes, so stop here: no New Game, no connection.
+        if not SaveIdentity.slot and SaveIdentity.all_slots_taken() then
+            SaveIdentity.refuse_slots_full("connect")
+            gt_defer(50, function() APClient:disconnect("no free AP save slot") end)
+            return
+        end
+
         -- Only a returning run has a world worth warding before the player
         -- enters it. A fresh run goes straight to New Game, which rebuilds the
         -- world anyway, so warding the title-behind one would only make the
@@ -4782,6 +4803,9 @@ APClient.on_disconnected = function()
         _G._librarian_menu.set_status("Disconnected", "bad")
         _G._librarian_menu.show()
     end
+    -- A refusal outlives the disconnect it caused: keep it on screen instead of the plain banner.
+    local SIs = package.loaded["AP/SaveIdentity"]
+    if SIs and SIs.slots_full then SIs.refuse_slots_full("disconnected") end
 end
 
 APClient.on_slot_refused = function(reason)

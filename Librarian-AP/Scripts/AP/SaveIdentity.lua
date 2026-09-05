@@ -58,6 +58,10 @@ M.save_missing = nil
 M.slot_resolved = false
 M.start_enabled = false    -- the title gating's own verdict on New Game; auto-New-Game defers to it
 M.mirror_pending = nil     -- a save happened; copy the world into our slot
+-- Every slot in SLOT_MIN..SLOT_MAX holds a save, so a fresh run has nowhere to go. Set by
+-- refuse_slots_full and never cleared: the game does not rescan, so the only way out is to delete a
+-- save and restart. Survives reset() on purpose, so a reconnect in the same session is refused too.
+M.slots_full = false
 M.mirroring    = false     -- a mirror write is in flight; ignore its own hook echo
 M.disabled     = false     -- player chose vanilla; passive until the next connect
 
@@ -116,6 +120,43 @@ function M.first_free_slot()
         if M.slot_exists(n, false) == false then return n end
     end
     return nil
+end
+
+--- Every mod slot confirmed occupied. Stricter than first_free_slot() == nil, which is also
+--- what an unanswered probe looks like: refusing a run needs every slot to say yes.
+function M.all_slots_taken()
+    for n = M.SLOT_MIN, M.SLOT_MAX do
+        if M.slot_exists(n, false) ~= true then return false end
+    end
+    return true
+end
+
+M.SLOTS_FULL_TEXT = ("AP: all AP save slots (%d-%d) are in use, so this seed cannot start. "
+    .. "Click Close on the AP window, open Load, right-click an AP save in slots %d-%d to delete it, "
+    .. "then restart the game and connect again."):format(M.SLOT_MIN, M.SLOT_MAX, M.SLOT_MIN, M.SLOT_MAX)
+
+--- Refuse to run this seed because the mod's slots are all taken. Latches slots_full, says so on
+--- the HUD and in the connect window, and holds the title buttons; the caller drops the connection.
+--- Without this the run went ahead with no slot of its own, and the game's next save landed in a
+--- low slot, over the player's own game.
+function M.refuse_slots_full(where)
+    M.slots_full = true
+    M.pending_fresh, M.autonew_done = false, true
+    print(("[LibrarianAP] [save-id] refusing: all AP save slots %d-%d are in use (%s)\n")
+        :format(M.SLOT_MIN, M.SLOT_MAX, tostring(where)))
+    pcall(function()
+        local H = package.loaded["AP/HUD"]
+        if H then
+            H.notify(M.SLOTS_FULL_TEXT, 60.0)
+            H.set_status(("AP: save slots %d-%d are full. Free one, then restart the game.")
+                :format(M.SLOT_MIN, M.SLOT_MAX), H.COL_STATUS_BAD)
+        end
+        local menu = _G._librarian_menu
+        if menu and menu.set_status then
+            menu.set_status(("All AP save slots (%d-%d) are in use. Delete one via Close, then Load, "
+                .. "then restart the game."):format(M.SLOT_MIN, M.SLOT_MAX), "bad")
+        end
+    end)
 end
 
 --- Does ANY save exist? Replaces the old flat-file test behind the title

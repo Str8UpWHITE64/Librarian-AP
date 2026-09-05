@@ -648,6 +648,12 @@ there is nothing to tidy up by hand.
 Note the game won't let you delete the save you're currently playing, so
 clear old runs from the title screen before starting a new one.
 
+**If all eleven AP slots are in use**, a new seed refuses to start: the mod
+disconnects and tells you so instead of letting the game save the new run
+over one of your own slots. Click **Close** on the AP window, open **Load**,
+delete an old AP save in the 20–30 range, then restart the game and connect
+again.
+
 **Deleting an AP save cannot be undone.** The run can only be regenerated,
 not resumed.
 
