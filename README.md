@@ -657,6 +657,21 @@ again.
 **Deleting an AP save cannot be undone.** The run can only be regenerated,
 not resumed.
 
+**If the mod says the save does not match**, checks are paused until it
+does. There are two messages:
+
+- *Book layout does not match this run's last save.* Usually you loaded a
+  different slot; load the run's own slot and carry on. If you are sure this
+  is the run's save (you restored it from a backup, say), press **F7** to
+  accept it. The mod re-checks that nothing on the shelves is a book this run
+  never unlocked, then records this save as the run's and resumes.
+- *This save holds books this run never unlocked.* That save belongs to
+  another game and cannot be accepted. Load the run's own slot, or delete
+  the AP save from the Load menu and start the seed over.
+
+The match record is kept on your machine, not on the server, so there is
+nothing to reset there.
+
 **If a run's save goes missing**, whether you moved it or deleted it and
 changed your mind, connecting to that seed will say so and wait. Put the save file
 back and reconnect and the run continues as before. Press **New Game** and

@@ -78,7 +78,7 @@ end
 --- survives; only the judgement is cleared.
 function M.reset_world()
     if M.verdict ~= M.UNKNOWN then
-        M.verdict, M.reason = M.UNKNOWN, nil
+        M.verdict, M.reason, M.reject_kind = M.UNKNOWN, nil, nil
     end
     M.fp_checked = false
 end
@@ -525,7 +525,7 @@ function M.evaluate()
                 M.verdict, M.reason = M.VERIFIED, nil
                 return M.verdict
             end
-            M.verdict = M.REJECTED
+            M.verdict, M.reject_kind = M.REJECTED, "layout"
             M.reason = "book layout does not match this run's last save"
             return M.verdict
         end
@@ -539,7 +539,7 @@ function M.evaluate()
                 M.count_keys(IA._series_unlocked), M.count_keys(IA._books_unlocked))
 
     if n_bad > 0 then
-        M.verdict = M.REJECTED
+        M.verdict, M.reject_kind = M.REJECTED, "contents"
         M.reason = ("%d shelved item(s) this run never unlocked (e.g. %s)")
             :format(n_bad, tostring(example))
     elseif n_shelved > 0 and n_unresolved == 0 then
@@ -549,6 +549,43 @@ function M.evaluate()
     -- world could not be read to call it either way. Refusing to decide is the
     -- safe answer -- a world we cannot read must not pass by default.
     return M.verdict
+end
+
+--- What a rejected player should do, for the HUD. The layout hash is kept only on this machine,
+--- so there is nothing to reset on the server: the ways out are loading the run's own save,
+--- accepting the loaded one (F7, layout mismatch only), or deleting the AP save to start over.
+function M.reject_advice()
+    local own = M.slot and ("slot %d"):format(M.slot) or "this run's save"
+    if M.reject_kind == "layout" then
+        return ("AP: this save's book layout does not match this run's last save, so checks are "
+            .. "paused. Load %s to continue the run. If this IS %s, press F7 to accept this save.")
+            :format(own, own)
+    end
+    return ("AP: this save is not this run's: %s. Checks are paused. Load %s, or delete the AP "
+        .. "save from the Load menu to start the seed over."):format(M.reason or "it does not match", own)
+end
+
+--- The player vouches for the loaded save (F7). Only lifts a layout mismatch, and only when the
+--- world holds nothing this run never unlocked: a contradiction is evidence of the wrong world and
+--- stays refused. On success the layout is re-recorded so the next load matches on its own.
+function M.accept_loaded_save()
+    if M.verdict ~= M.REJECTED then return false, "nothing to accept: this save is not refused" end
+    if M.reject_kind ~= "layout" then
+        return false, "this save holds books the run never unlocked; it cannot be accepted"
+    end
+    local IA = package.loaded["AP/ItemApply"]
+    if not IA then return false, "world not readable yet" end
+    local n_bad, _n_shelved, example = M.count_impossible(IA)
+    if n_bad == nil then return false, "world not readable yet, try again in a moment" end
+    if n_bad > 0 then
+        M.verdict, M.reject_kind = M.REJECTED, "contents"
+        M.reason = ("%d shelved item(s) this run never unlocked (e.g. %s)"):format(n_bad, tostring(example))
+        return false, M.reason
+    end
+    M.verdict, M.reason, M.reject_kind = M.VERIFIED, nil, nil
+    M.fp_checked = true
+    M.record_layout()
+    return true
 end
 
 --- Size of a set-style table.
@@ -629,7 +666,7 @@ end
 --- Cleared per connection; the slot is re-established from the server or the
 --- local file, never carried over from a previous run.
 function M.reset()
-    M.verdict, M.reason = M.UNKNOWN, nil
+    M.verdict, M.reason, M.reject_kind = M.UNKNOWN, nil, nil
     M.slot, M.slot_source = nil, nil
     M.override = false
     M.seed, M.ap_slot, M.storage_key = nil, nil, nil

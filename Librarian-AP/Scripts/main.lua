@@ -66,7 +66,9 @@ local _gt_pending_activate = nil  -- reason string set by a title-button hook; c
 local _gt_pending_f12 = false     -- F12/F4/F6 fire on the UE4SS input thread; the binds set a
 local _gt_pending_f4  = false     -- boolean and the master tick runs the actual work
 local _gt_pending_f6  = false     -- dev: fire the Recall Stone once (MAGIC_TEST_RECALL_STONE)
-local _gt_pending_f7  = false     -- accept the loaded save as this run's (layout mismatch only)
+-- A global, not a local: the main chunk sits at Lua's 200-local ceiling. Same role as the three
+-- above: set on the input thread, drained by the master tick.
+_gt_pending_f7 = false            -- accept the loaded save as this run's (layout mismatch only)
 local _l3_resume = nil            -- L3 (book-pile HISM) chunk resume; the master scheduler advances it one chunk/frame
 local _l3c_ep, _l3c_mgr, _l3c_mat, _l3c_ready   -- L3 setup scan cache (per world epoch): HISM mgr / mask material / ready flag
 local _gt_last_epoch = -1         -- last world epoch the scheduler saw; a bump means the captured warding arrays are freed
