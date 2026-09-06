@@ -591,6 +591,13 @@ function Client:say(text)
 end
 
 function Client:set_status(status)
+    if status == Client.STATUS_GOAL then
+        local SI = package.loaded["AP/SaveIdentity"]
+        if SI and not SI.may_send_checks() then
+            log(("Goal held: %s"):format(SI.reason or "save identity not confirmed"))
+            return
+        end
+    end
     self._outgoing_status = status
 end
 

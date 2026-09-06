@@ -4281,6 +4281,10 @@ end
 
 function _goal.send(rows)
     if _goal.sent then return end
+    -- The counts below come from the loaded world. A world that is not this run's (wrong save,
+    -- verdict pending) proves nothing, so it neither opens the way out nor arms the goal. Same
+    -- gate as checks: a rejected save used to hold every check and still send the goal.
+    if not _goal.allowed() then return end
     local APClient_mod = package.loaded["AP/APClient"]
     local sd = APClient_mod and APClient_mod.slot_data
     if not sd then return end
@@ -4315,6 +4319,20 @@ function _goal.send(rows)
     _bh.drop_end_barrier()
 end
 
+--- The goal follows the same rule as checks: only from a world proven to be this run's.
+function _goal.allowed()
+    local SI = package.loaded["AP/SaveIdentity"]
+    if SI and not SI.may_send_checks() then
+        if not _goal.held_logged then
+            _goal.held_logged = true
+            log(("[AP] goal held: %s"):format(SI.reason or "save identity not confirmed"))
+        end
+        return false
+    end
+    _goal.held_logged = nil
+    return true
+end
+
 --- Send the goal a beat after the ending starts, not on the same frame.
 ---
 --- The server releases the rest of the seed the moment the goal lands, and taking three
@@ -4338,6 +4356,7 @@ function _goal.tick_victory()
         if not _goal.reached then return end
         _goal.idle_ticks = (_goal.idle_ticks or 0) + 1
         if _goal.idle_ticks < 300 then return end   -- ticks of the 1s loop
+        if not _goal.allowed() then return end      -- not latched: sends once the world is verified
         _goal.sent = true
         log("[AP] goal reached and the ending untaken for 5 minutes; sending STATUS_GOAL")
         ap_send_goal()
@@ -4346,6 +4365,7 @@ function _goal.tick_victory()
     _goal.victory_ticks = _goal.victory_ticks - 1
     if _goal.victory_ticks > 0 then return end
     _goal.victory_ticks = nil
+    if not _goal.allowed() then return end          -- the ending in a foreign world is not ours
     _goal.sent = true
     log("[AP] sending STATUS_GOAL")
     ap_send_goal()
