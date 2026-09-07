@@ -2414,6 +2414,8 @@ local function start_gameplay_loops()
                 log(("[book-sanity] shelving → %d check(s) sent"):format(sent))
             end
         end
+        -- A full row that is out of order is named on the HUD until it is fixed. Self-gated.
+        if diag_on("MISORDER_NOTICE") then pcall(function() IA.pulse_misordered_rows() end) end
         -- Finishing a row is announced by FinishRow, which only arms this flag. Run the checks
         -- here, on the same 500ms loop BookSanity's shelving sweep already rides, so every mode
         -- reacts to a completed row at the same speed rather than waiting on the rotation.

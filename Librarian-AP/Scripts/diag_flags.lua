@@ -65,6 +65,9 @@ return {
     -- as the actor<->pile backfill). Restored on unlock. Off = actor ward alone gates grabbing.
     BOOK_PILE_TELEPORT = true,
 
+    -- Name on the HUD a row that is fully shelved but out of order, until it is fixed.
+    MISORDER_NOTICE    = true,
+
     -- Log what the mass-book magic skills actually touch: which books Assemble takes, whether the
     -- game asks CanBeGrab first, and which pile instances get rewritten while Insight is up. Cheap
     -- (a few lines per skill use) and it is the only evidence for whether the two guards below are

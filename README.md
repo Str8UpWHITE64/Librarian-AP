@@ -233,6 +233,9 @@ or host it locally.
 
 ### Tips
 
+- A row only counts when every volume is in its own slot. If a row is full
+  but out of order, the HUD names it and says how many volumes are out of
+  place, and repeats once a minute until it is fixed.
 - Working connection details are saved back to
   `Mods\Librarian-AP\Scripts\ap_config.json` after a successful connect,
   so the menu prefills with your last-used values on the next launch.

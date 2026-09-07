@@ -3211,6 +3211,152 @@ function M.detect_correct_books()
     return sent
 end
 
+-- ---------------------------------------------------------------------------
+-- Misordered rows: every volume on the shelf, not every volume in its slot
+-- ---------------------------------------------------------------------------
+-- The game flashes a book red the moment it is placed wrong, once, and only while it is looked
+-- at. A row filled out of order shows nothing afterwards; it simply never counts, and a tester
+-- spent a while looking for a book that was on the shelf all along. This walks the bookcases in
+-- chunks on the game thread, reads each row that does not count, and names on the HUD any
+-- series whose every volume is on the row with some out of order: once when first seen, then
+-- once a minute until it is right. The per-book "Is Abs Correct" flag is not used: the game does
+-- not restore it on load, so it reads false for everything placed in an earlier session.
+local MIS_CASES = 12    -- bookcases per 500ms pass: the library's ~70 cases in about 3s
+function M.pulse_misordered_rows()
+    if not (M._gameplay_active and M._apply_safe) or M._flush_in_progress then return end
+    if not M._cases_indexed then return end
+    if M._mis_cases and (M._world_epoch or 0) ~= (M._mis_epoch or 0) then M._mis_cases = nil end
+    local cases, cursor = M._mis_cases, M._mis_cursor or 0
+    if not cases or cursor >= #cases then
+        cases = {}
+        for sid, list in pairs(M._section_to_cases or {}) do
+            for _, c in ipairs(list) do cases[#cases + 1] = { sid = sid, case = c } end
+        end
+        if #cases == 0 then return end
+        M._mis_cases, M._mis_epoch, cursor = cases, M._world_epoch or 0, 0
+        M._mis_found = {}   -- aidx -> { sid, vols, wrong = { book, ... } }
+    end
+    local found = M._mis_found
+    local stop = math.min(cursor + MIS_CASES, #cases)
+    for ci = cursor + 1, stop do
+        local sid, case = cases[ci].sid, cases[ci].case
+        if case and case:IsValid() then
+            -- Row i's slots are (i-1)*per_row+1 .. i*per_row of the flat PlacingBookInfo grid, the
+            -- same reading detect_completed_rows uses. A row the case marks done is left alone.
+            local rs, pbi = nil, nil
+            pcall(function() rs = case.RowStatus end)
+            pcall(function() pbi = case.PlacingBookInfo end)
+            local rs_n, pbi_n = 0, 0
+            if rs then pcall(function() rs_n = #rs end) end
+            if pbi then pcall(function() pbi_n = #pbi end) end
+            local per_row = (rs_n > 0 and pbi_n > 0 and pbi_n % rs_n == 0) and math.floor(pbi_n / rs_n) or 0
+            -- Judge one set of books (slot order) of one series: every volume present and the
+            -- left-to-right order not the chapter order. Chapters are 0-based and a finished row
+            -- is the run 0..n-1, the same reading detect_completed_rows uses for cabinets.
+            local function judge(aidx, g)
+                local vols = M._asset_to_volumes[aidx] or 0
+                local sname = M._asset_to_series[aidx]
+                local unlocked = sname and (M._series_unlocked[sname]
+                    or M._books_unlocked[sname .. "|" .. g[1].ch])
+                if not (vols > 0 and #g == vols and unlocked) then return end
+                local sorted = {}
+                for k, e in ipairs(g) do sorted[k] = e.ch end
+                table.sort(sorted)
+                local wrong = {}
+                for k, e in ipairs(g) do
+                    if e.ch ~= sorted[k] then wrong[#wrong + 1] = e.book end
+                end
+                if #wrong > 0 then found[aidx] = { sid = sid, vols = vols, wrong = wrong } end
+            end
+            local function read_slot(slot, into)
+                local book = nil
+                pcall(function() book = pbi[slot] end)
+                if book and book:IsValid() then
+                    local aidx = _book_valid_asset_idx(book)
+                    if aidx ~= nil then
+                        local ch = nil
+                        pcall(function() ch = tonumber(book.ItemInfo.Chapter) end)
+                        if ch ~= nil then into[#into + 1] = { book = book, aidx = aidx, ch = ch } end
+                    end
+                end
+            end
+            if per_row == 0 and pbi_n > 0 then
+                -- Cabinet shape (1C/1D/1G/1H and the floor-2 cabinets): the slot count is not
+                -- rows x per_row and no slot-to-row map is readable, so read the whole case as one
+                -- run. A series that sits in chapter order is finished and yields nothing; one
+                -- with every volume present in any other order is out of order, whichever rows
+                -- it spans.
+                if not (M._mis_shapes or {})[sid] then
+                    M._mis_shapes = M._mis_shapes or {}
+                    M._mis_shapes[sid] = true
+                    local cls = "?"; pcall(function() cls = case:GetClass():GetFName():ToString() end)
+                    log(("[misorder] %s: cabinet shape %s, %d slots, %d row flags; reading as one run")
+                        :format(sid, cls, pbi_n, rs_n))
+                end
+                local flat = {}
+                for slot = 1, pbi_n do read_slot(slot, flat) end
+                local by_aidx = {}
+                for _, e in ipairs(flat) do
+                    local g = by_aidx[e.aidx]; if not g then g = {}; by_aidx[e.aidx] = g end
+                    g[#g + 1] = e
+                end
+                for aidx, g in pairs(by_aidx) do judge(aidx, g) end
+            end
+            if per_row > 0 then
+                for i = 1, rs_n do
+                    local done = false
+                    pcall(function() local v = rs[i]; done = (v == true or v == 1) end)
+                    if not done then
+                        -- Books on this row, in slot order, with their series and chapter.
+                        local row = {}
+                        for slot = (i - 1) * per_row + 1, i * per_row do read_slot(slot, row) end
+                        local by_aidx = {}
+                        for _, e in ipairs(row) do
+                            local g = by_aidx[e.aidx]; if not g then g = {}; by_aidx[e.aidx] = g end
+                            g[#g + 1] = e
+                        end
+                        for aidx, g in pairs(by_aidx) do judge(aidx, g) end
+                    end
+                end
+            end
+        end
+    end
+    M._mis_cursor = stop
+    if stop < #cases then return end
+
+    -- Lap done. Say which rows: once when a row is first caught, again every minute while it
+    -- stays wrong. (The game's own red flash, Correct(false), only shows while the book is being
+    -- looked at, so it is not replayed here; the notice is the indicator.)
+    local was = M._mis_flagged or {}
+    local now = {}
+    local tick = (M._mis_tick or 0) + 1
+    M._mis_tick = tick
+    for aidx, f in pairs(found) do
+        now[aidx] = true
+        local sname = M._asset_to_series[aidx] or "?"
+        if not was[aidx] then
+            log(("[misorder] %s '%s': all %d volumes shelved, %d out of place"):format(f.sid, sname, f.vols, #f.wrong))
+        end
+        if not was[aidx] or tick % 15 == 0 then
+            pcall(function()
+                local H = package.loaded["AP/HUD"]
+                if H then H.notify(("A row in %s is complete but out of order: %s (%d volume%s)"):format(
+                    f.sid, sname, #f.wrong, #f.wrong == 1 and "" or "s"), 12.0) end
+            end)
+        end
+    end
+    for aidx in pairs(was) do
+        if not now[aidx] then log(("[misorder] %s: row fixed"):format(M._asset_to_series[aidx] or "?")) end
+    end
+    M._mis_flagged = now
+    M._mis_laps = (M._mis_laps or 0) + 1
+    if M._mis_laps <= 3 or M._mis_laps % 150 == 0 then
+        local nf = 0; for _ in pairs(now) do nf = nf + 1 end
+        log(("[misorder] lap %d: %d cases, %d row(s) out of order"):format(M._mis_laps, #cases, nf))
+    end
+    M._mis_found = {}
+end
+
 function M.detect_completed_rows()
     if not M._cases_indexed then return 0 end
     if not M._slot_data then return 0 end
@@ -3219,6 +3365,8 @@ function M.detect_completed_rows()
 
     local sent_count = 0
     local rows_by_case = 0   -- RowStatus trues across every case: the shelves' own finished-row count
+    local complete_aidx = {} -- series (by asset idx) sitting on a row the case marks complete
+    local complete_partial = {}      -- sections where a case took the non-grid fallback: unknown there
 
     -- Send the row-completion location for one (section, series), de-duped via
     -- _sent_row_locations. Returns true if a NEW check was actually sent.
@@ -3293,6 +3441,7 @@ function M.detect_completed_rows()
                             -- Fire ONLY when the row's series belongs to THIS case's section;
                             -- a foreign mapping (mis-index / cross-section / mis-read) is logged, not fired.
                             local best_sid = best_aidx and M._asset_to_section[best_aidx]
+                            if best_aidx then complete_aidx[best_aidx] = true end
                             if best_aidx and best_sid == sid then
                                 if fire_row(sid, M._asset_to_series[best_aidx],
                                         ("(row %d, AssetIdx %d, %d/%d slots)"):format(i, best_aidx, best_n, per_row)) then
@@ -3304,6 +3453,7 @@ function M.detect_completed_rows()
                             end
                         end
                     else
+                        complete_partial[sid] = true
                         -- FALLBACK (non-grid PBI: slot count isn't rows*per_row): "fully present in
                         -- home section" scan capped by #completed. Less precise but never invents a
                         -- not-present series.
@@ -3418,6 +3568,7 @@ function M.detect_completed_rows()
     -- 19th row counted only on the next load, one level late). The shelves are the truth the
     -- level and threshold checks fall back on.
     M._rows_by_case, M._rows_by_case_epoch = rows_by_case, M._world_epoch or 0
+    M._complete_by_case, M._complete_by_case_partial = complete_aidx, complete_partial
     return sent_count
 end
 
