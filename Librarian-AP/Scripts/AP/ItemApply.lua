@@ -3218,6 +3218,7 @@ function M.detect_completed_rows()
     if type(row_loc_map) ~= "table" then return 0 end
 
     local sent_count = 0
+    local rows_by_case = 0   -- RowStatus trues across every case: the shelves' own finished-row count
 
     -- Send the row-completion location for one (section, series), de-duped via
     -- _sent_row_locations. Returns true if a NEW check was actually sent.
@@ -3253,6 +3254,7 @@ function M.detect_completed_rows()
                     pcall(function() local v = rs[i]; done = (v == true or v == 1) end)
                     if done then completed[#completed + 1] = i end
                 end
+                rows_by_case = rows_by_case + #completed
 
                 if #completed > 0 then
                     -- Read the completed series from the books ACTUALLY on each row: under free
@@ -3412,7 +3414,24 @@ function M.detect_completed_rows()
             end
         end
     end
+    -- The game's CurrentFinishedRowNum can miss a row the case already marks done (a tester's
+    -- 19th row counted only on the next load, one level late). The shelves are the truth the
+    -- level and threshold checks fall back on.
+    M._rows_by_case, M._rows_by_case_epoch = rows_by_case, M._world_epoch or 0
     return sent_count
+end
+
+--- Finished rows: the game's counter or the bookcases' own RowStatus count, whichever is higher.
+--- Both describe the current world; the case count is only trusted from this world's epoch.
+function M.rows_finished_floor(game_rows)
+    local by_case = ((M._rows_by_case_epoch or -1) == (M._world_epoch or 0)) and (M._rows_by_case or 0) or 0
+    local rows = math.max(tonumber(game_rows) or 0, by_case)
+    if by_case > (tonumber(game_rows) or 0) and M._rows_floor_logged ~= by_case then
+        M._rows_floor_logged = by_case
+        log(("[progress] bookcases report %d finished rows, the game's counter says %d; using %d")
+            :format(by_case, tonumber(game_rows) or 0, rows))
+    end
+    return rows
 end
 
 --- Mark every row location the server already knows checked (APClient._sent_checks) into
@@ -3548,9 +3567,9 @@ function M.fire_completion_passes()
         end
         -- Same stale-save rule as the other progress reads: during a New Game this is the PREVIOUS
         -- run's row count, and firing it sent 52 unearned thresholds.
-        if rf > 0 and not M.save_progress_is_stale(rf) then
-            M.fire_row_completion_checks(rf)
-        end
+        if M.save_progress_is_stale(rf) then rf = 0 end
+        rf = M.rows_finished_floor(rf)
+        if rf > 0 then M.fire_row_completion_checks(rf) end
     end)
     pcall(function() M.fire_book_completion_checks() end)
     pcall(function() M.fire_count_ticks() end)
@@ -3610,10 +3629,13 @@ end
 
 --- Fire "Shelved N Books" for every tick the run has reached. check_mode=by_count only.
 ---
---- The count comes from detect_correct_books' sweep, not from the server's checked set: in this
---- mode there are no per-book locations to count from. That makes the figure session-local until
---- the sweep has walked the library once, so a resumed run fires its ticks a lap late rather than
---- early. Late is recoverable; early would hand out checks nobody earned.
+--- Two sources, and the higher wins. The sweep counts books whose "Is Abs Correct" flag is set,
+--- which the game sets when a book goes in and does not restore on load: a resumed run read as
+--- 16 shelved with 194 on the shelves, and every tick past what that session placed stayed
+--- unsent. The game's own shelved counter (the HUD number, InsertedBookNum in the save) survives
+--- a reload and is read with the stale-save guard in sync_progress_state, so it is the floor;
+--- the sweep still moves the count between syncs. Neither the server's checked set: this mode
+--- has no per-book locations to count from.
 function M.fire_count_ticks()
     if not M._check_by_count then return 0 end
     local map = M._count_location_map
@@ -3621,7 +3643,12 @@ function M.fire_count_ticks()
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient.send_check) then return 0 end
 
-    local count = M._correct_count or 0
+    local swept, game = M._correct_count or 0, M._books_placed_peak or 0
+    local count = math.max(swept, game)
+    if game > swept and M._count_game_led ~= game then
+        M._count_game_led = game
+        log(("[count-tick] game counter %d leads the sweep's %d; counting from the game"):format(game, swept))
+    end
     local sent = 0
     for key, loc_id in pairs(map) do
         local n = tonumber(key)
@@ -3892,6 +3919,7 @@ function M.sync_progress_state()
     if M.save_progress_is_stale(rows_finished) then
         rows_finished, books_placed_save = 0, 0
     end
+    rows_finished = M.rows_finished_floor(rows_finished)
     local books_placed_widget = M._read_widget_book_count() or 0
     local books_placed_current = math.max(books_placed_save, books_placed_widget,
                                           M._books_placed_observed or 0)
