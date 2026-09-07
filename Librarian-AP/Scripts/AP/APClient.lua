@@ -276,6 +276,27 @@ function Client:_register_handlers()
         self._name_wait_idx, self._name_wait_tries = nil, 0
         self._outgoing_storage = {}
         self.on_storage = nil
+        -- The slot's own locations, missing plus checked, as the server lists them. The client
+        -- derives checks from counts and tables that can name locations a seed of another
+        -- version or mode never had; the server drops those, but the HUD announced each one as
+        -- a bare id. Sends outside this set go out unannounced.
+        self._slot_locations = nil
+        pcall(function()
+            local set, n = {}, 0
+            for _, list in ipairs({ c:get_missing_locations(), c:get_checked_locations() }) do
+                if list then
+                    for i = 1, #list do
+                        local id = tonumber(list[i])
+                        if id and not set[id] then set[id] = true; n = n + 1 end
+                    end
+                end
+            end
+            if n > 0 then
+                self._slot_locations = set
+                log(("Slot has %d locations"):format(n))
+            end
+        end)
+        self._foreign_logged = {}
         if self.on_slot_connected then pcall(self.on_slot_connected, self.slot_data) end
         -- Fire scouts for all our missing locations so on_check_sent can
         -- name what we're sending. Batched (25 per tick × 200ms delay) so
@@ -540,9 +561,27 @@ function Client:send_check(location_id)
     end
     self._id_block_logged = nil
 
+    -- Not one of this slot's locations: still sent, the server drops what it does not know,
+    -- but not announced. Logged once per id.
+    local foreign = self._slot_locations and not self._slot_locations[location_id]
+    if foreign and not self._foreign_logged[location_id] then
+        self._foreign_logged[location_id] = true
+        log(("Check %d is not a location of this slot; sent quietly"):format(location_id))
+    end
+
     self._outgoing_checks[#self._outgoing_checks + 1] = location_id
-    if self.on_check_sent then pcall(self.on_check_sent, location_id) end
+    if not foreign and self.on_check_sent then pcall(self.on_check_sent, location_id) end
     return true
+end
+
+--- The location's name from the data package, or nil.
+function Client:location_name(location_id)
+    local name = nil
+    pcall(function()
+        if self._client then name = self._client:get_location_name(location_id, self.game) end
+    end)
+    if name and name ~= "" then return name end
+    return nil
 end
 
 --- Mark whether the player is currently in a gameplay level. When false,

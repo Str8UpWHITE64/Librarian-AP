@@ -4561,7 +4561,10 @@ end
 APClient.on_check_sent = function(loc_id)
     local entry = APClient._scout_cache and APClient._scout_cache[loc_id]
     if not entry or not entry.item_name or entry.item_name == "" then
-        HUD.push_log("→ loc " .. tostring(loc_id), HUD.COL_SENT)
+        -- The scout for it has not answered yet (they arrive in batches over the first few
+        -- seconds), so the item is unknown; the location's name is still in the data package.
+        local name = APClient.location_name and APClient:location_name(loc_id)
+        HUD.push_log(name and ("You sent a check: " .. name) or "You sent a check", HUD.COL_SENT)
         return
     end
 
