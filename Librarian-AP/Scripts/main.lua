@@ -69,6 +69,7 @@ local _gt_pending_f6  = false     -- dev: fire the Recall Stone once (MAGIC_TEST
 -- A global, not a local: the main chunk sits at Lua's 200-local ceiling. Same role as the three
 -- above: set on the input thread, drained by the master tick.
 _gt_pending_f7 = false            -- accept the loaded save as this run's (layout mismatch only)
+_gt_pending_f8 = false            -- write the diagnostic report (also a global, same reason)
 local _l3_resume = nil            -- L3 (book-pile HISM) chunk resume; the master scheduler advances it one chunk/frame
 local _l3c_ep, _l3c_mgr, _l3c_mat, _l3c_ready   -- L3 setup scan cache (per world epoch): HISM mgr / mask material / ready flag
 local _gt_last_epoch = -1         -- last world epoch the scheduler saw; a bump means the captured warding arrays are freed
@@ -4008,6 +4009,14 @@ _G._librarian_gt_master_tick = function(dt_ms)
             H7.notify("AP: cannot accept this save: " .. tostring(why7), 15.0)
         end
     end
+    if _gt_pending_f8 then                               -- F8 pressed on the input thread
+        _gt_pending_f8 = false
+        local IA8 = package.loaded["AP/ItemApply"]
+        if IA8 and IA8.diagnostic_report then
+            IA8._mod_version = MOD_VERSION
+            pcall(function() IA8.diagnostic_report() end)
+        end
+    end
     if _gt_pending_f6 then                               -- F6 pressed on the input thread
         _gt_pending_f6 = false
         -- Diagnostics live in dev/AP/probe_magic.lua and are attached to _dev only under
@@ -5066,6 +5075,8 @@ RegisterKeyBind(Key.F4, function() _gt_pending_f4 = true end)
 RegisterKeyBind(Key.F6, function() _gt_pending_f6 = true end)
 -- F7: vouch for the loaded save after a layout-mismatch refusal. Same input-thread discipline.
 RegisterKeyBind(Key.F7, function() _gt_pending_f7 = true end)
+-- F8: the diagnostic report, to the log.
+RegisterKeyBind(Key.F8, function() _gt_pending_f8 = true end)
 
 -- DEV: feasibility probe harness (AP/probe.lua). Loads only when diag PROBE_MODE is EXPLICITLY
 -- true -- diag_on() defaults missing flags to ON, so gate on the raw table value to keep the

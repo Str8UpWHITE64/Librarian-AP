@@ -3357,6 +3357,226 @@ function M.pulse_misordered_rows()
     M._mis_found = {}
 end
 
+-- ---------------------------------------------------------------------------
+-- Diagnostic report (F8): where every unlocked book is, in one screen of text
+-- ---------------------------------------------------------------------------
+-- Written to the log, so a player asking for help still has one file to send. One frame's walk
+-- of the books and the cases, on demand only.
+local function _report_lines()
+    local L = {}
+    local function add(fmt, ...) L[#L + 1] = select("#", ...) > 0 and fmt:format(...) or fmt end
+    local sd = M._slot_data or {}
+    local SI = package.loaded["AP/SaveIdentity"]
+    local AC = package.loaded["AP/APClient"]
+
+    -- Case -> section, by full name, so a book's AttachedActor can be placed.
+    local case_sid = {}
+    for sid, list in pairs(M._section_to_cases or {}) do
+        for _, c in ipairs(list) do
+            pcall(function() if c and c:IsValid() then case_sid[c:GetFullName()] = sid end end)
+        end
+    end
+    local only_shelfable = sd.only_unward_shelfable_books == 1
+    local case_open = only_shelfable and M._compute_case_open_set() or nil
+
+    -- Per series: volumes, unlocked, on a shelf at home / elsewhere, loose, and order.
+    local ser = {}   -- aidx -> record
+    local function rec(aidx)
+        local r = ser[aidx]
+        if not r then
+            local name = M._asset_to_series[aidx] or ("asset " .. tostring(aidx))
+            r = { aidx = aidx, name = name, sid = M._asset_to_section[aidx] or "?",
+                  vols = M._asset_to_volumes[aidx] or 0, unlocked = 0, gated = 0, home = 0, away = {},
+                  loose = {}, misordered = false }
+            ser[aidx] = r
+        end
+        return r
+    end
+    local totals = { books = 0, unlocked = 0, gated = 0, shelved = 0, loose = 0, away = 0, locked = 0 }
+    local books = FindAllOf("BP_GrabbingBook_C") or {}
+    local n = 0; pcall(function() n = #books end)
+    for i = 1, n do
+        local b = books[i]
+        local aidx = _book_valid_asset_idx(b)
+        if aidx ~= nil then
+            totals.books = totals.books + 1
+            local sname = M._asset_to_series[aidx]
+            local ch = nil
+            pcall(function() ch = tonumber(b.ItemInfo.Chapter) end)
+            local unlocked = sname and (M._series_unlocked[sname]
+                or (ch ~= nil and M._books_unlocked[sname .. "|" .. ch])) or false
+            if unlocked then
+                local r = rec(aidx)
+                r.unlocked = r.unlocked + 1
+                totals.unlocked = totals.unlocked + 1
+                if case_open and sname and not case_open[sname] then
+                    -- Still warded behind a shut bookcase. The mod anchors a warded book to a
+                    -- case, so its AttachedActor says nothing about shelving.
+                    r.gated = r.gated + 1
+                    totals.gated = totals.gated + 1
+                else
+                    local where = nil
+                    pcall(function()
+                        local a = b.AttachedActor
+                        if a and a:IsValid() then where = case_sid[a:GetFullName()] or "?" end
+                    end)
+                    if where == nil then
+                        r.loose[#r.loose + 1] = (ch or -1) + 1
+                        totals.loose = totals.loose + 1
+                    elseif where == r.sid then
+                        r.home = r.home + 1
+                        totals.shelved = totals.shelved + 1
+                    else
+                        r.away[#r.away + 1] = ("vol %d on %s"):format((ch or -1) + 1, tostring(where))
+                        totals.away = totals.away + 1
+                    end
+                end
+            else
+                totals.locked = totals.locked + 1
+            end
+        end
+    end
+
+    -- Order, per case: a series' books in slot order against their chapters.
+    local rows_by_case = 0
+    for _, list in pairs(M._section_to_cases or {}) do
+        for _, c in ipairs(list) do
+            if c and c:IsValid() then
+                local rs, pbi = nil, nil
+                pcall(function() rs = c.RowStatus end)
+                pcall(function() pbi = c.PlacingBookInfo end)
+                local rs_n, pbi_n = 0, 0
+                if rs then pcall(function() rs_n = #rs end) end
+                if pbi then pcall(function() pbi_n = #pbi end) end
+                for k = 1, rs_n do pcall(function() local v = rs[k]; if v == true or v == 1 then rows_by_case = rows_by_case + 1 end end) end
+                local seq = {}
+                for slot = 1, pbi_n do
+                    local b = nil
+                    pcall(function() b = pbi[slot] end)
+                    if b and b:IsValid() then
+                        local aidx = _book_valid_asset_idx(b)
+                        local ch = nil
+                        pcall(function() ch = tonumber(b.ItemInfo.Chapter) end)
+                        if aidx ~= nil and ch ~= nil then
+                            seq[aidx] = seq[aidx] or {}
+                            seq[aidx][#seq[aidx] + 1] = ch
+                        end
+                    end
+                end
+                for aidx, chs in pairs(seq) do
+                    if ser[aidx] and #chs > 1 then
+                        local sorted = {}
+                        for k, v in ipairs(chs) do sorted[k] = v end
+                        table.sort(sorted)
+                        for k = 1, #chs do
+                            if chs[k] ~= sorted[k] then ser[aidx].misordered = true; break end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Header.
+    add("==== LibAP %s diagnostic ====", tostring(M._mod_version or "?"))
+    local unlock = M._individual_series_items and "individual series"
+        or M._random_bundle and "book bundles"
+        or M._book_sanity_enabled and "individual books" or "series bundles"
+    local checks = M._check_by_count and "count" or M._per_book_checks and "booksanity" or "series"
+    add("run: seed %s  ap slot %s  save slot %s  verdict %s", tostring(SI and SI.seed), tostring(SI and SI.ap_slot),
+        tostring(SI and SI.slot), tostring(SI and SI.verdict))
+    add("modes: unlocks %s, checks %s, shelf gate %s, goal %s", unlock, checks, only_shelfable and "on" or "off", tostring(sd.goal))
+    local game_rows, game_books = 0, 0
+    pcall(function()
+        local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
+        local gpd = gi and gi:IsValid() and gi.GameSaveData and gi.GameSaveData.GameProgressData
+        if gpd then game_rows = tonumber(gpd.CurrentFinishedRowNum) or 0; game_books = tonumber(gpd.InsertedBookNum) or 0 end
+    end)
+    add("books: %d unlocked of %d (%d locked) | of the unlocked: %d behind a shut bookcase, %d on their shelf, %d on a wrong shelf, %d loose",
+        totals.unlocked, totals.books, totals.locked, totals.gated, totals.shelved, totals.away, totals.loose)
+    add("progress: game says %d books shelved, %d rows finished; bookcases show %d rows finished; level %d",
+        game_books, game_rows, rows_by_case, M._levels_reached or 0)
+    if M._check_by_count then
+        local sent, nxt = 0, nil
+        for k in pairs(M._count_location_map or {}) do
+            local t = tonumber(k)
+            if t and M._sent_count_ticks[t] then sent = sent + 1
+            elseif t and (nxt == nil or t < nxt) then nxt = t end
+        end
+        add("count ticks: %d sent, next at %s books (counting %d)", sent, tostring(nxt), math.max(M._correct_count or 0, M._books_placed_peak or 0))
+    end
+
+    -- Sections: one line each, then the series that need attention.
+    local counts = sd.bookcase_counts or {}
+    local sids = {}
+    for sid in pairs(M._section_to_cases or {}) do sids[#sids + 1] = sid end
+    table.sort(sids)
+    local per_sid = {}
+    for _, r in pairs(ser) do per_sid[r.sid] = per_sid[r.sid] or {}; table.insert(per_sid[r.sid], r) end
+    local attention = 0
+    for _, sid in ipairs(sids) do
+        local rs = per_sid[sid] or {}
+        table.sort(rs, function(a, b) return a.name < b.name end)
+        -- Per series: done (every volume placed in order), waiting (every unlocked volume placed,
+        -- more to come), gated (bookcase shut), or a line saying what is wrong.
+        local done, waiting, gated, lines = 0, 0, 0, {}
+        for _, r in ipairs(rs) do
+            local tags = {}
+            if #r.away > 0 then tags[#tags + 1] = "WRONG SHELF: " .. table.concat(r.away, ", ") end
+            if r.misordered then tags[#tags + 1] = "OUT OF ORDER" end
+            if #r.loose > 0 then
+                table.sort(r.loose)
+                local lv = {}
+                for _, v in ipairs(r.loose) do lv[#lv + 1] = tostring(v) end
+                tags[#tags + 1] = ("LOOSE vol %s (%d of %d unlocked placed)"):format(
+                    table.concat(lv, ","), r.home, r.unlocked - r.gated)
+            end
+            if #tags > 0 then
+                local more = r.unlocked < r.vols and (" [%d/%d unlocked]"):format(r.unlocked, r.vols) or ""
+                lines[#lines + 1] = ("      %-52s %s%s"):format(r.name:sub(1, 52), table.concat(tags, "; "), more)
+            elseif r.gated > 0 and r.home == 0 then
+                gated = gated + 1
+            elseif r.home == r.vols then
+                done = done + 1
+            else
+                waiting = waiting + 1
+            end
+        end
+        add("  %s  bookcases %d/%s  series %d: done %d, waiting for volumes %d, behind a shut bookcase %d%s",
+            sid, M._shelves_open[sid] or 0, tostring(counts[sid] or "?"), #rs, done, waiting, gated,
+            #lines > 0 and (", NEED ATTENTION " .. #lines) or "")
+        for _, l in ipairs(lines) do add(l) end
+        attention = attention + #lines
+    end
+    add("==== end of diagnostic ====")
+    return L, totals, attention
+end
+
+function M.diagnostic_report()
+    if not (M._gameplay_active and M._cases_indexed) then
+        pcall(function()
+            local H = package.loaded["AP/HUD"]
+            if H then H.notify("Diagnostic: not in a loaded world yet.", 8.0) end
+        end)
+        return
+    end
+    local ok, lines, totals, attention = pcall(_report_lines)
+    if not ok then log("[report] failed: " .. tostring(lines)); return end
+    for _, l in ipairs(lines) do log(l) end
+    pcall(function()
+        local H = package.loaded["AP/HUD"]
+        if H then
+            local unwarded = totals.shelved + totals.loose + totals.away
+            local msg = ("Books: %d unwarded, %d on their shelf, %d loose (%d in the library). Full report is in UE4SS.log")
+                :format(unwarded, totals.shelved, totals.loose, totals.books)
+            if totals.away > 0 then
+                H.notify(("%d on a wrong shelf, see the report."):format(totals.away), 20.0)
+            end
+            H.notify(msg, 20.0)
+        end
+    end)
+end
+
 function M.detect_completed_rows()
     if not M._cases_indexed then return 0 end
     if not M._slot_data then return 0 end
