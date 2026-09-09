@@ -169,6 +169,16 @@ def build_apworld(output_dir: Path) -> Path:
                 continue
             if path.is_file():
                 arcname = Path("librarian") / path.relative_to(APWORLD_SRC)
+                if path == ARCHIPELAGO_JSON:
+                    # The source manifest must not carry the container version (AP's
+                    # manifest test checks that); the zip loader requires it. Add it
+                    # here, the way Archipelago's own packager does. 7 has been the
+                    # container version since 0.6.4.
+                    manifest = json.loads(path.read_text(encoding="utf-8"))
+                    manifest.update({"version": 7, "compatible_version": 7})
+                    text = json.dumps(manifest, indent=4) + chr(10)
+                    zf.writestr(arcname.as_posix(), text)
+                    continue
                 zf.write(path, arcname.as_posix())
     info(f"wrote {out.relative_to(REPO_ROOT)} ({out.stat().st_size:,} bytes)")
     return out
