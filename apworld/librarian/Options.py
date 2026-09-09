@@ -94,8 +94,8 @@ class UnlockMode(Choice):
 
     option_random_series_bundles = 0
     option_individual_series_unlocks = 1
-    option_individual_book_unlocks = 2
-    option_random_book_bundle = 3
+    option_random_book_bundle = 2
+    option_individual_book_unlocks = 3
     default = 0
 
 
@@ -218,15 +218,40 @@ class CheckMode(Choice):
 
 
 class CheckInterval(Range):
-    """How many books you shelve between checks, when check_mode = count.
+    """How many books you shelve between checks, when check_mode is count.
 
-    Lower means more checks, each worth less. Lowered automatically if the seed needs
-    more checks than the selected interval; with individual_book_unlocks that is every
-    book, so the interval becomes 1."""
+    Lower means more checks, each worth less. A seed needs enough checks to hold all of
+    its items, so an interval that is too wide is brought down to fit, and the generation
+    log tells you what it landed on.
+
+    With random_book_bundle the two settings are tied: the interval can be at most about
+    books_per_bundle divided by 2.5. Five books or fewer per bundle means a check every
+    book; 10 per bundle allows a check every 3; 25 per bundle allows every 6 to 9,
+    depending on bookcase_unlocks. count_bundle_preference decides which of the two
+    gives way."""
     display_name = "Check Interval"
     range_start = 1
     range_end = 100
     default = 10
+
+
+class CountBundlePreference(Choice):
+    """With random_book_bundle and check_mode: count, the size of your bundles and how
+    often you get a check are tied together: smaller bundles need checks closer
+    together. If the two settings you picked cannot both be kept, this decides which
+    one wins.
+
+    narrow_interval (default): your bundle size stays as you set it, and checks come
+        more often than you asked for.
+    widen_bundle: your check interval stays as you set it, and each bundle holds more
+        books than you asked for.
+
+    Either way the generation log tells you the numbers it settled on. The other unlock
+    modes are not affected."""
+    display_name = "Count Bundle Preference"
+    option_narrow_interval = 0
+    option_widen_bundle = 1
+    default = 0
 
 
 
@@ -300,6 +325,7 @@ class LibrarianOptions(PerGameCommonOptions):
     spare_shelf_items: SpareShelfItems
     check_mode: CheckMode
     check_interval: CheckInterval
+    count_bundle_preference: CountBundlePreference
     magic_skills_enabled: MagicSkillsEnabled
     local_filler: LocalFiller
     book_visibility: BookVisibility
@@ -336,7 +362,7 @@ option_groups = [
     ),
     OptionGroup(
         "Checks",
-        [CheckMode, CheckInterval],
+        [CheckMode, CheckInterval, CountBundlePreference],
     ),
     OptionGroup(
         "Item Pool",

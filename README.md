@@ -546,15 +546,29 @@ rather than by which shelves you finish.
 
 #### `check_interval`
 
-How many books you shelve between checks. Range 1-100. Default 10.
-`check_mode: count` only.
+How many books you shelve between checks, when `check_mode` is `count`.
+Lower means more checks, each worth less. The seed needs enough checks to
+hold its items, so a wide interval is narrowed to fit, and generation prints
+what it landed on.
 
-Lower means more checks, each worth less. Lowered automatically if the seed
-needs more checks than the selected interval.
+With `random_book_bundle` there is a second limit: the interval can be at
+most about `books_per_bundle` divided by 2.5. Five books or fewer per bundle
+means a check every book; 10 per bundle allows every 3; 25 per bundle allows
+every 6 to 9, depending on `bookcase_unlocks`. Which of the two settings gives
+way is `count_bundle_preference`.
 
----
+#### `count_bundle_preference`
 
-### Item pool
+When `check_mode` is `count` and `random_book_bundle` cannot honor both
+`check_interval` and `books_per_bundle`, which one keeps its value.
+
+| Value | Effect |
+|---|---|
+| `narrow_interval` | Keep `books_per_bundle`; checks come more often than asked (default). |
+| `widen_bundle` | Keep `check_interval`; bundles hold more books than asked. |
+
+Generation prints what it landed on either way. The other unlock modes have no
+such limit, so this does nothing there.
 
 #### `magic_skills_enabled`
 

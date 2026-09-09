@@ -578,10 +578,25 @@ class LibrarianWorld(World):
 
         The interval is a preference: too fine and the ticks outnumber the bundles that
         have to fill them, so it widens until the pool fits, the same way the bundle size
-        and the spare settings do."""
+        and the spare settings do.
+
+        Settled once. Region creation reads it first, and the bundle size can still widen
+        after that (numbered bundles settle theirs against the checks), which would move
+        the ticks out from under the locations already built. A tracker re-gen takes the
+        seed's list from slot_data outright: the interval it was asked for is not there,
+        and the list is."""
+        settled = getattr(self, "_count_ticks_settled", None)
+        if settled is not None:
+            return settled
+        pt = self._ut_passthrough()
+        if pt and pt.get("count_ticks"):
+            self._count_ticks_settled = [int(n) for n in pt["count_ticks"]]
+            return self._count_ticks_settled
         total = sum(s.volume_count for s in self.active_sections)
         step = max(1, self._ut_opt("check_interval", self.options.check_interval))
-        per = max(1, self._ut_opt("books_per_bundle", self.options.books_per_bundle))
+        per = getattr(self, "books_per_bundle_effective", None) or max(
+            1, self._ut_opt("books_per_bundle", self.options.books_per_bundle))
+        asked_step, asked_per = step, per
 
         # There has to be at least one tick per item the pool will hold, or the seed has
         # more items than checks. A wide interval is the failure case here, not a narrow
@@ -606,25 +621,59 @@ class LibrarianWorld(World):
                 q for nm, q in ITEM_QUANTITIES.items()
                 if nm.startswith("Progressive Shelf Unlock (")
                 and nm[nm.index("(") + 1:-1] in self.active_section_ids)
-        need = (unlocks
-                + sum(self._optional_quantities().values())
-                + len(_MAJOR_MAGIC_NAMES) * 10)
-        # Fitting the pool is not enough when the unlocks are a chain. Every rung of the
-        # ladder needs series (or bundles) AND their bookcases, so the chain of paired
-        # items is deep, and a deep chain against a ladder with no slack deadlocks the
-        # fill: the early links end up with no reachable rung left to sit on. Measured on
-        # the full goal at series_per_unlock 3 and 4, seeds fail below about 2.1 ticks
-        # per chain item and pass from 2.5; bundles at 8 per item failed 7 of 20 at 1.4.
-        # The individual modes hand out one specific item per series or book, no chain,
-        # so they keep the plain fit.
-        # Numbered series bundles are specific items, not an ordered chain, and measured
-        # 10/10 at series_per_unlock 3 without any slack. Book bundles still need it:
-        # 1/10 without, 10/10 with, on the full goal at 10 per bundle.
-        if self.random_bundle or (not (self.individual or self.book_sanity)
-                                  and not self.distinct_bundles):
-            need = max(need, math.ceil(unlocks * 2.5))
+        pool_other = (sum(self._optional_quantities().values())
+                      + len(_MAJOR_MAGIC_NAMES) * 10)
+        # The ticks are not the only room: a count seed also has its level-ups, section
+        # and floor completions and chests, and items sit there too. Counting them is
+        # what lets a requested interval stand; counting the ticks alone narrowed nearly
+        # every count seed (a floor-1 series seed at 10 landed on 8).
+        others = (sum(1 for x in data.XP_CURVE if x <= self.max_reachable_rows)
+                  + len(self.active_sections)
+                  + len({s.floor for s in self.active_sections})
+                  + len(_chest_locations))
+        chain = self.random_bundle or (not (self.individual or self.book_sanity)
+                                       and not self.distinct_bundles)
+
+        def ticks_needed(n_unlocks: int) -> int:
+            room = max(1, n_unlocks + pool_other - others + 6)
+            # Fitting the pool is not enough when the unlocks are a chain. Every rung of
+            # the ladder needs series (or bundles) AND their bookcases, so the chain of
+            # paired items is deep, and a deep chain against a ladder with no slack
+            # deadlocks the fill: the early links end up with no reachable rung left to
+            # sit on. Measured on the full goal at series_per_unlock 3 and 4, seeds fail
+            # below about 2.1 ticks per chain item and pass from 2.5; bundles at 8 per
+            # item failed 7 of 20 at 1.4. Numbered bundles are specific items, not an
+            # ordered chain, and measured 10/10 at series_per_unlock 3 without slack.
+            return max(room, math.ceil(n_unlocks * 2.5)) if chain else room
+
+        # Under book bundles the unlock count moves with the bundle size; the bookcases
+        # are the part that does not.
+        case_items = unlocks - math.ceil(total / per) if self.random_bundle else 0
+        widen = (self.random_bundle and self.check_by_count
+                 and self.options.count_bundle_preference.value == self.options.count_bundle_preference.option_widen_bundle
+                 and not self._ut_passthrough())
+        if widen:
+            # The interval keeps its value; the bundle grows until the ticks it leaves
+            # can hold the chain. Settled here so every later reader sees one size.
+            want_ticks = max(1, total // step)
+            while per < total and ticks_needed(math.ceil(total / per) + case_items) > want_ticks:
+                per += 1
+            if per != asked_per:
+                self.books_per_bundle_effective = per
+                unlocks = math.ceil(total / per) + case_items
+                print(f"[Librarian - '{self.player_name}'] check_interval {step} with "
+                      f"books_per_bundle {asked_per} would need "
+                      f"{ticks_needed(math.ceil(total / asked_per) + case_items)} checks; "
+                      f"count_bundle_preference keeps the interval, so bundles hold {per} books.")
+        need = ticks_needed(unlocks)
         step = min(step, max(1, total // max(1, need)))
-        return list(range(step, total + 1, step))
+        if step != asked_step and not self._ut_passthrough() and not getattr(self, "_interval_logged", False):
+            self._interval_logged = True
+            print(f"[Librarian - '{self.player_name}'] check_interval {asked_step} needs at most "
+                  f"{total // need} between checks here ({need} checks to hold the "
+                  f"{'chain' if chain and math.ceil(unlocks * 2.5) >= need else 'items'}); using {step}.")
+        self._count_ticks_settled = list(range(step, total + 1, step))
+        return self._count_ticks_settled
 
     @property
     def book_checks(self) -> bool:
