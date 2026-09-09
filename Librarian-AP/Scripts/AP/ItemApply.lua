@@ -530,9 +530,19 @@ function M.set_slot_data(slot_data)
     -- where the answer was always one.
     M._bookcases_per_unlock = (type(slot_data.bookcases_per_unlock) == "table")
         and slot_data.bookcases_per_unlock or {}
+    -- The series in the goal's scope, for the count checks. Series seeds carry series_order;
+    -- bundle seeds carry book_order and the book map instead, so read the series from that. An
+    -- empty set meant nothing ever counted under book bundles with count checks.
     M._count_series = {}
     for _, name in ipairs(slot_data.series_order or {}) do M._count_series[name] = true end
+    if not next(M._count_series) and type(slot_data.book_item_to_book) == "table" then
+        for _, ac in pairs(slot_data.book_item_to_book) do
+            if type(ac) == "table" and type(ac[1]) == "string" then M._count_series[ac[1]] = true end
+        end
+    end
+    if not next(M._count_series) then M._count_series = nil end   -- no scope known: count everything
     M._correct_count = 0
+    M._floor_books, M._floor_count, M._count_load_floor = nil, nil, nil
     M._sent_count_ticks = {}
 
     M._book_sanity_enabled = (slot_data.book_sanity == 1)
@@ -1484,6 +1494,7 @@ function M.reset_hism_state()
     -- the OLD world's refs (notably layer 3's HISM array) re-checks this and bails instead
     -- of dereferencing freed memory — the LoadMap-teardown use-after-free (a native AV).
     M._world_epoch = (M._world_epoch or 0) + 1
+    M._count_load_floor, M._floor_books, M._floor_count = nil, nil, nil   -- a new world starts over
     -- Ward pump: invalidate the old world. Bump the generation (so an in-flight stale
     -- closure self-noops its gen-guarded busy-clear), free the gate, reset the alive
     -- log, and release the L1 flush lock. The queue is deliberately NOT rebound here --
@@ -3151,6 +3162,7 @@ function M.detect_correct_books()
     local seen = M._books_correct_seen
     local sent = 0
     local stop = math.min(cursor + (M._dcb_fast and DCB_FAST_CHUNK or DCB_CHUNK), n)
+    local dbg_correct, dbg_valid = 0, 0
     for i = cursor + 1, stop do
         local book = books[i]
         if book and book:IsValid() then
@@ -3167,6 +3179,8 @@ function M.detect_correct_books()
                     end
                 end)
                 local series_name = M._asset_to_series[asset_idx]
+                dbg_valid = dbg_valid + 1
+                if is_correct then dbg_correct = dbg_correct + 1 end
                 if is_correct and chapter ~= nil and series_name then
                     local bid = series_name .. "|" .. chapter
                     if not seen[bid] then
@@ -3176,7 +3190,7 @@ function M.detect_correct_books()
                             -- by_count, where books are counted rather than checked): mark seen
                             -- so it isn't rescanned every sweep.
                             seen[bid] = true
-                            if M._count_series and M._count_series[series_name] then
+                            if not M._count_series or M._count_series[series_name] then
                                 M._correct_count = (M._correct_count or 0) + 1
                             end
                         elseif APClient:send_check(loc_id) then
@@ -3193,6 +3207,13 @@ function M.detect_correct_books()
         end
     end
     M._dcb_cursor = stop
+    if M._check_by_count then
+        M._dcb_dbg = (M._dcb_dbg or 0) + 1
+        if M._dcb_dbg <= 2 or M._dcb_dbg % 400 == 0 then
+            log(("[count-sweep] pass %d: books %d-%d of %d, %d valid, %d read correct, session count %d, fast=%s")
+                :format(M._dcb_dbg, cursor + 1, stop, n, dbg_valid, dbg_correct, M._correct_count or 0, tostring(M._dcb_fast)))
+        end
+    end
     if M._dcb_fast and stop >= n then                             -- fast sweep wrapped
         M._dcb_fast_laps = (M._dcb_fast_laps or 1) - 1
         if M._dcb_fast_laps > 0 then
@@ -4000,13 +4021,99 @@ end
 
 --- Fire "Shelved N Books" for every tick the run has reached. check_mode=by_count only.
 ---
---- Two sources, and the higher wins. The sweep counts books whose "Is Abs Correct" flag is set,
---- which the game sets when a book goes in and does not restore on load: a resumed run read as
---- 16 shelved with 194 on the shelves, and every tick past what that session placed stayed
---- unsent. The game's own shelved counter (the HUD number, InsertedBookNum in the save) survives
---- a reload and is read with the stale-save guard in sync_progress_state, so it is the floor;
---- the sweep still moves the count between syncs. Neither the server's checked set: this mode
---- has no per-book locations to count from.
+--- The books on a shelf when the world settled, plus every book the game has called correct
+--- since that was not among them. The first half is a snapshot (snapshot_shelved_books): the
+--- per-book "Is Abs Correct" flag is not restored on load and in some runs never reads true at
+--- all, so earlier sessions' placements can only be counted by presence. The second half comes
+--- from the hook on the book's Correct(true), the game's own verdict, the moment it is made,
+--- with the flag sweep as its backstop; both mark the same per-book set, so nothing counts
+--- twice. The game's live counter is never used: it moves for a book in the wrong slot too.
+--- Not the server's checked set: this mode has no per-book locations to count from.
+--- The game's own verdict on a placement, from the hook on the book's Correct(IsAbsCorrect):
+--- the call the game makes the moment it decides a book is in its slot, for a hand placement
+--- and for one the game shelves itself. Count checks count from this, so a book in the wrong
+--- slot never counts, and the tick follows the decision on the next 500ms pass rather than the
+--- flag sweep. De-duplicated per book with the sweep's own set, so the two never double count.
+--- Count checks only: under BookSanity that set means "check sent", and the sweep owns it.
+function M.note_book_verdict(book, is_correct)
+    M._verdict_dbg = (M._verdict_dbg or 0) + 1
+    if M._verdict_dbg <= 3 then
+        log(("[count] Correct(%s) fired (%s, gameplay=%s apply_safe=%s)"):format(tostring(is_correct),
+            M._check_by_count and "count mode" or "not count mode", tostring(M._gameplay_active), tostring(M._apply_safe)))
+    end
+    if is_correct ~= true or not M._check_by_count then return end
+    if not (M._gameplay_active and M._apply_safe) then return end
+    local aidx = _book_valid_asset_idx(book)
+    if aidx == nil then return end
+    local sname = M._asset_to_series[aidx]
+    local ch = nil
+    pcall(function() ch = tonumber(book.ItemInfo.Chapter) end)
+    if not sname or ch == nil then return end
+    local bid = sname .. "|" .. ch
+    local seen = M._books_correct_seen
+    if seen[bid] then return end
+    seen[bid] = true
+    if not M._count_series or M._count_series[sname] then
+        M._correct_count = (M._correct_count or 0) + 1
+    end
+    M._count_tick_pending = true
+end
+
+--- The books on a shelf when the world settled, by id: the floor a resumed run starts from,
+--- taken once per world. The game's saved counter gives the same number but not the set, and
+--- the set is what keeps a floor book that is picked up and put back from counting twice.
+function M.snapshot_shelved_books()
+    if M._floor_books or not (M._gameplay_active and M._apply_safe and M._cases_indexed) then return end
+    -- Only a world proven to be this run's. Taken at the first count pass after the world
+    -- settles, which is before the player can place anything; should it ever come later, a
+    -- book already counted this session is left out, so the two halves cannot overlap.
+    local SI = package.loaded["AP/SaveIdentity"]
+    if not (SI and SI.verdict == SI.VERIFIED) then return end
+    local seen = M._books_correct_seen or {}
+    -- A warded book is anchored to a bookcase by the mod, so attachment alone says nothing:
+    -- only a book that is unlocked and not behind a shut bookcase can be on a shelf by play.
+    local only_shelfable = M._slot_data and M._slot_data.only_unward_shelfable_books == 1
+    local case_open = only_shelfable and M._compute_case_open_set() or nil
+    local set, n = {}, 0
+    local books = FindAllOf("BP_GrabbingBook_C") or {}
+    local cnt = 0; pcall(function() cnt = #books end)
+    for i = 1, cnt do
+        local b = books[i]
+        local aidx = _book_valid_asset_idx(b)
+        if aidx ~= nil then
+            local sname = M._asset_to_series[aidx]
+            local ch = nil
+            pcall(function() ch = tonumber(b.ItemInfo.Chapter) end)
+            if sname and ch ~= nil and (not M._count_series or M._count_series[sname]) then
+                local bid = sname .. "|" .. ch
+                local unlocked = M._series_unlocked[sname] or M._books_unlocked[bid]
+                local shelvable = unlocked and (not case_open or case_open[sname])
+                if shelvable then
+                    local on_case = false
+                    pcall(function() local a = b.AttachedActor; on_case = (a and a:IsValid()) and true or false end)
+                    if on_case and not seen[bid] then set[bid] = true; n = n + 1 end
+                end
+            end
+        end
+    end
+    M._floor_books, M._floor_count = set, n
+    log(("[count] floor: %d books on a shelf at load (game's saved counter %s)"):format(
+        n, tostring(M._count_load_floor or "not read yet")))
+end
+
+--- Books counted this session that were not on a shelf at load.
+function M.count_new_this_session()
+    local floor = M._floor_books or {}
+    local n = 0
+    for bid in pairs(M._books_correct_seen or {}) do
+        if not floor[bid] then
+            local sname = bid:match("^(.*)|%d+$")
+            if sname and (not M._count_series or M._count_series[sname]) then n = n + 1 end
+        end
+    end
+    return n
+end
+
 function M.fire_count_ticks()
     if not M._check_by_count then return 0 end
     local map = M._count_location_map
@@ -4014,11 +4121,15 @@ function M.fire_count_ticks()
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient.send_check) then return 0 end
 
-    local swept, game = M._correct_count or 0, M._books_placed_peak or 0
-    local count = math.max(swept, game)
-    if game > swept and M._count_game_led ~= game then
-        M._count_game_led = game
-        log(("[count-tick] game counter %d leads the sweep's %d; counting from the game"):format(game, swept))
+    -- Floor plus this session's new placements. Until the floor snapshot exists, the game's
+    -- saved counter stands in for it.
+    M.snapshot_shelved_books()
+    local floor = M._floor_count or M._count_load_floor or 0
+    local fresh = M.count_new_this_session()
+    local count = floor + fresh
+    if count ~= M._count_last_logged then
+        M._count_last_logged = count
+        log(("[count-tick] counting %d (%d on a shelf at load + %d placed since)"):format(count, floor, fresh))
     end
     local sent = 0
     for key, loc_id in pairs(map) do
@@ -4289,6 +4400,11 @@ function M.sync_progress_state()
     -- new run had never played.
     if M.save_progress_is_stale(rows_finished) then
         rows_finished, books_placed_save = 0, 0
+    end
+    -- The saved counter, once per world, as the floor a resumed run starts from. The live
+    -- counter counts a book in the wrong slot too, so it is never used past this point.
+    if books_placed_save > 0 and not M._count_load_floor then
+        M._count_load_floor = books_placed_save
     end
     rows_finished = M.rows_finished_floor(rows_finished)
     local books_placed_widget = M._read_widget_book_count() or 0

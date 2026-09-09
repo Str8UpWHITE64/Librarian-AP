@@ -2417,6 +2417,11 @@ local function start_gameplay_loops()
         end
         -- A full row that is out of order is named on the HUD until it is fixed. Self-gated.
         if diag_on("MISORDER_NOTICE") then pcall(function() IA.pulse_misordered_rows() end) end
+        -- The game called a placement correct: fire any count tick it reaches now.
+        if IA._count_tick_pending then
+            IA._count_tick_pending = false
+            pcall(function() IA.fire_count_ticks() end)
+        end
         -- Finishing a row is announced by FinishRow, which only arms this flag. Run the checks
         -- here, on the same 500ms loop BookSanity's shelving sweep already rides, so every mode
         -- reacts to a completed row at the same speed rather than waiting on the rotation.
@@ -2565,6 +2570,13 @@ local function start_gameplay_loops()
             -- Re-hide pile instances Insight dragged up. From here and not the SetActorVisible
             -- hook: a re-hide issued inside the hook is overwritten while the skill still shows.
             pcall(function() IA.resweep_book_piles() end)
+        end
+        -- Count checks ride the flag sweep, and the events that would arm its fast path do not
+        -- fire for books the game shelves on the player's behalf, so under count checks the
+        -- rolling sweep runs every tick rather than every fourth: a lap of the library in about
+        -- forty seconds instead of two and a half minutes. One 250-book chunk per 3s.
+        if IA._check_by_count and _sync_rot ~= 2 then
+            pcall(function() IA.detect_correct_books() end)
         end
         return false
     end)
@@ -4093,6 +4105,16 @@ register_bp_hooks_once = function()
     if bp_hooks_registered then return end
     local ok1 = hook_safe("/Game/Librarian/Blueprints/Character/BP_LibrarianCharacter.BP_LibrarianCharacter_C:OnLevelUp",
         "OnLevelUp (BP)", on_level_up_bp)
+    -- The game's verdict on a placement: Correct(true) is the moment a book counts as shelved.
+    -- Count checks count from it (ItemApply.note_book_verdict); a scalar and one object read.
+    hook_safe(BOOK_BP .. ":Correct", "Book Correct (BP)", function(self, is_abs)
+        local IA = package.loaded["AP/ItemApply"]
+        if not (IA and IA.note_book_verdict) then return end
+        local b, v = nil, nil
+        pcall(function() b = self:get() end)
+        pcall(function() v = is_abs:get() end)
+        if b then IA.note_book_verdict(b, v) end
+    end)
 
     -- Single-thread crash-fix driver (Stage 1, gated POLL_ON_GAME_THREAD). Registered ONLY when the
     -- flag is on, so the default build gains ZERO per-frame overhead. A per-frame GAME-THREAD pawn
