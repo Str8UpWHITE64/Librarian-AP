@@ -7,6 +7,9 @@ local MOD = "LibrarianAP"
 local function log(msg)
     print(("[%s] %s\n"):format(MOD, tostring(msg)))
 end
+-- One log file per launch under Mods/Librarian-AP/logs/, mirrored from print, before anything
+-- else prints. UE4SS.log itself is rewritten by UE4SS on every start.
+pcall(require, "AP/runlog")
 
 -- ============================================================
 -- Crash-hunt instrumentation (see AP/trace.lua, diag_flags.lua, CRASH_HANDOFF.md)

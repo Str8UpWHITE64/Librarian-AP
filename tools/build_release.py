@@ -282,7 +282,8 @@ def write_install_txt(staging: Path, version: str) -> Path:
         "\n"
         "If something breaks, capture:\n"
         "  - Your YAML (or at least the Librarian: section)\n"
-        "  - The last 100-200 lines of <Win64>\\UE4SS.log after the issue\n"
+        "  - The log for that session: <Win64>\\Mods\\Librarian-AP\\logs\\ keeps one\n"
+        "    file per launch (the newest twenty); UE4SS.log holds only the last launch\n"
         "  - What you expected vs. what happened\n",
         encoding="utf-8",
     )

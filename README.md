@@ -729,8 +729,10 @@ what a reload or the out-of-bounds recovery gives you.
 When reporting a problem, please include:
 
 1. Your YAML (or at least the `Librarian:` section).
-2. The relevant chunk of `UE4SS.log` (last 100–200 lines after the
-   issue).
+2. The log. The mod keeps one file per launch under
+   `<Game>\Librarian\Binaries\Win64\Mods\Librarian-AP\logs\` (the newest
+   twenty), so attach the file for the session where it happened; `UE4SS.log`
+   in `Win64` holds only the most recent launch.
 3. What you expected vs. what happened.
 
 ---
