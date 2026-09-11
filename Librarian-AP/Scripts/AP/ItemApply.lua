@@ -541,8 +541,8 @@ function M.set_slot_data(slot_data)
         end
     end
     if not next(M._count_series) then M._count_series = nil end   -- no scope known: count everything
-    M._correct_count = 0
-    M._floor_books, M._floor_count, M._count_load_floor = nil, nil, nil
+    M._count_total, M._cnt_cases, M._cnt_by_case, M._cnt_hot, M._cnt_verdicts = nil, nil, nil, nil, nil
+    M._cnt_lap_done, M._count_last_logged, M._cnt_layer_said = false, nil, nil
     M._sent_count_ticks = {}
 
     M._book_sanity_enabled = (slot_data.book_sanity == 1)
@@ -1494,7 +1494,7 @@ function M.reset_hism_state()
     -- the OLD world's refs (notably layer 3's HISM array) re-checks this and bails instead
     -- of dereferencing freed memory — the LoadMap-teardown use-after-free (a native AV).
     M._world_epoch = (M._world_epoch or 0) + 1
-    M._count_load_floor, M._floor_books, M._floor_count = nil, nil, nil   -- a new world starts over
+    M._cnt_cases, M._cnt_by_case, M._cnt_hot, M._cnt_verdicts, M._cnt_lap_done, M._count_total = nil, nil, nil, nil, false, nil   -- a new world starts over
     -- Ward pump: invalidate the old world. Bump the generation (so an in-flight stale
     -- closure self-noops its gen-guarded busy-clear), free the gate, reset the alive
     -- log, and release the L1 flush lock. The queue is deliberately NOT rebound here --
@@ -1683,7 +1683,8 @@ function M._apply_books_to_world()
     -- The ~3000-actor walk is too high-volume to mark per book; timestamp the whole flush
     -- so a crash trace shows a flush was in flight. BOOK_ACTOR_WARDING is the bisection lever.
     trace.mark("books-flush", nil, "n=" .. tostring(n))
-    local stats = { warded = 0, unwarded = 0, skipped = 0, gate_skipped_unwards = 0 }
+    local stats = { warded = 0, unwarded = 0, skipped = 0, gate_skipped_unwards = 0,
+                    unwarded_set = unwarded_set, case_open_set = case_open_set, seen = {} }
     local cursor = 1
 
     -- Cache ModActor once per flush (vs FindFirstOf per book). nil if the pre-v1.1.0 pak is
@@ -1822,6 +1823,7 @@ function M._apply_books_to_world()
                     should_unward = true
                 end
             end
+            if should_unward and chapter ~= nil then stats.seen[series_name .. "|" .. chapter] = true end
         end
         local key = book:GetFullName()
         local is_warded = M._books_warded[key] or false
@@ -2022,6 +2024,25 @@ function M._finalize_apply_books(books, n, stats, series_snap, shelves_snap, las
     for _ in pairs(series_snap) do series_n = series_n + 1 end
     log(("State: sections-active=%d series=%d | applied: unwarded=%d warded=%d skipped=%d gate-skipped-unwards=%d"):format(
         section_n, series_n, stats.unwarded, stats.warded, stats.skipped, stats.gate_skipped_unwards))
+    -- Per-book modes: what the rule says should be unwarded against the books the walk reached.
+    -- A difference names the books, so a book that stays hidden is a line in the log rather
+    -- than a search of the library.
+    if M._per_book_unlocks and stats.seen then
+        local open, uw = stats.case_open_set, stats.unwarded_set or {}
+        local expected, reached, missing = 0, 0, {}
+        for _ in pairs(stats.seen) do reached = reached + 1 end
+        for bid in pairs(M._books_unlocked or {}) do
+            local sname = bid:match("^(.*)|%d+$")
+            if sname and (uw[sname] or not open or open[sname]) then
+                expected = expected + 1
+                if not stats.seen[bid] and #missing < 6 then missing[#missing + 1] = bid end
+            end
+        end
+        if expected ~= reached then
+            log(("[apply] %d book(s) should be unwarded, the walk reached %d; not reached: %s%s"):format(
+                expected, reached, table.concat(missing, ", "), (expected - reached) > #missing and ", ..." or ""))
+        end
+    end
 end
 
 -- ============================================================================
@@ -2040,7 +2061,9 @@ end
 -- poll loop pumping; warded books are skipped (ENFORCE + Layer 3 keep them hidden).
 -- Single-thread runs the reconcile pass on the 60fps pawn tick, so a 1000-book pass hitches; use a
 -- smaller per-pass budget (its rolling cursor still covers everything over a few passes). Legacy async = 1000.
-local RECONCILE_BUDGET = M._poll_on_game_thread and 20 or 1000
+-- 100 books per 5s pass reads the library in about two and a half minutes; the read pass is a
+-- few property reads per book, and only mismatches reach the write pass.
+local RECONCILE_BUDGET = M._poll_on_game_thread and 100 or 1000
 function M.reconcile_book_actors()
     if not _diag_on("BOOK_ACTOR_RECONCILE") then return end
     if not M._apply_safe then return end
@@ -2056,11 +2079,15 @@ function M.reconcile_book_actors()
         if M._recon_books then pcall(function() M._recon_n = #M._recon_books end) end
         M._recon_cursor = 1
         M._recon_epoch = M._world_epoch
-        local only_shelfable = M._slot_data and M._slot_data.only_unward_shelfable_books == 1
-        M._recon_uw = M._compute_unwarded_set(only_shelfable)
-        M._recon_case_open = only_shelfable and M._compute_case_open_set() or nil
         if M._recon_n == 0 then return end
     end
+    -- The sets are read fresh every pass, not once per lap. A lap over the library takes
+    -- minutes, and a lap-old set called every book a shelf unlock had just revealed warded, so
+    -- this sweep put the ward anchor back on it and Assemble and Insight skipped it as shelved:
+    -- a book the player could not find until a reload.
+    local only_shelfable = M._slot_data and M._slot_data.only_unward_shelfable_books == 1
+    M._recon_uw = M._compute_unwarded_set(only_shelfable)
+    M._recon_case_open = only_shelfable and M._compute_case_open_set() or nil
     local books = M._recon_books
     local unwarded = M._recon_uw
     if not (books and unwarded) then return end
@@ -2119,8 +2146,24 @@ function M.reconcile_book_actors()
                         if mh == true or mv == false then fix_mesh = true end
                     end
                 end
-                if fix_coll or fix_mesh then
-                    fixes[#fixes + 1] = { book = b, coll = fix_coll, mesh = fix_mesh, sm = sm, series = series }
+                -- Hidden by the ward while it should show: the flush did not reach this book (an
+                -- actor or a chapter it could not read at the time). Healed here, and named in the
+                -- log, so a book that stayed hidden is a line to read rather than a library to
+                -- search. Only a book this mod hid: the game hides actors of its own, a far book
+                -- drawn by its pile, a book in the bag, and those are not ours to show.
+                local wkey = nil
+                pcall(function() wkey = b:GetFullName() end)
+                local fix_hide = (bhid == true) and M._book_hide_mode and wkey and M._books_warded[wkey] == true or false
+                local chapter = nil
+                if fix_hide then
+                    pcall(function()
+                        local info = b.ItemInfo
+                        if info and info:IsValid() then chapter = tonumber(info.Chapter) end
+                    end)
+                end
+                if fix_coll or fix_mesh or fix_hide then
+                    fixes[#fixes + 1] = { book = b, coll = fix_coll, mesh = fix_mesh, hide = fix_hide,
+                                          sm = sm, series = series, aidx = aidx, chapter = chapter }
                 end
             end
         end
@@ -2132,10 +2175,23 @@ function M.reconcile_book_actors()
     -- freed actors (a native AV pcall can't catch).
     _on_game_thread(function()
         if (M._world_epoch or 0) ~= (epoch0 or 0) then return end
-        local c_coll, c_mesh = 0, 0
+        local c_coll, c_mesh, c_hide = 0, 0, 0
         for _, f in ipairs(fixes) do
             local b = f.book
             if b and b:IsValid() then
+                if f.hide then
+                    pcall(function() b:SetActorHiddenInGame(false) end)
+                    pcall(function() b:SetActorEnableCollision(true) end)
+                    local key = nil
+                    pcall(function() key = b:GetFullName() end)
+                    if key then M._books_warded[key] = nil end
+                    if M._restore_pile_instance then pcall(M._restore_pile_instance, f.aidx, f.chapter) end
+                    c_hide = c_hide + 1
+                    if c_hide <= 5 then
+                        log(("[reconcile] unwarded %s vol %s: it should show and was hidden"):format(
+                            tostring(f.series), f.chapter and tostring(f.chapter + 1) or "?"))
+                    end
+                end
                 if f.coll then
                     pcall(function() b:SetActorEnableCollision(true) end)
                     c_coll = c_coll + 1
@@ -2147,8 +2203,8 @@ function M.reconcile_book_actors()
                 end
             end
         end
-        log(("[reconcile] corrected %d book(s) (coll=%d mesh=%d) of %d examined"):format(
-            #fixes, c_coll, c_mesh, checked_unwarded))
+        log(("[reconcile] corrected %d book(s) (coll=%d mesh=%d unhid=%d) of %d examined"):format(
+            #fixes, c_coll, c_mesh, c_hide, checked_unwarded))
     end, "BOOK_ACTOR_GAMETHREAD")
 end
 
@@ -3107,11 +3163,9 @@ function M.request_full_book_scan()
     M._dcb_full_scan = true
 end
 function M.detect_correct_books()
-    -- by_count rides this same walk: it has no book locations to fire, but it needs the count
-    -- of correctly shelved books, and that is exactly what this sweep already establishes.
-    if not (M._per_book_checks or M._check_by_count) then return 0 end
+    if not M._per_book_checks then return 0 end
     local blm = M._book_location_map or {}
-    if not (M._check_by_count or next(blm)) then return 0 end
+    if not next(blm) then return 0 end
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient.send_check) then return 0 end
 
@@ -3162,7 +3216,6 @@ function M.detect_correct_books()
     local seen = M._books_correct_seen
     local sent = 0
     local stop = math.min(cursor + (M._dcb_fast and DCB_FAST_CHUNK or DCB_CHUNK), n)
-    local dbg_correct, dbg_valid = 0, 0
     for i = cursor + 1, stop do
         local book = books[i]
         if book and book:IsValid() then
@@ -3179,20 +3232,14 @@ function M.detect_correct_books()
                     end
                 end)
                 local series_name = M._asset_to_series[asset_idx]
-                dbg_valid = dbg_valid + 1
-                if is_correct then dbg_correct = dbg_correct + 1 end
                 if is_correct and chapter ~= nil and series_name then
                     local bid = series_name .. "|" .. chapter
                     if not seen[bid] then
                         local loc_id = tonumber(blm[bid])
                         if not loc_id then
-                            -- No mapped location (e.g. the other floor under a floor goal, or
-                            -- by_count, where books are counted rather than checked): mark seen
-                            -- so it isn't rescanned every sweep.
+                            -- No mapped location (the other floor under a floor goal): mark
+                            -- seen so it isn't rescanned every sweep.
                             seen[bid] = true
-                            if not M._count_series or M._count_series[series_name] then
-                                M._correct_count = (M._correct_count or 0) + 1
-                            end
                         elseif APClient:send_check(loc_id) then
                             -- Marked only on an accepted send. send_check refuses while identity
                             -- is unverified, and marking first burned the check for the session.
@@ -3207,13 +3254,6 @@ function M.detect_correct_books()
         end
     end
     M._dcb_cursor = stop
-    if M._check_by_count then
-        M._dcb_dbg = (M._dcb_dbg or 0) + 1
-        if M._dcb_dbg <= 2 or M._dcb_dbg % 400 == 0 then
-            log(("[count-sweep] pass %d: books %d-%d of %d, %d valid, %d read correct, session count %d, fast=%s")
-                :format(M._dcb_dbg, cursor + 1, stop, n, dbg_valid, dbg_correct, M._correct_count or 0, tostring(M._dcb_fast)))
-        end
-    end
     if M._dcb_fast and stop >= n then                             -- fast sweep wrapped
         M._dcb_fast_laps = (M._dcb_fast_laps or 1) - 1
         if M._dcb_fast_laps > 0 then
@@ -3228,7 +3268,6 @@ function M.detect_correct_books()
     -- Thresholds ride the same sweep that counts the books: shelving is what moves the count, and
     -- waiting for the row hub would leave them unfired until a whole row happened to close.
     pcall(function() M.fire_book_completion_checks() end)
-    pcall(function() M.fire_count_ticks() end)
     return sent
 end
 
@@ -3391,12 +3430,7 @@ local function _report_lines()
     local AC = package.loaded["AP/APClient"]
 
     -- Case -> section, by full name, so a book's AttachedActor can be placed.
-    local case_sid = {}
-    for sid, list in pairs(M._section_to_cases or {}) do
-        for _, c in ipairs(list) do
-            pcall(function() if c and c:IsValid() then case_sid[c:GetFullName()] = sid end end)
-        end
-    end
+    local placed = M.index_placed_books()
     local only_shelfable = sd.only_unward_shelfable_books == 1
     local case_open = only_shelfable and M._compute_case_open_set() or nil
 
@@ -3436,11 +3470,10 @@ local function _report_lines()
                     r.gated = r.gated + 1
                     totals.gated = totals.gated + 1
                 else
+                    -- On a shelf means a bookcase lists the book in its slots; an attachment
+                    -- alone can be the mod's own ward anchor.
                     local where = nil
-                    pcall(function()
-                        local a = b.AttachedActor
-                        if a and a:IsValid() then where = case_sid[a:GetFullName()] or "?" end
-                    end)
+                    pcall(function() where = placed[b:GetFullName()] end)
                     if where == nil then
                         r.loose[#r.loose + 1] = (ch or -1) + 1
                         totals.loose = totals.loose + 1
@@ -3524,7 +3557,30 @@ local function _report_lines()
             if t and M._sent_count_ticks[t] then sent = sent + 1
             elseif t and (nxt == nil or t < nxt) then nxt = t end
         end
-        add("count ticks: %d sent, next at %s books (counting %d)", sent, tostring(nxt), math.max(M._correct_count or 0, M._books_placed_peak or 0))
+        add("count ticks: %d sent, next at %s books (counting %d in place on the shelves)", sent, tostring(nxt), M._count_total or 0)
+        local t = M.count_layers_report()
+        add("count sources: game verdicts this session %d, bookcase flags %d (%d of %d cases answered), row offset %d (%d answered), column-and-order %d (%d answered), chapter order %d; in use %d",
+            t.judged or 0, t.state, t.with_state, t.cases, t.pos, t.with_pos, t.col, t.with_col, t.order, t.n)
+        -- One uniform case and one cabinet with books on them, raw.
+        local shown = {}
+        for sid2, list in pairs(M._section_to_cases or {}) do
+            for _, c in ipairs(list) do
+                if c and c:IsValid() then
+                    local rs_n, pbi_n, placed = 0, 0, 0
+                    pcall(function() rs_n = #c.RowStatus end)
+                    pcall(function()
+                        local pbi = c.PlacingBookInfo
+                        pbi_n = #pbi
+                        for i = 1, pbi_n do local b = pbi[i]; if b and b:IsValid() then placed = placed + 1 end end
+                    end)
+                    local shape = (rs_n > 0 and pbi_n > 0 and pbi_n % rs_n == 0) and "uniform" or "cabinet"
+                    if placed > 0 and not shown[shape] then
+                        shown[shape] = true
+                        M.dump_case_structure(c, sid2, add)
+                    end
+                end
+            end
+        end
     end
 
     -- Sections: one line each, then the series that need attention.
@@ -4019,101 +4075,376 @@ function M.count_correct_books()
     return n
 end
 
---- Fire "Shelved N Books" for every tick the run has reached. check_mode=by_count only.
----
---- The books on a shelf when the world settled, plus every book the game has called correct
---- since that was not among them. The first half is a snapshot (snapshot_shelved_books): the
---- per-book "Is Abs Correct" flag is not restored on load and in some runs never reads true at
---- all, so earlier sessions' placements can only be counted by presence. The second half comes
---- from the hook on the book's Correct(true), the game's own verdict, the moment it is made,
---- with the flag sweep as its backstop; both mark the same per-book set, so nothing counts
---- twice. The game's live counter is never used: it moves for a book in the wrong slot too.
---- Not the server's checked set: this mode has no per-book locations to count from.
---- The game's own verdict on a placement, from the hook on the book's Correct(IsAbsCorrect):
---- the call the game makes the moment it decides a book is in its slot, for a hand placement
---- and for one the game shelves itself. Count checks count from this, so a book in the wrong
---- slot never counts, and the tick follows the decision on the next 500ms pass rather than the
---- flag sweep. De-duplicated per book with the sweep's own set, so the two never double count.
---- Count checks only: under BookSanity that set means "check sent", and the sweep owns it.
-function M.note_book_verdict(book, is_correct)
-    M._verdict_dbg = (M._verdict_dbg or 0) + 1
-    if M._verdict_dbg <= 3 then
-        log(("[count] Correct(%s) fired (%s, gameplay=%s apply_safe=%s)"):format(tostring(is_correct),
-            M._check_by_count and "count mode" or "not count mode", tostring(M._gameplay_active), tostring(M._apply_safe)))
-    end
-    if is_correct ~= true or not M._check_by_count then return end
-    if not (M._gameplay_active and M._apply_safe) then return end
-    local aidx = _book_valid_asset_idx(book)
-    if aidx == nil then return end
-    local sname = M._asset_to_series[aidx]
-    local ch = nil
-    pcall(function() ch = tonumber(book.ItemInfo.Chapter) end)
-    if not sname or ch == nil then return end
-    local bid = sname .. "|" .. ch
-    local seen = M._books_correct_seen
-    if seen[bid] then return end
-    seen[bid] = true
-    if not M._count_series or M._count_series[sname] then
-        M._correct_count = (M._correct_count or 0) + 1
-    end
-    M._count_tick_pending = true
-end
+--- Count checks: what the bookcases say. A case's PlacingBookInfo lists the books placed in its
+--- slots; a book the mod anchored to a case for warding is never in it, nor is a book lying
+--- loose, and a book taken off a shelf leaves it. A listed book counts when the case belongs to
+--- the book's own section and its series-mates on that row sit in chapter order around it, the
+--- reading the finished-row flag agrees with. Neither the per-book flag (not restored on load),
+--- nor the game's verdict call (missed for some placements), nor its counter (moves for a wrong
+--- slot too) is used, so a resumed run and a live one count the same way and the count can go
+--- down. A dozen cases per pass re-reads the library every few seconds; the case the game just
+--- judged a placement on is re-read on the very next pass.
+local CNT_CASES = 12
 
---- The books on a shelf when the world settled, by id: the floor a resumed run starts from,
---- taken once per world. The game's saved counter gives the same number but not the set, and
---- the set is what keeps a floor book that is picked up and put back from counting twice.
-function M.snapshot_shelved_books()
-    if M._floor_books or not (M._gameplay_active and M._apply_safe and M._cases_indexed) then return end
-    -- Only a world proven to be this run's. Taken at the first count pass after the world
-    -- settles, which is before the player can place anything; should it ever come later, a
-    -- book already counted this session is left out, so the two halves cannot overlap.
-    local SI = package.loaded["AP/SaveIdentity"]
-    if not (SI and SI.verdict == SI.VERIFIED) then return end
-    local seen = M._books_correct_seen or {}
-    -- A warded book is anchored to a bookcase by the mod, so attachment alone says nothing:
-    -- only a book that is unlocked and not behind a shut bookcase can be on a shelf by play.
-    local only_shelfable = M._slot_data and M._slot_data.only_unward_shelfable_books == 1
-    local case_open = only_shelfable and M._compute_case_open_set() or nil
-    local set, n = {}, 0
-    local books = FindAllOf("BP_GrabbingBook_C") or {}
-    local cnt = 0; pcall(function() cnt = #books end)
-    for i = 1, cnt do
-        local b = books[i]
-        local aidx = _book_valid_asset_idx(b)
-        if aidx ~= nil then
-            local sname = M._asset_to_series[aidx]
-            local ch = nil
-            pcall(function() ch = tonumber(b.ItemInfo.Chapter) end)
-            if sname and ch ~= nil and (not M._count_series or M._count_series[sname]) then
-                local bid = sname .. "|" .. ch
-                local unlocked = M._series_unlocked[sname] or M._books_unlocked[bid]
-                local shelvable = unlocked and (not case_open or case_open[sname])
-                if shelvable then
-                    local on_case = false
-                    pcall(function() local a = b.AttachedActor; on_case = (a and a:IsValid()) and true or false end)
-                    if on_case and not seen[bid] then set[bid] = true; n = n + 1 end
+--- Books in place in one bookcase. The game's own rule, as far as it can be read through
+--- UE4SS: a book is in place when this case accepts its series in that slot's column
+--- (IsPlaceWithAbsCorrectColumn, the one bookcase call that answers) and it stands at its
+--- volume's offset from the start of its run: volume k in the k-th slot of the row. On the
+--- ordinary cases every row is one run of per_row slots and a series may sit on any row, so
+--- the offset is the slot's position within its row. The cabinets (4x16, 6x16) have columns
+--- of widths nothing readable gives (GetRowNumArray answers zeros, GetCorrectColumn's values
+--- do not read, GetCurrentRowNum does not marshal), so there the acceptance call plus
+--- chapter order along the run stands in; F8 dumps one cabinet's raw structure to settle it.
+--- The order rule alone is the floor when the call does not answer. Returns the count used,
+--- then each source's count and whether it answered, for F8.
+function M.count_case_correct(case, sid)
+    local pbi = nil; pcall(function() pbi = case.PlacingBookInfo end)
+    local pbi_n = 0; if pbi then pcall(function() pbi_n = #pbi end) end
+    if pbi_n == 0 then return 0, 0, 0, 0, 0, false, false, false end
+    local case_name = nil
+    pcall(function() case_name = case:GetFullName() end)
+    local verdicts = M._cnt_verdicts or {}
+    local slots, placed_n, judged = {}, 0, {}
+    for i = 1, pbi_n do
+        local book = nil; pcall(function() book = pbi[i] end)
+        if book and book:IsValid() then
+            local aidx = _book_valid_asset_idx(book)
+            if aidx ~= nil then
+                local ch = nil; pcall(function() ch = tonumber(book.ItemInfo.Chapter) end)
+                if ch ~= nil then
+                    slots[i] = { aidx = aidx, ch = ch }; placed_n = placed_n + 1
+                    -- The game judged this book on this case this session: that answer stands.
+                    local bname = nil
+                    pcall(function() bname = book:GetFullName() end)
+                    local v = bname and verdicts[bname]
+                    if v and v.case == case_name then judged[i] = v.ok end
                 end
             end
         end
     end
-    M._floor_books, M._floor_count = set, n
-    log(("[count] floor: %d books on a shelf at load (game's saved counter %s)"):format(
-        n, tostring(M._count_load_floor or "not read yet")))
-end
-
---- Books counted this session that were not on a shelf at load.
-function M.count_new_this_session()
-    local floor = M._floor_books or {}
-    local n = 0
-    for bid in pairs(M._books_correct_seen or {}) do
-        if not floor[bid] then
-            local sname = bid:match("^(.*)|%d+$")
-            if sname and (not M._count_series or M._count_series[sname]) then n = n + 1 end
+    if placed_n == 0 then return 0, 0, 0, 0, 0, false, false, false end
+    local function in_scope(aidx, ch)
+        local sname = M._asset_to_series[aidx]
+        if not sname or M._asset_to_section[aidx] ~= sid then return false end
+        if M._count_series and not M._count_series[sname] then return false end
+        return (M._series_unlocked[sname] or M._books_unlocked[sname .. "|" .. ch]) and true or false
+    end
+    -- Order along each run: rows of the grid shape, the whole case for a cabinet.
+    local rs = nil; pcall(function() rs = case.RowStatus end)
+    local rs_n = 0; if rs then pcall(function() rs_n = #rs end) end
+    local per_row = (rs_n > 0 and pbi_n % rs_n == 0) and math.floor(pbi_n / rs_n) or 0
+    local order_ok = {}
+    local function run(first, last)
+        local by, order = {}, {}
+        for i = first, last do
+            local e = slots[i]
+            if e then
+                local g = by[e.aidx]
+                if not g then g = {}; by[e.aidx] = g; order[#order + 1] = e.aidx end
+                g[#g + 1] = { slot = i, ch = e.ch }
+            end
+        end
+        -- In order means part of the longest run of rising chapters along the shelf: the
+        -- books outside it are the fewest whose removal leaves the series ordered, so one
+        -- misplaced volume is the only one that reads wrong. Ranking each book against the
+        -- sorted chapters instead let one intruder take its series-mates down with it: a
+        -- wrong placement in a cabinet dropped the count by three and removing it gave them
+        -- back.
+        for _, aidx in ipairs(order) do
+            local g = by[aidx]
+            local n_g = #g
+            local best, prev = {}, {}
+            for a = 1, n_g do
+                best[a], prev[a] = 1, nil
+                for b = 1, a - 1 do
+                    if g[b].ch < g[a].ch and best[b] + 1 > best[a] then best[a], prev[a] = best[b] + 1, b end
+                end
+            end
+            local tail = 1
+            for a = 2, n_g do if best[a] > best[tail] then tail = a end end
+            local k = tail
+            while k do order_ok[g[k].slot] = true; k = prev[k] end
         end
     end
-    return n
+    if per_row > 0 then
+        for i = 1, rs_n do run((i - 1) * per_row + 1, i * per_row) end
+    else
+        run(1, pbi_n)
+    end
+    local n_order = 0
+    for i, e in pairs(slots) do
+        if order_ok[i] and in_scope(e.aidx, e.ch) then n_order = n_order + 1 end
+    end
+    -- The case asked slot by slot (column only), combined with the order along the run.
+    local n_col, have_col, col_ok = 0, false, {}
+    pcall(function()
+        for i, e in pairs(slots) do
+            local ok = case:IsPlaceWithAbsCorrectColumn(i - 1, e.aidx)
+            if type(ok) == "boolean" then
+                have_col = true
+                if ok then col_ok[i] = true end
+            end
+        end
+    end)
+    if have_col then
+        for i, e in pairs(slots) do
+            if col_ok[i] and order_ok[i] and in_scope(e.aidx, e.ch) then n_col = n_col + 1 end
+        end
+    end
+    -- The exact slot on a uniform case: accepted here, and standing at its volume's offset
+    -- from the start of its row.
+    local n_pos, have_pos = 0, false
+    if have_col and per_row > 0 then
+        have_pos = true
+        for i, e in pairs(slots) do
+            if col_ok[i] and ((i - 1) % per_row) == e.ch and in_scope(e.aidx, e.ch) then
+                n_pos = n_pos + 1
+            end
+        end
+    end
+    -- The case's own per-slot flags.
+    local n_state, have_state = 0, false
+    pcall(function()
+        local st = case:GetCorrectState()
+        local st_n = 0; pcall(function() st_n = #st end)
+        if st_n ~= pbi_n then
+            if not M._cnt_state_said then
+                M._cnt_state_said = true
+                log(("[count] GetCorrectState gave %s of length %d for %d slots; not used"):format(
+                    type(st), st_n, pbi_n))
+            end
+            return
+        end
+        local trues = {}
+        for i = 1, st_n do
+            local v = st[i]
+            if v == true or v == 1 then
+                if not slots[i] then return end        -- a flag on an empty slot: not believed
+                trues[i] = true
+            end
+        end
+        if per_row > 0 then
+            for r = 1, rs_n do
+                local done = false
+                pcall(function() local v = rs[r]; done = (v == true or v == 1) end)
+                if done then
+                    local any = false
+                    for i = (r - 1) * per_row + 1, r * per_row do
+                        if trues[i] then any = true; break end
+                    end
+                    if not any then return end          -- a finished row with no flag: stale list
+                end
+            end
+        end
+        have_state = true
+        for i, e in pairs(slots) do
+            if trues[i] and in_scope(e.aidx, e.ch) then n_state = n_state + 1 end
+        end
+    end)
+    -- For a book the game has not judged this session: accepted here and in chapter order
+    -- along its run. Measured against 53 of the game's own verdicts in one session, this
+    -- agreed on every book; the slot-offset reading rejected 12 the game had accepted.
+    local layer = have_state and 1 or (have_col and 3 or 4)
+    local rule_ok = have_col and function(i) return col_ok[i] and order_ok[i] end
+        or function(i) return order_ok[i] end
+    local n, n_judged = 0, 0
+    for i, e in pairs(slots) do
+        if in_scope(e.aidx, e.ch) then
+            local ok
+            if judged[i] ~= nil then ok = judged[i]; n_judged = n_judged + 1 else ok = rule_ok(i) and true or false end
+            if ok then n = n + 1 end
+        end
+    end
+    M._cnt_layer_said = M._cnt_layer_said or {}
+    local shape = per_row > 0 and "uniform" or "cabinet"
+    if M._cnt_layer_said[shape] ~= layer then
+        M._cnt_layer_said[shape] = layer
+        log(("[count] %s cases: reading %s"):format(shape,
+            layer == 1 and "the bookcases' own per-slot flags (GetCorrectState)"
+            or layer == 2 and "the bookcase's acceptance of each slot with the volume's offset along its row"
+            or layer == 3 and "the game's verdict on each placement; for books it has not judged, the bookcase's acceptance with chapter order along the run"
+            or "the order along each run only (the bookcase calls did not answer)"))
+    end
+    return n, n_state, n_pos, n_col, n_order, have_state, have_pos, have_col, n_judged
 end
 
+--- One case's raw structure, for the log: what each readable field and call gives, and for
+--- every placed book its slot, series, chapter, the acceptance call and the game's own flag.
+--- Run from F8 on one uniform case and one cabinet, so a report settles the cabinet geometry.
+function M.dump_case_structure(case, sid, add)
+    local cls = "?"
+    pcall(function() cls = case:GetClass():GetFName():ToString() end)
+    local function arr_str(get)
+        local out = {}
+        pcall(function()
+            local a = get()
+            local n = 0; pcall(function() n = #a end)
+            for k = 1, math.min(n, 24) do out[#out + 1] = tostring(a[k]) end
+            if n > 24 then out[#out + 1] = "..." end
+        end)
+        return #out > 0 and table.concat(out, ",") or "-"
+    end
+    add("  case %s (%s): RowStatus=[%s] RowNumArray=[%s] GetRowNumArray=[%s] GetCorrectState=[%s] CDI=[%s]",
+        sid, cls,
+        arr_str(function() return case.RowStatus end),
+        arr_str(function() return case.RowNumArray end),
+        arr_str(function() return case:GetRowNumArray() end),
+        arr_str(function() return case:GetCorrectState() end),
+        arr_str(function() return case.CorrectBookDataIndex end))
+    pcall(function()
+        local bai = case.BookArrayInfo
+        local n = 0; pcall(function() n = #bai end)
+        local groups = {}
+        for k = 1, math.min(n, 24) do
+            groups[#groups + 1] = arr_str(function() return bai[k].CorrectIdx end)
+        end
+        add("    BookArrayInfo (%d): %s", n, table.concat(groups, " | "))
+    end)
+    local pbi = nil; pcall(function() pbi = case.PlacingBookInfo end)
+    local pbi_n = 0; if pbi then pcall(function() pbi_n = #pbi end) end
+    local lines = 0
+    for i = 1, pbi_n do
+        local book = nil; pcall(function() book = pbi[i] end)
+        if book and book:IsValid() and lines < 24 then
+            local aidx = _book_valid_asset_idx(book)
+            local ch, acc, flag = nil, "?", "?"
+            pcall(function() ch = tonumber(book.ItemInfo.Chapter) end)
+            if aidx ~= nil then pcall(function() acc = tostring(case:IsPlaceWithAbsCorrectColumn(i - 1, aidx)) end) end
+            pcall(function() flag = tostring(book["Is Abs Correct"]) end)
+            add("    slot %d: asset %s ch %s accepted=%s abs-correct=%s", i - 1, tostring(aidx), tostring(ch), acc, flag)
+            lines = lines + 1
+        end
+    end
+end
+
+--- Every source's total over the library, for F8.
+function M.count_layers_report()
+    local t = { n = 0, state = 0, pos = 0, col = 0, order = 0, cases = 0,
+                with_state = 0, with_pos = 0, with_col = 0 }
+    for sid, list in pairs(M._section_to_cases or {}) do
+        for _, c in ipairs(list) do
+            if c and c:IsValid() then
+                local n, ns, np, nc, no, hs, hp, hc, nj = M.count_case_correct(c, sid)
+                t.n, t.state, t.pos, t.col, t.order = t.n + n, t.state + ns, t.pos + np, t.col + nc, t.order + no
+                t.judged = (t.judged or 0) + (nj or 0)
+                t.cases = t.cases + 1
+                if hs then t.with_state = t.with_state + 1 end
+                if hp then t.with_pos = t.with_pos + 1 end
+                if hc then t.with_col = t.with_col + 1 end
+            end
+        end
+    end
+    return t
+end
+
+--- Which section's bookcase lists each placed book, keyed by the book's full name. One walk of
+--- the library, for the diagnostic.
+function M.index_placed_books()
+    local placed = {}
+    for sid, list in pairs(M._section_to_cases or {}) do
+        for _, c in ipairs(list) do
+            if c and c:IsValid() then
+                local pbi = nil; pcall(function() pbi = c.PlacingBookInfo end)
+                local n = 0; if pbi then pcall(function() n = #pbi end) end
+                for slot = 1, n do
+                    local b = nil; pcall(function() b = pbi[slot] end)
+                    if b and b:IsValid() then pcall(function() placed[b:GetFullName()] = sid end) end
+                end
+            end
+        end
+    end
+    return placed
+end
+
+--- The game's verdict on a placement, from the hook on the book's Correct(IsAbsCorrect). Not
+--- counted from: the case the book sits on is marked for re-reading on the next pass, right or
+--- wrong, so a tick follows a placement within half a second.
+function M.note_book_verdict(book, is_correct)
+    M._verdict_dbg = (M._verdict_dbg or 0) + 1
+    if M._verdict_dbg <= 3 then
+        log(("[count] Correct(%s) fired (%s)"):format(tostring(is_correct),
+            M._check_by_count and "count mode" or "not count mode"))
+    end
+    if not M._check_by_count then return end
+    local name, case = nil, nil
+    pcall(function()
+        local a = book.AttachedActor
+        if a and a:IsValid() then case, name = a, a:GetFullName() end
+    end)
+    if not name then return end
+    -- The game's own answer for this book on this case, kept while the book stays there. The
+    -- count prefers it to any rule of ours; a book moved again gets a new verdict.
+    local bname = nil
+    pcall(function() bname = book:GetFullName() end)
+    if bname then
+        M._cnt_verdicts = M._cnt_verdicts or {}
+        M._cnt_verdicts[bname] = { case = name, ok = (is_correct == true) }
+    end
+    M._cnt_hot = M._cnt_hot or {}
+    M._cnt_hot[name] = { case = case, laps = 2 }
+end
+
+--- A bookcase's own change events: CorrectNumUpdated when a placement moves its correct count,
+--- BookDetached when a book leaves it. Either marks the case for re-reading on the next pass.
+function M.note_case_event(case)
+    if not (M._check_by_count and case) then return end
+    local name = nil
+    pcall(function() if case:IsValid() then name = case:GetFullName() end end)
+    if not name then return end
+    M._cnt_hot = M._cnt_hot or {}
+    M._cnt_hot[name] = { case = case, laps = 2 }
+end
+
+--- One pass of the count: the cases a verdict just landed on, then the next dozen of the lap.
+--- Fires the ticks when the total moves. Rides the 500ms loop.
+function M.count_pulse()
+    if not M._check_by_count then return end
+    if not (M._gameplay_active and M._apply_safe and M._cases_indexed) or M._flush_in_progress then return end
+    if M._cnt_cases and (M._world_epoch or 0) ~= (M._cnt_epoch or 0) then
+        M._cnt_cases, M._cnt_by_case, M._cnt_hot, M._cnt_lap_done = nil, nil, nil, false
+    end
+    local cases, cursor = M._cnt_cases, M._cnt_cursor or 0
+    if not cases or cursor >= #cases then
+        cases = {}
+        local sids = {}
+        for sid, list in pairs(M._section_to_cases or {}) do
+            for _, c in ipairs(list) do
+                cases[#cases + 1] = { sid = sid, case = c }
+                pcall(function() sids[c:GetFullName()] = sid end)
+            end
+        end
+        if #cases == 0 then return end
+        M._cnt_cases, M._cnt_sid, M._cnt_epoch, cursor = cases, sids, M._world_epoch or 0, 0
+        M._cnt_by_case = M._cnt_by_case or {}
+    end
+    local by_case = M._cnt_by_case
+    local function read(c, sid)
+        if not (c and c:IsValid()) then return end
+        local key = nil
+        pcall(function() key = c:GetFullName() end)
+        if key then by_case[key] = M.count_case_correct(c, sid) end
+    end
+    for name, hot in pairs(M._cnt_hot or {}) do
+        local sid = M._cnt_sid and M._cnt_sid[name]
+        if sid then read(hot.case, sid) end
+        hot.laps = hot.laps - 1
+        if hot.laps <= 0 or not sid then M._cnt_hot[name] = nil end
+    end
+    local stop = math.min(cursor + CNT_CASES, #cases)
+    for ci = cursor + 1, stop do read(cases[ci].case, cases[ci].sid) end
+    M._cnt_cursor = stop
+    local total = 0
+    for _, n in pairs(by_case) do total = total + n end
+    local moved = total ~= M._count_total
+    M._count_total = total
+    if stop >= #cases and not M._cnt_lap_done then
+        M._cnt_lap_done = true
+        moved = true
+    end
+    if moved then M.fire_count_ticks() end
+end
+
+--- Fire "Shelved N Books" for every tick the count has reached. check_mode=by_count only.
 function M.fire_count_ticks()
     if not M._check_by_count then return 0 end
     local map = M._count_location_map
@@ -4121,15 +4452,13 @@ function M.fire_count_ticks()
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient.send_check) then return 0 end
 
-    -- Floor plus this session's new placements. Until the floor snapshot exists, the game's
-    -- saved counter stands in for it.
-    M.snapshot_shelved_books()
-    local floor = M._floor_count or M._count_load_floor or 0
-    local fresh = M.count_new_this_session()
-    local count = floor + fresh
+    -- Nothing fires until every bookcase has been read once: a partial lap only undercounts,
+    -- and the sends below are permanent.
+    if not M._cnt_lap_done then return 0 end
+    local count = M._count_total or 0
     if count ~= M._count_last_logged then
         M._count_last_logged = count
-        log(("[count-tick] counting %d (%d on a shelf at load + %d placed since)"):format(count, floor, fresh))
+        log(("[count-tick] counting %d books in place on the shelves"):format(count))
     end
     local sent = 0
     for key, loc_id in pairs(map) do
@@ -4400,11 +4729,6 @@ function M.sync_progress_state()
     -- new run had never played.
     if M.save_progress_is_stale(rows_finished) then
         rows_finished, books_placed_save = 0, 0
-    end
-    -- The saved counter, once per world, as the floor a resumed run starts from. The live
-    -- counter counts a book in the wrong slot too, so it is never used past this point.
-    if books_placed_save > 0 and not M._count_load_floor then
-        M._count_load_floor = books_placed_save
     end
     rows_finished = M.rows_finished_floor(rows_finished)
     local books_placed_widget = M._read_widget_book_count() or 0
@@ -5214,6 +5538,22 @@ local function _hism_arr()
     local arr
     pcall(function() arr = M._hism_mgr.HISMArray end)
     return arr
+end
+
+--- Put one book's pile instance back where the ward sank it. The flush restores on unward;
+--- this is for a book the reconcile sweep unwards itself.
+function M._restore_pile_instance(aidx, chapter)
+    if not (aidx and chapter and M._book_inst_state) then return false end
+    local st = M._book_inst_state[aidx .. "|" .. chapter]
+    if not (st and st.hidden and st.orig) then return false end
+    local arr = _hism_arr()
+    if not arr then return false end
+    local comp
+    pcall(function() comp = arr[aidx + 1] end)
+    if not (comp and comp:IsValid()) then return false end
+    local ok = pcall(function() comp:UpdateInstanceTransform(chapter, st.orig, true, true, true) end)
+    if ok then st.hidden = false end
+    return ok
 end
 
 --- Sink ONE pile instance back down, immediately.
