@@ -321,6 +321,13 @@ class LibrarianWorld(World):
                 quantities.pop(item, None)
         return quantities
 
+    def _custom_goal_count(self, books: bool) -> int:
+        """The custom goal's row or book count, as the seed was built. slot_data carries it;
+        a tracker re-gen would otherwise hold the options' defaults (200 rows, 1500 books)."""
+        if books:
+            return self._ut_opt("goal_book_threshold", self.options.custom_goal_book_count)
+        return self._ut_opt("goal_row_threshold", self.options.custom_goal_row_count)
+
     @property
     def goal_value(self) -> int:
         """The goal this seed was built with.
@@ -474,9 +481,22 @@ class LibrarianWorld(World):
         The other big pools are not the problem -- individual series with booksanity is
         11s solo and 12s for three players -- because the cost follows the number of
         advancement items, and only this shape has 3072 of them."""
-        if (self.book_sanity
-                and self.options.goal.value == self.options.goal.option_full):
+        if not self.book_sanity:
+            return ""
+        goal = self.options.goal
+        if goal.value == goal.option_full:
             return "unlock_mode: individual_book_unlocks on goal: full"
+        # A custom goal is the same shape once it keeps more books than a floor holds:
+        # measured, 2354 to 3033 books timed out where the floors do not. Estimated the way
+        # _custom_active_sections sizes the world, without its roll, so nothing here moves
+        # the seed's random stream.
+        if goal.value == goal.option_custom:
+            floor_max = max(sum(s.volume_count for s in data.SECTIONS if s.floor == f) for f in (1, 2))
+            kept = math.ceil(self.options.custom_goal_book_count.value
+                             * (1 + self.options.spare_book_item_percent.value / 100))
+            if kept > floor_max:
+                return (f"unlock_mode: individual_book_unlocks on a custom goal of "
+                        f"{self.options.custom_goal_book_count.value} books (more than a floor holds)")
         return ""
 
     @property
@@ -978,7 +998,9 @@ class LibrarianWorld(World):
         looked one up that was never created."""
         if not self.check_by_series or self.individual:
             return False
-        return self.options.series_per_unlock.value <= 3
+        # Read through slot_data: a tracker re-gen holds the option's default (5), and
+        # reading that dropped these checks from the tracker's copy of a P=3 seed.
+        return self._ut_opt("series_per_unlock", self.options.series_per_unlock) <= 3
 
     # ------------------------------------------------------------------
     # create_regions — Menu → Library → 31 section regions
@@ -1014,7 +1036,8 @@ class LibrarianWorld(World):
                 f"[Librarian - '{self.player_name}'] {self._slow_to_generate()} is slow to "
                 f"generate and is off by default. The host can allow it by setting "
                 f"librarian_options: allow_individual_book_unlocks: true in host.yaml. "
-                f"Otherwise pick a floor or custom goal, or a different unlock mode."
+                f"Otherwise pick a floor goal, a custom goal of at most a floor's books, or a "
+                f"different unlock mode."
             )
         # Every book its own item only fits when every book is also a check: ~3072 items
         # cannot go into ~400 rows or a few hundred count ticks. Bundles are drawn from
@@ -2279,12 +2302,12 @@ class LibrarianWorld(World):
         custom = self.goal_value == self.options.goal.option_custom
         if self.check_by_series:
             total_active_rows = sum(len(sec.series) for sec in active_sections)
-            need = (min(self.options.custom_goal_row_count.value, total_active_rows)
+            need = (min(self._custom_goal_count(False), total_active_rows)
                     if custom else total_active_rows)
             counter = feasible_rows
         else:
             total_active_books = sum(sec.volume_count for sec in active_sections)
-            need = (min(self.options.custom_goal_book_count.value, total_active_books)
+            need = (min(self._custom_goal_count(True), total_active_books)
                     if custom else total_active_books)
             counter = feasible_books
         goal = mw.get_location(GOAL_LOCATION_NAME, p)
@@ -2510,7 +2533,7 @@ class LibrarianWorld(World):
                 lambda state, n=data.XP_CURVE[level_n - 1]: feasible_rows(state) >= n)
 
         if self.check_by_count:
-            books_needed = (min(self.options.custom_goal_book_count.value, total_books)
+            books_needed = (min(self._custom_goal_count(True), total_books)
                             if self.goal_value == self.options.goal.option_custom
                             else total_books)
             mw.get_location(GOAL_LOCATION_NAME, p).access_rule = (
@@ -2523,7 +2546,7 @@ class LibrarianWorld(World):
                         continue
                     mw.get_location(f"Complete {thresh} Rows", p).access_rule = (
                         lambda state, n=thresh: feasible_rows(state) >= n)
-            rows_needed = (min(self.options.custom_goal_row_count.value, total_rows)
+            rows_needed = (min(self._custom_goal_count(False), total_rows)
                            if self.goal_value == self.options.goal.option_custom
                            else total_rows)
             mw.get_location(GOAL_LOCATION_NAME, p).access_rule = (
@@ -2536,7 +2559,7 @@ class LibrarianWorld(World):
                 mw.get_location(f"Correctly shelve {thresh} books", p).access_rule = (
                     lambda state, n=thresh: feasible_books(state) >= n)
 
-            books_needed = (min(self.options.custom_goal_book_count.value, total_books)
+            books_needed = (min(self._custom_goal_count(True), total_books)
                             if self.goal_value == self.options.goal.option_custom
                             else total_books)
             mw.get_location(GOAL_LOCATION_NAME, p).access_rule = (
@@ -2676,7 +2699,7 @@ class LibrarianWorld(World):
         # target would end the run almost immediately. Capped at the goal's own book total.
         total_active_books = sum(s.volume_count for s in active_sections)
         if self.goal_value == self.options.goal.option_custom:
-            books_needed = min(self.options.custom_goal_book_count.value, total_active_books)
+            books_needed = min(self._custom_goal_count(True), total_active_books)
         else:
             books_needed = total_active_books
         goal = mw.get_location(GOAL_LOCATION_NAME, p)
@@ -2699,7 +2722,7 @@ class LibrarianWorld(World):
             return
         mw = self.multiworld
         p = self.player
-        per_unlock = self.options.series_per_unlock.value
+        per_unlock = self._ut_opt("series_per_unlock", self.options.series_per_unlock)
         active_sections = self.active_sections
         series_req = self.series_req
         shelf_req = self.shelf_req
@@ -2905,11 +2928,11 @@ class LibrarianWorld(World):
             # Counted the way this seed checks: rows under check_mode series, books
             # otherwise. Both counters are exact, so neither needs a conversion.
             if self.check_by_series:
-                threshold = self.options.custom_goal_row_count.value
+                threshold = self._custom_goal_count(False)
                 goal.access_rule = (
                     lambda state, n=threshold: feasible_rows(state) >= n)
             else:
-                threshold = self.options.custom_goal_book_count.value
+                threshold = self._custom_goal_count(True)
                 goal.access_rule = (
                     lambda state, n=threshold: feasible_books(state) >= n)
         else:

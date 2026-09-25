@@ -310,7 +310,9 @@ that number grows: about a minute for one such player on their own, three and
 a half for two, seven and a half for three. Every player in the lobby waits on it, so the
 decision belongs to whoever runs generation. With it `false` (the default) a
 YAML asking for that shape is refused with a message naming this setting;
-set it `true` to allow it. Floor and custom goals in that mode are fine and
+set it `true` to allow it. A custom goal counts as that shape once it keeps
+more books than one floor holds (about 1,600, spare books included), since
+by then it is most of the library. Floor goals, and smaller custom goals,
 need nothing.
 
 `allow_numbered_book_bundles` gates `numbered_book_bundles` the same way; see
@@ -342,8 +344,8 @@ Whichever goal you pick, reaching it opens the way out rather than ending the
 run on the spot. The library has its own ending, and the mod leaves it to you.
 
 `individual_book_unlocks` on the `full` goal is slow to generate, so it is off
-unless the host allows it; see Host settings below. A floor or custom goal
-there needs no permission.
+unless the host allows it; see Host settings below. So is a custom goal there
+that keeps more books than one floor holds. A floor goal needs no permission.
 
 #### `custom_goal_row_count`
 

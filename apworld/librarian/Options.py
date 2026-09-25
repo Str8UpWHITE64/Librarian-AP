@@ -30,8 +30,9 @@ class Goal(Choice):
                are not waiting on items you will never need.
 
     individual_book_unlocks on the full goal is slow to generate and is off unless the
-    host allows it (allow_individual_book_unlocks in host.yaml). A floor or custom
-    goal there needs no permission."""
+    host allows it (allow_individual_book_unlocks in host.yaml). So is a custom goal
+    there that keeps more books than one floor holds (about 1600). A floor goal needs
+    no permission."""
     display_name = "Goal"
 
     option_full = 0
@@ -88,8 +89,9 @@ class UnlockMode(Choice):
     individual_book_unlocks -- one unlock item per book, about 3000 of them. Every
         bookcase is open from the start. Much the biggest pool: with check_mode:
         series it is switched to booksanity, since 3000 items cannot sit in 400 row
-        checks, and on the full goal it needs the host's permission
-        (allow_individual_book_unlocks in host.yaml) because it is slow to generate."""
+        checks, and on the full goal, or a custom goal larger than a floor, it needs the
+        host's permission (allow_individual_book_unlocks in host.yaml) because it is slow
+        to generate."""
     display_name = "Unlock Mode"
 
     option_random_series_bundles = 0
