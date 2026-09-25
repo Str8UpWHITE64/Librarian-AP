@@ -1862,6 +1862,17 @@ function M._apply_books_to_world()
         if hism_arr and chapter ~= nil then
             _teleport_inst(asset_idx, chapter, not should_unward)
         end
+        -- A revealed book resting on a shelf it spawned on goes to the floor in front of it, so it
+        -- is not inside a book the player shelved into its space while it was hidden. Once per
+        -- book per world, and only a book that has never been moved.
+        if ok and should_unward and _diag_on("SHELF_BOOK_DROP") then
+            local SD = package.loaded["AP/ShelfDrop"]
+            if not SD then
+                local rok, mod = pcall(require, "AP/ShelfDrop")
+                SD = rok and mod or nil
+            end
+            if SD then pcall(SD.on_unward, M, book) end
+        end
         if ok then
             if should_unward then stats.unwarded = stats.unwarded + 1
             else stats.warded = stats.warded + 1 end
@@ -3550,6 +3561,10 @@ local function _report_lines()
         totals.unlocked, totals.books, totals.locked, totals.gated, totals.shelved, totals.away, totals.loose)
     add("progress: game says %d books shelved, %d rows finished; bookcases show %d rows finished; level %d",
         game_books, game_rows, rows_by_case, M._levels_reached or 0)
+    do
+        local SD = package.loaded["AP/ShelfDrop"]
+        if SD then add("books moved off shelves they spawned on: %s", SD.summary()) end
+    end
     if M._check_by_count then
         local sent, nxt = 0, nil
         for k in pairs(M._count_location_map or {}) do

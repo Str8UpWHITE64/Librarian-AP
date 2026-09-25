@@ -2888,6 +2888,12 @@ function _dev.restore_book_home(book)
     local alive = false
     pcall(function() alive = book and book:IsValid() end)
     if not alive then return false end
+    -- A book whose spawn point is on a shelf goes to the floor in front of it instead, the spot it
+    -- was moved to when revealed; its shelf spawn is exactly where it must not reappear.
+    if diag_on("SHELF_BOOK_DROP") then
+        local SD, IA = package.loaded["AP/ShelfDrop"], package.loaded["AP/ItemApply"]
+        if SD and IA and SD.redirect_home(IA, book) == true then return true end
+    end
 
     local t
     pcall(function() t = book.SpawnTransform end)

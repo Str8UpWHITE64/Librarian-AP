@@ -68,6 +68,11 @@ return {
     -- Name on the HUD a row that is fully shelved but out of order, until it is fixed.
     MISORDER_NOTICE    = true,
 
+    -- A revealed book that spawned resting on a shelf moves to the floor in front of it, so it is
+    -- not inside a book shelved into its space while it was hidden. Writes book positions (never
+    -- SpawnTransform, which the save fingerprint reads). Off = books stay where they spawned.
+    SHELF_BOOK_DROP    = true,
+
     -- Log what the mass-book magic skills actually touch: which books Assemble takes, whether the
     -- game asks CanBeGrab first, and which pile instances get rewritten while Insight is up. Cheap
     -- (a few lines per skill use) and it is the only evidence for whether the two guards below are
