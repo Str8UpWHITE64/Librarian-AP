@@ -653,6 +653,11 @@ class LibrarianWorld(World):
                   + len(_chest_locations))
         chain = self.random_bundle or (not (self.individual or self.book_sanity)
                                        and not self.distinct_bundles)
+        # Numbered series bundles need no chain slack from the default start, but a short start
+        # leaves the first rungs with little to reach: at 5 or 6 starting series a check every
+        # 15 books failed 10-20% of seeds on the full goal, every 12 or 10 none of 20.
+        thin_start = (not chain and not (self.individual or self.book_sanity)
+                      and self._ut_opt("starting_series_count", self.options.starting_series_count) < 10)
 
         def ticks_needed(n_unlocks: int) -> int:
             room = max(1, n_unlocks + pool_other - others + 6)
@@ -664,7 +669,9 @@ class LibrarianWorld(World):
             # below about 2.1 ticks per chain item and pass from 2.5; bundles at 8 per
             # item failed 7 of 20 at 1.4. Numbered bundles are specific items, not an
             # ordered chain, and measured 10/10 at series_per_unlock 3 without slack.
-            return max(room, math.ceil(n_unlocks * 2.5)) if chain else room
+            if chain:
+                return max(room, math.ceil(n_unlocks * 2.5))
+            return max(room, math.ceil(n_unlocks * 1.75)) if thin_start else room
 
         # Under book bundles the unlock count moves with the bundle size; the bookcases
         # are the part that does not.
@@ -1795,12 +1802,17 @@ class LibrarianWorld(World):
         # Rows as the checks need a shorter chain still: a row opens on its closing
         # volume, so the bundle chain and the bookcase chain interleave at every row.
         # Measured on the full goal with progressive bookcases: 154 bundles fail 4 of
-        # 10, 110 or fewer fill 10 of 10.
+        # 10, 110 or fewer fill 10 of 10. With the bookcases open, rows still interleave
+        # the bundle chain with itself: 384 bundles failed 4 of 20 and 256 or fewer 0 of
+        # 20, so row checks keep a looser cap there.
         chain_div = 5 if (self.check_by_series
                           or (self.check_by_count and self.numbered_book_bundles)) else 3
-        chain_cap = (max(1, target // chain_div)
-                     if self.bookcase_unlocks != self.options.bookcase_unlocks.option_unlocked
-                     else n_books)
+        if self.bookcase_unlocks != self.options.bookcase_unlocks.option_unlocked:
+            chain_cap = max(1, target // chain_div)
+        elif self.check_by_series:
+            chain_cap = max(1, target // 2)
+        else:
+            chain_cap = n_books
         while per < n_books and (math.ceil(n_books / per) > max(1, head_room)
                                  or math.ceil(n_books / per) > chain_cap):
             per += 1
