@@ -727,6 +727,7 @@ function M.set_gameplay_active(state)
         -- instead of apply-on-change skipping as "unchanged".
         M._case_ward_state = {}
         M._case_placement_mesh = {}   -- stale (old world's components)
+        M._comp_vis_orig = {}
         M._section_to_label = nil
         M._section_glow_state = {}
         M._section_glow_orig = {}
@@ -1175,6 +1176,36 @@ local function _book_valid_asset_idx(book)
 end
 M._book_valid_asset_idx = _book_valid_asset_idx  -- expose for diagnostics
 
+--- One bookcase component's visibility. Showing puts it back to the game's own state, recorded the
+--- first time it is touched, rather than forcing it on: forcing it on lit PreviewBookLocation, the
+--- ghost book the game shows only while a book is aimed at the case, on every shelf from load, green
+--- until looked at and then the game's thin red outline. That ghost is the game's alone to show.
+M._comp_vis_orig = {}
+local function _set_comp_vis(comp, visible)
+    local name, key = "", nil
+    pcall(function() name = comp:GetFName():ToString() end)
+    if name == "PreviewBookLocation" then return end
+    pcall(function() key = comp:GetFullName() end)
+    local orig = key and M._comp_vis_orig[key]
+    if key and not orig then
+        local v, h
+        pcall(function() v = comp:IsVisible() end)
+        pcall(function() h = comp.bHiddenInGame end)
+        if type(v) == "boolean" and type(h) == "boolean" then
+            orig = { vis = v, hid = h }
+            M._comp_vis_orig[key] = orig
+        end
+    end
+    if visible then
+        if not orig then return end          -- unread: leave the game's state alone
+        pcall(function() comp:SetVisibility(orig.vis, false) end)
+        pcall(function() comp:SetHiddenInGame(orig.hid, false) end)
+    else
+        pcall(function() comp:SetVisibility(false, false) end)
+        pcall(function() comp:SetHiddenInGame(true, false) end)
+    end
+end
+
 --- Recursively set visibility on a SceneComponent tree. bHiddenInGame alone doesn't
 --- always refresh the render proxy in UE 5.5; MarkRenderStateDirty forces invalidation.
 local function _walk_set_visibility(comp, visible, owner, depth)
@@ -1184,8 +1215,7 @@ local function _walk_set_visibility(comp, visible, owner, depth)
     -- (handled by L1/L3); recursing into one mid-stream or being torn down derefs freed memory -- the
     -- recurring ward native AV. Fail OPEN (process) if GetOwner is unavailable so warding still works.
     if owner then local same = true; pcall(function() same = (comp:GetOwner() == owner) end); if not same then return end end
-    pcall(function() comp:SetVisibility(visible, false) end)
-    pcall(function() comp:SetHiddenInGame(not visible, false) end)
+    _set_comp_vis(comp, visible)
     -- MarkRenderStateDirty dropped: it force-recreates the render proxy and native-faults on a not-ready
     -- component (a confirmed mid-stream AV site); SetVisibility/SetHiddenInGame above already refresh it.
     local children
@@ -1529,6 +1559,7 @@ function M.reset_hism_state()
     M._case_orig_collision = {}
     M._case_ward_state = {}
     M._case_placement_mesh = {}
+    M._comp_vis_orig = {}
     M._section_to_label = nil
     M._section_glow_state = {}
     M._section_glow_orig = {}
@@ -2889,8 +2920,7 @@ function M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap)
                             for j = 1, cn do
                                 local c = comps[j]
                                 if c and c:IsValid() then
-                                    pcall(function() c:SetVisibility(true, false) end)
-                                    pcall(function() c:SetHiddenInGame(false, false) end)
+                                    _set_comp_vis(c, true)
                                     -- MarkRenderStateDirty dropped (render-proxy recreate AVs on a not-ready comp)
                                 end
                             end
@@ -3056,8 +3086,7 @@ function M._apply_bookcases_impl(cases_snap, shelves_snap, stray_snap)
                     for j = 1, cn do
                         local c = comps[j]
                         if c and c:IsValid() then
-                            pcall(function() c:SetVisibility(false, false) end)
-                            pcall(function() c:SetHiddenInGame(true, false) end)
+                            _set_comp_vis(c, false)
                             -- MarkRenderStateDirty dropped (render-proxy recreate AVs on a not-ready comp)
                         end
                     end
