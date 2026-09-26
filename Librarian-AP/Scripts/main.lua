@@ -4308,7 +4308,14 @@ function _goal.book_target(sd)
     local want = tonumber(sd.goal_book_threshold)
     if not want or want <= 0 then return nil end
     local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA.count_correct_books) then return nil end
+    if not IA then return nil end
+    -- Count checks have no per-book locations to read from the server; the goal counts what the
+    -- Shelved N Books checks count, the books in place on the shelves, once every case is read.
+    if sd.check_by_count == 1 then
+        if not IA._cnt_lap_done then return nil end
+        return IA._count_total or 0, want
+    end
+    if not IA.count_correct_books then return nil end
     return IA.count_correct_books(), want
 end
 
@@ -4323,11 +4330,14 @@ function _goal.send(rows)
     if not sd then return end
 
     local have, want, unit
-    if sd.book_sanity == 1 and sd.goal == 1 then
-        -- Book-counted goal. Never fall through to the row path from here: this seed still
-        -- carries a goal_row_threshold (the row default, meaningless under booksanity), and
-        -- firing off it would send the goal hundreds of books early. If the count is not
-        -- readable yet -- ItemApply still loading -- wait for the next pass instead.
+    local by_books = sd.goal == 1 and (sd.goal_counts_books == 1
+        or (sd.goal_counts_books == nil and sd.book_sanity == 1))
+    if by_books then
+        -- Book-counted goal: a custom goal under booksanity or count checks, whatever the unlock
+        -- mode. Keyed on the unlock mode it missed count checks with book bundles, which fell to
+        -- the row path and compared rows against the unused row default instead of the books the
+        -- player chose. Never fall through to the row path from here; if the count is not
+        -- readable yet, wait for the next pass.
         have, want = _goal.book_target(sd)
         if not have then return end
         unit = "books shelved"
