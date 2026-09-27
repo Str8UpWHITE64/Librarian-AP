@@ -17,6 +17,9 @@ local FRONT_PAD = 12.0        -- a book resting on a shelf pokes out past the ca
                               -- measured 1, 3 and 9 units on three such books
 local ON_SHELF = 15.0         -- that margin only counts this far above the floor, where books lying
                               -- on piles in front of a case (measured 20-34 units out) do not reach
+local HIGH, HIGH_PAD = 90.0, 30.0 -- above this nothing but a shelf is there, and books resting on
+                              -- one were measured 12-20 units past the face
+local STACK_R = 30.0          -- a landing this close to one already made goes on top of it
 local NAMED_PARTS = { "StaticMesh", "SM_M01_BookCabinet_03", "SM_M01_CabinetWall_02" }
 local KSL_PATH = "/Script/Engine.Default__KismetSystemLibrary"
 local SMC_PATH = "/Script/Engine.StaticMeshComponent"
@@ -26,6 +29,7 @@ M._done = {}              -- book full name -> true once judged this world
 M._cases, M._cases_epoch = nil, nil
 M._trace_state = nil      -- nil untested, "ok", or "unreadable"
 M._logged, M._near_logged = 0, 0
+M._landed = {}            -- this world's landings: { x, y, top }, for stacking
 
 local function v3(v)
     if not v then return nil end
@@ -195,7 +199,7 @@ local function cases(IA)
         end
     end
     M._cases, M._cases_epoch = list, IA._world_epoch or 0
-    M._done = {}
+    M._done, M._landed = {}, {}
     log(("bookcases: %d of %d read, %d mesh pieces, %d fronts from the slot billboards"):format(
         #list, n_all, n_parts, fronts))
     return list
@@ -222,8 +226,9 @@ local function case_resting(IA, p)
             local l = to_local(m, p)
             local o = (a == "X") and "Y" or "X"
             local s = math.abs(m.S[a]) ~= 0 and math.abs(m.S[a]) or 1
-            local lo = c.lo - ((c.front < 0) and FRONT_PAD / s or 0)
-            local hi = c.hi + ((c.front > 0) and FRONT_PAD / s or 0)
+            local pad = (p.Z > c.floor_z + HIGH) and HIGH_PAD or FRONT_PAD
+            local lo = c.lo - ((c.front < 0) and pad / s or 0)
+            local hi = c.hi + ((c.front > 0) and pad / s or 0)
             if l[a] >= lo and l[a] <= hi and l[o] >= m.min[o] and l[o] <= m.max[o]
                     and l.Z >= m.min.Z and l.Z <= m.max.Z then
                 return c
@@ -280,13 +285,33 @@ local function ground_z(book, x, y, z_from, z_to)
     end
     local hit = {}
     local got, z, what = false, nil, nil
-    pcall(function()
-        got = ksl:LineTraceSingle(book, { X = x, Y = y, Z = z_from }, { X = x, Y = y, Z = z_to },
-            0, false, { book }, 0, hit, true,
-            { R = 0, G = 0, B = 0, A = 0 }, { R = 0, G = 0, B = 0, A = 0 }, 0)
-        local ip = v3(hit.ImpactPoint) or v3(hit.Location)
-        if ip then z = ip.Z end
-    end)
+    local black = { R = 0, G = 0, B = 0, A = 0 }
+    -- By object type first: static world, movable, physics body, destructible, so a book lying on
+    -- the floor blocks it. The visibility channel alone passed straight through books, and every
+    -- landing came out at floor height, on top of whatever book was already there.
+    if M._obj_trace ~= false then
+        local ok = pcall(function()
+            got = ksl:LineTraceSingleForObjects(book, { X = x, Y = y, Z = z_from }, { X = x, Y = y, Z = z_to },
+                { 0, 1, 3, 5 }, false, { book }, 0, hit, true, black, black, 0)
+            local ip = v3(hit.ImpactPoint) or v3(hit.Location)
+            if ip then z = ip.Z end
+        end)
+        if not ok and M._obj_trace == nil then
+            M._obj_trace = false
+            log("object trace: unavailable; tracing the visibility channel, stacking from this mod's own landings")
+        elseif ok and M._obj_trace == nil then
+            M._obj_trace = true
+        end
+    end
+    if M._obj_trace == false then
+        hit, got, z = {}, false, nil
+        pcall(function()
+            got = ksl:LineTraceSingle(book, { X = x, Y = y, Z = z_from }, { X = x, Y = y, Z = z_to },
+                0, false, { book }, 0, hit, true, black, black, 0)
+            local ip = v3(hit.ImpactPoint) or v3(hit.Location)
+            if ip then z = ip.Z end
+        end)
+    end
     if got and z then
         what = weak_owner_class(hit.Component)
         if not what then pcall(function() what = weak_owner_class(hit.HitObjectHandle.ReferenceObject) end) end
@@ -379,6 +404,25 @@ function M.move(IA, book, spot, why)
             end
         end
     end
+    if pick then
+        -- On top of what is already there. The trace finds a book lying on the floor when it can;
+        -- this mod's own landings in this world are known regardless, so a second book off the
+        -- same stretch of shelf goes on the first rather than inside it.
+        local top = gz
+        if hits[1] then
+            for i, c in ipairs(spot.spots) do
+                if c == pick and hits[i] and hits[i] > top and hits[i] <= spot.floor_z + GROUND_ABOVE_MAX then
+                    top = hits[i]
+                end
+            end
+        end
+        for _, l in ipairs(M._landed) do
+            local dx, dy = l.x - pick.x, l.y - pick.y
+            if dx * dx + dy * dy <= STACK_R * STACK_R and l.top > top then top = l.top end
+        end
+        if top > gz + 1 then ground = "books on the floor" end
+        gz = top
+    end
     if not pick then
         M.stats.no_floor = M.stats.no_floor + 1
         log(("left on %s: %s (no bare floor within %.0f of its front; first surface %.0f up)"):format(
@@ -407,6 +451,7 @@ function M.move(IA, book, spot, why)
         local st = IA._book_inst_state and IA._book_inst_state[aidx .. "|" .. ch]
         if st then st.orig, st.hidden = t, false end
     end
+    M._landed[#M._landed + 1] = { x = loc.X, y = loc.Y, top = loc.Z + spot.lift }
     M.stats.moved = M.stats.moved + 1
     if M._logged < 20 then
         M._logged = M._logged + 1
