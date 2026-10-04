@@ -453,7 +453,7 @@ function M.move(IA, book, spot, why)
     end
     M._landed[#M._landed + 1] = { x = loc.X, y = loc.Y, top = loc.Z + spot.lift }
     M.stats.moved = M.stats.moved + 1
-    if M._logged < 20 then
+    if M._logged < 100 then
         M._logged = M._logged + 1
         log(("%s: %s off %s onto the %s at (%.0f, %.0f, %.0f), book %.0fx%.0fx%.0f laid pitch %d roll %d"):format(
             why or "moved", name, tostring(spot.sid), ground, loc.X, loc.Y, loc.Z,
@@ -490,7 +490,7 @@ function M.on_unward(IA, book)
     local e = case_resting(IA, here)
     if not e then
         -- Near misses, off the floor: a book resting on a case's edge rather than inside it.
-        if M._near_logged < 10 then
+        if M._near_logged < 60 then
             for _, c in ipairs(M._cases) do
                 if here.Z > c.floor_z + 15 then
                     for _, part in ipairs(c.parts) do
@@ -519,6 +519,32 @@ function M.on_unward(IA, book)
         return
     end
     M.move(IA, book, spot, "revealed")
+end
+
+--- For F8: where a loose book is, the bookcase piece nearest it, and how this module reads it.
+--- The second value says whether it is by a bookcase: inside one, or within NEAR off the floor.
+function M.explain(IA, book)
+    local here
+    pcall(function() here = v3(book:K2_GetActorLocation()) end)
+    local name = select(1, book_name(IA, book))
+    if not here then return name .. ": position unreadable", false end
+    local best, bd, bp
+    for _, c in ipairs(cases(IA)) do
+        for _, part in ipairs(c.parts) do
+            local d = outside_by(part, to_local(part, here))
+            if not bd or d < bd then best, bd, bp = c, d, part end
+        end
+    end
+    if not best then return name .. ": no bookcases read", false end
+    local key
+    pcall(function() key = book:GetFullName() end)
+    local up = here.Z - best.floor_z
+    local text = ("%s at (%.0f, %.0f, %.0f): %s %s (%s), %.0f above its floor; %s, %s"):format(
+        name, here.X, here.Y, here.Z, bd > 0 and ("%.0f outside"):format(bd) or "inside",
+        tostring(best.sid), tostring(bp.name), up,
+        case_resting(IA, here) and "reads as resting on it" or "reads as not on it",
+        (key and M._done[key]) and "judged this world" or "not judged this world")
+    return text, bd <= NEAR and up > OFF_FLOOR, bd, up
 end
 
 --- For the paths that send a book home (Assemble's bag eviction, the planned trap): a book whose

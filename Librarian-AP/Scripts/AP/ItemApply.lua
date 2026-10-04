@@ -3479,6 +3479,7 @@ local function _report_lines()
 
     -- Per series: volumes, unlocked, on a shelf at home / elsewhere, loose, and order.
     local ser = {}   -- aidx -> record
+    local loose_books = {}
     local function rec(aidx)
         local r = ser[aidx]
         if not r then
@@ -3520,6 +3521,7 @@ local function _report_lines()
                     if where == nil then
                         r.loose[#r.loose + 1] = (ch or -1) + 1
                         totals.loose = totals.loose + 1
+                        loose_books[#loose_books + 1] = b
                     elseif where == r.sid then
                         r.home = r.home + 1
                         totals.shelved = totals.shelved + 1
@@ -3596,6 +3598,21 @@ local function _report_lines()
     do
         local SD = package.loaded["AP/ShelfDrop"]
         if SD then add("books moved off shelves they spawned on: %s", SD.summary()) end
+        -- A loose book by a bookcase may be one the move missed: where it is and how it reads.
+        -- Inside a case first, then the highest off its floor; piles in front sort last.
+        if SD and SD.explain then
+            local near = {}
+            for _, b in ipairs(loose_books) do
+                local ok, text, by_case, out, up = pcall(SD.explain, M, b)
+                if ok and by_case then near[#near + 1] = { text = text, inside = out <= 0, up = up } end
+            end
+            table.sort(near, function(a, b)
+                if a.inside ~= b.inside then return a.inside end
+                return a.up > b.up
+            end)
+            for i = 1, math.min(#near, 15) do add("  loose by a bookcase: %s", near[i].text) end
+            add("loose books by a bookcase: %d of %d loose", #near, #loose_books)
+        end
     end
     if M._check_by_count then
         local sent, nxt = 0, nil
