@@ -543,6 +543,7 @@ function M.set_slot_data(slot_data)
     if not next(M._count_series) then M._count_series = nil end   -- no scope known: count everything
     M._count_total, M._cnt_cases, M._cnt_by_case, M._cnt_hot, M._cnt_verdicts = nil, nil, nil, nil, nil
     M._cnt_lap_done, M._count_last_logged, M._cnt_layer_said = false, nil, nil
+    M._cnt_wrong, M._cnt_wrong_seen, M._cnt_wrong_said = nil, nil, nil
     M._sent_count_ticks = {}
 
     M._book_sanity_enabled = (slot_data.book_sanity == 1)
@@ -1525,6 +1526,8 @@ function M.reset_hism_state()
     -- of dereferencing freed memory — the LoadMap-teardown use-after-free (a native AV).
     M._world_epoch = (M._world_epoch or 0) + 1
     M._cnt_cases, M._cnt_by_case, M._cnt_hot, M._cnt_verdicts, M._cnt_lap_done, M._count_total = nil, nil, nil, nil, false, nil   -- a new world starts over
+    M._mis_flagged = nil
+    M._cnt_wrong, M._cnt_wrong_seen, M._cnt_wrong_said = nil, nil, nil
     -- Ward pump: invalidate the old world. Bump the generation (so an in-flight stale
     -- closure self-noops its gen-guarded busy-clear), free the gate, reset the alive
     -- log, and release the L1 flush lock. The queue is deliberately NOT rebound here --
@@ -3605,6 +3608,15 @@ local function _report_lines()
         local t = M.count_layers_report()
         add("count sources: game verdicts this session %d, bookcase flags %d (%d of %d cases answered), row offset %d (%d answered), column-and-order %d (%d answered), chapter order %d; in use %d",
             t.judged or 0, t.state, t.with_state, t.cases, t.pos, t.with_pos, t.col, t.with_col, t.order, t.n)
+        -- The report above just re-read every case, so this list is current.
+        local nw = 0
+        for _, list in pairs(M._cnt_wrong or {}) do
+            for _, w in ipairs(list) do
+                nw = nw + 1
+                if nw <= 20 then add("  %s (slot %d)", M.uncounted_text(w), w.slot - 1) end
+            end
+        end
+        add("books on a shelf the count leaves out: %d", nw)
         -- One uniform case and one cabinet with books on them, raw.
         local shown = {}
         for sid2, list in pairs(M._section_to_cases or {}) do
@@ -4156,22 +4168,30 @@ function M.count_case_correct(case, sid)
             if aidx ~= nil then
                 local ch = nil; pcall(function() ch = tonumber(book.ItemInfo.Chapter) end)
                 if ch ~= nil then
-                    slots[i] = { aidx = aidx, ch = ch }; placed_n = placed_n + 1
                     -- The game judged this book on this case this session: that answer stands.
                     local bname = nil
                     pcall(function() bname = book:GetFullName() end)
+                    slots[i] = { aidx = aidx, ch = ch, bname = bname }; placed_n = placed_n + 1
+                    -- Bound to the slot the book is first read in after that placement, so a
+                    -- move along the same case whose call is missed falls back to the rule.
                     local v = bname and verdicts[bname]
-                    if v and v.case == case_name then judged[i] = v.ok end
+                    if v and v.case == case_name then
+                        if v.slot == nil then v.slot = i end
+                        if v.slot == i then judged[i] = v.ok end
+                    end
                 end
             end
         end
     end
     if placed_n == 0 then return 0, 0, 0, 0, 0, false, false, false end
-    local function in_scope(aidx, ch)
+    local function counted_book(aidx, ch)
         local sname = M._asset_to_series[aidx]
-        if not sname or M._asset_to_section[aidx] ~= sid then return false end
+        if not sname then return false end
         if M._count_series and not M._count_series[sname] then return false end
         return (M._series_unlocked[sname] or M._books_unlocked[sname .. "|" .. ch]) and true or false
+    end
+    local function in_scope(aidx, ch)
+        return M._asset_to_section[aidx] == sid and counted_book(aidx, ch)
     end
     -- Order along each run: rows of the grid shape, the whole case for a cabinet.
     local rs = nil; pcall(function() rs = case.RowStatus end)
@@ -4291,13 +4311,27 @@ function M.count_case_correct(case, sid)
     local layer = have_state and 1 or (have_col and 3 or 4)
     local rule_ok = have_col and function(i) return col_ok[i] and order_ok[i] end
         or function(i) return order_ok[i] end
-    local n, n_judged = 0, 0
+    -- Books on this case the count leaves out, for the notice and F8: wrong slot here, or a
+    -- book of another section put on this case.
+    local n, n_judged, wrong = 0, 0, {}
     for i, e in pairs(slots) do
         if in_scope(e.aidx, e.ch) then
             local ok
             if judged[i] ~= nil then ok = judged[i]; n_judged = n_judged + 1 else ok = rule_ok(i) and true or false end
-            if ok then n = n + 1 end
+            if ok then n = n + 1
+            else wrong[#wrong + 1] = { aidx = e.aidx, ch = e.ch, slot = i, sid = sid } end
+        elseif counted_book(e.aidx, e.ch) and not col_ok[i] then   -- this case refuses it
+            wrong[#wrong + 1] = { aidx = e.aidx, ch = e.ch, slot = i, sid = sid,
+                                  home = M._asset_to_section[e.aidx] }
         end
+    end
+    if case_name then
+        for _, w in ipairs(wrong) do
+            local e = slots[w.slot]
+            w.key = ("%s@%s#%d"):format(e.bname or (w.aidx .. "|" .. w.ch), case_name, w.slot)
+        end
+        M._cnt_wrong = M._cnt_wrong or {}
+        M._cnt_wrong[case_name] = wrong
     end
     M._cnt_layer_said = M._cnt_layer_said or {}
     local shape = per_row > 0 and "uniform" or "cabinet"
@@ -4365,6 +4399,7 @@ end
 function M.count_layers_report()
     local t = { n = 0, state = 0, pos = 0, col = 0, order = 0, cases = 0,
                 with_state = 0, with_pos = 0, with_col = 0 }
+    M._cnt_wrong = {}   -- rebuilt by the reads below
     for sid, list in pairs(M._section_to_cases or {}) do
         for _, c in ipairs(list) do
             if c and c:IsValid() then
@@ -4446,6 +4481,7 @@ function M.count_pulse()
     if not (M._gameplay_active and M._apply_safe and M._cases_indexed) or M._flush_in_progress then return end
     if M._cnt_cases and (M._world_epoch or 0) ~= (M._cnt_epoch or 0) then
         M._cnt_cases, M._cnt_by_case, M._cnt_hot, M._cnt_lap_done = nil, nil, nil, false
+        M._cnt_wrong, M._cnt_wrong_seen, M._cnt_wrong_said = nil, nil, nil
     end
     local cases, cursor = M._cnt_cases, M._cnt_cursor or 0
     if not cases or cursor >= #cases then
@@ -4466,7 +4502,10 @@ function M.count_pulse()
         if not (c and c:IsValid()) then return end
         local key = nil
         pcall(function() key = c:GetFullName() end)
-        if key then by_case[key] = M.count_case_correct(c, sid) end
+        if key then
+            if M._cnt_wrong then M._cnt_wrong[key] = nil end   -- an emptied case lists nothing
+            by_case[key] = M.count_case_correct(c, sid)
+        end
     end
     for name, hot in pairs(M._cnt_hot or {}) do
         local sid = M._cnt_sid and M._cnt_sid[name]
@@ -4486,6 +4525,62 @@ function M.count_pulse()
         moved = true
     end
     if moved then M.fire_count_ticks() end
+    M.notice_uncounted()
+end
+
+--- A shelved book the count leaves out sits there silently: the game flashes it red once,
+--- only while it is looked at, and its own counter includes it. A tester spent an hour one
+--- book short. Name it on the HUD once it has stayed put ~10s (a book set down for a moment
+--- is not flagged), right away for each new one, and once a minute while any remain. One
+--- notice covers them all. Counted in 500ms count passes.
+local CNT_WRONG_GRACE, CNT_WRONG_REPEAT = 20, 120
+function M.notice_uncounted()
+    -- A save the checks are held on is not this run's library; say nothing about it.
+    local SI = package.loaded["AP/SaveIdentity"]
+    if SI and not SI.may_send_checks() then return end
+    M._cnt_pass = (M._cnt_pass or 0) + 1
+    local pass, seen, now = M._cnt_pass, M._cnt_wrong_seen or {}, {}
+    local ready, fresh = {}, nil
+    for _, list in pairs(M._cnt_wrong or {}) do
+        for _, w in ipairs(list) do
+            local s = seen[w.key] or { first = pass }
+            now[w.key] = s
+            -- A full row out of order already has its own notice; its books wait here unnamed.
+            if not (M._mis_flagged and M._mis_flagged[w.aidx]) and pass - s.first >= CNT_WRONG_GRACE then
+                if not s.text then
+                    s.text = M.uncounted_text(w)
+                    log(("[count] %s (slot %d)"):format(s.text, w.slot - 1))
+                end
+                ready[#ready + 1] = s
+                if not s.announced then fresh = fresh or s end
+            end
+        end
+    end
+    -- New books are named as they come due, ten seconds apart at most; the rest once a minute.
+    local last = M._cnt_wrong_said
+    if #ready > 0 and (not last or pass - last >= CNT_WRONG_REPEAT
+                       or (fresh and pass - last >= CNT_WRONG_GRACE)) then
+        M._cnt_wrong_said = pass
+        for _, s in ipairs(ready) do s.announced = true end
+        local text = (fresh or ready[1]).text
+        if #ready > 1 then text = ("%s (and %d more; F8 lists them)"):format(text, #ready - 1) end
+        pcall(function()
+            local H = package.loaded["AP/HUD"]
+            if H then H.notify(text, 12.0) end
+        end)
+    end
+    for key, s in pairs(seen) do
+        if not now[key] and s.text then log("[count] moved: " .. s.text) end
+    end
+    M._cnt_wrong_seen = now
+end
+
+function M.uncounted_text(w)
+    local name = ("%s vol %d"):format(M._asset_to_series[w.aidx] or "?", w.ch + 1)
+    if w.home then
+        return ("Not counted: %s is on a %s shelf; it belongs in %s"):format(name, w.sid, w.home)
+    end
+    return ("Not counted: %s on %s is in the wrong slot"):format(name, w.sid)
 end
 
 --- Fire "Shelved N Books" for every tick the count has reached. check_mode=by_count only.
