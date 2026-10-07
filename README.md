@@ -235,9 +235,12 @@ or host it locally.
 
 - Stuck, or not sure what is left? Press **F8** in the library. The HUD shows
   how many books you have unwarded, on their shelf and loose, and the full
-  picture goes into `UE4SS.log`: every section's open bookcases and, for any
-  series that needs attention, which volumes are loose, on the wrong shelf,
-  or out of order. When you ask for help, that log is the one file to send.
+  picture goes into that session's log in `Mods\Librarian-AP\logs\`: every
+  section's open bookcases and, for any series that needs attention, which
+  volumes are loose, on the wrong shelf, or out of order. When you ask for
+  help, that log is the one file to send.
+- With count checks, a book left in a wrong slot does not count. The HUD
+  names it after a few seconds and reminds you until it moves.
 - A row only counts when every volume is in its own slot. If a row is full
   but out of order, the HUD names it and says how many volumes are out of
   place, and repeats once a minute until it is fixed.
