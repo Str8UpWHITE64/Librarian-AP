@@ -249,8 +249,9 @@ or host it locally.
 - Your AP progress is saved in a per-seed save slot named
   `Sav_AP_<seed>_<slot>.sav`, separate from your normal save. The
   original `Sav.sav` is left alone.
-- **F12** is a direct-connect shortcut that bypasses the menu and uses
+- **F9** is a direct-connect shortcut that bypasses the menu and uses
   whatever's currently in `ap_config.json`. Useful for quick reconnects.
+  (Before 3.0.0 it was F12, which Steam uses for screenshots.)
 - If you ever see visual artifacts (e.g., a book showing in an
   unexpected place), going to the title screen and clicking Continue
   again will force a clean world reload.
@@ -648,7 +649,7 @@ When you launch the game, the UE4SS log
 [Lua] [LibrarianAP] LibAP v3.0.0 — Game v1.0.13 (verified compatible)
 [Lua] [BPModLoaderMod] Actor: ModActor_C /Game/Librarian/Map/...
 [Lua] [LibrarianAP] Press F4 to toggle the connection menu.
-[Lua] [LibrarianAP] Press F12 to connect to Archipelago.
+[Lua] [LibrarianAP] Press F9 to connect to Archipelago.
 ```
 
 If you see those, both the Lua mod and the BP pak are loaded correctly.

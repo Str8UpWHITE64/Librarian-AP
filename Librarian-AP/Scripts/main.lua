@@ -1,6 +1,6 @@
 -- Librarian Archipelago Mod (UE4SS Lua)
 -- Top-level wiring: AP client, save-slot redirection, title gating, BP hooks,
--- F4/F12 keybinds, post-connect pre-apply loop. World mutations live in AP/ItemApply.lua.
+-- F4/F9 keybinds, post-connect pre-apply loop. World mutations live in AP/ItemApply.lua.
 
 local MOD = "LibrarianAP"
 
@@ -66,7 +66,7 @@ _G._librarian_poll_gt = POLL_GT
 local _gt_steps = {}          -- name -> { fn, interval, accum, stopped }
 local _gt_step_order = {}
 local _gt_pending_activate = nil  -- reason string set by a title-button hook; consumed on the game thread by the scheduler
-local _gt_pending_f12 = false     -- F12/F4/F6 fire on the UE4SS input thread; the binds set a
+local _gt_pending_f9 = false      -- F9/F4/F6 fire on the UE4SS input thread; the binds set a
 local _gt_pending_f4  = false     -- boolean and the master tick runs the actual work
 local _gt_pending_f6  = false     -- dev: fire the Recall Stone once (MAGIC_TEST_RECALL_STONE)
 -- A global, not a local: the main chunk sits at Lua's 200-local ceiling. Same role as the three
@@ -3994,16 +3994,16 @@ _G._librarian_gt_master_tick = function(dt_ms)
     pcall(function() c:_tick_once() end)                 -- create + poll + outgoing + item-apply
     -- Both reached at runtime, not through the file-locals: `APClient` and `menu_toggle` are
     -- declared further down the file, so a closure built here would only see nil globals.
-    if _gt_pending_f12 then                              -- F12 pressed on the input thread
-        _gt_pending_f12 = false
+    if _gt_pending_f9 then                              -- F9 pressed on the input thread
+        _gt_pending_f9 = false
         local SIc = package.loaded["AP/SaveIdentity"]
         if SIc and SIc.slots_full then
-            SIc.refuse_slots_full("F12")
+            SIc.refuse_slots_full("F9")
         elseif not c._slot_connected then
-            log("[F12] connecting to AP...")
+            log("[F9] connecting to AP...")
             pcall(function() c:connect() end)
         else
-            log("[F12] already connected")
+            log("[F9] already connected")
         end
     end
     if _gt_pending_f7 then                               -- F7 pressed on the input thread
@@ -4215,7 +4215,7 @@ register_bp_hooks_once = function()
                 return
             end
             if c._slot_connected then
-                log("[menu] already connected — ignoring Connect (use F12 or restart to switch slots)")
+                log("[menu] already connected — ignoring Connect (use F9 or restart to switch slots)")
                 if _G._librarian_menu and _G._librarian_menu.set_status then
                     _G._librarian_menu.set_status("Already connected", "warn")
                 end
@@ -4519,7 +4519,7 @@ end)
 -- ============================================================
 -- Keybinds
 -- ============================================================
--- F12 = connect to the Archipelago server (or trigger a reconnect).
+-- F9 = connect to the Archipelago server (or trigger a reconnect).
 
 
 -- ============================================================
@@ -4887,7 +4887,7 @@ APClient.on_disconnected = function()
     if SId then SId.reset() end
     -- Disconnected: both gameplay buttons return to disabled-by-default.
     gt_defer(50, _title_refresh)
-    HUD.set_status("AP: disconnected — F4 for menu, F12 to reconnect", HUD.COL_STATUS_BAD)
+    HUD.set_status("AP: disconnected — F4 for menu, F9 to reconnect", HUD.COL_STATUS_BAD)
     -- Connect menu: re-show + status. Repopulate fields from current
     -- APClient values so the player can edit and retry.
     if _G._librarian_menu then
@@ -4913,7 +4913,7 @@ APClient.on_slot_refused = function(reason)
 end
 
 -- Initialize the client (loads config + starts LoopAsync poll thread).
--- Connection is NOT triggered automatically — press F12 to connect.
+-- Connection is NOT triggered automatically — press F9 to connect.
 APClient:init(AP_CONFIG_PATH)
 -- Stage 1 single-thread fix: when POLL_ON_GAME_THREAD is on, the game-thread pawn tick (registered in
 -- register_bp_hooks_once) owns AP client create+poll+apply; the async loop stays idle while it fires.
@@ -4930,19 +4930,20 @@ local function _initial_hud_status()
     -- The delay is tick time now, so this can land after a fast connect; don't overwrite it.
     if APClient._slot_connected then return end
     HUD.set_status(
-        ("AP: not connected (server=%s, slot=%s) — F4 for menu, F12 to connect"):format(
+        ("AP: not connected (server=%s, slot=%s) — F4 for menu, F9 to connect"):format(
             tostring(APClient.server or "?"),
             tostring(APClient.slot or "?")),
         HUD.COL_STATUS_WARN)
 end
 gt_defer(2000, _initial_hud_status)
 
--- F12: connect to Archipelago (or trigger a reconnect if the socket dropped).
+-- F9: connect to Archipelago (or trigger a reconnect if the socket dropped). Not F12: Steam and
+-- most capture tools take a screenshot on it.
 -- Keybind callbacks fire on the UE4SS input thread, so the handler only sets a scalar; the master
 -- tick does the work on the game thread. Same discipline probe.lua already applies to its binds.
-RegisterKeyBind(Key.F12, function() _gt_pending_f12 = true end)
+RegisterKeyBind(Key.F9, function() _gt_pending_f9 = true end)
 
-log("Press F12 to connect to Archipelago.")
+log("Press F9 to connect to Archipelago.")
 
 -- ============================================================
 -- Connection menu (F4 toggle, default on)
