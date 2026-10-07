@@ -4304,8 +4304,8 @@ end
 --- stops being redundant: 400 rows hold 3072 books, so "500" means very different runs, and only
 --- the book threshold describes the one the player picked.
 ---
---- Books come from the server's checked set rather than the world, so this needs no stale-save
---- guard: it cannot describe the previous run the way GameSaveData can.
+--- Books come from the bookcases of the loaded world, not GameSaveData's counters, so this needs no
+--- stale-save guard; a world that is not this run's is held by the goal's own identity gate.
 function _goal.book_target(sd)
     -- The check mode decides whether the goal counts books, not the unlock mode: a seed
     -- can check per book while unlocking whole series. Older seeds carry no flag and are
@@ -4317,14 +4317,11 @@ function _goal.book_target(sd)
     if not want or want <= 0 then return nil end
     local IA = package.loaded["AP/ItemApply"]
     if not IA then return nil end
-    -- Count checks have no per-book locations to read from the server; the goal counts what the
-    -- Shelved N Books checks count, the books in place on the shelves, once every case is read.
-    if sd.check_by_count == 1 then
-        if not IA._cnt_lap_done then return nil end
-        return IA._count_total or 0, want
-    end
-    if not IA.count_correct_books then return nil end
-    return IA.count_correct_books(), want
+    -- The books in place on the shelves, once every case is read: what the count checks and the
+    -- book milestones count. Not the server's checked set, which a collect fills with books
+    -- nobody shelved.
+    if not IA._cnt_lap_done then return nil end
+    return IA._count_total or 0, want
 end
 
 function _goal.send(rows)
@@ -4494,9 +4491,9 @@ gt_loop("goal_catchup", 5000, function()
     if _goal.sent then return false end
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._gameplay_active and IA._apply_safe) then return false end
-    -- A book-counted goal reads the server's checked set, not the save, so it needs neither the
-    -- GameSaveData walk below nor its stale guard -- and it must not be gated on a row count, since
-    -- the target can be met with few rows finished.
+    -- A book-counted goal reads the shelves, not the save, so it needs neither the GameSaveData walk
+    -- below nor its stale guard -- and it must not be gated on a row count, since the target can be
+    -- met with few rows finished.
     local APClient_mod = package.loaded["AP/APClient"]
     local have, want = _goal.book_target(APClient_mod and APClient_mod.slot_data)
     if have then

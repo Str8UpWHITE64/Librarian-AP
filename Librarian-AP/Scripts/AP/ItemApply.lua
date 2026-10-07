@@ -345,9 +345,6 @@ M._sent_row_completions = {}
 -- Already-fired book-completion thresholds this session (de-dupe), keyed by threshold value.
 M._sent_book_completions = {}
 
--- This seed's book location IDs as a flat array; see set_slot_data. Empty outside BookSanity.
-M._book_loc_ids = {}
-
 -- Already-fired section completions this session (de-dupe, keyed by section_id).
 -- Fires when every row location in the section is in _sent_row_locations.
 M._sent_section_completions = {}
@@ -559,15 +556,12 @@ function M.set_slot_data(slot_data)
         and slot_data.book_item_to_book or {}
     M._books_unlocked = {}
     M._books_correct_seen = {}
-    -- Flat array of this seed's book location IDs, so the completion count can be taken against the
-    -- server's checked set without walking the string-keyed map each time.
     -- Books are the CHECKS when the seed mapped book locations, whatever hands them out.
     M._per_book_checks = next(M._book_location_map) ~= nil
-    M._book_loc_ids = {}
-    for _, lid in pairs(M._book_location_map) do
-        local n = tonumber(lid)
-        if n then M._book_loc_ids[#M._book_loc_ids + 1] = n end
-    end
+    -- The shelf count: count checks tick on it, and per-book seeds count their "Correctly shelve
+    -- N books" milestones on it. Never the server's checked set, which a collect fills with books
+    -- nobody shelved.
+    M._shelf_count = M._per_book_checks or (slot_data.check_by_count == 1)
     if M._book_sanity_enabled then
         local nloc, nitem = 0, 0
         for _ in pairs(M._book_location_map) do nloc = nloc + 1 end
@@ -3614,6 +3608,12 @@ local function _report_lines()
             add("loose books by a bookcase: %d of %d loose", #near, #loose_books)
         end
     end
+    if M._per_book_checks and not M._check_by_count then
+        local done = 0
+        for _ in pairs(M._sent_book_completions or {}) do done = done + 1 end
+        add("book milestones: counting %d books in place on the shelves%s; %d reached",
+            M._count_total or 0, M._cnt_lap_done and "" or " (first read not finished)", done)
+    end
     if M._check_by_count then
         local sent, nxt = 0, nil
         for k in pairs(M._count_location_map or {}) do
@@ -3737,6 +3737,7 @@ function M.detect_completed_rows()
     local rows_by_case = 0   -- RowStatus trues across every case: the shelves' own finished-row count
     local complete_aidx = {} -- series (by asset idx) sitting on a row the case marks complete
     local complete_partial = {}      -- sections where a case took the non-grid fallback: unknown there
+    local flags = {}                 -- sid -> { done, total, ok }: every case's RowStatus, summed
 
     -- Send the row-completion location for one (section, series), de-duped via
     -- _sent_row_locations. Returns true if a NEW check was actually sent.
@@ -3760,12 +3761,16 @@ function M.detect_completed_rows()
     end
 
     for sid, cases in pairs(M._section_to_cases) do
+        local f = { done = 0, total = 0, ok = true }
+        flags[sid] = f
         for _, case in ipairs(cases) do
+            if not (case and case:IsValid()) then f.ok = false end
             if case and case:IsValid() then
                 -- RowStatus[i] (TArray<bool>, one per shelf) == true only when shelf i holds
                 -- its series fully placed in order. Read the bool values, not the length.
                 local rs = nil; pcall(function() rs = case.RowStatus end)
                 local rs_n = 0; if rs then pcall(function() rs_n = #rs end) end
+                if rs_n == 0 then f.ok = false end
                 local completed = {}   -- 1-based shelf indices with rs[i] == true
                 for i = 1, rs_n do
                     local done = false
@@ -3773,6 +3778,7 @@ function M.detect_completed_rows()
                     if done then completed[#completed + 1] = i end
                 end
                 rows_by_case = rows_by_case + #completed
+                f.done, f.total = f.done + #completed, f.total + rs_n
 
                 if #completed > 0 then
                     -- Read the completed series from the books ACTUALLY on each row: under free
@@ -3939,7 +3945,17 @@ function M.detect_completed_rows()
     -- level and threshold checks fall back on.
     M._rows_by_case, M._rows_by_case_epoch = rows_by_case, M._world_epoch or 0
     M._complete_by_case, M._complete_by_case_partial = complete_aidx, complete_partial
+    M._section_flags, M._section_flags_epoch = flags, M._world_epoch or 0
     return sent_count
+end
+
+--- Whether a section is finished on its own bookcases: every RowStatus flag true, on at least as
+--- many rows as the seed gives it. Section and floor completions go by this rather than by row
+--- checks the server holds, since a collect marks rows checked that nobody shelved.
+local function _section_finished(sid, seed_rows)
+    if (M._section_flags_epoch or -1) ~= (M._world_epoch or 0) then return false end
+    local f = M._section_flags and M._section_flags[sid]
+    return f ~= nil and f.ok and f.total > 0 and f.total >= seed_rows and f.done == f.total
 end
 
 --- Finished rows: the game's counter or the bookcases' own RowStatus count, whichever is higher.
@@ -3975,9 +3991,9 @@ function M._sync_sent_row_locations_from_server()
     return synced
 end
 
---- Fire "Section Complete: <id>" for any section whose every row location is marked sent
---- (de-duped via _sent_section_completions). Derived from _sent_row_locations since the
---- game emits no section-complete signal. Called from the FinishRow hook and run_baseline_sync.
+--- Fire "Section Complete: <id>" for any section finished on its own bookcases (de-duped via
+--- _sent_section_completions). The game emits no section-complete signal; detect_completed_rows,
+--- which every caller runs first, reads the rows. Called from the FinishRow hook and the sync.
 function M.fire_section_completions()
     if not M._slot_data then return 0 end
     if not M._section_to_row_locs then return 0 end
@@ -4001,14 +4017,7 @@ function M.fire_section_completions()
         end
         if complete_loc and not M._sent_section_completions[sid]
                 and #row_locs > 0 then
-            local all_done = true
-            for _, loc_id in ipairs(row_locs) do
-                if not M._sent_row_locations[loc_id] then
-                    all_done = false
-                    break
-                end
-            end
-            if all_done then
+            if _section_finished(sid, #row_locs) then
                 M._sent_section_completions[sid] = true
                 log(("[section] All %d row(s) complete for section %s → loc %d%s"):format(
                     #row_locs, sid, complete_loc,
@@ -4021,9 +4030,8 @@ function M.fire_section_completions()
     return sent
 end
 
---- Fire "Floor N Complete" for any floor whose every active-section row location is sent.
---- Like fire_section_completions at floor granularity (loc 1910550/1910551). Called from
---- the FinishRow hook, the 3s detect_completed_rows poll, and run_baseline_sync.
+--- Fire "Floor N Complete" for any floor whose every active section is finished on its own
+--- bookcases. Like fire_section_completions at floor granularity (loc 1910550/1910551).
 function M.fire_floor_completions()
     if not M._slot_data then return 0 end
     if not M._floor_to_row_locs then return 0 end
@@ -4048,8 +4056,8 @@ function M.fire_floor_completions()
         if complete_loc and not M._sent_floor_completions[floor_n]
                 and #row_locs > 0 then
             local all_done = true
-            for _, loc_id in ipairs(row_locs) do
-                if not M._sent_row_locations[loc_id] then
+            for sid, srows in pairs(M._section_to_row_locs) do
+                if tonumber(sid:sub(1, 1)) == floor_n and not _section_finished(sid, #srows) then
                     all_done = false
                     break
                 end
@@ -4126,28 +4134,6 @@ function M.fire_row_completion_checks(total_rows)
     return sent
 end
 
---- How many of this seed's books are correctly shelved, counted from the SERVER's checked set.
----
---- This is the only cross-session record of the answer. Counting live sweep detections instead
---- looked equivalent and was not: a sweep can only see books the game has evaluated in the current
---- session, so a run resuming with books already shelved counted zero of them and the thresholds
---- restarted from nothing on every load. The server has known the real figure the whole time --
---- one book check per correctly shelved book -- and hands it back as checked_locations on connect.
----
---- Counts mapped books only, since _book_loc_ids is built from book_location_map: under a floor
---- goal the other floor's books are not locations of ours and must not inflate the total.
-function M.count_correct_books()
-    local APClient = package.loaded["AP/APClient"]
-    if not (APClient and APClient._sent_checks) then return 0 end
-    local ids = M._book_loc_ids
-    if not ids then return 0 end
-    local sent, n = APClient._sent_checks, 0
-    for i = 1, #ids do
-        if sent[ids[i]] then n = n + 1 end
-    end
-    return n
-end
-
 --- Count checks: what the bookcases say. A case's PlacingBookInfo lists the books placed in its
 --- slots; a book the mod anchored to a case for warding is never in it, nor is a book lying
 --- loose, and a book taken off a shelf leaves it. A listed book counts when the case belongs to
@@ -4205,6 +4191,7 @@ function M.count_case_correct(case, sid)
         local sname = M._asset_to_series[aidx]
         if not sname then return false end
         if M._count_series and not M._count_series[sname] then return false end
+        if M._per_book_checks and not M._book_location_map[sname .. "|" .. ch] then return false end
         return (M._series_unlocked[sname] or M._books_unlocked[sname .. "|" .. ch]) and true or false
     end
     local function in_scope(aidx, ch)
@@ -4461,7 +4448,7 @@ function M.note_book_verdict(book, is_correct)
         log(("[count] Correct(%s) fired (%s)"):format(tostring(is_correct),
             M._check_by_count and "count mode" or "not count mode"))
     end
-    if not M._check_by_count then return end
+    if not M._shelf_count then return end
     local name, case = nil, nil
     pcall(function()
         local a = book.AttachedActor
@@ -4483,7 +4470,7 @@ end
 --- A bookcase's own change events: CorrectNumUpdated when a placement moves its correct count,
 --- BookDetached when a book leaves it. Either marks the case for re-reading on the next pass.
 function M.note_case_event(case)
-    if not (M._check_by_count and case) then return end
+    if not (M._shelf_count and case) then return end
     local name = nil
     pcall(function() if case:IsValid() then name = case:GetFullName() end end)
     if not name then return end
@@ -4494,7 +4481,7 @@ end
 --- One pass of the count: the cases a verdict just landed on, then the next dozen of the lap.
 --- Fires the ticks when the total moves. Rides the 500ms loop.
 function M.count_pulse()
-    if not M._check_by_count then return end
+    if not M._shelf_count then return end
     if not (M._gameplay_active and M._apply_safe and M._cases_indexed) or M._flush_in_progress then return end
     if M._cnt_cases and (M._world_epoch or 0) ~= (M._cnt_epoch or 0) then
         M._cnt_cases, M._cnt_by_case, M._cnt_hot, M._cnt_lap_done = nil, nil, nil, false
@@ -4541,8 +4528,11 @@ function M.count_pulse()
         M._cnt_lap_done = true
         moved = true
     end
-    if moved then M.fire_count_ticks() end
-    M.notice_uncounted()
+    if moved then
+        M.fire_count_ticks()
+        M.fire_book_completion_checks()
+    end
+    if M._check_by_count then M.notice_uncounted() end
 end
 
 --- A shelved book the count leaves out sits there silently: the game flashes it red once,
@@ -4648,7 +4638,10 @@ function M.fire_book_completion_checks()
     if type(map) ~= "table" then return 0 end
     local APClient = package.loaded["AP/APClient"]
     if not (APClient and APClient.send_check) then return 0 end
-    local total_books = M.count_correct_books()
+    -- Books in place on the shelves, once every bookcase has been read: a partial lap only
+    -- undercounts, and these sends are permanent.
+    if not M._cnt_lap_done then return 0 end
+    local total_books = M._count_total or 0
     if total_books <= 0 then return 0 end
 
     local sent = 0
