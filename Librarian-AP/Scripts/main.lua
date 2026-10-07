@@ -4001,9 +4001,18 @@ _G._librarian_gt_master_tick = function(dt_ms)
             SIc.refuse_slots_full("F9")
         elseif not c._slot_connected then
             log("[F9] connecting to AP...")
+            -- Show the attempt in the window the way its Connect button does, with the details
+            -- F9 uses, which may not be what was typed there.
+            local m = _G._librarian_menu
+            if m then
+                pcall(function() m.set_fields(c.server, c.slot, c.password) end)
+                pcall(function() m.set_status("Connecting...", "warn") end)
+            end
             pcall(function() c:connect() end)
         else
             log("[F9] already connected")
+            local m = _G._librarian_menu
+            if m then pcall(function() m.set_status("Already connected", "warn") end) end
         end
     end
     if _gt_pending_f7 then                               -- F7 pressed on the input thread
@@ -4891,9 +4900,8 @@ APClient.on_disconnected = function()
     -- Connect menu: re-show + status. Repopulate fields from current
     -- APClient values so the player can edit and retry.
     if _G._librarian_menu then
-        _G._librarian_menu.set_fields(APClient.server, APClient.slot, APClient.password)
-        _G._librarian_menu.set_status("Disconnected", "bad")
         _G._librarian_menu.show()
+        _G._librarian_menu.set_status("Disconnected", "bad")
     end
     -- A refusal outlives the disconnect it caused: keep it on screen instead of the plain banner.
     local SIs = package.loaded["AP/SaveIdentity"]
@@ -4969,6 +4977,9 @@ local function _menu_color(status)
 end
 
 local function menu_set_status(text, status)
+    -- Kept for the next show: the window is rebuilt each time it opens, and a status sent while
+    -- it is shut lands nowhere.
+    _G._librarian_menu_status = { text = text, status = status }
     local ma = _get_mod_actor()
     if not ma then log("[menu] set_status: no ModActor_C"); return end
     local r, g, b = _menu_color(status or "neutral")
@@ -5081,6 +5092,15 @@ local function menu_show()
     end)
     log("[menu] post-show: ConnectMenuRef = " .. ref_status)
     pcall(function() menu_fix_layout(ma.ConnectMenuRef) end)
+    -- The Blueprint builds the window afresh on every show, empty. Fill it from the settings in
+    -- use, which a working connect has also saved to ap_config.json.
+    menu_set_fields(APClient.server, APClient.slot, APClient.password)
+    local last = _G._librarian_menu_status
+    if last then
+        menu_set_status(last.text, last.status)
+    else
+        menu_set_status("Disconnected — enter details and Connect", "warn")
+    end
 end
 
 local function menu_hide()
@@ -5094,11 +5114,22 @@ end
 local function menu_toggle()
     local ma = _get_mod_actor()
     if not ma then log("[menu] toggle: no ModActor_C"); return end
-    local path = "?"
-    pcall(function() path = ma:GetFullName() end)
-    log("[menu] toggle: calling ToggleConnectMenu on " .. path)
+    -- Open or shut, read from the window itself, since its Close button shuts it without us. A
+    -- reopen goes through menu_show so it is filled and sized like the first one.
+    local open = nil
+    pcall(function()
+        local ref = ma.ConnectMenuRef
+        if not (ref and ref:IsValid()) then open = false; return end
+        local shown = ref:IsInViewport()
+        pcall(function() shown = shown and ref:IsVisible() end)   -- hidden by collapsing, not removal
+        open = shown and true or false
+    end)
+    if open == true then menu_hide(); return end
+    if open == false then menu_show(); return end
+    log("[menu] toggle: window state unreadable; leaving it to the Blueprint")
     local ok, err = pcall(function() ma:ToggleConnectMenu() end)
     if not ok then log("[menu] toggle FAILED: " .. tostring(err)) end
+    menu_set_fields(APClient.server, APClient.slot, APClient.password)
 end
 
 -- Expose to other modules (used by on_slot_connected / on_disconnected /
@@ -5166,8 +5197,6 @@ gt_loop("menu_show", 500, function()
     _menu_initial_shown = true
     log("[menu] ModActor found on M01; running initial show + prefill")
     menu_show()
-    menu_set_fields(APClient.server, APClient.slot, APClient.password)
-    menu_set_status("Disconnected — enter details and Connect", "warn")
     return true
 end)
 
