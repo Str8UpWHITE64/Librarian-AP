@@ -1046,11 +1046,9 @@ class LibrarianWorld(World):
                 f"Otherwise pick a floor goal, a custom goal of at most a floor's books, or a "
                 f"different unlock mode."
             )
-        # Every book its own item only fits when every book is also a check: ~3072 items
-        # cannot go into ~400 rows or a few hundred count ticks. Bundles are drawn from
-        # the whole library, so a row fills only once nearly every bundle has arrived and
-        # the fill cannot route it. Both settle to booksanity, the check mode built for
-        # book-shaped unlocks.
+        # Every book its own item cannot sit in row checks: ~3072 items do not go into
+        # ~400 rows. That one pairing settles to booksanity, the check mode built for
+        # book-shaped unlocks; the count ladder routes them with ticks of its own.
         opt = self.options.check_mode
         if self.book_sanity and self.check_by_series:
             print(f"[Librarian - '{self.player_name}'] unlock_mode: individual_book_unlocks "
