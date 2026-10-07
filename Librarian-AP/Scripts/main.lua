@@ -4261,22 +4261,21 @@ end
 --   send       -- the row-threshold check itself
 local _goal = { sent = false, milestones = {} }
 
-local function announce_goal_progress(row)
-    local APClient_mod = package.loaded["AP/APClient"]
-    local sd = APClient_mod and APClient_mod.slot_data
-    if not (sd and sd.goal_row_threshold) then return end
-    local threshold = tonumber(sd.goal_row_threshold) or 0
-    if threshold <= 0 then return end
+local function announce_goal_progress(have, want, unit)
+    if not (have and want) or want <= 0 then return end
     local HUD_mod = package.loaded["AP/HUD"]
     if not (HUD_mod and HUD_mod.notify) then return end
+    -- Only the highest mark newly passed: a load past two of them says one thing, not three.
+    local said
     for _, pct in ipairs({25, 50, 75}) do
-        local mark = math.floor((threshold * pct) / 100)
-        if mark > 0 and row >= mark and not _goal.milestones[pct] then
+        local mark = math.floor((want * pct) / 100)
+        if mark > 0 and have >= mark and not _goal.milestones[pct] then
             _goal.milestones[pct] = true
-            HUD_mod.notify(
-                ("Goal progress: %d / %d rows (%d%%)"):format(row, threshold, pct),
-                6.0)
+            said = pct
         end
+    end
+    if said then
+        HUD_mod.notify(("Goal progress: %d / %d %s (%d%%)"):format(have, want, unit, said), 6.0)
     end
 end
 
@@ -4356,7 +4355,7 @@ function _goal.send(rows)
         have, want, unit, tostring(sd.goal)))
     local HUD_mod = package.loaded["AP/HUD"]
     if HUD_mod and HUD_mod.notify then
-        HUD_mod.notify(("Goal complete! (%d %s). The way out is open"):format(
+        HUD_mod.notify(("Goal reached! (%d %s). Leave through the library door to finish"):format(
             want, unit:match("^(%a+)")), 12.0)
     end
     _bh.drop_end_barrier()
@@ -4398,6 +4397,14 @@ function _goal.tick_victory()
         -- during gameplay, so a long pause or a trip to the menu does not spend the clock.
         if not _goal.reached then return end
         _goal.idle_ticks = (_goal.idle_ticks or 0) + 1
+        if _goal.idle_ticks % 60 == 0 and _goal.idle_ticks < 300 then
+            local HUD_mod = package.loaded["AP/HUD"]
+            if HUD_mod and HUD_mod.notify then
+                local left = (300 - _goal.idle_ticks) // 60
+                HUD_mod.notify(("Goal reached: leave through the library door to send it (sends by itself in %d min)")
+                    :format(left), 8.0)
+            end
+        end
         if _goal.idle_ticks < 300 then return end   -- ticks of the 1s loop
         if not _goal.allowed() then return end      -- not latched: sends once the world is verified
         _goal.sent = true
@@ -4420,7 +4427,13 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:FinishRow", function(self, fi
     pcall(function() row = finishedRow:get() end)
     log((">> FinishRow        row=%s"):format(tostring(row)))
 
-    if row then announce_goal_progress(row) end
+    -- Rows only for a goal counted in rows; a book-counted goal reports from the catch-up loop.
+    local sd_f = package.loaded["AP/APClient"] and package.loaded["AP/APClient"].slot_data
+    local by_books = sd_f and sd_f.goal == 1 and (sd_f.goal_counts_books == 1
+        or (sd_f.goal_counts_books == nil and sd_f.book_sanity == 1))
+    if row and sd_f and not by_books then
+        announce_goal_progress(row, tonumber(sd_f.goal_row_threshold), "rows")
+    end
     _goal.send(row)
 
     -- Arm the fast path; do not run the checks here. They mutate the shared _sent_* / _milestones_sent
@@ -4476,7 +4489,9 @@ gt_loop("goal_catchup", 5000, function()
     -- GameSaveData walk below nor its stale guard -- and it must not be gated on a row count, since
     -- the target can be met with few rows finished.
     local APClient_mod = package.loaded["AP/APClient"]
-    if _goal.book_target(APClient_mod and APClient_mod.slot_data) then
+    local have, want = _goal.book_target(APClient_mod and APClient_mod.slot_data)
+    if have then
+        announce_goal_progress(have, want, "books")
         _goal.send(nil)
         return false
     end
