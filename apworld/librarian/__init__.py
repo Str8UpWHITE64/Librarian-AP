@@ -309,16 +309,22 @@ class LibrarianWorld(World):
         return tuple(f"Progressive {n}" for n in self.enabled_skills)
 
     def _drop_disabled_skills(self, quantities: dict) -> dict:
-        """Strip every item belonging to a skill the player turned off.
+        """Strip every item belonging to a skill the player turned off, and with vanilla_caps
+        every item that lifts a skill or the bag past the base game's maximum.
 
-        Magic is useful and never gates anything, so this cannot affect logic; each pool
-        builder pads back to the location count with filler afterwards."""
+        Magic and capacity are useful and never gate anything, so this cannot affect logic; each
+        pool builder pads back to the location count with filler afterwards."""
         keep = self.enabled_skills
         for name in _SKILL_NAMES:
             if name in keep:
                 continue
             for item in (f"Progressive {name}", f"{name} Mastery", f"Fatigue: {name}"):
                 quantities.pop(item, None)
+        if self.options.vanilla_caps:
+            for name in _SKILL_NAMES:
+                quantities.pop(f"{name} Mastery", None)
+            quantities.pop("+2 Book Capacity", None)
+            quantities.pop("+3 Book Capacity", None)
         return quantities
 
     def _custom_goal_count(self, books: bool) -> int:

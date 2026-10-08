@@ -271,6 +271,17 @@ class MagicSkillsEnabled(OptionSet):
     default = frozenset(valid_keys)
 
 
+class VanillaCaps(Toggle):
+    """Keep your magic skills and book capacity at the base game's maximum.
+
+    Off (default): this randomizer makes you stronger than the base game ever does. Each magic
+    skill can go up to five steps past its normal maximum through Mastery items (shorter cooldowns,
+    longer effects), and Book Capacity items let you carry up to 40 books instead of the game's 15.
+    On: there are no Mastery or Book Capacity items. Skills top out where the base game's do
+    and you carry at most 15 books. Their places go to filler; Fatigue traps stay."""
+    display_name = "Vanilla Caps"
+
+
 class LocalFiller(DefaultOnToggle):
     """Keep this game's filler items in your own world.
 
@@ -329,6 +340,7 @@ class LibrarianOptions(PerGameCommonOptions):
     check_interval: CheckInterval
     count_bundle_preference: CountBundlePreference
     magic_skills_enabled: MagicSkillsEnabled
+    vanilla_caps: VanillaCaps
     local_filler: LocalFiller
     book_visibility: BookVisibility
     only_unward_shelfable_books: OnlyUnwardShelfableBooks
@@ -368,7 +380,7 @@ option_groups = [
     ),
     OptionGroup(
         "Item Pool",
-        [MagicSkillsEnabled, LocalFiller],
+        [MagicSkillsEnabled, VanillaCaps, LocalFiller],
     ),
     OptionGroup(
         "The Library",

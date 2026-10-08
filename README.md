@@ -594,6 +594,21 @@ Dropping a skill also drops its Mastery upgrades and its Fatigue trap. What they
 held becomes filler. Nothing in logic needs magic, so a shorter list only
 changes what you find, never whether the seed is winnable.
 
+#### `vanilla_caps`
+
+Toggle (default `false`). By default this randomizer makes you **stronger than
+the base game ever does**:
+
+- Each magic skill can go up to five steps past its normal maximum through
+  `<Skill> Mastery` items: shorter cooldowns, longer effects.
+- `+2 Book Capacity` and `+3 Book Capacity` items let you carry up to 40 books
+  instead of the game's 15.
+
+Set `vanilla_caps: true` to stop where the base game does. There are then no
+Mastery or Book Capacity items: skills top out at their normal maximum, and you
+carry at most 15 books. Their places go to filler. Fatigue traps stay either
+way, since they only ever make a skill weaker for a while.
+
 #### `local_filler`
 
 Toggle (default `true`). Keeps this game's filler items in your own world
