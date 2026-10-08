@@ -1099,7 +1099,7 @@ class LibrarianWorld(World):
                 if self.random_bundle:
                     deferred_rows.append((section, series))
                     continue
-                loc_name = f"Shelf: {section.id} - {series.name}"
+                loc_name = f"Shelf: {section.id} - {data.display_name(series.name)}"
                 home = (self._bundle_region(library, "Series Bundle",
                                             self.series_req[series.name])
                         if self._grouped_series else region)
@@ -1168,7 +1168,7 @@ class LibrarianWorld(World):
                 k = max(need_at.get(book_item_name(series.name, ch), 1)
                         for ch in range(series.volumes))
                 home = self._bundle_region(library, "Book Bundle", k)
-                loc_name = f"Shelf: {section.id} - {series.name}"
+                loc_name = f"Shelf: {section.id} - {data.display_name(series.name)}"
                 home.locations.append(LibrarianLocation(
                     self.player, loc_name,
                     self.location_name_to_id.get(loc_name), home))
@@ -2352,7 +2352,7 @@ class LibrarianWorld(World):
         if self.check_by_series:
             for sec in self.active_sections:
                 for ser in sec.series:
-                    mw.get_location(f"Shelf: {sec.id} - {ser.name}", p).access_rule = (
+                    mw.get_location(f"Shelf: {sec.id} - {data.display_name(ser.name)}", p).access_rule = (
                         row_rule(sec, ser))
             return
         for sec in self.active_sections:
@@ -2994,7 +2994,7 @@ class LibrarianWorld(World):
         else:
             return None
         sec = next((x for x in self.active_sections if x.id == sid), None)
-        ser = next((x for x in sec.series if x.name == series), None) if sec else None
+        ser = next((x for x in sec.series if data.display_name(x.name) == series), None) if sec else None
         if ser is None:
             return None
         prog = state.prog_items[self.player]
@@ -3065,7 +3065,7 @@ class LibrarianWorld(World):
         section_location_map: dict[str, int] = {}
         for section in self.active_sections:
             for series in section.series:
-                loc_name = f"Shelf: {section.id} - {series.name}"
+                loc_name = f"Shelf: {section.id} - {data.display_name(series.name)}"
                 loc_id = self.location_name_to_id.get(loc_name)
                 if loc_id is not None:
                     row_location_map[f"{section.id}|{series.name}"] = loc_id

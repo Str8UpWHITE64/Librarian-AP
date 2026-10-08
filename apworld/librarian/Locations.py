@@ -109,7 +109,7 @@ class LibrarianLocation(Location):
 # --- Shelf rows: 400 entries (1..400), one per series in declaration order ---
 
 def _row_name(section: data.Section, series: data.Series) -> str:
-    return f"Shelf: {section.id} - {series.name}"
+    return f"Shelf: {section.id} - {data.display_name(series.name)}"
 
 
 _row_locations: list[LibrarianLocationData] = []
@@ -248,7 +248,7 @@ _goal_locations: list[LibrarianLocationData] = [
 # book's own item) -- depth-1, so the shared fill stays flat. Global order
 # matches data.ALL_BOOKS.
 def _book_name(section_id: str, series_name: str, chapter: int) -> str:
-    return f"Book: {section_id} - {series_name} Vol {chapter + 1}"
+    return f"Book: {section_id} - {data.display_name(series_name)} Vol {chapter + 1}"
 
 
 _book_locations: list[LibrarianLocationData] = [

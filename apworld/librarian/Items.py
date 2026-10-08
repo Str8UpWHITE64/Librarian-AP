@@ -164,7 +164,7 @@ _filler_items: list[LibrarianItemData] = [
 # exist, but only enter the pool when the option is on (see create_items);
 # ITEM_QUANTITIES omits them.
 def series_unlock_item_name(series_name: str) -> str:
-    return f"Series Unlock: {series_name}"
+    return f"Series Unlock: {data.display_name(series_name)}"
 
 
 _individual_series_items: list[LibrarianItemData] = [
@@ -183,7 +183,7 @@ _individual_series_items: list[LibrarianItemData] = [
 # order matches data.ALL_BOOKS. Series names are globally unique, so
 # "Book: <series> Vol N" is a unique item name.
 def book_item_name(series_name: str, chapter: int) -> str:
-    return f"Book: {series_name} Vol {chapter + 1}"
+    return f"Book: {data.display_name(series_name)} Vol {chapter + 1}"
 
 
 _book_items: list[LibrarianItemData] = [

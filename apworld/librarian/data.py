@@ -975,6 +975,15 @@ def total_bookcases() -> int:
     return sum(s.bookcase_count for s in SECTIONS)
 
 
+def display_name(series_name: str) -> str:
+    """A series name as item and location names show it: full-width letters as plain ASCII.
+
+    The series names keep the game's own spelling, since they are what the client matches books
+    by. The Archipelago client's font has no glyph for a full-width letter (1B's Self-Ｗriting
+    showed as a box), so the names a player reads and types use the plain one."""
+    return "".join(chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else c for c in series_name)
+
+
 def section_for_series(series_name: str) -> Section | None:
     """Look up which section a series belongs to. None if not found."""
     section_id = SERIES_TO_SECTION.get(series_name)
