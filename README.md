@@ -664,7 +664,7 @@ When you launch the game, the UE4SS log
 (`<Game>\Librarian\Binaries\Win64\UE4SS.log`) should include lines like:
 
 ```
-[Lua] [LibrarianAP] LibAP v3.0.0 — Game v1.0.13 (verified compatible)
+[Lua] [LibrarianAP] LibAP v3.0.1 — Game v1.0.13 (verified compatible)
 [Lua] [BPModLoaderMod] Actor: ModActor_C /Game/Librarian/Map/...
 [Lua] [LibrarianAP] Press F4 to toggle the connection menu.
 [Lua] [LibrarianAP] Press F9 to connect to Archipelago.
