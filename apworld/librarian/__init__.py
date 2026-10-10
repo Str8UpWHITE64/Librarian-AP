@@ -1283,10 +1283,12 @@ class LibrarianWorld(World):
             if (loc.name == "Floor 1 Complete" and 1 in active_floors)
             or (loc.name == "Floor 2 Complete" and 2 in active_floors)
         ]
-        # Level-ups + book-completion milestones within the active book count.
+        # Levels count ROWS, like every set_rules path filters them; the book count here
+        # created levels past the seed's rows that no rule ever gated.
+        max_rows = self.max_reachable_rows
         active_levelup_locs = [
             loc for idx, loc in enumerate(_levelup_locations)
-            if data.XP_CURVE[idx] <= max_books
+            if data.XP_CURVE[idx] <= max_rows
         ]
         active_book_completion_locs = [
             loc for idx, loc in enumerate(_book_completion_locations)
@@ -2347,9 +2349,15 @@ class LibrarianWorld(World):
 
         row_rule(sec, ser)        -> rule for completing that row
         book_rule(sec, ser, ch)   -> rule for shelving that book, or None to skip it
-        feasible_books(state)     -> how many books the state can already shelve
+        feasible_books(state)     -> how many books the state can already shelve; it also
+                                     gates the "Correctly shelve N books" milestones
         """
         mw, p = self.multiworld, self.player
+        if self.book_checks:
+            for thresh in BOOK_COMPLETION_THRESHOLDS:
+                if thresh <= self.max_reachable_books:
+                    mw.get_location(f"Correctly shelve {thresh} books", p).access_rule = (
+                        lambda state, n=thresh: feasible_books(state) >= n)
         if self.check_by_count:
             for n in self.count_ticks:
                 mw.get_location(f"Shelved {n} Books", p).access_rule = (
@@ -2568,13 +2576,7 @@ class LibrarianWorld(World):
             mw.get_location(GOAL_LOCATION_NAME, p).access_rule = (
                 lambda state, n=rows_needed: feasible_rows(state) >= n)
         else:
-            max_books = self.max_reachable_books
-            for thresh in BOOK_COMPLETION_THRESHOLDS:
-                if thresh > max_books:
-                    continue
-                mw.get_location(f"Correctly shelve {thresh} books", p).access_rule = (
-                    lambda state, n=thresh: feasible_books(state) >= n)
-
+            # The book-completion milestones were set in _apply_check_locations.
             books_needed = (min(self._custom_goal_count(True), total_books)
                             if self.goal_value == self.options.goal.option_custom
                             else total_books)
