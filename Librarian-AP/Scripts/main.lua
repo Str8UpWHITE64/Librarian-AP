@@ -260,10 +260,9 @@ end
 
 --- Take the force field down so the player can reach the ending door.
 ---
---- Its own handler ignores the count it is handed and re-asks the game, which still says the
---- library is unfinished, so the fade cannot be driven honestly. Faking that count is not an
---- option: CurrentFinishedRowNum is what our row checks read. Hiding it and dropping its
---- collision is what actually lets the player through, and both are reversible.
+--- Its own handler fades only when GameManager.OnBookCaseNumChanged hands it InsertedBookNum ==
+--- 3072, so it cannot be driven honestly. It is not what keeps the player in, either: the door
+--- is (see door_hold). Hiding it and dropping its collision is reversible.
 --- Re-asserted rather than run once: a level load brings a fresh barrier back, and a player
 --- who reloads after reaching the goal would otherwise be walled off from their own ending.
 --- Each actor is checked before it is touched, so the repeat costs nothing and stays silent.
@@ -320,6 +319,52 @@ function _bh.set_ward_attach(b, warded)
         _bh.anchored[key] = nil
         _bh.ward_detached = (_bh.ward_detached or 0) + 1
     end
+end
+
+--- Keep the end door shut until the AP goal is reached.
+---
+--- The game lets the player leave once every book has an AttachedActor
+--- (BP_LibrarianCharacter.CanBeFinish); it never checks the order. The ward anchors each locked
+--- book to a bookcase, so a player who has shelved every unlocked book passes that test with the
+--- library unfinished. Lift one of our anchors in the door's world for the length of its check,
+--- and the game refuses with its own message. door_release puts it back a tick later.
+function _bh.door_hold(door)
+    if _bh.door_sentinel then return true end      -- one is already lifted
+    local anchor = _bh.ward_anchor
+    local aa, wa
+    pcall(function() aa = anchor and anchor:IsValid() and anchor:GetAddress() end)
+    pcall(function() wa = door:GetWorld():GetAddress() end)
+    if not (aa and wa and _bh.anchored) then return false end
+    local books; pcall(function() books = FindAllOf("BP_GrabbingBook_C") end)
+    local n = 0; if books then pcall(function() n = #books end) end
+    for i = 1, n do
+        local b = books[i]
+        local ca; pcall(function()
+            local c = b.AttachedActor
+            ca = c and c:IsValid() and c:GetAddress()
+        end)
+        if ca == aa then
+            local key, bw
+            pcall(function() key = b:GetFullName() end)
+            pcall(function() bw = b:GetWorld():GetAddress() end)
+            if key and _bh.anchored[key] and bw == wa then
+                _bh.set_ward_attach(b, false)
+                _bh.door_sentinel = b
+                return true
+            end
+        end
+    end
+    return false
+end
+
+--- Re-anchor the book door_hold lifted, if it is still locked. Run from the 1 s goal loop, after
+--- the door's own check has finished.
+function _bh.door_release()
+    local b = _bh.door_sentinel
+    if not b then return end
+    _bh.door_sentinel = nil
+    local ok = false; pcall(function() ok = b:IsValid() end)
+    if ok and _bh_book_is_warded(b) == true then _bh.set_ward_attach(b, true) end
 end
 
 -- BookSanity: true when this book's own per-book item has arrived (no series is
@@ -1160,18 +1205,24 @@ local function try_register_magic_hooks()
         -- the player has actually finished anything.
         -- ConfirmLeave is the commit: the player has chosen to finish and the cutscene is
         -- starting. That is the moment the run is really over, so the goal hangs off it.
-        -- The door refuses until the game's own count says the library is finished, and that
-        -- count is not ours to fake: CurrentFinishedRowNum is what our row checks read. Writing
-        -- GameClear does not help either -- it is a separate flag the checks below ignore.
+        -- The door refuses until every book has an AttachedActor (CanBeFinish), and otherwise
+        -- offers to leave even with rows unfinished. Our ward anchors pass that test for locked
+        -- books, so before the AP goal door_hold makes it fail again.
         --
         -- ConfirmLeave, though, starts the ending whatever the game thinks. So the player's
         -- interaction still drives it: they walk to the door and use it, and once the AP goal
         -- is reached we answer for the prompt they would otherwise be refused.
         mreg("/Game/Librarian/Environment/M01_Library/Meshes/BP_M01_Door_01.BP_M01_Door_01_C" .. ":Interact", "Door.InteractGoal", function(self)
-            if not _bh.goal_reached then return end
             local d; pcall(function() d = self:get() end)
             local ok = false; pcall(function() ok = d and d:IsValid() end)
             if not ok then return end
+            if not _bh.goal_reached then
+                local held = _bh.door_hold(d)
+                log(("[end-door] door used before the AP goal; %s"):format(held
+                    and "one ward anchor lifted so the game keeps it shut"
+                    or "no ward anchor to lift, the game decides"))
+                return
+            end
             log("[end-door] goal reached and the player used the door -- starting the ending")
             -- The sequence opens the door itself, so leave it alone: calling OpenDoor here just
             -- snapped it open a frame before the cutscene did the same thing properly.
@@ -4478,6 +4529,7 @@ end)
 -- fact, so re-read it on a slow timer. Cheap, and the latch makes it a no-op the moment the goal
 -- is out; it deliberately does NOT unregister on success, so a second connection can still fire.
 gt_loop("goal_victory", 1000, function()
+    _bh.door_release()
     _goal.tick_victory()
     return false
 end)
