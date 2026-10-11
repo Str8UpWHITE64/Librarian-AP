@@ -502,7 +502,9 @@ class LibrarianWorld(World):
                              * (1 + self.options.spare_book_item_percent.value / 100))
             if kept > floor_max:
                 return (f"unlock_mode: individual_book_unlocks on a custom goal of "
-                        f"{self.options.custom_goal_book_count.value} books (more than a floor holds)")
+                        f"{self.options.custom_goal_book_count.value} books plus "
+                        f"{self.options.spare_book_item_percent.value}% spare "
+                        f"({kept} books, more than a floor holds)")
         return ""
 
     @property
@@ -1035,6 +1037,21 @@ class LibrarianWorld(World):
         # spoiler's playthrough paring grows faster than linearly in advancement items,
         # and every player in the lobby waits on it. The gate lives in host.yaml under
         # librarian_options, so a host who is fine with the wait can lift it.
+        if self.options.spare_book_item_percent.value > 20:
+            if self.options.goal.value != self.options.goal.option_custom:
+                # Full and floor goals only add spare copies out of free filler, capped
+                # anyway; past 20% would mean doubling every bundle, so hold it there.
+                print(f"[Librarian - '{self.player_name}'] spare_book_item_percent "
+                      f"{self.options.spare_book_item_percent.value} is only allowed on goal: "
+                      f"custom; using 20.")
+                self.options.spare_book_item_percent.value = 20
+            elif not getattr(self.settings, "allow_high_spare_book_percent", False):
+                raise OptionError(
+                    f"[Librarian - '{self.player_name}'] spare_book_item_percent above 20 is "
+                    f"off by default. The host can allow it by setting "
+                    f"librarian_options: allow_high_spare_book_percent: true in host.yaml, "
+                    f"or lower it to 20 or less."
+                )
         if (self.random_bundle and self.options.numbered_book_bundles.value
                 and not getattr(self.settings, "allow_numbered_book_bundles", False)):
             raise OptionError(

@@ -176,10 +176,14 @@ class SpareBookItemPercent(Range):
 
     On goal: custom it sets how much of the library the seed keeps past your goal.
     A goal of 200 rows and 10% spare leads to at least 220 series in the pool.
-    A book-counted goal of 1500 books and 10% spare has at least 1650 books in it."""
+    A book-counted goal of 1500 books and 10% spare has at least 1650 books in it.
+
+    Past 20% only works on goal: custom, and only when the host allows it
+    (allow_high_spare_book_percent in host.yaml). Other goals are held to 20%. The
+    kept amount never goes past the whole library, so 100% on a large goal keeps it all."""
     display_name = "Spare Book Item Percent"
     range_start = 0
-    range_end = 20
+    range_end = 100
     default = 10
 
 
@@ -361,8 +365,14 @@ class LibrarianSettings(Group):
         about three times the generation time with check_mode: count, and it can fail
         to generate with bookcases unlocked and series checks."""
 
+    class AllowHighSpareBookPercent(Bool):
+        """Allow spare_book_item_percent above 20 on goal: custom. A larger share keeps
+        more of the library in the world, which makes for a bigger pool and, with
+        individual_book_unlocks, slower generation."""
+
     allow_individual_book_unlocks: Union[AllowIndividualBookUnlocks, bool] = False
     allow_numbered_book_bundles: Union[AllowNumberedBookBundles, bool] = False
+    allow_high_spare_book_percent: Union[AllowHighSpareBookPercent, bool] = False
 
 
 option_groups = [
