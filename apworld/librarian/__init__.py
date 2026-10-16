@@ -3161,7 +3161,7 @@ class LibrarianWorld(World):
                     sum(s.volume_count for s in data.SECTIONS))
             else:
                 goal_book_threshold = sum(s.volume_count for s in data.SECTIONS)
-        if self.book_checks or self.random_bundle:
+        if self.book_checks or self.random_bundle or self.book_sanity:
             active_sids = self.active_section_ids
             for (asset_idx, chapter, sid, series_name) in data.ALL_BOOKS:
                 if sid not in active_sids:
