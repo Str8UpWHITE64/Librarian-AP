@@ -85,6 +85,15 @@ referred to below as `<Game>`.
    <Archipelago>\custom_worlds\librarian.apworld
    ```
 
+**Upgrading from an earlier version:** the same steps work; merging over the
+old files replaces them. The zip carries a blank `ap_config.json` with the
+default server, so if you want your saved server and slot name back, copy
+`Mods\Librarian-AP\Scripts\ap_config.json` somewhere before you merge and put
+it back after (or just type them in again at the connection menu). Replace the
+old `librarian.apworld` too, and **regenerate any seed you have not started yet**
+with the new apworld. A seed generated with an older apworld keeps working
+with the new mod, but it keeps that version's behaviour and bugs.
+
 That's it — skip to **Playing** (unless you're on Steam Deck / Linux,
 in which case there's one more step below).
 
@@ -265,7 +274,7 @@ or host it locally.
 
 All options go under your `Librarian:` section in the YAML. The generated
 template groups them the same way this section does: Goal, Unlocks, Checks,
-Item pool, and The library.
+Item pool, Traps, and The library.
 
 3.0.0 reshapes the option set, so generate a fresh template rather than
 reusing a 2.x YAML.
@@ -306,6 +315,7 @@ YAML, under `librarian_options`:
 librarian_options:
   allow_individual_book_unlocks: false
   allow_numbered_book_bundles: false
+  allow_high_spare_book_percent: false
 ```
 
 `individual_book_unlocks` on the `full` goal puts 3,072 progression items in
@@ -321,6 +331,12 @@ need nothing.
 
 `allow_numbered_book_bundles` gates `numbered_book_bundles` the same way; see
 that option under Unlocks for what it costs.
+
+`allow_high_spare_book_percent` gates `spare_book_item_percent` above 20, which
+only works on `goal: custom`; see that option under Unlocks. If your
+`host.yaml` already has a `librarian_options` block from an earlier version,
+add the new key by hand, or let Archipelago add it the next time it loads the
+apworld.
 
 Archipelago writes the keys into `host.yaml` the first time it loads the
 apworld, so look there after one generation.
@@ -471,7 +487,10 @@ individual unlock modes are always `unlocked` regardless of what you set here.
 
 #### `spare_book_item_percent`
 
-Range 0-20. Default 10.
+Range 0-100. Default 10. Above 20 only works on `goal: custom`, and only when
+the host allows it (`allow_high_spare_book_percent` in `host.yaml`, see Host
+settings). On every other goal the value is held to 20, and the generation log
+says so.
 
 How much slack to leave beyond what your goal actually needs. A goal that needs
 every last unlock is fragile in a multiworld: one item sitting in a stalled or
@@ -489,9 +508,12 @@ It does that two ways, depending on the goal:
 On a 200-row custom goal: 0 gives no margin, 10 gives about three spare unlocks,
 20 gives about eight.
 
-The cap is 20. Past that it starts costing `spare_shelf_items` whole steps, and
-on a custom goal a bigger margin mostly just re-adds the surplus checks the trim
-exists to remove.
+Past 20 it starts costing `spare_shelf_items` whole steps, and on a custom goal
+a bigger margin mostly just re-adds the surplus checks the trim exists to
+remove. That is why the higher range is off by default. The kept amount never
+goes past the whole library, so 100 on a large goal simply keeps all of it. With
+`individual_book_unlocks` a big margin also slows generation, the same way the
+full goal does.
 
 The spare-copy half is `random_series_bundles` only. Everywhere else each series
 or book is its own specific item, or bundles are handed out to a fixed count, so
@@ -590,8 +612,8 @@ given. All five are included by default:
     - Assemble
 ```
 
-Dropping a skill also drops its Mastery upgrades and its Fatigue trap. What they
-held becomes filler. Nothing in logic needs magic, so a shorter list only
+Dropping a skill also drops its Mastery upgrades, and its Fatigue trap can no
+longer come up (see Traps). What they held becomes filler. Nothing in logic needs magic, so a shorter list only
 changes what you find, never whether the seed is winnable.
 
 #### `vanilla_caps`
@@ -606,8 +628,8 @@ the base game ever does**:
 
 Set `vanilla_caps: true` to stop where the base game does. There are then no
 Mastery or Book Capacity items: skills top out at their normal maximum, and you
-carry at most 15 books. Their places go to filler. Fatigue traps stay either
-way, since they only ever make a skill weaker for a while.
+carry at most 15 books. Their places go to filler. Traps are separate: they
+are controlled by `trap_percentage` and `trap_weights`, not by this.
 
 #### `local_filler`
 
@@ -615,6 +637,66 @@ Toggle (default `true`). Keeps this game's filler items in your own world
 instead of scattering them across the multiworld. Your meaningful items still
 circulate normally. Recommended, since Librarian adds a lot of checks. No effect
 in a solo game.
+
+---
+
+### Traps
+
+Traps are items that make things harder for a short while. They take the place
+of filler items, never of anything a check or your goal depends on, so they
+cannot make a seed unwinnable. Every effect is temporary and none of it is
+saved into your game: quit and reload and it is gone.
+
+**Traps are on by default.** A YAML that says nothing about them gets about 10%
+of its filler turned into traps. Set `trap_percentage: 0` for a seed with none.
+A YAML from before 3.0.2 has no trap lines either, so regenerating it with the
+new apworld gives it traps too.
+
+#### `trap_percentage`
+
+Range 0-100. Default 10.
+
+The share of your filler items that become traps. 0 turns traps off entirely.
+Filler is whatever the pool has left over after the items the seed needs, so
+with `local_filler` on, the traps you receive come from your own world.
+
+#### `trap_weights`
+
+How likely each trap is when a filler item becomes a trap. A weight of 0 turns
+that trap off. The defaults:
+
+```yaml
+  trap_weights:
+    Fatigue: 2
+    Floor Shuffle: 2
+    Veil: 2
+    Butterfingers: 2
+    Scramble Shelf: 1
+    Shelf Spill: 1
+```
+
+In the multiworld each trap shows up as an item named with "Trap" on the end:
+`Floor Shuffle Trap`, `Veil Trap`, `Butterfingers Trap`, `Scramble Shelf Trap`,
+`Shelf Spill Trap`, and one `<skill> Fatigue Trap` per skill (`Sort Fatigue Trap`,
+`Shelf Guide Fatigue Trap` and so on). The `trap_weights` keys stay the
+short names, so existing YAMLs keep working.
+
+When a trap takes effect you see a notice on screen, for example "Received Veil Trap from
+Player2". Older item names without "Trap" still work too.
+
+| Trap | What it does |
+|---|---|
+| `Fatigue` | One magic skill recovers slowly for two minutes. Which skill is picked at generation, from the skills you have enabled. |
+| `Floor Shuffle` | The loose books lying on the floor swap places with each other. |
+| `Veil` | The loose books you could pick up are hidden for 30 seconds, then come back. |
+| `Butterfingers` | Some of the books in your hands, from one up to all of them, fall to the floor beside you in a pile. |
+| `Scramble Shelf` | A few books in a row you have not finished trade places. |
+| `Shelf Spill` | A few books in a row you have not finished fall out onto the floor in front of their bookcase. |
+
+The two shelf traps never touch a finished row, so a row you completed, and the
+check it gave, stay done. They have half the default weight of the others
+because they undo shelving work. If you would rather not have them, set both to
+0.
 
 ---
 
@@ -664,7 +746,7 @@ When you launch the game, the UE4SS log
 (`<Game>\Librarian\Binaries\Win64\UE4SS.log`) should include lines like:
 
 ```
-[Lua] [LibrarianAP] LibAP v3.0.1 — Game v1.0.13 (verified compatible)
+[Lua] [LibrarianAP] LibAP v3.0.2 — Game v1.0.13 (verified compatible)
 [Lua] [BPModLoaderMod] Actor: ModActor_C /Game/Librarian/Map/...
 [Lua] [LibrarianAP] Press F4 to toggle the connection menu.
 [Lua] [LibrarianAP] Press F9 to connect to Archipelago.
