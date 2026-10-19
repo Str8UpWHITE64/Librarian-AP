@@ -4788,14 +4788,22 @@ APClient.on_item = function(it, item_name)
             label = label .. " (from player " .. sender .. ")"
         end
     end
+    -- A trap shows its own "Received ... Trap" notice when it is acted on (ItemApply), so the item popup
+    -- is left off for it: one notice, and none for a replay the fired-floor drops.
+    local trap_kind, trap_arg
+    if item_name then trap_kind, trap_arg = ItemApply.trap_kind(item_name) end
+    if trap_kind then show_popup = false end
     HUD.push_log(label, color, show_popup)
 
     if item_name then
         ItemApply.apply_item(item_name)
         -- Traps (Fatigue and the rest) are one-shot, keyed on the item's server index so a
         -- reconnect re-dump can't replay them. Everything else re-derives from counts and doesn't care.
-        local trap_kind, trap_arg = ItemApply.trap_kind(item_name)
         if trap_kind then
+            if sender ~= me and sender > 0 then
+                local alias = APClient:get_alias(sender)
+                ItemApply._trap_from[tonumber(it.index) or -1] = (alias and alias ~= "") and alias or ("player " .. sender)
+            end
             ItemApply.on_trap_received(trap_kind, trap_arg, tonumber(it.index) or -1)
         end
     end

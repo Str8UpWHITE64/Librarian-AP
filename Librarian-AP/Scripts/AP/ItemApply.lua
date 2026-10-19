@@ -5202,6 +5202,22 @@ local function _alen(a)
     return n
 end
 
+-- Who sent each trap, by item index, set by main.lua when the item arrives.
+M._trap_from = {}
+
+--- The "Received ... Trap" notice, shown when a trap is first acted on (never for a replay after a
+--- reconnect, which the fired-floor drops first). The item's own popup is silent for traps, so this
+--- is the one notice, and it shows whoever sent the item (the server's /send included).
+function M._trap_notice(kind, arg, index)
+    local name = (kind == "Fatigue") and ((arg and (tostring(arg) .. " ") or "") .. "Fatigue Trap") or (kind .. " Trap")
+    local from = M._trap_from[index]
+    M._trap_from[index] = nil
+    local text = "Received " .. name
+    if from and from ~= "" then text = text .. " from " .. from end
+    local H = package.loaded["AP/HUD"]
+    if H and H.notify then pcall(H.notify, text) end
+end
+
 -- Fire a fatigue trap if its item index is above the fired-floor, then raise the floor both
 -- locally and in server storage so the same trap can never fire again.
 local function _maybe_fire_fatigue(skill, index)
@@ -5212,6 +5228,7 @@ local function _maybe_fire_fatigue(skill, index)
     end
     if index > floor then M._fatigue_floor = index end
     if M._fatigue_persist then pcall(M._fatigue_persist, index) end
+    M._trap_notice("Fatigue", skill, index)
     local dur = FATIGUE_DURATION
     M._fatigue_active[skill] = (M._fatigue_active[skill] or 0) + dur
     log(("[fatigue] %s hit for %ds (idx=%d, total %ds)"):format(
@@ -5296,6 +5313,7 @@ local function _fire_trap(kind, arg, index)
     end
     if index > floor then M._fatigue_floor = index end
     if M._fatigue_persist then pcall(M._fatigue_persist, index) end
+    M._trap_notice(kind, arg, index)
     local t = _traps()
     if t then t.run(M, kind, arg, index) end
 end
