@@ -328,45 +328,134 @@ end
 --- The game lets the player leave once every book has an AttachedActor
 --- (BP_LibrarianCharacter.CanBeFinish); it never checks the order. The ward anchors each locked
 --- book to a bookcase, so a player who has shelved every unlocked book passes that test with the
---- library unfinished. Lift one of our anchors in the door's world for the length of its check,
---- and the game refuses with its own message. door_release puts it back a tick later.
+--- library unfinished. Lift the anchor off a few locked books for the length of the door's check,
+--- and the game refuses with its own message. door_release puts them back a tick later.
+---
+--- Runs from the door's Interact hook, which UE4SS calls before the blueprint body (a script hook
+--- has one slot, and it is the pre slot), so the books are already loose when the body asks
+--- CanBeFinish.
+---
+--- Which books, best first:
+---   1. on the ward anchor and either recorded as warded by the mod or called locked by the ward rule;
+---   2. attached to anything else but called locked by the ward rule (a stale anchor after a
+---      reload, a Veil book).
+--- No world test: a book's world never matches the door's (none of the game's 3072 books do),
+--- and every book lives in the one library level anyway.
+--- If some book already has nothing attached, the game refuses by itself and nothing is touched.
+--- Every write is read back, so the log says whether the game really saw a loose book.
+_bh.DOOR_LIFT_MAX = 8
 function _bh.door_hold(door)
-    if _bh.door_sentinel then return true end      -- one is already lifted
+    if _bh.door_lifted and #_bh.door_lifted > 0 then return true, { note = "already lifted" } end
     local anchor = _bh.ward_anchor
-    local aa, wa
-    pcall(function() aa = anchor and anchor:IsValid() and anchor:GetAddress() end)
-    pcall(function() wa = door:GetWorld():GetAddress() end)
-    if not (aa and wa and _bh.anchored) then return false end
+    local aa
+    pcall(function() aa = anchor and anchor:IsValid() and anchor:GetAddress() or nil end)
     local books; pcall(function() books = FindAllOf("BP_GrabbingBook_C") end)
     local n = 0; if books then pcall(function() n = #books end) end
+    local st = { books = n, attached = 0, on_anchor = 0, ours = 0, picked = 0, lifted = 0, loose_after = 0 }
+    local MAX = _bh.DOOR_LIFT_MAX
+    local first, second = {}, {}
     for i = 1, n do
         local b = books[i]
-        local ca; pcall(function()
+        local cur, ca
+        pcall(function()
             local c = b.AttachedActor
-            ca = c and c:IsValid() and c:GetAddress()
+            if c and c:IsValid() then cur = c; ca = c:GetAddress() end
         end)
-        if ca == aa then
-            local key, bw
-            pcall(function() key = b:GetFullName() end)
-            pcall(function() bw = b:GetWorld():GetAddress() end)
-            if key and _bh.anchored[key] and bw == wa then
-                _bh.set_ward_attach(b, false)
-                _bh.door_sentinel = b
-                return true
+        if cur then
+            st.attached = st.attached + 1
+            local on_anchor = (aa ~= nil and ca == aa)
+            if on_anchor then st.on_anchor = st.on_anchor + 1 end
+            local key; pcall(function() key = b:GetFullName() end)
+            local mine = on_anchor and key ~= nil and _bh.anchored ~= nil and _bh.anchored[key] == true
+            if mine then st.ours = st.ours + 1 end
+            if #first < MAX and on_anchor then
+                if mine or _bh_book_is_warded(b) == true then
+                    first[#first + 1] = { b = b, prev = cur, on_anchor = true }
+                end
+            elseif #first == 0 and #second < MAX and not on_anchor and _bh_book_is_warded(b) == true then
+                second[#second + 1] = { b = b, prev = cur, on_anchor = false }
             end
         end
     end
-    return false
+    st.loose_before = n - st.attached
+    _bh.door_stats = st
+    if n > 0 and st.loose_before > 0 then
+        st.note = "a book is already loose, the game refuses by itself"
+        return true, st
+    end
+    local pick = (#first > 0) and first or second
+    st.picked = #pick
+    local lifted = {}
+    for _, e in ipairs(pick) do
+        pcall(function() e.b.AttachedActor = nil end)
+        local still = true
+        pcall(function() local c = e.b.AttachedActor; still = (c ~= nil and c:IsValid()) and true or false end)
+        lifted[#lifted + 1] = e
+        if not still then st.loose_after = st.loose_after + 1 end
+    end
+    st.lifted = #lifted
+    if #lifted > 0 then _bh.door_lifted = lifted end
+    if st.loose_after == 0 then
+        st.note = (#pick == 0) and "no locked book to lift" or "the lift did not stick"
+        return false, st
+    end
+    return true, st
 end
 
---- Re-anchor the book door_hold lifted, if it is still locked. Run from the 1 s goal loop, after
---- the door's own check has finished.
+--- Put back what door_hold lifted. A book taken off a real shelf always gets it back. One taken off
+--- the anchor gets it back unless the ward rule now says it is unlocked; an unreadable book (nil)
+--- keeps its old attachment too, since leaving a locked book loose is the leak this whole anchor
+--- exists to stop. Run from the 1 s goal loop, after the door's own check has finished.
 function _bh.door_release()
-    local b = _bh.door_sentinel
-    if not b then return end
-    _bh.door_sentinel = nil
-    local ok = false; pcall(function() ok = b:IsValid() end)
-    if ok and _bh_book_is_warded(b) == true then _bh.set_ward_attach(b, true) end
+    local lifted = _bh.door_lifted
+    if not lifted then return end
+    _bh.door_lifted = nil
+    for _, e in ipairs(lifted) do
+        local ok = false; pcall(function() ok = e.b:IsValid() end)
+        if ok and (not e.on_anchor or _bh_book_is_warded(e.b) ~= false) then
+            local has = false; pcall(function() local c = e.b.AttachedActor; has = c and c:IsValid() end)
+            if not has then
+                local back = false
+                pcall(function() back = e.prev and e.prev:IsValid() end)
+                if back then pcall(function() e.b.AttachedActor = e.prev end)
+                else _bh.set_ward_attach(e.b, true) end
+            end
+        end
+    end
+end
+
+--- Close the leave prompt the door has just opened, the way its own Cancel does, and say why.
+---
+--- Loosening books is too late when the hook runs after the door's own code: the game has already
+--- asked CanBeFinish and opened the prompt. So when the hook finds the prompt up before the AP
+--- goal, it shuts it again inside the same call, before the frame is drawn: take the dialog off the
+--- screen, run the door's CancelLeave, unpause.
+--- Returns how many dialogs it closed (0 when the hook ran first, or the game refused itself).
+--- With look_only it closes nothing and only counts the dialogs on screen.
+function _bh.door_shut_prompt(door, look_only)
+    local dialogs; pcall(function() dialogs = FindAllOf("WBP_ConfirmationDialogue_C") end)
+    local n = 0; if dialogs then pcall(function() n = #dialogs end) end
+    local closed = 0
+    for i = 1, n do
+        local w = dialogs[i]
+        local up = false
+        pcall(function() up = w:IsValid() and w:IsInViewport() end)
+        if up then
+            if not look_only then pcall(function() w:RemoveFromParent() end) end
+            closed = closed + 1
+        end
+    end
+    if closed == 0 or look_only then return closed end
+    pcall(function() door:CancelLeave() end)
+    local p = rawget(_G, "_librarian_tick_pawn")
+    local pok = false; pcall(function() pok = p and p:IsValid() end)
+    if not pok then pcall(function() p = FindFirstOf("BP_LibrarianCharacter_C") end) end
+    pcall(function() p:SetPauseGame(false) end)
+    local HUD_mod = package.loaded["AP/HUD"]
+    if HUD_mod and HUD_mod.notify then
+        pcall(HUD_mod.notify, "The way out stays shut until your Archipelago goal is reached")
+    end
+    return closed
 end
 
 -- BookSanity: true when this book's own per-book item has arrived (no series is
@@ -1229,10 +1318,30 @@ local function try_register_magic_hooks()
             local ok = false; pcall(function() ok = d and d:IsValid() end)
             if not ok then return end
             if not _bh.goal_reached then
-                local held = _bh.door_hold(d)
-                log(("[end-door] door used before the AP goal; %s"):format(held
-                    and "one ward anchor lifted so the game keeps it shut"
-                    or "no ward anchor to lift, the game decides"))
+                -- The prompt already up means this hook ran after the door's own code: close it.
+                -- Otherwise the hook ran first (or the game refused by itself), and loosening a few
+                -- locked books makes the game's own check refuse.
+                local closed = _bh.door_shut_prompt(d)
+                if closed > 0 then
+                    log(("[end-door] door used before the AP goal; the game had opened the leave prompt (the hook runs after the door's code), closed it (%d) and kept the door shut"):format(closed))
+                    return
+                end
+                local held, st = _bh.door_hold(d)
+                local d_ = type(st) == "table" and st or {}
+                log(("[end-door] door used before the AP goal; %s (books=%s attached=%s on_anchor=%s ours=%s picked=%s lifted=%s loose_before=%s loose_after=%s%s)"):format(
+                    held and "no leave prompt; locked books loosened for the game's check"
+                    or "FAILED to loosen a book, the game decides",
+                    tostring(d_.books), tostring(d_.attached), tostring(d_.on_anchor), tostring(d_.ours),
+                    tostring(d_.picked), tostring(d_.lifted), tostring(d_.loose_before), tostring(d_.loose_after),
+                    d_.note and ("; " .. d_.note) or ""))
+                return
+            end
+            -- The game's own leave prompt is already up (the hook ran after the door's code and
+            -- every book is on a shelf): leave the choice to the player. Confirming runs
+            -- ConfirmLeave, whose hook below sends the goal; starting the ending from here would
+            -- run it under a paused game with the dialog still on screen.
+            if _bh.door_shut_prompt(d, true) > 0 then
+                log("[end-door] goal reached and the player used the door -- the game's leave prompt is up, the player confirms")
                 return
             end
             log("[end-door] goal reached and the player used the door -- starting the ending")
