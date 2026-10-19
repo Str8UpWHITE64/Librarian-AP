@@ -252,6 +252,8 @@ local function _bh_book_is_warded(book_obj)
     if not (IA and IA._unwarded_snapshot) then return nil end
     local _, series = _bh_series(book_obj)
     if not series then return nil end
+    -- A book a Veil holds hidden counts as warded for the length of the Veil.
+    if IA._veil_has and IA._veil_has(book_obj) then return true end
     if IA._unwarded_snapshot[series] then return false end
     local unlocked = _bh_book_unlocked(book_obj, series)
     if unlocked == nil then return nil end   -- unreadable book: leave it alone, per the rule above
@@ -580,6 +582,8 @@ local function _bh_grab_check(b, tag)
         -- ItemApply._unwarded_snapshot.
         local uw = IA._unwarded_snapshot
         unwarded_here = (uw and uw[series]) or _bh_book_unlocked(b, series) or false
+        -- Not while a Veil holds it: showing it here would end the Veil for this one book.
+        if unwarded_here and IA._veil_has and IA._veil_has(b) then unwarded_here = false end
     end
     -- BROKEN = any signal that renders an unwarded book invisible/unpickable: meshZ far from
     -- actorZ (deep-Z hide), opacity<1 (stuck-transparent MID), scaleX~0, or the raw hide flags.
@@ -697,6 +701,14 @@ local function try_register_book_hooks()
             pcall(function() b = self:get() end)
             pcall(function() v = is_visible:get() end)
             _bh_sample("SetActorVisible", b, "vis=" .. tostring(v))
+            -- A Veil keeps its books hidden when the game's distance swap tries to show them.
+            if v == true and b then
+                local IAv = package.loaded["AP/ItemApply"]
+                if IAv and IAv._veil_has and IAv._veil_has(b) then
+                    pcall(function() is_visible:set(false) end)
+                    return
+                end
+            end
             -- ENFORCE: when the game tries to SHOW (v==true) a WARDED book, override the arg to
             -- false so its own call keeps it hidden -- no flicker, no re-entrancy. Unwarded books
             -- show normally (unlock takes effect on next show). Reads the LIVE unwarded set.
@@ -2623,6 +2635,14 @@ local function start_gameplay_loops()
             -- hook: a re-hide issued inside the hook is overwritten while the skill still shows.
             pcall(function() IA.resweep_book_piles() end)
         end
+        return false
+    end)
+
+    -- Trap clock: waits out a trap that arrived while loading, runs a Veil's hide and restore in
+    -- chunks. Idle when no trap is live.
+    gt_loop("traps", 250, function()
+        local IA = package.loaded["AP/ItemApply"]
+        if IA and IA.traps_tick then IA.traps_tick() end
         return false
     end)
 
@@ -4589,6 +4609,8 @@ local ItemApply = require("AP/ItemApply")
 -- Wired at load, not from a loop: the first warding flush runs at connect, and an anchor that is
 -- only installed once the 5s maintenance loop has ticked would miss every book in it.
 ItemApply._ward_anchor = _bh.set_ward_attach
+-- Traps are dropped once the goal is reached.
+ItemApply._goal_met = function() return _bh.goal_reached and true or false end
 local APConfig = require("AP/APConfig")
 local HUD = require("AP/HUD")
 local SaveIdentity = require("AP/SaveIdentity")
@@ -4661,11 +4683,11 @@ APClient.on_item = function(it, item_name)
 
     if item_name then
         ItemApply.apply_item(item_name)
-        -- Fatigue traps are one-shot, keyed on the item's server index so a reconnect
-        -- re-dump can't replay them. Everything else re-derives from counts and doesn't care.
-        local fatigue_skill = item_name:match("^Fatigue: (.+)$")
-        if fatigue_skill then
-            ItemApply.on_fatigue_received(fatigue_skill, tonumber(it.index) or -1)
+        -- Traps (Fatigue and the rest) are one-shot, keyed on the item's server index so a
+        -- reconnect re-dump can't replay them. Everything else re-derives from counts and doesn't care.
+        local trap_kind, trap_arg = ItemApply.trap_kind(item_name)
+        if trap_kind then
+            ItemApply.on_trap_received(trap_kind, trap_arg, tonumber(it.index) or -1)
         end
     end
 end

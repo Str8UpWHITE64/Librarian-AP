@@ -233,7 +233,7 @@ _book_bundle_items: list[LibrarianItemData] = [
 # longer active-time). A useful item, not more Progressive copies -- those are load-bearing level-up
 # gates. Fatigue: a one-shot ~2-min debuff (slow recovery, short active-time) that bites at any
 # level. Client-side only; names must match the client's ATTUNE_SKILLS ("<skill> Mastery" /
-# "Fatigue: <skill>").
+# "<skill> Fatigue Trap").
 _ATTUNE_SKILLS = ("Sort", "Shelf Guide", "Insight", "Auto-Shelving", "Assemble")
 
 _attunement_items: list[LibrarianItemData] = [
@@ -251,9 +251,17 @@ _bag_items: list[LibrarianItemData] = [
 ]
 
 _fatigue_items: list[LibrarianItemData] = [
-    LibrarianItemData(f"Fatigue: {name}", 307 + i,
+    LibrarianItemData(f"{name} Fatigue Trap", 307 + i,
                       LibrarianItemCategory.TRAP, ItemClassification.trap)
     for i, name in enumerate(_ATTUNE_SKILLS)
+]
+
+# Non-skill traps. Item names are the kind plus " Trap"; the kinds are the contract with the client's trap dispatch table (AP/Traps.lua).
+TRAP_NAMES_OTHER = ("Floor Shuffle", "Veil", "Butterfingers", "Scramble Shelf", "Shelf Spill")
+
+_other_trap_items: list[LibrarianItemData] = [
+    LibrarianItemData(f"{name} Trap", 312 + i, LibrarianItemCategory.TRAP, ItemClassification.trap)
+    for i, name in enumerate(TRAP_NAMES_OTHER)
 ]
 
 
@@ -267,6 +275,7 @@ _all_items: list[LibrarianItemData] = (
     + _attunement_items
     + _bag_items
     + _fatigue_items
+    + _other_trap_items
     + _filler_items
     + _individual_series_items
     + _book_items
@@ -293,7 +302,7 @@ item_name_groups: dict[str, set[str]] = {
     "Book Bundles":     {it.name for it in _book_bundle_items},
     "Skill Mastery":    {it.name for it in _attunement_items},
     "Book Capacity":    {it.name for it in _bag_items},
-    "Traps":            {it.name for it in _fatigue_items},
+    "Traps":            {it.name for it in _fatigue_items} | {it.name for it in _other_trap_items},
 }
 
 
@@ -349,7 +358,7 @@ for cat, lo, hi in [
     (LibrarianItemCategory.SECTION,      131, 199),
     (LibrarianItemCategory.MAJOR_SKILL,  200, 299),
     (LibrarianItemCategory.USEFUL,       300, 306),
-    (LibrarianItemCategory.TRAP,         307, 311),
+    (LibrarianItemCategory.TRAP,         307, 317),
     (LibrarianItemCategory.FILLER,       400, 499),
     (LibrarianItemCategory.SERIES_INDIV, 700, 1199),
     (LibrarianItemCategory.BOOK,         2000, 5099),

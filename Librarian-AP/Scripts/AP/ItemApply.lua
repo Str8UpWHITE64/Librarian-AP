@@ -455,6 +455,7 @@ function M.set_slot_data(slot_data)
     M._fatigue_floor      = nil
     M._fatigue_pending    = {}
     M._fatigue_persist    = nil
+    if M._traps_reset then M._traps_reset() end
     M._pending_skill_grants = {}
     if not midgame_reconnect then
         M._applied_skill_counts = {}
@@ -1833,6 +1834,11 @@ function M._apply_books_to_world()
             stats.skipped = stats.skipped + 1
             return
         end
+        -- A book a Veil holds hidden stays as it is until the Veil ends and re-asserts the ward.
+        if M._veil_has(book) then
+            stats.skipped = stats.skipped + 1
+            return
+        end
         local series_name = M._asset_to_series[asset_idx]
         local should_unward = series_name and unwarded_set[series_name]
         -- BookSanity: read this book's Chapter once -- used for both the per-book unlock gate here
@@ -2158,6 +2164,8 @@ function M.reconcile_book_actors()
                     reconcile_this = true
                 end
             end
+            -- A Veil holds this book hidden: treated as warded here, so nothing below shows it.
+            if reconcile_this and M._veil_has(b) then reconcile_this = false end
             -- Anchor warded books to a bookcase, clear the anchor when they become unwarded.
             -- Assemble skips any book whose AttachedActor is set -- that is how it leaves shelved
             -- books alone -- and it reads the field before asking CanBeGrab, so the anchor has to
@@ -5204,9 +5212,92 @@ local function _maybe_fire_fatigue(skill, index)
     end
     if index > floor then M._fatigue_floor = index end
     if M._fatigue_persist then pcall(M._fatigue_persist, index) end
-    M._fatigue_active[skill] = (M._fatigue_active[skill] or 0) + FATIGUE_DURATION
+    local dur = FATIGUE_DURATION
+    M._fatigue_active[skill] = (M._fatigue_active[skill] or 0) + dur
     log(("[fatigue] %s hit for %ds (idx=%d, total %ds)"):format(
-        skill, FATIGUE_DURATION, index, M._fatigue_active[skill]))
+        skill, dur, index, M._fatigue_active[skill]))
+end
+
+-- The trap module, loaded on first use; nil if it cannot load, which drops traps rather than
+-- breaking item handling.
+local function _traps()
+    if M._traps_mod == nil then
+        local ok, t = pcall(require, "AP/Traps")
+        M._traps_mod = (ok and type(t) == "table") and t or false
+    end
+    return M._traps_mod or nil
+end
+
+--- A function(book) -> true when the mod treats that book as unwarded (earned and its case open
+--- where that matters), false when warded, nil when unreadable. Reads the state the ward flush
+--- itself reads, never the live collision flags, which lag the flush after a load or an unlock.
+function M.unwarded_checker()
+    local snap = M._unwarded_snapshot or {}
+    local only = M._slot_data and M._slot_data.only_unward_shelfable_books == 1
+    local case_open
+    return function(book)
+        local aidx = _book_valid_asset_idx(book)
+        if aidx == nil then return nil end
+        local series = M._asset_to_series[aidx]
+        if not series then return false end
+        if snap[series] then return true end
+        if M._per_book_unlocks and M._books_unlocked then
+            local ch
+            pcall(function() ch = tonumber(book.ItemInfo.Chapter) end)
+            if ch ~= nil and M._books_unlocked[series .. "|" .. ch] then
+                if not only then return true end
+                case_open = case_open or M._compute_case_open_set()
+                return case_open[series] == true
+            end
+        end
+        return false
+    end
+end
+
+--- True once the ward flush has run for this world.
+function M.ward_applied()
+    return not M._flush_in_progress
+        and (next(M._books_warded) ~= nil or next(M._last_applied_series_unlocked or {}) ~= nil)
+end
+
+--- True while a Veil holds this book hidden. The ward paths ask before they show a book.
+function M._veil_has(book)
+    local t = _traps()
+    return t ~= nil and t.has(book)
+end
+
+--- Called four times a second by main.lua: the traps' own clock.
+function M.traps_tick()
+    local t = _traps()
+    if t then t.tick(M) end
+end
+
+--- A new connection: traps waiting on the old one are dropped, a running Veil is wound up.
+function M._traps_reset()
+    local t = M._traps_mod
+    if t then t.reset() end
+end
+
+--- "Floor Shuffle Trap" -> kind; "Sort Fatigue Trap" -> "Fatigue", "Sort"; not a trap -> nil.
+function M.trap_kind(item_name)
+    local t = _traps()
+    if not t then return nil end
+    return t.kind_of(item_name)
+end
+
+-- Fire one trap, once per item index: the floor test and the raise to it are shared by every kind.
+-- Fatigue is a timer in this file; the rest run in Traps.lua.
+local function _fire_trap(kind, arg, index)
+    if kind == "Fatigue" then return _maybe_fire_fatigue(arg, index) end
+    local floor = M._fatigue_floor or -1
+    if index <= floor then
+        log(("[traps] %s idx=%d already fired (floor=%d); skipping"):format(kind, index, floor))
+        return
+    end
+    if index > floor then M._fatigue_floor = index end
+    if M._fatigue_persist then pcall(M._fatigue_persist, index) end
+    local t = _traps()
+    if t then t.run(M, kind, arg, index) end
 end
 
 --- Called by main.lua when the fired-floor arrives from server storage. Drains any traps that
@@ -5217,18 +5308,19 @@ function M.set_fatigue_floor(value)
         M._fatigue_floor, #M._fatigue_pending))
     local pending = M._fatigue_pending
     M._fatigue_pending = {}
-    for _, p in ipairs(pending) do _maybe_fire_fatigue(p.skill, p.index) end
+    for _, p in ipairs(pending) do _fire_trap(p.kind or "Fatigue", p.arg or p.skill, p.index) end
 end
 
---- Called by main.lua for each received "Fatigue: <skill>" item. Held until the fired-floor is
+--- Called by main.lua for each received trap item (Fatigue, Floor Shuffle, Veil, ...). Held until the fired-floor is
 --- known so a reconnect's item re-dump can't replay old traps.
-function M.on_fatigue_received(skill, index)
+function M.on_trap_received(kind, arg, index)
     if M._fatigue_floor == nil then
-        M._fatigue_pending[#M._fatigue_pending + 1] = { skill = skill, index = index }
+        M._fatigue_pending[#M._fatigue_pending + 1] = { kind = kind, arg = arg, index = index }
         return
     end
-    _maybe_fire_fatigue(skill, index)
+    _fire_trap(kind, arg, index)
 end
+function M.on_fatigue_received(skill, index) return M.on_trap_received("Fatigue", skill, index) end
 
 -- Write each captured skill's arrays back to the game's own values. Used when a slot with the
 -- tuning system off inherits arrays a previous slot left modified (mid-gameplay reconnect keeps

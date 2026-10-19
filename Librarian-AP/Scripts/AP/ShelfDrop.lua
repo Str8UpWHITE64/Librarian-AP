@@ -20,6 +20,15 @@ local ON_SHELF = 15.0         -- that margin only counts this far above the floo
 local HIGH, HIGH_PAD = 90.0, 30.0 -- above this nothing but a shelf is there, and books resting on
                               -- one were measured 12-20 units past the face
 local STACK_R = 30.0          -- a landing this close to one already made goes on top of it
+local UPPER_REACH = 250.0     -- an upper floor counts only this far below the book it takes
+local UPPER_FLAT = 5          -- and only when this many steps out (75 units deep) find that same floor
+local LOW_START = 100.0       -- the low trace starts this far over the case's base
+local KNEE = 20.0             -- the way out from the face is tested this far over the floor
+local PLAYER_LEVEL = 10.0     -- the player stands on a floor when their own floor is within this of it
+local line_hits, player_floor -- set further down, beside off_case
+local SPREAD = 45.0           -- Shelf Spill: books lie at least this far apart where the floor allows.
+                              -- Two spilled books stacked on a third were measured back on their
+                              -- shelf moments later (LB-22: 220 up, 7 units inside the face)
 local NAMED_PARTS = { "StaticMesh", "SM_M01_BookCabinet_03", "SM_M01_CabinetWall_02" }
 local KSL_PATH = "/Script/Engine.Default__KismetSystemLibrary"
 local SMC_PATH = "/Script/Engine.StaticMeshComponent"
@@ -353,6 +362,9 @@ function M.floor_spot(IA, book, e, p)
     -- each step goes further, so whatever sits at the case's base (a plinth, a lip the mesh box
     -- does not cover) is passed over until the floor below is bare. move() takes the first one.
     local spots, why = {}, nil
+    local lf = { X = l0.X, Y = l0.Y, Z = l0.Z }
+    lf[a] = (first > 0) and (e.hi + CLEAR / s) or (e.lo - CLEAR / s)
+    local face = to_world(main, lf)
     local extra = 0
     while extra <= MAX_OUT do
         local l = { X = l0.X, Y = l0.Y, Z = l0.Z }
@@ -360,7 +372,7 @@ function M.floor_spot(IA, book, e, p)
         l[a] = (first > 0) and (e.hi + d) or (e.lo - d)
         local out = to_world(main, l)
         local blocker = case_at(IA, { X = out.X, Y = out.Y, Z = e.floor_z + 2 }, 0)
-        if blocker and blocker ~= e then why = "landing inside " .. tostring(blocker.sid); break end
+        if blocker and blocker.case ~= e.case then why = "landing inside " .. tostring(blocker.sid); break end
         if not blocker then spots[#spots + 1] = { x = out.X, y = out.Y, out = reach + CLEAR + extra } end
         extra = extra + STEP
     end
@@ -373,7 +385,11 @@ function M.floor_spot(IA, book, e, p)
     local scale
     pcall(function() scale = v3(book.SpawnTransform.Scale3D) end)
     if not scale or scale.X == 0 then scale = { X = 1, Y = 1, Z = 1 } end
-    return { spots = spots, from_z = math.max(p.Z, e.floor_z + 100), floor_z = e.floor_z, sid = e.sid,
+    -- low_start: the traces start just over the case's base instead of at the book, so a book off a
+    -- top shelf finds the floor the case stands on, under anything overhead in front of the shelf
+    local from_z = e.low_start and (e.floor_z + LOW_START) or math.max(p.Z, e.floor_z + 100)
+    return { spots = spots, from_z = from_z, floor_z = e.floor_z, sid = e.sid,
+             face_x = face.X, face_y = face.Y, low_start = e.low_start,
              pitch = pitch, yaw = yaw, roll = roll, lift = thick / 2 + 0.5, scale = scale, dims = dims }
 end
 
@@ -386,21 +402,68 @@ function M.move(IA, book, spot, why)
     -- slightly into a raised floor (measured 16 units in part of floor 2), and the first step
     -- clear of the case with that surface under it is the landing.
     local hits, pick, gz, ground, first_hit = {}, nil, nil, nil, nil
+    M.last_first_z = nil      -- the first surface the steps found, for off_case's upper-floor try
     for i, c in ipairs(spot.spots) do
         hits[i] = ground_z(book, c.x, c.y, spot.from_z, spot.floor_z - 50)
         if not hits[i] then break end
         first_hit = first_hit or (hits[i] - spot.floor_z)
+        M.last_first_z = M.last_first_z or hits[i]
     end
     if not hits[1] then
-        -- Unreadable trace: the case floor, a fair step further out than the first spot.
-        local i = math.min(#spot.spots, 4)
-        pick, gz, ground = spot.spots[i], spot.floor_z, "case floor"
+        -- Unreadable trace: the case floor, a fair step further out than the first spot. Never for
+        -- an upper floor, which only a trace can prove.
+        if not spot.need_flat and not spot.low_start then
+            local i = math.min(#spot.spots, 4)
+            pick, gz, ground = spot.spots[i], spot.floor_z, "case floor"
+        end
     else
         local low
         for _, z in ipairs(hits) do if not low or z < low then low = z end end
-        if low <= spot.floor_z + GROUND_ABOVE_MAX then
-            for i, c in ipairs(spot.spots) do
-                if hits[i] and hits[i] <= low + 4 then pick, gz, ground = c, hits[i], "floor"; break end
+        -- need_flat: an upper floor must be a walkway, not a ledge: that many steps out from the
+        -- face all find the same surface
+        local flat_ok = true
+        if spot.need_flat then
+            local n = 0
+            for i = 1, #spot.spots do
+                if hits[i] and math.abs(hits[i] - low) <= 4 then n = n + 1 end
+            end
+            flat_ok = n >= spot.need_flat
+        end
+        if flat_ok and low <= spot.floor_z + GROUND_ABOVE_MAX then
+            -- spread: the first bare-floor step with no landing of this world within SPREAD, so
+            -- books spilled together lie side by side instead of on each other
+            -- low_start: the way out from the case's face to the spot is open at knee height, so
+            -- the spot is the floor in front of the case and not a space closed off under something
+            local open = {}
+            local function path_ok(i, c)
+                -- spread (a spill): the book must lie loose where it lands, not on a plinth or the
+                -- top of a low case (measured: one landed 35 up on something by the 1D cabinet)
+                if spot.spread and case_resting(IA, { X = c.x, Y = c.y, Z = hits[i] + spot.lift }) then
+                    return false
+                end
+                if not spot.low_start then return true end
+                if open[i] == nil then
+                    local z = spot.floor_z + KNEE
+                    open[i] = not line_hits(book, { X = spot.face_x, Y = spot.face_y, Z = z }, { X = c.x, Y = c.y, Z = z })
+                end
+                return open[i]
+            end
+            if spot.spread then
+                for i, c in ipairs(spot.spots) do
+                    if hits[i] and hits[i] <= low + 4 and path_ok(i, c) then
+                        local free = true
+                        for _, l in ipairs(M._landed) do
+                            local dx, dy = l.x - c.x, l.y - c.y
+                            if dx * dx + dy * dy < SPREAD * SPREAD then free = false; break end
+                        end
+                        if free then pick, gz, ground = c, hits[i], "floor"; break end
+                    end
+                end
+            end
+            if not pick then
+                for i, c in ipairs(spot.spots) do
+                    if hits[i] and hits[i] <= low + 4 and path_ok(i, c) then pick, gz, ground = c, hits[i], "floor"; break end
+                end
             end
         end
     end
@@ -424,11 +487,15 @@ function M.move(IA, book, spot, why)
         gz = top
     end
     if not pick then
-        M.stats.no_floor = M.stats.no_floor + 1
-        log(("left on %s: %s (no bare floor within %.0f of its front; first surface %.0f up)"):format(
-            tostring(spot.sid), (select(1, book_name(IA, book))), MAX_OUT, first_hit or -1))
+        if not spot.dry then
+            M.stats.no_floor = M.stats.no_floor + 1
+            log(("left on %s: %s (no bare floor within %.0f of its front; first surface %.0f up)"):format(
+                tostring(spot.sid), (select(1, book_name(IA, book))), MAX_OUT, first_hit or -1))
+        end
         return false
     end
+    -- a dry run (can_land) only asks whether a landing exists: the book is not touched
+    if spot.dry then return true end
     spot.x, spot.y = pick.x, pick.y
     ground = ("%s, %.0f out from the face"):format(ground, pick.out)
     local loc = { X = spot.x, Y = spot.y, Z = gz + spot.lift }
@@ -452,6 +519,7 @@ function M.move(IA, book, spot, why)
         if st then st.orig, st.hidden = t, false end
     end
     M._landed[#M._landed + 1] = { x = loc.X, y = loc.Y, top = loc.Z + spot.lift }
+    M.last_pose = { loc = loc, rot = rot }
     M.stats.moved = M.stats.moved + 1
     if M._logged < 100 then
         M._logged = M._logged + 1
@@ -460,6 +528,62 @@ function M.move(IA, book, spot, why)
             spot.dims.X, spot.dims.Y, spot.dims.Z, spot.pitch, spot.roll))
     end
     return true
+end
+
+--- A book's flat thickness: its thin axis is the one that goes vertical when it lies down.
+function M.thickness(book)
+    local d = book_dims(book)
+    if not d then return 12 end
+    return math.min(d.X, d.Y, d.Z)
+end
+
+--- Where a book is, when it is loose on the floor: not inside a bookcase and not resting on one.
+--- nil for a book on a case, one at the world origin (the inert copy), or one that cannot be read.
+function M.loose_position(IA, book)
+    local here
+    pcall(function() here = v3(book:K2_GetActorLocation()) end)
+    if not here or (here.X == 0 and here.Y == 0 and here.Z == 0) then return nil end
+    if case_resting(IA, here) then return nil end
+    return here
+end
+
+--- Put a book at a pose: the actor and its pile instance together, physics off. The pile instance
+--- keeps the book's own scale. Only the live position moves, never SpawnTransform.
+function M.set_pose(IA, book, loc, rot)
+    pcall(function() book:SetSimulate(false) end)
+    local ok = false
+    pcall(function() ok = book:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) and true or false end)
+    if not ok then return false end
+    local _, aidx, ch = book_name(IA, book)
+    if aidx and ch then
+        local scale
+        pcall(function() scale = v3(book.SpawnTransform.Scale3D) end)
+        if not scale or scale.X == 0 then scale = { X = 1, Y = 1, Z = 1 } end
+        local t = { Translation = loc, Rotation = quat(rot.Pitch, rot.Yaw, rot.Roll), Scale3D = scale }
+        pcall(function()
+            local mgr = FindFirstOf("BP_HISM_Manager_C")
+            mgr.HISMArray[aidx + 1]:UpdateInstanceTransform(ch, t, true, true, true)
+        end)
+        local st = IA._book_inst_state and IA._book_inst_state[aidx .. "|" .. ch]
+        if st then st.orig, st.hidden = t, false end
+    end
+    return true
+end
+
+--- Lay a book flat on the floor under (x, y): the surface found by a trace down from from_z, or
+--- fallback_z when the trace cannot be read. Actor and pile instance together. Returns ok, floor z.
+function M.place_flat(IA, book, x, y, from_z, fallback_z)
+    local dims = book_dims(book) or { X = 48, Y = 30, Z = 12 }
+    local pitch, roll, thick = 0, 0, dims.Z
+    if dims.X <= dims.Y and dims.X <= dims.Z then pitch, thick = 90, dims.X
+    elseif dims.Y <= dims.X and dims.Y <= dims.Z then roll, thick = 90, dims.Y end
+    local gz = ground_z(book, x, y, from_z, from_z - 600)
+    if not gz or gz > from_z - 20 then gz = fallback_z end
+    local yaw = 0
+    pcall(function() yaw = book:K2_GetActorRotation().Yaw or 0 end)
+    local ok = M.set_pose(IA, book, { X = x, Y = y, Z = gz + thick / 2 + 0.5 },
+                          { Pitch = pitch, Yaw = yaw, Roll = roll })
+    return ok, gz
 end
 
 local function in_slots(case, key)
@@ -558,6 +682,220 @@ function M.redirect_home(IA, book)
     local spot = M.floor_spot(IA, book, e, home)
     if not spot then return nil end
     return M.move(IA, book, spot, "sent home")
+end
+
+--- For Shelf Spill: a book that has just left a slot of `case` goes to the floor in front of that
+--- case. Unlike on_unward it does not ask whether the book reads as resting on the case (a wide
+--- cabinet's pieces do not box its shelves, and a bottom-shelf book sits within OFF_FLOOR of the
+--- case floor): the case is known. Out the front first, then the other face. Returns true on a move,
+--- else false and why.
+--- A straight line through world geometry (static and movable), ignoring the book: true when it
+--- hits something, false when clear, nil when the trace cannot be read (counted as not clear).
+line_hits = function(book, from, to)
+    local ksl
+    pcall(function() ksl = StaticFindObject(KSL_PATH) end)
+    if not (ksl and ksl:IsValid()) then return true end
+    local hit, got = {}, nil
+    local black = { R = 0, G = 0, B = 0, A = 0 }
+    local ok = pcall(function()
+        got = ksl:LineTraceSingleForObjects(book, from, to, { 0, 1 }, false, { book }, 0, hit, true, black, black, 0)
+    end)
+    if not ok then return true end
+    return got == true
+end
+
+--- The floor under the player: their capsule's bottom. nil when it cannot be read.
+player_floor = function()
+    local z
+    pcall(function()
+        local p = FindFirstOf("BP_LibrarianCharacter_C")
+        if not (p and p:IsValid()) then return end
+        local l = p:K2_GetActorLocation()
+        local hh = 90
+        pcall(function() hh = p.CapsuleComponent:GetScaledCapsuleHalfHeight() end)
+        z = l.Z - hh
+    end)
+    return z
+end
+
+--- Whether off_case would find this book a floor, asked while it is still in its slot: nothing is
+--- moved, logged or counted. A book with no floor is then never taken off its shelf at all.
+function M.can_land(IA, book, case)
+    local ok, moved = pcall(M.off_case, IA, book, case, nil, true)
+    return ok and moved == true
+end
+
+function M.off_case(IA, book, case, from, dry)
+    if not dry then M.still(book) end
+    local ck
+    pcall(function() ck = case:GetFullName() end)
+    local e
+    for _, c in ipairs(cases(IA)) do
+        local k
+        pcall(function() k = c.case:GetFullName() end)
+        if k and k == ck then e = c; break end
+    end
+    if not e then return false, "bookcase not read" end
+    -- where the book stood in its slot, read before it left: once out, the game may already be
+    -- carrying it somewhere
+    local here = from
+    if not here then pcall(function() here = v3(book:K2_GetActorLocation()) end) end
+    if not here or (here.X == 0 and here.Y == 0 and here.Z == 0) then return false, "book position unreadable" end
+    local why
+    -- Where a spilled book may land, in order:
+    --   the floor the case stands on, traced down from the book's height (an ordinary shelf);
+    --   the same floor traced from just over the case's base, with the way out from the face open
+    --     at knee height: the 1D cabinet stands two storeys high and its top shelves face a gallery
+    --     450 over its base, so a book off them falls past it to the floor below;
+    --   that upper floor itself, only while the player is standing on it (their own floor within
+    --     PLAYER_LEVEL of it): it may be a level the player has not reached, and a book left there
+    --     could not be fetched.
+    local function try(side, floor_z, low)
+        local f = e.front or 1
+        local es = setmetatable({ front = f * side, floor_z = floor_z, low_start = low }, { __index = e })
+        local spot, w = M.floor_spot(IA, book, es, here)
+        local upper
+        if spot then
+            spot.spread = true
+            spot.dry = dry
+            if floor_z then spot.need_flat = UPPER_FLAT end
+            if M.move(IA, book, spot, "spilled") then
+                if not dry and M.last_pose then M.pin(IA, book, M.last_pose.loc, M.last_pose.rot) end
+                return true
+            end
+            w = "no bare floor"
+            upper = M.last_first_z
+        end
+        why = (why and (why .. "; ") or "") .. ((side == 1) and "front" or "back")
+            .. (floor_z and (" at %.0f up"):format(floor_z - e.floor_z) or "") .. (low and " from below" or "")
+            .. ": " .. tostring(w)
+        return false, upper
+    end
+    local uppers = {}
+    for _, side in ipairs({ 1, -1 }) do
+        local ok, up = try(side, nil, false)
+        if ok then return true end
+        if up and up > e.floor_z + GROUND_ABOVE_MAX and up < here.Z and here.Z - up <= UPPER_REACH then
+            uppers[#uppers + 1] = { side = side, z = up }
+        end
+    end
+    if here.Z > e.floor_z + LOW_START then
+        for _, side in ipairs({ 1, -1 }) do
+            if try(side, nil, true) then return true end
+        end
+    end
+    local pf = player_floor()
+    for _, u in ipairs(uppers) do
+        if pf and math.abs(pf - u.z) <= PLAYER_LEVEL then
+            if try(u.side, u.z, false) then return true end
+        else
+            why = why .. ("; not the gallery %.0f up: the player is not on it"):format(u.z - e.floor_z)
+        end
+    end
+    return false, why
+end
+
+-- ----------------------------------------------------------------------------
+-- Holding a laid book still
+-- ----------------------------------------------------------------------------
+-- The game goes on moving a book after it leaves a slot: books Scramble Shelf had put on a shelf
+-- were measured flying back to it (220 up, inside the face) or across the room (826 away) a moment
+-- after they were laid on the floor. Its movement timelines are stopped before it is laid, and for
+-- PIN_TICKS after, a book that moved is put back where it was laid. The hold lets go as soon as the
+-- book is the player's again: owned (in the hands), on a shelf, flying to one (a skill or the
+-- player's placing, started after the lay), or the player standing on or against it.
+local MOTIONS = { "CloseUp", "GoToPath", "BezierCurveMove", "ToCenterPoint", "RotateFromCenter", "ToBookCase" }
+local PIN_TICKS = 32          -- ticks of the shelf traps' clock (a quarter second each): 8 s
+local PIN_SLACK = 1.5         -- moved further than this, it is put back
+local PIN_CLOSE = 45.0        -- the player this close: whatever moves it is the player's doing
+M.pins = {}                   -- book full name -> { book, loc, rot, left, moved, maxd, epoch }
+
+--- Stop the game's own motion of a book and turn its physics off. Returns the motions that were running.
+function M.still(book)
+    local stopped = {}
+    for _, n in ipairs(MOTIONS) do
+        pcall(function()
+            local tl = book[n]
+            if tl and tl:IsValid() then
+                if tl:IsPlaying() then stopped[#stopped + 1] = n end
+                tl:Stop()
+            end
+        end)
+    end
+    pcall(function() book:SetSimulate(false) end)
+    return stopped
+end
+
+--- Hold a book where it was just laid (loc, rot) for PIN_TICKS.
+function M.pin(IA, book, loc, rot)
+    local key
+    pcall(function() key = book:GetFullName() end)
+    M.pins[key or tostring(book)] = { book = book, loc = { X = loc.X, Y = loc.Y, Z = loc.Z },
+        rot = { Pitch = rot.Pitch, Yaw = rot.Yaw, Roll = rot.Roll }, left = PIN_TICKS, moved = 0, maxd = 0,
+        epoch = IA._world_epoch or 0 }
+end
+
+--- Whether a held book is the player's again, and why; nil while it is still held.
+local function pin_released(IA, pin, p)
+    local b = pin.book
+    if (IA._world_epoch or 0) ~= pin.epoch or not (b and b:IsValid()) then return "gone" end
+    local owned, attached = false, false
+    pcall(function() owned = b.OwningCharacter ~= nil and b.OwningCharacter:IsValid() end)
+    if owned then return "picked up" end
+    pcall(function() attached = b.AttachedActor ~= nil and b.AttachedActor:IsValid() end)
+    if attached then return "on a shelf" end
+    for _, n in ipairs({ "BezierCurveMove", "ToBookCase" }) do
+        local on = false
+        pcall(function() on = b[n]:IsPlaying() == true end)
+        if on then return "flying to a shelf" end
+    end
+    if p then
+        local close = false
+        pcall(function()
+            local a, c = p:K2_GetActorLocation(), b:K2_GetActorLocation()
+            close = math.sqrt((a.X - c.X) ^ 2 + (a.Y - c.Y) ^ 2) < PIN_CLOSE
+        end)
+        if close then return "the player is at it" end
+    end
+    return nil
+end
+
+--- One tick of every hold: a book that moved goes back where it was laid. p: the player, or nil.
+--- Returns how many holds are still running.
+function M.pin_tick(IA, p)
+    local n = 0
+    for k, pin in pairs(M.pins) do
+        local why = pin_released(IA, pin, p)
+        if not why then
+            local b, l = pin.book, nil
+            pcall(function() l = v3(b:K2_GetActorLocation()) end)
+            local sim = false
+            pcall(function() sim = b:IsSimulatePhysics() == true end)
+            if l then
+                local d = math.sqrt((l.X - pin.loc.X) ^ 2 + (l.Y - pin.loc.Y) ^ 2 + (l.Z - pin.loc.Z) ^ 2)
+                if d > PIN_SLACK or sim then
+                    local ran = M.still(b)
+                    M.set_pose(IA, b, pin.loc, pin.rot)
+                    pin.moved = pin.moved + 1
+                    if d > pin.maxd then pin.maxd = d end
+                    if #ran > 0 then pin.ran = table.concat(ran, ",") end
+                end
+            end
+        end
+        pin.left = pin.left - 1
+        if why or pin.left <= 0 then
+            M.pins[k] = nil
+            if pin.moved > 0 or (why and why ~= "gone") then
+                log(("hold: %s moved %d time(s), up to %.0f away, put back each time%s%s"):format(
+                    (select(1, book_name(IA, pin.book))), pin.moved, pin.maxd,
+                    pin.ran and ("; the game was running " .. pin.ran) or "",
+                    why and ("; let go: " .. why) or ""))
+            end
+        else
+            n = n + 1
+        end
+    end
+    return n
 end
 
 function M.summary()

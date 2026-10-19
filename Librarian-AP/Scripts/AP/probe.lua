@@ -883,7 +883,7 @@ local function probe_skill_timers()
             local name, klass, prog = cls[1], cls[2], cls[3]
             P(("[F12] %s: level=%s mastery=%s fatigue=%s left=%ss"):format(
                 name, tostring(ac[prog] or 0), tostring(rc[name .. " Mastery"] or 0),
-                tostring(rc["Fatigue: " .. name] or 0), tostring(math.floor(fa[name] or 0))))
+                tostring(rc[name .. " Fatigue Trap"] or 0), tostring(math.floor(fa[name] or 0))))
             local sk = FindFirstOf(klass)
             if sk and sk:IsValid() then
                 local _, cd = dump_num_array(sk, "CoolDownTimePreLevel")

@@ -68,7 +68,7 @@ from .Locations import (
     _book_completion_locations,
     _goal_locations,
 )
-from .Options import LibrarianOptions, LibrarianSettings, option_groups
+from .Options import TRAPS_BUILT, LibrarianOptions, LibrarianSettings, option_groups
 
 # Item names used as constants below (avoids typos)
 ITEM_PROG_SERIES  = "Progressive Series Unlock"
@@ -94,7 +94,7 @@ _SKILL_NAMES = ("Sort", "Shelf Guide", "Insight", "Auto-Shelving", "Assemble")
 
 def _trap_names() -> list:
     """Fatigue items, the only trap category. First to be dropped when the pool overshoots."""
-    return [f"Fatigue: {n}" for n in _SKILL_NAMES]
+    return [f"{n} Fatigue Trap" for n in _SKILL_NAMES]
 
 
 def _mastery_names() -> list:
@@ -104,14 +104,13 @@ def _mastery_names() -> list:
 
 
 def _buffs_traps_quantities() -> dict:
-    """{item_name: qty} for the buff/trap items every mode adds: Skill Mastery (useful), Fatigue
-    (trap), and Book Capacity (useful). Every skill gets its full 5-item Mastery set -- the pool now
-    keeps all Major Magic so each skill maxes, and the client treats Mastery as extra skill levels
-    past the native max. Fatigue (bites at any level) and the bag items always go in too."""
+    """{item_name: qty} for the buff items every mode adds: Skill Mastery and Book Capacity (both
+    useful). Every skill gets its full 5-item Mastery set -- the pool now keeps all Major Magic so
+    each skill maxes, and the client treats Mastery as extra skill levels past the native max.
+    Traps are not here: they are made from filler afterwards (_convert_traps)."""
     q: dict = {}
     for name in _SKILL_NAMES:
         q[f"{name} Mastery"] = 5
-        q[f"Fatigue: {name}"] = 2
     q["+2 Book Capacity"] = 8
     q["+3 Book Capacity"] = 3
     return q
@@ -318,7 +317,7 @@ class LibrarianWorld(World):
         for name in _SKILL_NAMES:
             if name in keep:
                 continue
-            for item in (f"Progressive {name}", f"{name} Mastery", f"Fatigue: {name}"):
+            for item in (f"Progressive {name}", f"{name} Mastery", f"{name} Fatigue Trap"):
                 quantities.pop(item, None)
         if self.options.vanilla_caps:
             for name in _SKILL_NAMES:
@@ -804,6 +803,11 @@ class LibrarianWorld(World):
     def generate_early(self) -> None:
         rng = self.random
         self._validate_modes()
+        for _kind, _w in self.options.trap_weights.value.items():
+            if _w > 0 and _kind not in TRAPS_BUILT:
+                raise OptionError(
+                    f"Librarian - '{self.player_name}': trap_weights {_kind} is not available "
+                    f"yet. Set it to 0.")
         # How many books each series unlock is worth. Series hold 3, 5 or 10 volumes, so a
         # book count cannot be derived from a row count -- collect/remove carries this sum
         # the same way it carries the row count.
@@ -1343,6 +1347,43 @@ class LibrarianWorld(World):
     # ------------------------------------------------------------------
 
     def create_items(self) -> None:
+        self._create_items_pool()
+        self._convert_traps()
+
+    def _convert_traps(self) -> None:
+        """Turn trap_percentage of this player's filler into traps, drawn by trap_weights.
+
+        Runs on the finished pool, after every mode's builder has padded it with filler, so it
+        cannot disturb the overshoot guards or any count the logic reads. Traps are the trap
+        classification and never progression."""
+        pct = self.options.trap_percentage.value
+        weights = {k: int(v) for k, v in self.options.trap_weights.value.items()
+                   if int(v) > 0}
+        if pct <= 0 or not weights:
+            return
+        skills = list(self.enabled_skills)
+        if not skills:
+            weights.pop("Fatigue", None)
+        if not weights:
+            return
+        kinds = sorted(weights)
+        pool = self.multiworld.itempool
+        filler_idx = [i for i, it in enumerate(pool)
+                      if it.player == self.player
+                      and it.classification == ItemClassification.filler]
+        n = min(len(filler_idx), round(len(filler_idx) * pct / 100))
+        if n <= 0:
+            return
+        picks = self.random.sample(filler_idx, n)
+        kind_picks = self.random.choices(kinds, weights=[weights[k] for k in kinds], k=n)
+        for i, kind in zip(picks, kind_picks):
+            name = (f"{self.random.choice(skills)} Fatigue Trap" if kind == "Fatigue"
+                    else f"{kind} Trap")
+            pool[i] = self.create_item(name)
+        print(f"[Librarian - '{self.player_name}'] {n} of {len(filler_idx)} filler items "
+              f"became traps.")
+
+    def _create_items_pool(self) -> None:
         if self.random_bundle:
             self._create_items_bundle()
             return

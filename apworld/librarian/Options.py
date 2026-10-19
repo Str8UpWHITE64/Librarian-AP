@@ -9,7 +9,7 @@ options page lay out from, so the class order here follows it.
 from dataclasses import dataclass
 from typing import Union
 
-from Options import (Choice, Range, Toggle, DefaultOnToggle, OptionGroup,
+from Options import (Choice, OptionCounter, Range, Toggle, DefaultOnToggle, OptionGroup,
                      OptionSet, PerGameCommonOptions)
 from settings import Bool, Group
 
@@ -282,7 +282,7 @@ class VanillaCaps(Toggle):
     skill can go up to five steps past its normal maximum through Mastery items (shorter cooldowns,
     longer effects), and Book Capacity items let you carry up to 40 books instead of the game's 15.
     On: there are no Mastery or Book Capacity items. Skills top out where the base game's do
-    and you carry at most 15 books. Their places go to filler; Fatigue traps stay."""
+    and you carry at most 15 books. Their places go to filler."""
     display_name = "Vanilla Caps"
 
 
@@ -327,6 +327,55 @@ class OnlyUnwardShelfableBooks(DefaultOnToggle):
     display_name = "Only Unward Shelfable Books"
 
 
+# --------------------------------------------------------------------------
+# Traps
+# --------------------------------------------------------------------------
+
+# Every trap kind a weight can name. "Fatigue" stands for the five per-skill Fatigue items.
+TRAP_KINDS = ("Fatigue", "Floor Shuffle", "Veil", "Butterfingers", "Scramble Shelf", "Shelf Spill")
+# The kinds the client can run today. A weight above 0 on any other kind is refused at
+# generation rather than turned into an item that does nothing; add a kind here when its
+# client handler lands.
+TRAPS_BUILT = ("Fatigue", "Floor Shuffle", "Veil", "Butterfingers", "Scramble Shelf", "Shelf Spill")
+# Default weights. The shelf traps undo real shelving work, so they come half as often as the others.
+TRAP_DEFAULT_WEIGHTS = {"Fatigue": 2, "Floor Shuffle": 2, "Veil": 2, "Butterfingers": 2,
+                        "Scramble Shelf": 1, "Shelf Spill": 1}
+
+
+class TrapPercentage(Range):
+    """Share of your filler items that become traps, as a percentage.
+
+    0 means no traps at all; the default is 10. Traps only ever replace filler, never anything
+    a check or the goal depends on, and every one of them is temporary: nothing a trap does
+    is saved into your game. Which traps appear is set by trap_weights."""
+    display_name = "Trap Percentage"
+    range_start = 0
+    range_end = 100
+    default = 10
+
+
+class TrapWeights(OptionCounter):
+    """How likely each trap is when a filler item becomes a trap. A weight of 0 turns that
+    trap off. The names below are the option keys; the items in the multiworld are called, for
+    example, Floor Shuffle Trap, or Sort Fatigue Trap for the Sort skill.
+
+    Fatigue: one skill recovers slowly for two minutes.
+    Floor Shuffle: the loose books on the floor swap places.
+    Veil: the loose books you can pick up are hidden for 30 seconds, then come back.
+    Butterfingers: some of the books in your hands (one up to all) fall beside you.
+    Scramble Shelf: a few books of a row you have not finished trade places.
+    Shelf Spill: a few books of a row you have not finished fall out onto the floor in front of
+    their bookcase.
+    The two shelf traps never touch a finished row, so a row you completed, and its check, stay
+    done.
+    By default the shelf traps have weight 1 and the others 2, so each shelf trap comes about
+    half as often as each of the others."""
+    display_name = "Trap Weights"
+    valid_keys = TRAP_KINDS
+    min = 0
+    default = {kind: (TRAP_DEFAULT_WEIGHTS.get(kind, 0) if kind in TRAPS_BUILT else 0) for kind in TRAP_KINDS}
+
+
 @dataclass
 class LibrarianOptions(PerGameCommonOptions):
     goal: Goal
@@ -348,6 +397,8 @@ class LibrarianOptions(PerGameCommonOptions):
     local_filler: LocalFiller
     book_visibility: BookVisibility
     only_unward_shelfable_books: OnlyUnwardShelfableBooks
+    trap_percentage: TrapPercentage
+    trap_weights: TrapWeights
 
 
 class LibrarianSettings(Group):
@@ -391,6 +442,10 @@ option_groups = [
     OptionGroup(
         "Item Pool",
         [MagicSkillsEnabled, VanillaCaps, LocalFiller],
+    ),
+    OptionGroup(
+        "Traps",
+        [TrapPercentage, TrapWeights],
     ),
     OptionGroup(
         "The Library",
