@@ -690,8 +690,8 @@ Player2". Older item names without "Trap" still work too.
 | `Floor Shuffle` | The loose books lying on the floor swap places with each other. |
 | `Veil` | The loose books you could pick up are hidden for 30 seconds, then come back. |
 | `Butterfingers` | Some of the books in your hands, from one up to all of them, fall to the floor beside you in a pile. |
-| `Scramble Shelf` | A few books in a row you have not finished trade places. |
-| `Shelf Spill` | A few books in a row you have not finished fall out onto the floor in front of their bookcase. |
+| `Scramble Shelf` | A few books in a row you have not finished trade places. A notice names the bookcase and row. |
+| `Shelf Spill` | A few books in a row you have not finished fall out onto the floor in front of their bookcase. A notice names the bookcase and row. |
 
 The two shelf traps never touch a finished row, so a row you completed, and the
 check it gave, stay done. They have half the default weight of the others

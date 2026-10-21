@@ -1159,6 +1159,19 @@ local function run_label(IA, sid, row, aidx)
     return ("%s cabinet, %s"):format(tostring(sid), sname and ("'" .. sname .. "'") or "a series")
 end
 
+--- A HUD line for the player. Shelf traps say where they acted, in the same words as the
+--- out-of-order row notice: the bookcase name, and a row counted from 1 (the log counts from 0).
+local function hud(text)
+    local H = package.loaded["AP/HUD"]
+    if H and H.notify then pcall(H.notify, text, 12.0) end
+end
+
+local function where_text(IA, job)
+    if job.row then return ("bookcase %s, row %d"):format(tostring(job.sid), job.row + 1) end
+    local label = tostring(job.label or job.sid or "a bookcase")
+    return "bookcase " .. label
+end
+
 local function shelfdrop()
     local SD = package.loaded["AP/ShelfDrop"]
     if not SD then
@@ -1301,6 +1314,7 @@ local function spill_step(IA, job)
         log(("Shelf Spill: %d books off %s onto the floor (%d put back, %d left; %.0f from the player)"):format(
             floor, tostring(job.label), back, stuck, job.dist or 0))
         if floor == 0 then return "done", "no book reached the floor" end
+        hud(("Shelf Spill: %d book%s fell off %s"):format(floor, floor == 1 and "" or "s", where_text(IA, job)))
         job.phase, job.vt = "hold", HOLD_TICKS
         return nil
     end
@@ -1502,7 +1516,10 @@ local function scramble_step(IA, job)
             log(("Scramble Shelf: the finished rows on %s went from %d to %d"):format(
                 tostring(job.label), job.fin, finished_count(case)))
         end
-        if n >= 2 then return "done" end
+        if n >= 2 then
+            hud(("Scramble Shelf: %d books on %s are out of order"):format(n, where_text(IA, job)))
+            return "done"
+        end
         return "done", "fewer than two books moved"
     end
     return "done", "bad phase"
@@ -1521,6 +1538,11 @@ local function shelf_tick(IA)
         if why then
             M.stats.dropped = M.stats.dropped + 1
             log(("%s dropped (idx=%s): %s"):format(job.kind, tostring(job.index), why))
+            if why == "player is carrying books" then
+                hud(job.kind .. " skipped: you were carrying books")
+            elseif why ~= "the world reloaded" and why ~= "goal reached" then
+                hud(job.kind .. " skipped: nothing on the shelves for it to move")
+            end
         end
     end
     if (IA._world_epoch or 0) ~= job.epoch then
