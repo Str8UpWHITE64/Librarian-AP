@@ -27,8 +27,8 @@ local KNEE = 20.0             -- the way out from the face is tested this far ov
 local PLAYER_LEVEL = 10.0     -- the player stands on a floor when their own floor is within this of it
 local line_hits, player_floor -- set further down, beside off_case
 local SPREAD = 45.0           -- Shelf Spill: books lie at least this far apart where the floor allows.
-                              -- Two spilled books stacked on a third were measured back on their
-                              -- shelf moments later (LB-22: 220 up, 7 units inside the face)
+                              -- Spilled books stacked on each other can be carried back up onto
+                              -- their shelf by the game's own book motion moments later.
 local NAMED_PARTS = { "StaticMesh", "SM_M01_BookCabinet_03", "SM_M01_CabinetWall_02" }
 local KSL_PATH = "/Script/Engine.Default__KismetSystemLibrary"
 local SMC_PATH = "/Script/Engine.StaticMeshComponent"

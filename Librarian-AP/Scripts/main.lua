@@ -1307,7 +1307,7 @@ local function try_register_magic_hooks()
         -- ConfirmLeave is the commit: the player has chosen to finish and the cutscene is
         -- starting. That is the moment the run is really over, so the goal hangs off it.
         -- The door refuses until every book has an AttachedActor (CanBeFinish), and otherwise
-        -- offers to leave even with rows unfinished. Our ward anchors pass that test for locked
+        -- offers to leave even with rows unfinished. The mod's ward anchors pass that test for locked
         -- books, so before the AP goal door_hold makes it fail again.
         --
         -- ConfirmLeave, though, starts the ending whatever the game thinks. So the player's
