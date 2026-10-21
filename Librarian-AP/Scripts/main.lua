@@ -681,9 +681,9 @@ local function _bh_grab_check(b, tag)
         or (type(opacity) == "number" and opacity < 1.0)
         or (type(scalex) == "number" and scalex < 0.01)
         or (meshz_off > 1000.0)
-    -- Dump full state for the first 100 grabs (baseline) AND any broken-looking grab beyond that
+    -- Dump full state for the first 5 grabs (baseline) AND any broken-looking grab beyond that
     -- (bounded), so an intermittent invisible book is captured long after the baseline cap.
-    local dump = (tag == "SCAN") or (_bh.grab_samples < 100) or (looks_broken and (_bh.broken_dumps or 0) < 60)
+    local dump = (tag == "SCAN") or (_bh.grab_samples < 5) or (looks_broken and (_bh.broken_dumps or 0) < 60)
     if dump then
         if looks_broken then
             _bh.broken_dumps = (_bh.broken_dumps or 0) + 1
@@ -1152,7 +1152,7 @@ end
 -- the file and perturb the thing it is measuring.
 local _magic_trace_n = 0
 local function _magic_trace(what, detail)
-    if _magic_trace_n >= 60 then return end
+    if _magic_trace_n >= 10 then return end
     _magic_trace_n = _magic_trace_n + 1
     log(("[magic] %s%s"):format(tostring(what), detail and (" -- " .. tostring(detail)) or ""))
 end
@@ -1161,7 +1161,7 @@ end
 --- Assemble is whether a book the run has not earned can end up here: from the bag it can be
 --- shelved, and shelving is what fires row-completion checks.
 local function _magic_bag_report(when)
-    if _magic_trace_n >= 60 then return end
+    if _magic_trace_n >= 10 then return end
     local total, warded, example = 0, 0, nil
     pcall(function()
         local pawn = FindFirstOf("BP_LibrarianCharacter_C")
@@ -1371,7 +1371,7 @@ local _bh_report_tick = 0
 local function bh_report_periodic()
     if not diag_on("BOOK_EVENT_HOOKS") then return end
     _bh_report_tick = _bh_report_tick + 1
-    if _bh_report_tick % 6 ~= 0 then return end   -- ~every 30s (6 ticks of the 5s loop)
+    if _bh_report_tick % 60 ~= 0 then return end  -- ~every 5 min (60 ticks of the 5s loop)
     -- refresh-grab is reported alongside refresh-sweep: the grab-path redraw rewrites book
     -- materials, and leaving it out of this line hid it while a material-state bug was being
     -- chased through the counters that were printed.
@@ -2158,8 +2158,12 @@ local function update_title_status_text()
     -- Read existing for diagnostics; show what we'd write.
     local current
     pcall(function() current = tv.Text:ToString() end)
-    log(("[title-text] would set Text_Version: '%s' (currently: '%s')"):format(
-        text, tostring(current)))
+    local tsig = tostring(text) .. "|" .. tostring(current)
+    if tsig ~= _bh._title_sig then
+        _bh._title_sig = tsig
+        log(("[title-text] would set Text_Version: '%s' (currently: '%s')"):format(
+            text, tostring(current)))
+    end
 end
 
 -- Via package.loaded so callable before the require() at the bottom resolves (hooks fire later).
@@ -2391,7 +2395,7 @@ local function start_gameplay_loops()
                 end
                 return true
             end
-            if apply_attempts % 4 == 0 then
+            if apply_attempts % 20 == 0 then
                 log(("LoadMap apply-gate waiting: books=%d/%d distinct=%d/%d ticks=%d/%d")
                     :format(n, APPLY_MIN_BOOKS, distinct, APPLY_MIN_DISTINCT,
                             apply_attempts, APPLY_MIN_TICKS))
@@ -2586,9 +2590,6 @@ local function start_gameplay_loops()
         if (IA._dcb_full_scan or IA._dcb_fast) and IA._apply_safe and not IA._flush_in_progress then
             local sent = 0
             pcall(function() sent = IA.detect_correct_books() or 0 end)
-            if sent > 0 then
-                log(("[book-sanity] shelving → %d check(s) sent"):format(sent))
-            end
         end
         -- A full row that is out of order is named on the HUD until it is fixed. Self-gated.
         if diag_on("MISORDER_NOTICE") then pcall(function() IA.pulse_misordered_rows() end) end
@@ -2790,6 +2791,7 @@ local function start_gameplay_loops()
         if dist2 > 100 then  -- ~10 unreal units of movement (sqrt 100)
             log(("[gameplay] First movement detected (Δ=%.1f units) → running baseline sync"):format(
                 math.sqrt(dist2)))
+            IA._state_sig, IA._bundle_sig, IA._apply_sig = nil, nil, nil   -- a new world logs its first State again
             pcall(function() IA.run_baseline_sync() end)
             return true  -- one-shot, exit loop
         end
@@ -3688,7 +3690,11 @@ end)
 
 -- /Script/Engine.GameplayStatics:DoesSaveGameExist(SlotName, UserIndex) → bool
 RegisterHook("/Script/Engine.GameplayStatics:DoesSaveGameExist", function(self, slot_param, _user)
-    log(("[AP][save-probe] GameplayStatics.DoesSaveGameExist SlotName='%s'"):format(fstring_to_str(slot_param)))
+    local sn = fstring_to_str(slot_param)
+    if _bh._probe_exist ~= sn then
+        _bh._probe_exist = sn
+        log(("[AP][save-probe] GameplayStatics.DoesSaveGameExist SlotName='%s'"):format(sn))
+    end
 end)
 
 -- /Script/Librarian.LibrarianGameInstanceBase:SaveGameData(saveSlotNum)
@@ -3857,7 +3863,10 @@ RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:DeleteGameData",
 RegisterHook("/Script/Librarian.LibrarianGameInstanceBase:SaveGameData", function(self, slot_num_param)
     local n = "?"
     pcall(function() n = tostring(slot_num_param:get()) end)
-    log(("[AP][save-probe] GI.SaveGameData(slot=%s)"):format(n))
+    if _bh._probe_save ~= n then
+        _bh._probe_save = n
+        log(("[AP][save-probe] GI.SaveGameData(slot=%s)"):format(n))
+    end
     record_layout_on_save("manual save")
     -- After save, InsertedBookNum is fresh -> re-run the progress sync so book milestones catch
     -- up (safety net if a BP-hook counter missed an event).
@@ -4162,11 +4171,15 @@ _G._librarian_gt_master_tick = function(dt_ms)
         local top = {}
         for k, v in pairs(_perf.blame) do top[#top + 1] = ("%s=%d"):format(k, v) end
         table.sort(top)
+        _perf.quiet = (_perf.quiet or 0) + 1
+        if _perf.b66 + _perf.b100 + _perf.b150 > 0 or _perf.quiet >= 10 then   -- quiet minutes: every 10th
+        _perf.quiet = 0
         log(("[perf] 60s: avg=%.1fms worst=%dms spikes(33/66/100/150ms)=%d/%d/%d/%d lua=%.1fMB (%+.1fMB since start)%s"):format(
             _perf.sum / math.max(1, _perf.cnt), math.floor(_perf.worst),
             _perf.b33, _perf.b66, _perf.b100, _perf.b150,
             kb / 1024, (kb - _perf.kb0) / 1024,
             #top > 0 and ("; spike-steps: " .. table.concat(top, ",")) or ""))
+        end
         _perf.worst, _perf.sum, _perf.cnt = 0, 0, 0
         _perf.b33, _perf.b66, _perf.b100, _perf.b150 = 0, 0, 0, 0
         _perf.blame = {}
@@ -4282,8 +4295,11 @@ _G._librarian_gt_master_tick = function(dt_ms)
         local names, keyn = {}, 0
         for i = 1, #_gt_step_order do names[i] = tostring(_gt_step_order[i]) end
         for _ in pairs(_gt_steps) do keyn = keyn + 1 end
-        log(("[gt-tick] master driver (ticks=%d, steps=%d, keys=%d) order=[%s]"):format(
-            c._gt_tick_count, #_gt_step_order, keyn, table.concat(names, ",")))
+        local sig = ("steps=%d, keys=%d) order=[%s]"):format(#_gt_step_order, keyn, table.concat(names, ","))
+        if sig ~= c._gt_sig then                             -- once, then only if the step list changes
+            c._gt_sig = sig
+            log(("[gt-tick] master driver (ticks=%d, %s"):format(c._gt_tick_count, sig))
+        end
     end
 end
 
@@ -4752,12 +4768,6 @@ local AP_GAME_NAME = "Librarian Tidy Up the Arcane Library"
 ItemApply.load_asset_data()
 
 APClient.on_item = function(it, item_name)
-    log(("[AP] received item: %s (id=%d) from player=%s loc=%s flags=%d"):format(
-        tostring(item_name or "?"),
-        tonumber(it.item) or 0,
-        tostring(it.player),
-        tostring(it.location),
-        tonumber(it.flags) or 0))
 
     -- HUD: classify by sender. player=0 = server (starting items / connect re-dump) -- logged but
     -- no popup (the dump floods the BP notifier); player=us = self-check echo; else = another player.

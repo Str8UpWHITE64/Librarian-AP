@@ -370,7 +370,12 @@ function Client:_register_handlers()
         end
         local total = 0
         for _ in pairs(self._scout_cache) do total = total + 1 end
-        log(("location_info: cached %d entries (total %d)"):format(count, total))
+        self._li_n = (self._li_n or 0) + count                -- one line a minute, not one per scout reply
+        if os.time() - (self._li_t or 0) >= 60 then
+            self._li_t = os.time()
+            log(("location_info: cached %d entries (total %d)"):format(self._li_n, total))
+            self._li_n = 0
+        end
     end)
 end
 

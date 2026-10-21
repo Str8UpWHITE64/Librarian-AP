@@ -698,6 +698,7 @@ function M.set_gameplay_active(state)
     state = state and true or false
     if M._gameplay_active == state then return end
     M._gameplay_active = state
+    M._state_sig, M._bundle_sig, M._apply_sig = nil, nil, nil
     log(("Gameplay-active: %s"):format(tostring(state)))
 
     if not state then
@@ -789,6 +790,7 @@ end
 function M.apply_item(name)
     if not name then return end
     M._received_counts[name] = (M._received_counts[name] or 0) + 1
+    M._state_sig, M._apply_sig = nil, nil   -- the State line after a received item always prints
     M._last_item_apply_tick = M._last_item_apply_tick + 1
 
     -- Skill items: grant immediately (no slot_data / asset_data dependency).
@@ -1127,8 +1129,12 @@ function M._recompute_state()
         end
         local nb = 0
         for _ in pairs(books_unlocked) do nb = nb + 1 end
-        log(("[bundle] %d bundle(s) x %d -> %d of %d books unlocked%s"):format(
-            held, per, nb, #order, numbered and " (numbered)" or ""))
+        local bsig = ("%d bundle(s) x %d -> %d of %d books unlocked%s"):format(
+            held, per, nb, #order, numbered and " (numbered)" or "")
+        if bsig ~= M._bundle_sig then                         -- only when the count moves
+            M._bundle_sig = bsig
+            log("[bundle] " .. bsig)
+        end
     end
 
     -- Publish atomically (single reference assignment each), tables first so the snapshot below is
@@ -1520,6 +1526,7 @@ function M.reset_hism_state()
     -- the OLD world's refs (notably layer 3's HISM array) re-checks this and bails instead
     -- of dereferencing freed memory — the LoadMap-teardown use-after-free (a native AV).
     M._world_epoch = (M._world_epoch or 0) + 1
+    M._state_sig, M._bundle_sig, M._apply_sig = nil, nil, nil   -- the first State line of every world prints
     M._cnt_cases, M._cnt_by_case, M._cnt_hot, M._cnt_verdicts, M._cnt_lap_done, M._count_total = nil, nil, nil, nil, false, nil   -- a new world starts over
     M._mis_flagged = nil
     M._cnt_wrong, M._cnt_wrong_seen, M._cnt_wrong_said = nil, nil, nil
@@ -1695,8 +1702,12 @@ function M._apply_books_to_world()
             end
         end
         if distinct < 2 then
-            log(("(books spawned but ItemInfo not populated: %d distinct AssetIdx in sample of %d; deferring)"):format(
-                distinct, math.min(20, n)))
+            local isig = ("%d/%d"):format(distinct, math.min(20, n))
+            if isig ~= M._ii_sig then                         -- once per distinct reading
+                M._ii_sig = isig
+                log(("(books spawned but ItemInfo not populated: %d distinct AssetIdx in sample of %d; deferring)"):format(
+                    distinct, math.min(20, n)))
+            end
             return
         end
     end
@@ -1918,7 +1929,12 @@ function M._apply_books_to_world()
     -- Finalizer after the last chunk: diff log, state summary, in-progress/pending bookkeeping.
     local function _finalize_apply()
         M._finalize_apply_books(books, n, stats, series_snap, shelves_snap, last_applied_snap)
-        if (stats.tp_hide or 0) + (stats.tp_show or 0) > 0 then
+        M._tp_hid = (M._tp_hid or 0) + (stats.tp_hide or 0)
+        M._tp_rest = (M._tp_rest or 0) + (stats.tp_show or 0)
+        if (M._tp_hid + M._tp_rest) > 0 and os.time() - (M._tp_t or 0) >= 60 then
+            M._tp_t = os.time()
+            stats.tp_hide, stats.tp_show = M._tp_hid, M._tp_rest
+            M._tp_hid, M._tp_rest = 0, 0
             log(("[book-pile] instances teleported: hid=%d restored=%d (tracked=%d)"):format(
                 stats.tp_hide or 0, stats.tp_show or 0, (function() local c = 0; for _ in pairs(M._book_inst_state) do c = c + 1 end; return c end)()))
         end
@@ -2067,8 +2083,12 @@ function M._finalize_apply_books(books, n, stats, series_snap, shelves_snap, las
     end
     local series_n = 0
     for _ in pairs(series_snap) do series_n = series_n + 1 end
-    log(("State: sections-active=%d series=%d | applied: unwarded=%d warded=%d skipped=%d gate-skipped-unwards=%d"):format(
-        section_n, series_n, stats.unwarded, stats.warded, stats.skipped, stats.gate_skipped_unwards))
+    local ssig = ("sections-active=%d series=%d | applied: unwarded=%d warded=%d skipped=%d gate-skipped-unwards=%d"):format(
+        section_n, series_n, stats.unwarded, stats.warded, stats.skipped, stats.gate_skipped_unwards)
+    if ssig ~= M._state_sig then                              -- only when it changes (reset at first movement)
+        M._state_sig = ssig
+        log("State: " .. ssig)
+    end
     -- Per-book modes: what the rule says should be unwarded against the books the walk reached.
     -- A difference names the books, so a book that stays hidden is a line in the log rather
     -- than a search of the library.
@@ -2083,9 +2103,14 @@ function M._finalize_apply_books(books, n, stats, series_snap, shelves_snap, las
                 if not stats.seen[bid] and #missing < 6 then missing[#missing + 1] = bid end
             end
         end
-        if expected ~= reached then
+        local asig = expected .. "/" .. reached
+        if expected == reached then asig = nil end
+        if asig ~= M._apply_sig then
+            M._apply_sig = asig
+            if asig then
             log(("[apply] %d book(s) should be unwarded, the walk reached %d; not reached: %s%s"):format(
                 expected, reached, table.concat(missing, ", "), (expected - reached) > #missing and ", ..." or ""))
+            end
         end
     end
 end
@@ -3307,9 +3332,6 @@ function M.detect_correct_books()
             M._dcb_fast = false                                  -- back to the rolling backstop
         end
     end
-    if sent > 0 then
-        log(("[book-correct] sent %d new book check(s)"):format(sent))
-    end
     -- Thresholds ride the same sweep that counts the books: shelving is what moves the count, and
     -- waiting for the row hub would leave them unfired until a whole row happened to close.
     pcall(function() M.fire_book_completion_checks() end)
@@ -3455,8 +3477,9 @@ function M.pulse_misordered_rows()
     end
     M._mis_flagged = now
     M._mis_laps = (M._mis_laps or 0) + 1
-    if M._mis_laps <= 3 or M._mis_laps % 150 == 0 then
-        local nf = 0; for _ in pairs(now) do nf = nf + 1 end
+    local nf = 0; for _ in pairs(now) do nf = nf + 1 end
+    if M._mis_laps == 1 or nf ~= M._mis_nf then
+        M._mis_nf = nf
         log(("[misorder] lap %d: %d cases, %d row(s) out of order"):format(M._mis_laps, #cases, nf))
     end
     M._mis_found = {}
