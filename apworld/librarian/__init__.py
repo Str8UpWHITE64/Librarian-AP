@@ -945,7 +945,12 @@ class LibrarianWorld(World):
             # the player cannot open yet: sphere 0 ends up with nowhere to put anything
             # and the fill has no reachable spot for its first item. Everything after the
             # opening stretch stays in shuffled order, so the mode is still library-wide.
-            start = {self.starting_section, self.starting_section_b} - {None}
+            # With every bookcase open from the start, any book is shelvable at once, so
+            # the order stays a plain library-wide shuffle.
+            if self.bookcase_unlocks == self.options.bookcase_unlocks.option_unlocked:
+                start = set()
+            else:
+                start = {self.starting_section, self.starting_section_b} - {None}
             self.book_order = ([b for sid, b in shuffled if sid in start]
                                + [b for sid, b in shuffled if sid not in start])
             if self.check_by_series:
