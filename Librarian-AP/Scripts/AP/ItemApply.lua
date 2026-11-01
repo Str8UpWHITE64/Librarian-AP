@@ -1557,6 +1557,7 @@ function M.reset_hism_state()
     M._bag_gate_logged = nil
     M._bag_orphans_done = false  -- the surplus is re-orphaned by every load, so re-check each world
     M._unmapped_warded_books = {}
+    M._books_retry_at = nil
     M._last_applied_series_unlocked = {}
     M._case_last_applied_hidden = {}
     -- WardCover actors are destroyed on reload; drop dangling refs (next apply re-spawns).
@@ -1707,6 +1708,17 @@ function M._apply_books_to_world()
                 M._ii_sig = isig
                 log(("(books spawned but ItemInfo not populated: %d distinct AssetIdx in sample of %d; deferring)"):format(
                     distinct, math.min(20, n)))
+            end
+            -- Nothing else re-fires the pass until the next item, so poll for population.
+            if M._poll_on_game_thread then
+                M._books_retry_at = os.time() + 2
+            elseif not M._books_retry_async then
+                M._books_retry_async = true
+                LoopAsync(2000, function()
+                    M._books_retry_async = false
+                    M.flush_apply()
+                    return true
+                end)
             end
             return
         end

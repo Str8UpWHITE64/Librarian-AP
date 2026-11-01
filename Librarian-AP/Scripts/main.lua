@@ -4299,8 +4299,10 @@ _G._librarian_gt_master_tick = function(dt_ms)
             if IA._l1_resume then pcall(IA._l1_resume) end   -- one L1 warding chunk / frame
             if _l3_resume then pcall(_l3_resume) end          -- one L3 book-pile HISM chunk / frame
         end
-        if IA._flush_reflush_pending then                    -- L1 finalizer re-fire (no marshal to nest now)
+        if IA._flush_reflush_pending
+                or (IA._books_retry_at and os.time() >= IA._books_retry_at) then   -- L1 finalizer re-fire / book-population retry
             IA._flush_reflush_pending = false
+            IA._books_retry_at = nil
             pcall(function() IA.flush_apply() end)
         end
     end
