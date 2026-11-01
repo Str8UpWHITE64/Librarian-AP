@@ -7,9 +7,10 @@ local MOD = "LibrarianAP"
 local function log(msg)
     print(("[%s] %s\n"):format(MOD, tostring(msg)))
 end
--- One log file per launch under Mods/Librarian-AP/logs/, mirrored from print, before anything
--- else prints. UE4SS.log itself is rewritten by UE4SS on every start.
+-- One log file per launch under Mods/Librarian-AP/logs/ (AP/runlog.lua), mirrored from print,
+-- before anything else prints. UE4SS.log itself is rewritten by UE4SS on every start.
 pcall(require, "AP/runlog")
+pcall(function() require("AP/statelog") end)
 
 -- ============================================================
 -- Crash-hunt instrumentation (see AP/trace.lua, diag_flags.lua, CRASH_HANDOFF.md)
@@ -143,6 +144,8 @@ end
 
 local function gt_run_deferred(dt_ms)
     _gt_clock_ms = _gt_clock_ms + dt_ms   -- advance even when idle, or a later due-time reads stale
+    local RL = package.loaded["AP/runlog"]
+    if RL then RL.advance(dt_ms) end
     local i = 1
     while i <= #_gt_deferred do
         local d = _gt_deferred[i]
@@ -3427,6 +3430,14 @@ gt_loop("claim_slot", 1000, function()
     return false
 end)
 
+-- STATE snapshot every five minutes while connected (AP/statelog.lua builds the sentence).
+gt_loop("state_log", 1000, function()
+    local RL = package.loaded["AP/runlog"]
+    local AC = package.loaded["AP/APClient"]
+    if RL and AC and AC._slot_connected then RL.tick_snapshot() end
+    return false
+end)
+
 gt_loop("selected_level", 1000, function()
     local gi = FindFirstOf("BP_LibrarianGameInstance_C")
     if not gi or not gi:IsValid() then return false end
@@ -3435,9 +3446,13 @@ gt_loop("selected_level", 1000, function()
     if selected ~= _prev_selected_level then
         if _prev_selected_level < 0 and selected >= 0 then
             log(("SelectedLevel transition: -1 → %d (Continue or save load)"):format(selected))
+            local RL = package.loaded["AP/runlog"]
+            if RL then RL.event("INFO", "state", ("Save selected (level %s)"):format(tostring(selected))) end
             activate_gameplay("SelectedLevel >= 0")
         elseif _prev_selected_level >= 0 and selected < 0 then
             log(("SelectedLevel transition: %d → -1 (returned to title)"):format(_prev_selected_level))
+            local RL = package.loaded["AP/runlog"]
+            if RL then RL.event("INFO", "state", "Returned to the title screen") end
             deactivate_gameplay("SelectedLevel = -1")
         end
         _prev_selected_level = selected
@@ -4095,6 +4110,11 @@ local function notify_version_compat()
         secs = 12.0
     end
     log(msg)
+    local RL = package.loaded["AP/runlog"]
+    if RL then
+        RL.event("INFO", "start", ("Librarian-AP %s started. Game %s, apworld %s expected"):format(
+            MOD_VERSION, game_v, MOD_VERSION))
+    end
     local HUD = package.loaded["AP/HUD"]
     if HUD and HUD.notify then HUD.notify(msg, secs) end
 end
@@ -4807,6 +4827,8 @@ APClient.on_item = function(it, item_name)
 
     if item_name then
         ItemApply.apply_item(item_name)
+        local RLi = package.loaded["AP/runlog"]
+        if RLi then RLi.event("INFO", "items", "Applied " .. tostring(item_name)) end
         -- Traps (Fatigue and the rest) are one-shot, keyed on the item's server index so a
         -- reconnect re-dump can't replay them. Everything else re-derives from counts and doesn't care.
         if trap_kind then
@@ -4852,6 +4874,11 @@ end
 APClient.on_slot_connected = function(slot_data)
     lc_event("on_slot_connected")  -- TITLE→CONNECTING (no-op if reconnect in GAMEPLAY)
     log("[AP] slot_connected — slot data summary:")
+    -- The first STATE line of the session, once the server's counts have arrived.
+    gt_defer(3000, function()
+        local RL = package.loaded["AP/runlog"]
+        if RL then RL.snapshot(); RL.reset_snapshot_clock() end
+    end)
     pcall(function()
         if slot_data.starting_section then
             log("  starting_section: " .. tostring(slot_data.starting_section))

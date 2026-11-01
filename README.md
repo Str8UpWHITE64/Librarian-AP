@@ -244,7 +244,7 @@ or host it locally.
 
 - Stuck, or not sure what is left? Press **F8** in the library. The HUD shows
   how many books you have unwarded, on their shelf and loose, and the full
-  picture goes into that session's log in `Mods\Librarian-AP\logs\`: every
+  picture goes into that session's log, `Mods\Librarian-AP\logs\AP_<date>_<time>.log`: every
   section's open bookcases and, for any series that needs attention, which
   volumes are loose, on the wrong shelf, or out of order. When you ask for
   help, that log is the one file to send.

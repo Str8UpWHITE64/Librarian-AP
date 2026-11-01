@@ -3743,12 +3743,15 @@ function M.diagnostic_report()
     end
     local ok, lines, totals, attention = pcall(_report_lines)
     if not ok then log("[report] failed: " .. tostring(lines)); return end
+    local RL = package.loaded["AP/runlog"]
+    if RL then RL.force = "report" end
     for _, l in ipairs(lines) do log(l) end
+    if RL then RL.force = nil end
     pcall(function()
         local H = package.loaded["AP/HUD"]
         if H then
             local unwarded = totals.shelved + totals.loose + totals.away
-            local msg = ("Books: %d unwarded, %d on their shelf, %d loose (%d in the library). Full report is in UE4SS.log")
+            local msg = ("Books: %d unwarded, %d on their shelf, %d loose (%d in the library). The full report is in the AP log")
                 :format(unwarded, totals.shelved, totals.loose, totals.books)
             if totals.away > 0 then
                 H.notify(("%d on a wrong shelf, see the report."):format(totals.away), 20.0)

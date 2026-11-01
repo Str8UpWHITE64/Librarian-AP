@@ -86,6 +86,11 @@ local Client = {
 
 local LOG_PREFIX = "[LibrarianAP]"
 local function log(msg) print(LOG_PREFIX .. " " .. tostring(msg)) end
+--- A line for the run log under a standard category (conn, items, checks, config).
+local function ev(level, cat, msg)
+    local RL = package.loaded["AP/runlog"]
+    if RL then RL.event(level, cat, msg) else print(("%s [%s] %s"):format(LOG_PREFIX, cat, tostring(msg))) end
+end
 
 -- AP status constants (matches CommonClient)
 Client.STATUS_UNKNOWN   = 0
@@ -106,6 +111,8 @@ function Client:init(config_path)
     self.game           = config.game           or self.game
     self.uuid           = config.uuid           or self.uuid
     self.items_handling = config.items_handling or self.items_handling
+    local RL = package.loaded["AP/runlog"]
+    if RL then RL.configure(config) end
 
     if self.slot == "" then
         log("WARNING: no slot name configured; edit Scripts/ap_config.json")
@@ -114,6 +121,9 @@ function Client:init(config_path)
     self.enabled = true
     self:_start_async_loop()
     log(("Initialized (server=%s slot='%s')"):format(self.server, self.slot))
+    ev("INFO", "config", ("Server %s, slot %s, items_handling %s, debug log %s"):format(
+        tostring(self.server), tostring(self.slot), tostring(self.items_handling),
+        (RL and RL.debug) and "on" or "off"))
     return true
 end
 
@@ -239,26 +249,29 @@ function Client:_register_handlers()
 
     c:set_socket_connected_handler(function()
         self._connected = true
-        log("Socket connected to " .. self.server)
+        ev("INFO", "conn", "Socket connected to " .. self.server)
     end)
     c:set_socket_disconnected_handler(function()
         self._connected = false
         self._slot_connected = false
-        log("Socket disconnected")
+        ev("WARN", "conn", "Disconnected from " .. tostring(self.server))
         if self.on_disconnected then pcall(self.on_disconnected) end
     end)
     c:set_socket_error_handler(function(err)
-        log("Socket error: " .. tostring(err))
+        ev("WARN", "conn", "Socket error: " .. tostring(err))
     end)
     c:set_room_info_handler(function()
-        log("RoomInfo received; sending ConnectSlot...")
+        ev("INFO", "conn", ("Room found, joining as %s"):format(tostring(self.slot)))
         c:ConnectSlot(self.slot, self.password, self.items_handling, self.tags, self.version)
     end)
     c:set_slot_connected_handler(function(slot_data)
         self._slot_connected = true
         self.slot_data = slot_data or {}
         pcall(function() self.slot_number = c:get_player_number() or -1 end)
-        log("Slot connected (slot #" .. tostring(self.slot_number) .. ")")
+        local seed
+        if type(slot_data) == "table" then seed = slot_data.seed end
+        ev("INFO", "conn", ("Connected to %s as %s (slot %s, seed %s)"):format(
+            tostring(self.server), tostring(self.slot), tostring(self.slot_number), tostring(seed or "unknown")))
         if type(slot_data) == "table" then
             local keys = {}
             for k in pairs(slot_data) do keys[#keys + 1] = k end
@@ -307,7 +320,7 @@ function Client:_register_handlers()
     c:set_slot_refused_handler(function(reasons)
         self._slot_connected = false
         local reason_str = (type(reasons) == "table") and table.concat(reasons, ", ") or tostring(reasons)
-        log("ERROR: slot refused: " .. reason_str)
+        ev("ERROR", "conn", "Connection refused: " .. reason_str)
         if self.on_slot_refused then pcall(self.on_slot_refused, reason_str) end
     end)
     c:set_items_received_handler(function(items)
@@ -525,9 +538,9 @@ function Client:_apply_pending_items()
             self._name_wait_idx, self._name_wait_tries = nil, 0
 
             self._applied_index = idx
-            log(("Received item idx=%d id=%d name=%s player=%s loc=%s"):format(
-                idx, item_id, tostring(name or "?"),
-                tostring(it.player), tostring(it.location)))
+            ev("INFO", "items", ("Received %s from %s (%s)"):format(
+                tostring(name or ("unknown item " .. item_id)), self:sender_label(it.player),
+                self:origin_label(it.player, it.location)))
             if self.on_item then
                 -- Surfaced, not swallowed: a dropped error here is indistinguishable from a
                 -- clean apply, which hid a real fault for several debugging rounds.
@@ -577,6 +590,30 @@ function Client:send_check(location_id)
     self._outgoing_checks[#self._outgoing_checks + 1] = location_id
     if not foreign and self.on_check_sent then pcall(self.on_check_sent, location_id) end
     return true
+end
+
+--- Who an item came from, for the log: a player alias, "the server" or "yourself".
+function Client:sender_label(player)
+    player = tonumber(player) or -1
+    if player == 0 then return "the server" end
+    if player == self.slot_number then return "yourself" end
+    return self:get_alias(player) or ("player " .. tostring(player))
+end
+
+--- Where an item came from: the location's name in the sender's game, or why there is none.
+function Client:origin_label(player, location)
+    location = tonumber(location) or -1
+    if location == -2 then return "starting inventory" end
+    if location < 0 then return "server" end
+    local name
+    pcall(function()
+        local game = self.game
+        local g = self._client:get_player_game(tonumber(player) or -1)
+        if g and g ~= "" then game = g end
+        name = self._client:get_location_name(location, game)
+    end)
+    if name and name ~= "" and name ~= "Unknown" then return name end
+    return "location " .. tostring(location)
 end
 
 --- The location's name from the data package, or nil.
@@ -658,7 +695,15 @@ function Client:_process_outgoing()
         end
         self._outgoing_checks = {}
         if #new_checks > 0 then
-            log(("Sending %d location checks: %s"):format(#new_checks, table.concat(new_checks, ", ")))
+            ev("INFO", "checks", ("Sending %s location checks: %s"):format(tostring(#new_checks), table.concat(new_checks, ", ")))
+            for _, lid in ipairs(new_checks) do
+                local lname = self:location_name(lid)
+                if lname and lname ~= "Unknown" then
+                    ev("INFO", "checks", "Checked " .. lname)
+                else
+                    ev("INFO", "checks", ("Checked unknown location %s"):format(tostring(lid)))
+                end
+            end
             self._client:LocationChecks(new_checks)
         end
     end

@@ -12,6 +12,7 @@ local DEFAULTS = {
     uuid = "",
     tags = { "AP" },
     items_handling = 7,  -- receive own + others' + starting
+    debug = false,       -- true adds the chatty DEBUG lines to the run log
 }
 
 -- ---------------------------------------------------------------
