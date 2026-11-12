@@ -819,9 +819,9 @@ class LibrarianWorld(World):
         # bool -- the collect/remove hot path checks it constantly.
         self._is_book_sanity = self.book_sanity
 
-        # local_filler is applied in pre_fill (_place_local_filler), NOT via
+        # local_filler is applied in post_fill (_bring_filler_home), NOT via
         # options.local_items: local_items lets AP's greedy remaining_fill strand
-        # it on an all-tight multiworld. Pre-placing with a margin is robust.
+        # it on an all-tight multiworld.
 
         # UT regen path: reconstruct the seed's state from slot_data
         # (stored in re_gen_passthrough by interpret_slot_data) rather
@@ -1741,17 +1741,63 @@ class LibrarianWorld(World):
         for i, loc in zip(lslots, ordered):
             fill_locations[i] = loc
 
-    def pre_fill(self) -> None:
-        """Keep this world's filler in-world before the cross-player fill.
+    def post_fill(self) -> None:
+        """local_filler (default on): once the fill is done, bring our filler home."""
+        if not self.options.local_filler or self.multiworld.players <= 1:
+            return
+        self._bring_filler_home()
 
-        The deep count-gated locations (level-ups, row/book completions, section
-        and floor completions) are routed out of AP's swap-prone progression fill
-        by an item-rule ban applied in set_rules for individual/book modes
-        (_ban_advancement_on_deep). AP's remaining_fill then back-fills them with
-        filler + useful items, so progression only ever routes into the shallow
-        depth-1 rows/books; grouped keeps them as ordinary progression targets.
-        pre_fill's only remaining job is the local-filler pass."""
-        self._place_local_filler()
+    def _bring_filler_home(self) -> None:
+        """Swap our filler that landed in other worlds with other players' non-progression
+        items sitting on our checks.
+
+        Locking filler onto our checks before the fill (what this replaced) left the
+        progression fill too few open slots: it swapped tens of thousands of times in a
+        4-player count seed and put every real item in the first quarter of the checks.
+        Nothing is locked now, so the fill keeps every slot. Only non-progression items
+        move here, so logic is unchanged, and a swap is made only where both locations
+        accept the item they would get. Filler stays abroad only where we hold more of
+        other players' progression than they hold of ours."""
+        mw, p = self.multiworld, self.player
+        real = set(mw.player_ids)
+        state = CollectionState(mw)
+
+        def free(loc) -> bool:
+            it = loc.item
+            return (loc.address is not None and it is not None and not loc.locked
+                    and not it.advancement and it.player in real and it.code is not None)
+
+        away = [loc for loc in mw.get_filled_locations()
+                if loc.player != p and loc.player in real and free(loc) and loc.item.player == p
+                and loc.item.classification == ItemClassification.filler]
+        hosts: dict[int, list] = {}
+        for loc in mw.get_locations(p):
+            if free(loc) and loc.item.player != p:
+                hosts.setdefault(loc.item.player, []).append(loc)
+        if not away or not hosts:
+            return
+        away.sort(key=lambda l: (l.player, l.name))
+        for lst in hosts.values():
+            lst.sort(key=lambda l: l.name)
+            self.random.shuffle(lst)
+        for far in away:
+            ours = far.item
+            # first choice: an item that belongs to the world our filler sits in
+            order = [far.player] + sorted(k for k in hosts if k != far.player)
+            done = False
+            for owner in order:
+                lst = hosts.get(owner) or []
+                for i in range(len(lst) - 1, max(len(lst) - 9, -1), -1):
+                    home = lst[i]
+                    theirs = home.item
+                    if (far.can_fill(state, theirs, False) and home.can_fill(state, ours, False)):
+                        far.item, home.item = theirs, ours
+                        theirs.location, ours.location = far, home
+                        lst.pop(i)
+                        done = True
+                        break
+                if done:
+                    break
 
     def _ban_advancement_on_deep(self, deep_categories) -> None:
         """Forbid advancement items on this player's deep count-gated locations so
@@ -1760,70 +1806,13 @@ class LibrarianWorld(World):
         item is rejected here without ever evaluating feasible_rows and no
         swap-storm forms. The locations stay DEFAULT, so AP's remaining_fill still
         fills them with filler + useful items (magic can land on level-ups). This
-        replaces the old hand-rolled deep-lock pre_fill."""
+        replaces the old hand-rolled deep-lock."""
         p = self.player
         ban = lambda item: not item.advancement
         for loc in self.multiworld.get_unfilled_locations(p):
             data = location_dictionary.get(loc.name)
             if data is not None and data.category in deep_categories:
                 add_item_rule(loc, ban)
-
-    def _place_local_filler(self) -> None:
-        """local_filler (default on): keep our filler in our own world by
-        pre-placing it on our own unfilled locations before the cross-player fill,
-        so it doesn't flood other slots; real items still circulate.
-
-        Done here rather than via options.local_items because local_items lets the
-        greedy remaining_fill strand our filler on an all-tight multiworld. We keep
-        a margin of our locations open so the cross-fill always has reachable slots
-        for progression. No-op solo and when the option is off. Filler is
-        non-logical, so a locked filler placement can't make anything unreachable."""
-        if not self.options.local_filler or self.multiworld.players <= 1:
-            return
-        mw = self.multiworld
-        p = self.player
-        filler_items = [it for it in mw.itempool
-                        if it.player == p
-                        and it.classification == ItemClassification.filler]
-        if not filler_items:
-            return
-        n_prog = sum(1 for it in mw.itempool if it.player == p and it.advancement)
-        own_unfilled = list(mw.get_unfilled_locations(p))
-        # Place filler on the DEEPEST (latest-reachable) of our locations and leave
-        # the SHALLOWEST open, so the cross-fill still has early reachable slots to
-        # bootstrap the series/shelf progression chain. Random placement here
-        # starves fill (a filler on an early row blocks the sphere-0 route).
-        # Depth proxy: count-gated / completion locations are the deepest; a row's
-        # depth is its series' unlock order (later series = deeper). Ties broken
-        # deterministically so a seed is reproducible.
-        rng_key = {loc: i for i, loc in enumerate(sorted(own_unfilled, key=lambda l: l.name))}
-        # Depth: the bundle region's k, else a count rung's N or a grouped row's series
-        # group; other count-gated checks are deepest. Books must not land there with a
-        # random tiebreak, or the filler takes the sphere-0 books the bundles need.
-        def _depth(loc):
-            rname = loc.parent_region.name if loc.parent_region is not None else ""
-            if rname.startswith("Book Bundle ") or rname.startswith("Series Bundle "):
-                return (0, int(rname.rsplit(" ", 1)[1]), rng_key[loc])
-            cat = (location_dictionary[loc.name].category
-                   if loc.name in location_dictionary else None)
-            if cat == LibrarianLocationCategory.ROW:
-                series = loc.name.split(" - ", 1)[-1]
-                return (0, self.series_req.get(series, 0), rng_key[loc])
-            if cat == LibrarianLocationCategory.BOOK:
-                return (0, 0, rng_key[loc])           # its own item: shallow
-            if cat == LibrarianLocationCategory.CHEST:
-                return (0, -1, rng_key[loc])          # chests: shallowest
-            if loc.name.startswith("Shelved ") and loc.name.endswith(" Books"):
-                return (1, int(loc.name.split()[1]), rng_key[loc])   # rungs in order
-            return (1, 10 ** 6, rng_key[loc])         # completions, levels: deepest
-        own_unfilled.sort(key=_depth, reverse=True)   # deepest first
-        # Keep the shallowest (own progression + 20% headroom) OPEN for the fill.
-        keep_open = min(len(own_unfilled), n_prog + len(own_unfilled) // 5)
-        placeable = own_unfilled[:len(own_unfilled) - keep_open]
-        n_place = min(len(filler_items), len(placeable))
-        for i in range(n_place):
-            mw.itempool.remove(filler_items[i])
-            placeable[i].place_locked_item(filler_items[i])
 
     # Deep count-gated categories banned from advancement in book_sanity (see
     # _ban_advancement_on_deep).
