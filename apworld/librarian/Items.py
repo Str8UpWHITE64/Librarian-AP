@@ -76,6 +76,12 @@ class LibrarianItemData(NamedTuple):
 class LibrarianItem(Item):
     game: str = "Librarian Tidy Up the Arcane Library"
 
+    @property
+    def advancement(self) -> bool:
+        # Item.advancement, as a bit test: the enum's own "in" is a Python-level call and
+        # this is read tens of millions of times per seed with the big pools.
+        return self.classification._value_ & 1 == 1
+
     @staticmethod
     def get_name_to_id() -> dict[str, int | None]:
         return {

@@ -94,6 +94,43 @@ class LibrarianLocationData(NamedTuple):
 class LibrarianLocation(Location):
     game: str = "Librarian Tidy Up the Arcane Library"
 
+    # The fill and the spoiler playthrough ask can_reach hundreds of millions of times
+    # with the big pools, and Python call overhead is most of that time. Two shortcuts,
+    # both giving Location.can_reach's own answer:
+    #   - can_reach below folds Region.can_reach in, saving one call;
+    #   - reach_directly makes can_reach the access rule itself, for a location whose
+    #     region nothing can close.
+
+    def __setattr__(self, name, value):
+        # A new access_rule makes the direct shortcut stale; fall back to can_reach below.
+        if name == "access_rule":
+            self.__dict__.pop("can_reach", None)
+        object.__setattr__(self, name, value)
+
+    def can_reach(self, state) -> bool:
+        p = self.player
+        if state.stale[p]:
+            state.update_reachable_regions(p)
+        return self.parent_region in state.reachable_regions[p] and self.access_rule(state)
+
+    def reach_directly(self) -> None:
+        """Skip the region test. Only for a location whose parent region is reachable
+        whenever its rule holds; the caller checks that."""
+        self.__dict__["can_reach"] = self.access_rule
+
+    def reach_rule_first(self) -> None:
+        """Rule first, region second: the same answer, and the region cache is only
+        brought up to date for a state that passes the rule."""
+        rule, region, p = self.access_rule, self.parent_region, self.player
+
+        def can_reach(state) -> bool:
+            if not rule(state):
+                return False
+            if state.stale[p]:
+                state.update_reachable_regions(p)
+            return region in state.reachable_regions[p]
+        self.__dict__["can_reach"] = can_reach
+
     @staticmethod
     def get_name_to_id() -> dict[str, int | None]:
         return {

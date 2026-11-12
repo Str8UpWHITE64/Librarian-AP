@@ -2090,10 +2090,13 @@ class LibrarianWorld(World):
     # mutation changes the stamp, so a matching stamp means prog is unchanged.
     # Grouped seeds never read the stamp -- a harmless unused increment there.
     def collect(self, state, item, *args, **kwargs) -> bool:
-        changed = super().collect(state, item, *args, **kwargs)
+        # World.collect inlined (collect_item is not overridden here): the fill and the
+        # playthrough collect millions of items with the big pools.
+        changed = item.classification._value_ & 1 == 1
         if changed:
             sd = state.__dict__
             name = item.name
+            state.prog_items[self.player][name] += 1
             if self._is_book_sanity:
                 # book_sanity: feasible_books is an O(1) counter; section_done is
                 # uncached (and rarely called -- section/floor locs hold FILLER,
@@ -2268,8 +2271,10 @@ class LibrarianWorld(World):
         # Every bookcase is precollected in this mode, so a row costs exactly its series
         # item -- and a book costs the same, since nothing gates books individually here.
         def row_rule(_sec, ser):
+            # "in" rather than ">= 1": a held item always has a count of one or more
+            # (remove deletes the entry at zero), and a miss costs no __missing__ call.
             return lambda state, iname=series_unlock_item_name(ser.name): (
-                state.prog_items[p][iname] >= 1)
+                iname in state.prog_items[p])
 
         def book_rule(sec, ser, _ch):
             return row_rule(sec, ser)
@@ -2546,8 +2551,20 @@ class LibrarianWorld(World):
             sname, sn = self._shelf_gate(sec.id, ser.name)
             reqs = tuple(self._book_bundle_req(k) for k in sorted(
                 {need_at.get(book_item_name(ser.name, ch), 1) for ch in range(ser.volumes)}))
-            return lambda state, reqs=reqs, sname=sname, sn=sn: (
-                state.has(sname, p, sn) and all(state.has(gi, p, gc) for gi, gc in reqs))
+            if not self.numbered_book_bundles:
+                reqs = reqs[-1:]      # one fungible item: the highest count covers the rest
+
+            # state.has spelled out on the item table: these rules run millions of times.
+            def rule(state, reqs=reqs, sname=sname, sn=sn) -> bool:
+                prog = state.prog_items[p]
+                if prog.get(sname, 0) < sn:
+                    return False
+                for gi, gc in reqs:
+                    if prog.get(gi, 0) < gc:
+                        return False
+                return True
+            rule.needs = ((sname, sn),) + reqs
+            return rule
 
         def book_rule(sec, ser, ch):
             n = need_at.get(book_item_name(ser.name, ch))
@@ -2555,8 +2572,10 @@ class LibrarianWorld(World):
                 return None
             sname, sn = self._shelf_gate(sec.id, ser.name)
             gi, gc = self._book_bundle_req(n)
-            return lambda state, gi=gi, gc=gc, sname=sname, sn=sn: (
-                state.has(gi, p, gc) and state.has(sname, p, sn))
+            rule = lambda state, gi=gi, gc=gc, sname=sname, sn=sn: (
+                (prog := state.prog_items[p]).get(gi, 0) >= gc and prog.get(sname, 0) >= sn)
+            rule.needs = ((gi, gc), (sname, sn))
+            return rule
 
         self._apply_check_locations(row_rule, book_rule, feasible_books)
 
@@ -2566,7 +2585,9 @@ class LibrarianWorld(World):
             except KeyError:
                 continue          # count mode keeps its rungs in the library
             gi, gc = self._book_bundle_req(k)
-            ent.access_rule = (lambda state, gi=gi, gc=gc: state.has(gi, p, gc))
+            ent.access_rule = (
+                lambda state, gi=gi, gc=gc: state.prog_items[p].get(gi, 0) >= gc)
+            ent.access_rule.need = (gi, gc)
 
         # A section or floor is complete with every bundle holding its books in hand and
         # every one of its bookcases open.
@@ -2713,7 +2734,7 @@ class LibrarianWorld(World):
         if self.check_by_count:
             for n in self.count_ticks:
                 mw.get_location(f"Shelved {n} Books", p).access_rule = (
-                    lambda state, k=n: feasible_books(state) >= k)
+                    lambda state, k=n: state.__dict__.get(bookcount_key, 0) >= k)
         for sec in active_sections:
             if not self.check_by_count:
                 for ser in sec.series:
@@ -2721,7 +2742,7 @@ class LibrarianWorld(World):
                         iname = book_item_name(ser.name, ch)
                         loc = mw.get_location(_book_name(sec.id, ser.name, ch), p)
                         loc.access_rule = (
-                            lambda state, n=iname: state.prog_items[p][n] >= 1)
+                            lambda state, n=iname: n in state.prog_items[p])
             sec_loc = mw.get_location(section_completion_name(sec.id), p)
             sec_loc.access_rule = (
                 lambda state, sid=sec.id: section_done_book(state, sid))
@@ -2779,6 +2800,87 @@ class LibrarianWorld(World):
         mw.completion_condition[p] = lambda state: state.has(VICTORY_ITEM_NAME, p)
 
     def set_rules(self) -> None:
+        self._set_rules_by_mode()
+        self._reach_open_regions_directly()
+
+    def _reach_open_regions_directly(self) -> None:
+        """Let every location in an always-open region answer can_reach with its access
+        rule alone (see LibrarianLocation). Runs after all of this world's rules are set,
+        so the entrances can be read: a region is always open when every step back to
+        the origin is its only entrance and carries no rule.
+
+        A location also skips the region test when its own rule already demands what
+        the one entrance to its region demands (rules tag that as "needs", entrances as
+        "need"): a book in a bundle's region asks for that bundle itself.
+
+        The goal keeps the region test, behind its rule. The spoiler prints paths from
+        the region cache of the state that has just reached the goal, and this is what
+        fills it."""
+        origin = self.origin_region_name
+        always_open: dict = {}
+
+        def is_open(region) -> bool:
+            known = always_open.get(region)
+            if known is None:
+                if region.name == origin:
+                    known = True
+                else:
+                    ents = region.entrances
+                    known = (len(ents) == 1 and "access_rule" not in ents[0].__dict__
+                             and ents[0].parent_region is not None
+                             and is_open(ents[0].parent_region))
+                always_open[region] = known
+            return known
+
+        def rule_opens(loc) -> bool:
+            ents = loc.parent_region.entrances
+            if len(ents) != 1 or ents[0].parent_region is None or not is_open(ents[0].parent_region):
+                return False
+            need = getattr(ents[0].access_rule, "need", None)
+            needs = getattr(loc.access_rule, "needs", ())
+            return need is not None and any(
+                item == need[0] and count >= need[1] for item, count in needs)
+
+        for loc in self.multiworld.get_locations(self.player):
+            if loc.name == GOAL_LOCATION_NAME:
+                loc.reach_rule_first()
+            elif is_open(loc.parent_region) or rule_opens(loc):
+                loc.reach_directly()
+
+        # The same for entrances that leave an always-open region. Every bundle has its
+        # own region, so a state's region update tries up to 1536 closed entrances each
+        # time one of our items arrives. Entrance.can_reach is the parent test, the rule
+        # and the path note; with the parent always open only the last two are left, and
+        # a rule that is one item count (tagged "need" where it is set) is read in place.
+        p = self.player
+        for region in self.multiworld.get_regions(p):
+            if not is_open(region):
+                continue
+            for ent in region.exits:
+                if ent.hide_path or "can_reach" in ent.__dict__:
+                    continue
+                rule = ent.access_rule
+                need = getattr(rule, "need", None)
+                step = (ent.name, region)
+                if need is not None:
+                    def can_reach(state, ent=ent, step=step, item=need[0], count=need[1]) -> bool:
+                        if state.prog_items[p].get(item, 0) >= count:
+                            path = state.path
+                            if ent not in path:
+                                path[ent] = (step[0], path.get(step[1], (step[1].name, None)))
+                            return True
+                        return False
+                else:
+                    def can_reach(state, ent=ent, step=step, rule=rule) -> bool:
+                        if rule(state):
+                            path = state.path
+                            if ent not in path:
+                                path[ent] = (step[0], path.get(step[1], (step[1].name, None)))
+                            return True
+                        return False
+                ent.can_reach = can_reach
+
+    def _set_rules_by_mode(self) -> None:
         # opt-in: book_sanity / per-series items use separate rules paths so the
         # (default) grouped path below stays untouched.
         if self.random_bundle:
@@ -2898,8 +3000,10 @@ class LibrarianWorld(World):
         def row_rule(sec, ser):
             sname, sn = self._shelf_gate(sec.id, ser.name)
             gitem, gcount = self._series_group_req(series_req[ser.name])
-            return lambda state, sname=sname, sn=sn, gi=gitem, gc=gcount: (
-                state.has(sname, p, sn) and state.has(gi, p, gc))
+            rule = lambda state, sname=sname, sn=sn, gi=gitem, gc=gcount: (
+                (prog := state.prog_items[p]).get(sname, 0) >= sn and prog.get(gi, 0) >= gc)
+            rule.needs = ((sname, sn), (gitem, gcount))
+            return rule
 
         def book_rule(sec, ser, _ch):
             return row_rule(sec, ser)
@@ -2915,7 +3019,9 @@ class LibrarianWorld(World):
             except KeyError:
                 continue          # count mode has no per-row or per-book locations
             gitem, gcount = self._series_group_req(k)
-            ent.access_rule = (lambda state, gi=gitem, gc=gcount: state.has(gi, p, gc))
+            ent.access_rule = (
+                lambda state, gi=gitem, gc=gcount: state.prog_items[p].get(gi, 0) >= gc)
+            ent.access_rule.need = (gitem, gcount)
         for section in active_sections:
             entrance = mw.get_entrance(f"Open Section {section.id}", p)
             entrance.access_rule = (
