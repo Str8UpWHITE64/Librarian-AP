@@ -327,7 +327,7 @@ end
 --- then behind; each one with the way there clear at knee height and the player's own floor under
 --- the whole book (not a railing, a case or a drop). The player's feet last.
 --- Each spot: { x, y, fz, yaw, dir, d }.
-local function bf_spots(p, ignore, fl)
+local function bf_spots(p, ignore, fl, dists)
     local px, py, pz
     pcall(function() local l = p:K2_GetActorLocation(); px, py, pz = l.X, l.Y, l.Z end)
     if not px then return {} end
@@ -355,7 +355,7 @@ local function bf_spots(p, ignore, fl)
         local r = math.rad(yaw0 + a)
         local fx, fy = math.cos(r), math.sin(r)
         local tx, ty = -fy, fx            -- across the way out
-        for _, d in ipairs(BF_DISTS) do
+        for _, d in ipairs(dists or BF_DISTS) do
             local x, y = px + fx * d, py + fy * d
             local reach = d + fl.wid / 2 + 8
             local g, _, gin, gwho = bf_trace({ X = px, Y = py, Z = fz + BF_KNEE }, { X = px + fx * reach, Y = py + fy * reach, Z = fz + BF_KNEE }, ignore)
@@ -408,6 +408,69 @@ local function bf_still(book)
     return stopped
 end
 
+--- Lay a book that is out of the hands on open floor by the player: the job's pile while it has room, else the
+--- first checked spot around the player. Holds it there like Butterfingers does. Returns the spot, the book's final
+--- location, the floor or pile top it rests on, and how many books it was lifted over; nil when no spot is readable.
+local function bf_lay(IA, p, book, job, key, px, py, SD)
+    local fl = bf_flat(book)
+    local ignore = { book, p }
+    for _, o in ipairs(select(2, bf_held(IA, p))) do ignore[#ignore + 1] = o end
+    -- The job's pile while it has room, else the first spot around the player with room.
+    local near = bf_near(IA, p, px, py, key)
+    local spot, base
+    local tries = {}
+    if job.spot then tries[1] = job.spot end
+    -- the last pile this world, while the player is still by it: a trap right after another adds to it
+    local last = M.bf_pile
+    if last and last.epoch == (IA._world_epoch or 0) and math.sqrt((last.x - px) ^ 2 + (last.y - py) ^ 2) <= 100 then
+        tries[#tries + 1] = last
+    end
+    -- books lying near the player are not in the way: the way out is tested over them (a pile is
+    -- what the next book goes onto, not an obstacle)
+    local way_ignore = {}
+    for _, o in ipairs(ignore) do way_ignore[#way_ignore + 1] = o end
+    for _, n in ipairs(near) do way_ignore[#way_ignore + 1] = n.book end
+    for _, s in ipairs(bf_spots(p, way_ignore, fl, job.dists)) do tries[#tries + 1] = s end
+    for _, s in ipairs(tries) do
+        local hx, hy = bf_half(fl, s.yaw)
+        local top = bf_pile_top(near, s.x, s.y, hx, hy, s.fz)
+        if not top or top - s.fz < BF_PILE_MAX or s.d == 0 then
+            spot, base = s, math.max(s.fz, top or s.fz)
+            break
+        end
+    end
+    if not spot then return nil end   -- the player's place unreadable: the game's own fall puts it down
+    job.spot = spot
+    if spot.d > 0 then
+        M.bf_pile = { x = spot.x, y = spot.y, fz = spot.fz, yaw = spot.yaw, dir = spot.dir, d = spot.d, epoch = IA._world_epoch or 0 }
+    end
+    local rot = { Pitch = fl.pitch, Yaw = spot.yaw, Roll = fl.roll }
+    local loc = { X = spot.x, Y = spot.y, Z = base + fl.thick / 2 + 0.5 }
+    SD.set_pose(IA, book, loc, rot)
+    -- Rest it by its real bottom (its pivot is not always its middle), then lift it onto whatever
+    -- its real footprint covers, so a pile of any height stacks book on book.
+    local bottom = bf_bottom(book)
+    if bottom and math.abs(bottom - (base + 0.3)) > 0.3 then
+        loc.Z = loc.Z + (base + 0.3 - bottom)
+        SD.set_pose(IA, book, loc, rot)
+    end
+    local under = 0
+    for _ = 1, 8 do
+        local o, e = bf_box(book)
+        if not o then break end
+        local top = bf_pile_top(near, o.X, o.Y, e.X, e.Y, spot.fz)
+        local bot = o.Z - e.Z
+        if not (top and top > bot - 0.1) then break end
+        loc.Z = loc.Z + (top + 0.3 - bot)
+        SD.set_pose(IA, book, loc, rot)
+        under = under + 1
+    end
+    local final = v3((function() local l; pcall(function() l = book:K2_GetActorLocation() end); return l end)()) or loc
+    M.bf_pins[key or tostring(book)] = { book = book, key = key, loc = { X = final.X, Y = final.Y, Z = final.Z }, rot = rot,
+                                        left = BF_PIN_TICKS, moved = 0, maxd = 0, epoch = IA._world_epoch or 0 }
+    return spot, final, base, under
+end
+
 --- Let one book go and lay it on the job's pile. Returns true when it left the hands.
 local function bf_drop_one(IA, p, book, job)
     local key = key_of(book)
@@ -442,62 +505,8 @@ local function bf_drop_one(IA, p, book, job)
     local SD = shelf_drop_mod()
     if not SD then return true end      -- out of the hands; the game's own fall puts it down
 
-    local fl = bf_flat(book)
-    local ignore = { book, p }
-    for _, o in ipairs(select(2, bf_held(IA, p))) do ignore[#ignore + 1] = o end
-    -- The job's pile while it has room, else the first spot around the player with room.
-    local near = bf_near(IA, p, px, py, key)
-    local spot, base
-    local tries = {}
-    if job.spot then tries[1] = job.spot end
-    -- the last pile this world, while the player is still by it: a trap right after another adds to it
-    local last = M.bf_pile
-    if last and last.epoch == (IA._world_epoch or 0) and math.sqrt((last.x - px) ^ 2 + (last.y - py) ^ 2) <= 100 then
-        tries[#tries + 1] = last
-    end
-    -- books lying near the player are not in the way: the way out is tested over them (a pile is
-    -- what the next book goes onto, not an obstacle)
-    local way_ignore = {}
-    for _, o in ipairs(ignore) do way_ignore[#way_ignore + 1] = o end
-    for _, n in ipairs(near) do way_ignore[#way_ignore + 1] = n.book end
-    for _, s in ipairs(bf_spots(p, way_ignore, fl)) do tries[#tries + 1] = s end
-    for _, s in ipairs(tries) do
-        local hx, hy = bf_half(fl, s.yaw)
-        local top = bf_pile_top(near, s.x, s.y, hx, hy, s.fz)
-        if not top or top - s.fz < BF_PILE_MAX or s.d == 0 then
-            spot, base = s, math.max(s.fz, top or s.fz)
-            break
-        end
-    end
+    local spot, final, base, under = bf_lay(IA, p, book, job, key, px, py, SD)
     if not spot then return true end   -- the player's place unreadable: the game's own fall puts it down
-    job.spot = spot
-    if spot.d > 0 then
-        M.bf_pile = { x = spot.x, y = spot.y, fz = spot.fz, yaw = spot.yaw, dir = spot.dir, d = spot.d, epoch = IA._world_epoch or 0 }
-    end
-    local rot = { Pitch = fl.pitch, Yaw = spot.yaw, Roll = fl.roll }
-    local loc = { X = spot.x, Y = spot.y, Z = base + fl.thick / 2 + 0.5 }
-    SD.set_pose(IA, book, loc, rot)
-    -- Rest it by its real bottom (its pivot is not always its middle), then lift it onto whatever
-    -- its real footprint covers, so a pile of any height stacks book on book.
-    local bottom = bf_bottom(book)
-    if bottom and math.abs(bottom - (base + 0.3)) > 0.3 then
-        loc.Z = loc.Z + (base + 0.3 - bottom)
-        SD.set_pose(IA, book, loc, rot)
-    end
-    local under = 0
-    for _ = 1, 8 do
-        local o, e = bf_box(book)
-        if not o then break end
-        local top = bf_pile_top(near, o.X, o.Y, e.X, e.Y, spot.fz)
-        local bot = o.Z - e.Z
-        if not (top and top > bot - 0.1) then break end
-        loc.Z = loc.Z + (top + 0.3 - bot)
-        SD.set_pose(IA, book, loc, rot)
-        under = under + 1
-    end
-    local final = v3((function() local l; pcall(function() l = book:K2_GetActorLocation() end); return l end)()) or loc
-    M.bf_pins[key or tostring(book)] = { book = book, key = key, loc = { X = final.X, Y = final.Y, Z = final.Z }, rot = rot,
-                                        left = BF_PIN_TICKS, moved = 0, maxd = 0, epoch = IA._world_epoch or 0 }
     local still_owned = false
     pcall(function() still_owned = book.OwningCharacter ~= nil and book.OwningCharacter:IsValid() end)
     if still_owned then log("Butterfingers: the book is still owned by the player after the drop") end
@@ -1616,6 +1625,32 @@ function M.run(IA, kind, arg, index)
     end)
 end
 
+--- What AP/StackRecover needs: the same floor reading and landing as Butterfingers.
+M.util = { trace = bf_trace, box = bf_box, collision = collision_on, key = key_of, still = bf_still, pawn = pawn }
+
+--- Lay a loose book on open floor by the player, as Butterfingers does its dropped books, and hold it there for
+--- a few seconds. `job` is a table kept for one batch of books: they share one pile. Returns the spot and the
+--- book's final location, or nil when the player or a floor cannot be read.
+function M.lay_loose(IA, book, job)
+    local p = pawn()
+    local SD = shelf_drop_mod()
+    if not (p and SD) then return nil end
+    local px, py
+    pcall(function() local l = p:K2_GetActorLocation(); px, py = l.X, l.Y end)
+    if not px then return nil end
+    local spot, final = bf_lay(IA, p, book, job, key_of(book), px, py, SD)
+    return spot, final
+end
+
+local SR_MOD = nil
+local function stack_recover()
+    if SR_MOD == nil then
+        local ok, mod = pcall(require, "AP/StackRecover")
+        SR_MOD = (ok and type(mod) == "table") and mod or false
+    end
+    return SR_MOD or nil
+end
+
 --- Called four times a second from main.lua. Runs the Veil's work and retries waiting traps.
 --- A trap waiting only for the first ward flush stays until it has run (that flush comes with the
 --- player's first movement, once the books are populated); every other unsafe state gets GRACE_S.
@@ -1664,6 +1699,8 @@ function M.tick(IA)
             end
         end)
     end
+    local sr = stack_recover()
+    if sr then run_gt(IA, function() pcall(sr.tick, IA) end) end
     if #M.shelf_jobs > 0 then
         run_gt(IA, function()
             local ok, e = pcall(shelf_tick, IA)
