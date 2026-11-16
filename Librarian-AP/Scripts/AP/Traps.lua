@@ -704,7 +704,11 @@ M.HANDLERS["Floor Shuffle"] = function(IA)
                 local to = poses[(i % #poses) + 1]      -- the pose `from` takes was to's
                 local loc = { X = to.loc.X, Y = to.loc.Y, Z = to.loc.Z - (to.thick - from.thick) / 2 }
                 total = total + 1
-                if SD.set_pose(IA, from.book, loc, to.rot) then moved = moved + 1 end
+                if SD.set_pose(IA, from.book, loc, to.rot) then
+                    moved = moved + 1
+                    -- a book a Shelf Spill is still holding is held at its new place, not put back
+                    if SD.repin then SD.repin(from.book, loc, to.rot) end
+                end
             end
         end
     end
@@ -1489,8 +1493,8 @@ local function scramble_step(IA, job)
         pcall(function() held_by_player = it.book.OwningCharacter ~= nil and it.book.OwningCharacter:IsValid() end)
         if held_by_player or slot_book(case, it.target) then
             -- the player took it, or something filled its new slot: this one goes back home
-            if not held_by_player then put_back(case, it.slot, it.book) end
-            it.placed = true
+            -- (its own slot may hold the book before it by now: then it is left for the finish)
+            it.placed = held_by_player or put_back(case, it.slot, it.book)
             job.i = job.i + 1
             if job.i > #job.items then job.phase = "finish" end
             return nil
@@ -1504,16 +1508,36 @@ local function scramble_step(IA, job)
         pcall(function() held = it.book.OwningCharacter ~= nil and it.book.OwningCharacter:IsValid() end)
         if held and not slot_book(case, it.target) then
             pcall(function() case:InsertBook(it.target, it.book) end)
-            it.moved = true
+            it.moved, it.placed = true, true
         else
-            put_back(case, it.slot, it.book)
+            it.placed = put_back(case, it.slot, it.book)
         end
-        it.placed = true
         job.i = job.i + 1
         job.phase = (job.i > #job.items) and "finish" or "grab"
         return nil
     end
     if job.phase == "finish" then
+        -- A book that could not move on and found its own slot taken by the book before it is in
+        -- no slot: one more try at its slot, then the floor in front of the case.
+        local stray = 0
+        for _, x in ipairs(job.items) do
+            if x.detached and not x.placed then
+                local owned = false
+                pcall(function() owned = x.book.OwningCharacter ~= nil and x.book.OwningCharacter:IsValid() end)
+                if not owned and not same_actor(slot_book(case, x.slot), x.book) then
+                    stray = stray + 1
+                    if not put_back(case, x.slot, x.book) then
+                        local SD = shelfdrop()
+                        if SD and SD.off_case then pcall(SD.off_case, IA, x.book, case) end
+                    end
+                end
+                x.placed = true
+            end
+        end
+        if stray > 0 then
+            log(("Scramble Shelf: %d book%s on %s had no slot to go back to; put back or laid on the floor"):format(
+                stray, stray == 1 and "" or "s", tostring(job.label)))
+        end
         touched(IA, case)
         local n = 0
         for _, x in ipairs(job.items) do

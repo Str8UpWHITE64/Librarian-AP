@@ -835,6 +835,17 @@ function M.pin(IA, book, loc, rot)
         epoch = IA._world_epoch or 0 }
 end
 
+--- A held book was moved on purpose: its hold follows it to the new pose and keeps its time left.
+function M.repin(book, loc, rot)
+    local key
+    pcall(function() key = book:GetFullName() end)
+    local pin = M.pins[key or tostring(book)]
+    if not pin then return false end
+    pin.loc = { X = loc.X, Y = loc.Y, Z = loc.Z }
+    pin.rot = { Pitch = rot.Pitch, Yaw = rot.Yaw, Roll = rot.Roll }
+    return true
+end
+
 --- Whether a held book is the player's again, and why; nil while it is still held.
 local function pin_released(IA, pin, p)
     local b = pin.book
