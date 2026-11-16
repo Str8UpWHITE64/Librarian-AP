@@ -1634,7 +1634,10 @@ class LibrarianWorld(World):
         total = sum(quantities.values())
         if total > target:
             excess = total - target
-            pooled = sorted(int(n[14:]) for n in quantities if n.startswith("Series Bundle "))
+            # Only bundles with a copy still in the pool: the starting bundles keep a
+            # zero entry here, and lifting one of those would relieve nothing.
+            pooled = sorted(int(n[14:]) for n, q in quantities.items()
+                            if q > 0 and n.startswith("Series Bundle "))
             series_qty = len(pooled) if self.distinct_bundles else quantities.get(ITEM_PROG_SERIES, 0)
             lift = min(series_qty, excess)
             if lift > 0:
@@ -1960,6 +1963,19 @@ class LibrarianWorld(World):
                     mw.push_precollected(self.create_item(nm))
 
         self._drop_disabled_skills(quantities)   # magic the player turned off
+        # A small goal has fewer checks than the optional block and the magic need. Drop
+        # the surplus from them, worst-to-keep first as in the other pool builders;
+        # bundles and bookcase unlocks are never dropped.
+        excess = sum(max(0, q) for q in quantities.values()) - target
+        for name in (_trap_names() + _mastery_names()
+                     + ["+2 Book Capacity", "+3 Book Capacity"]
+                     + list(self._enabled_magic_names())):
+            if excess <= 0:
+                break
+            take = min(quantities.get(name, 0), excess)
+            if take > 0:
+                quantities[name] -= take
+                excess -= take
         pool_items: list[LibrarianItem] = []
         for name, qty in quantities.items():
             for _ in range(max(0, qty)):
@@ -1969,7 +1985,8 @@ class LibrarianWorld(World):
         if filler_needed < 0:
             raise OptionError(
                 f"Librarian: random_book_bundle pool overshoots this goal's checks by "
-                f"{-filler_needed}. Raise books_per_bundle or the custom goal.")
+                f"{-filler_needed} even after dropping optional items. Raise "
+                f"books_per_bundle or the custom goal.")
         for i in range(filler_needed):
             pool_items.append(self.create_item(_filler_items[i % len(_filler_items)].name))
         mw.itempool.extend(pool_items)
