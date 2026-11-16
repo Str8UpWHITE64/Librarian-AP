@@ -202,37 +202,6 @@ local function _bh_series(book_obj)
     return aidx, IA._asset_to_series[aidx]
 end
 
---- Refuse a warded book by setting what the game's own predicate reads, since we cannot answer it.
----
---- The trace settled how the game excludes shelved books: it asks CanBeGrab about every book of
---- the series, shelved ones included, and its own answer keeps them out. Across one Assemble, the
---- only book of ten it declined was the one carrying AttachedActor=BP_BookCase_C. So anchor a
---- warded book to a bookcase and the game refuses it for us -- no grab, nothing to evict.
----
---- Writes only over nil and clears only its own anchor, so a genuinely shelved book's attachment
---- is never disturbed. Note what this deliberately does NOT touch: 'Is Abs Correct' is the other
---- field that marked the shelved book, and it is the flag our own book checks read -- setting it
---- would hand out checks the run has not earned.
-local function _bh_book_unlocked(book_obj, series)
-    local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA._per_book_unlocks and series) then return false end
-    local bu = IA._books_unlocked
-    if not bu then return false end
-    local chapter = nil
-    pcall(function()
-        local info = book_obj.ItemInfo
-        if info and info:IsValid() then chapter = tonumber(info.Chapter) end
-    end)
-    if chapter == nil then return nil end
-    return bu[series .. "|" .. chapter] == true
-end
-
---- Is this book one the run has NOT earned? The same test the SetActorVisible ENFORCE path makes,
---- factored out so the magic-skill guards below cannot drift from it.
----
---- Returns nil, not false, when the answer cannot be established -- no series, no snapshot yet, a
---- book mid-spawn. Callers must treat nil as "leave it alone": denying a grab on a book we simply
---- failed to read would break ordinary play, which is a worse outcome than the leak.
 --- The (asset, chapter) pair identifying a book, in the same key space as _book_inst_state.
 local function _bh_book_key(book_obj)
     if not book_obj then return nil end
@@ -249,18 +218,22 @@ local function _bh_book_key(book_obj)
     return aidx, chapter
 end
 
+--- Is this book one the run has NOT earned? ItemApply.book_rule answers, the same rule the ward
+--- flush applies, so the hooks and magic-skill guards below cannot drift from it.
+---
+--- Returns nil, not false, when the answer cannot be established -- no series, a book mid-spawn or
+--- being carried. Callers must treat nil as "leave it alone": denying a grab on a book that simply
+--- could not be read would break ordinary play, which is a worse outcome than the leak.
 local function _bh_book_is_warded(book_obj)
     if not book_obj then return nil end
     local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA._unwarded_snapshot) then return nil end
-    local _, series = _bh_series(book_obj)
+    if not (IA and IA.book_shows) then return nil end
+    local shows, series = IA.book_shows(book_obj)
     if not series then return nil end
     -- A book a Veil holds hidden counts as warded for the length of the Veil.
     if IA._veil_has and IA._veil_has(book_obj) then return true end
-    if IA._unwarded_snapshot[series] then return false end
-    local unlocked = _bh_book_unlocked(book_obj, series)
-    if unlocked == nil then return nil end   -- unreadable book: leave it alone, per the rule above
-    return not unlocked
+    if shows == nil then return nil end
+    return not shows
 end
 
 --- Take the force field down so the player can reach the ending door.
@@ -295,6 +268,18 @@ function _bh.drop_end_barrier()
     log(("[end-door] barrier down (%d), door left for the player"):format(hid))
 end
 
+--- Refuse a warded book by setting what the game's own predicate reads, since its answer cannot
+--- be overridden.
+---
+--- The game excludes shelved books this way: it asks CanBeGrab about every book of the series,
+--- shelved ones included, and its own answer keeps them out. Across one Assemble, the only book
+--- of ten it declined was the one carrying AttachedActor=BP_BookCase_C. So anchor a warded book
+--- to a bookcase and the game refuses it itself -- no grab, nothing to evict.
+---
+--- Writes only over nil and clears only its own anchor, so a genuinely shelved book's attachment
+--- is never disturbed. Note what this deliberately does NOT touch: 'Is Abs Correct' is the other
+--- field that marked the shelved book, and it is the flag the mod's own book checks read -- setting it
+--- would hand out checks the run has not earned.
 function _bh.set_ward_attach(b, warded)
     local anchor = _bh.ward_anchor
     local ok = false; pcall(function() ok = anchor and anchor:IsValid() end)
@@ -461,17 +446,6 @@ function _bh.door_shut_prompt(door, look_only)
     return closed
 end
 
--- BookSanity: true when this book's own per-book item has arrived (no series is
--- unlocked in book mode, so this is what unwards it). Reads the atomic
--- _books_unlocked; game-thread safe (single lookup + a pcall Chapter read).
---- Has the run received THIS book? BookSanity only; false elsewhere, where the series alone
---- decides and the caller's series test has already answered.
----
---- Returns nil when the book cannot be identified. A book whose ItemInfo is unreadable -- one
---- being carried, mid-spawn, or part-way through the bag's own intake -- used to answer "not
---- unlocked", which the caller turned into "warded" and acted on. That is how Assemble came to
---- evict books the player had legitimately earned: not a strictness problem, a book the guard
---- simply could not read.
 local function _bh_sample(tag, book_obj, extra)
     if _bh.samples >= 15 then return end
     _bh.samples = _bh.samples + 1
@@ -668,12 +642,10 @@ local function _bh_grab_check(b, tag)
     end
     local IA = package.loaded["AP/ItemApply"]
     local unwarded_here
-    if series and IA and IA._unwarded_snapshot then
-        -- GAME THREAD (grab path): single snapshot lookup, no alloc/iterate. Calling
-        -- _compute_unwarded_set here races _recompute_state -> the rc3 crash. See
-        -- ItemApply._unwarded_snapshot.
-        local uw = IA._unwarded_snapshot
-        unwarded_here = (uw and uw[series]) or _bh_book_unlocked(b, series) or false
+    if series and IA and IA.book_shows then
+        -- The shared rule, read from the published snapshots (lookups only, nothing computed on
+        -- the game thread). A book it cannot judge is not restored.
+        unwarded_here = IA.book_shows(b) == true
         -- Not while a Veil holds it: showing it here would end the Veil for this one book.
         if unwarded_here and IA._veil_has and IA._veil_has(b) then unwarded_here = false end
     end
@@ -801,72 +773,61 @@ local function try_register_book_hooks()
                     return
                 end
             end
+            -- One verdict for both paths below, from the shared rule (ItemApply.book_rule). It
+            -- reads the published snapshots only: this fires per book on every distance swap.
+            local IA = package.loaded["AP/ItemApply"]
+            local show_book, series = nil, nil
+            if v == true and b and IA and IA.book_shows
+                    and (diag_on("BOOK_EVENT_ENFORCE") or diag_on("BOOK_EVENT_REVEAL")) then
+                show_book, series = IA.book_shows(b)
+            end
             -- ENFORCE: when the game tries to SHOW (v==true) a WARDED book, override the arg to
             -- false so its own call keeps it hidden -- no flicker, no re-entrancy. Unwarded books
-            -- show normally (unlock takes effect on next show). Reads the LIVE unwarded set.
-            if diag_on("BOOK_EVENT_ENFORCE") and v == true and b then
-                local _, series = _bh_series(b)
-                local IA = package.loaded["AP/ItemApply"]
-                if series and IA and IA._unwarded_snapshot then
-                    -- GAME THREAD: read the precomputed snapshot (single lookup, no alloc/iterate).
-                    -- Calling _compute_unwarded_set here is the rc3 crash (races _recompute_state).
-                    local unwarded = IA._unwarded_snapshot
-                    -- Show if the series is unwarded OR (book_sanity) this book's own item
-                    -- arrived -- else the game's show call re-hides it every time it's looked at.
-                    local show_book = (unwarded and unwarded[series])
-                        or _bh_book_unlocked(b, series)
-                    -- stacks mode (_book_hide_mode==false): warded actor stays visible, just
-                    -- non-grabbable (collision is layer 1's job) -- never force-hide it.
-                    if IA._book_hide_mode ~= false and not show_book then
-                        local set_ok = pcall(function() is_visible:set(false) end)
-                        _bh.enforced = _bh.enforced + 1
-                        if _bh.enf_samples < 10 then
-                            _bh.enf_samples = _bh.enf_samples + 1
-                            log(("[book-hook] ENFORCE keep-hidden warded series=%s set_ok=%s"):format(
-                                tostring(series), tostring(set_ok)))
-                        end
-                    end
+            -- show normally (unlock takes effect on next show). A book of a known series that the
+            -- rule cannot judge is kept hidden too: the ward flush hid it on the same terms.
+            -- stacks mode (_book_hide_mode==false): warded actor stays visible, just non-grabbable
+            -- (collision is layer 1's job) -- never force-hide it.
+            if diag_on("BOOK_EVENT_ENFORCE") and series
+                    and IA._book_hide_mode ~= false and show_book ~= true then
+                local set_ok = pcall(function() is_visible:set(false) end)
+                _bh.enforced = _bh.enforced + 1
+                if _bh.enf_samples < 10 then
+                    _bh.enf_samples = _bh.enf_samples + 1
+                    log(("[book-hook] ENFORCE keep-hidden warded series=%s set_ok=%s"):format(
+                        tostring(series), tostring(set_ok)))
                 end
             end
             -- REVEAL-complete: when the game SHOWS an UNWARDED book it doesn't always restore the
             -- MESH -- a stuck SM_Book_1 bHiddenInGame/bVisible leaves it "shown" yet invisible.
             -- Clear the mesh hide flags + ensure collision. Rides the show call, so Tick keeps it.
-            if diag_on("BOOK_EVENT_REVEAL") and v == true and b then
-                local _, rseries = _bh_series(b)
-                local IA = package.loaded["AP/ItemApply"]
-                if rseries and IA and IA._unwarded_snapshot then
-                    -- GAME THREAD: snapshot lookup only (see ENFORCE above / ItemApply._unwarded_snapshot).
-                    local unwarded = IA._unwarded_snapshot
-                    if (unwarded and unwarded[rseries]) or _bh_book_unlocked(b, rseries) then
-                        local sm; pcall(function() sm = b.SM_Book_1 end)
-                        if sm and sm:IsValid() then
-                            local mh, vis, op, mid
-                            pcall(function() mh = sm.bHiddenInGame end)
-                            pcall(function() vis = sm.bVisible end)
-                            pcall(function() mid = sm:GetMaterial(0) end)
-                            if mid and mid:IsValid() then op = _mid_scalar(mid, "Opacity") end
-                            -- op < 1 = stuck-transparent book; restore Opacity here too so just
-                            -- LOOKING at it repairs it. Gated BOOK_OPACITY_FIX.
-                            local op_bad = diag_on("BOOK_OPACITY_FIX") and type(op) == "number" and op < 1.0
-                            -- Collision first, and unconditionally. It used to be restored only
-                            -- inside the mesh-repair branch below, so a book whose mesh flags were
-                            -- already fine came back visible and still not pickable -- reported as
-                            -- "unhid but not interactable, Assemble fixes it", Assemble being the
-                            -- grab path that restores collision by another route. Showing an
-                            -- unwarded book and leaving it un-grabbable is never right, and the
-                            -- call is idempotent.
-                            pcall(function() b:SetActorEnableCollision(true) end)
-                            if mh == true or vis == false or op_bad then
-                                if mh == true then pcall(function() sm:SetHiddenInGame(false, false) end) end
-                                if vis == false then pcall(function() sm:SetVisibility(true, false) end) end
-                                if op_bad then pcall(function() mid:SetScalarParameterValue("Opacity", 1.0) end) end
-                                _bh.revealed = _bh.revealed + 1
-                                if _bh.rev_samples < 15 then
-                                    _bh.rev_samples = _bh.rev_samples + 1
-                                    log(("[book-hook] REVEAL-complete series=%s mh=%s vis=%s op=%s"):format(
-                                        tostring(rseries), tostring(mh), tostring(vis), tostring(op)))
-                                end
-                            end
+            if diag_on("BOOK_EVENT_REVEAL") and show_book == true then
+                local sm; pcall(function() sm = b.SM_Book_1 end)
+                if sm and sm:IsValid() then
+                    local mh, vis, op, mid
+                    pcall(function() mh = sm.bHiddenInGame end)
+                    pcall(function() vis = sm.bVisible end)
+                    pcall(function() mid = sm:GetMaterial(0) end)
+                    if mid and mid:IsValid() then op = _mid_scalar(mid, "Opacity") end
+                    -- op < 1 = stuck-transparent book; restore Opacity here too so just
+                    -- LOOKING at it repairs it. Gated BOOK_OPACITY_FIX.
+                    local op_bad = diag_on("BOOK_OPACITY_FIX") and type(op) == "number" and op < 1.0
+                    -- Collision first, and unconditionally. It used to be restored only
+                    -- inside the mesh-repair branch below, so a book whose mesh flags were
+                    -- already fine came back visible and still not pickable -- reported as
+                    -- "unhid but not interactable, Assemble fixes it", Assemble being the
+                    -- grab path that restores collision by another route. Showing an
+                    -- unwarded book and leaving it un-grabbable is never right, and the
+                    -- call is idempotent.
+                    pcall(function() b:SetActorEnableCollision(true) end)
+                    if mh == true or vis == false or op_bad then
+                        if mh == true then pcall(function() sm:SetHiddenInGame(false, false) end) end
+                        if vis == false then pcall(function() sm:SetVisibility(true, false) end) end
+                        if op_bad then pcall(function() mid:SetScalarParameterValue("Opacity", 1.0) end) end
+                        _bh.revealed = _bh.revealed + 1
+                        if _bh.rev_samples < 15 then
+                            _bh.rev_samples = _bh.rev_samples + 1
+                            log(("[book-hook] REVEAL-complete series=%s mh=%s vis=%s op=%s"):format(
+                                tostring(series), tostring(mh), tostring(vis), tostring(op)))
                         end
                     end
                 end
@@ -2574,6 +2535,8 @@ local function start_gameplay_loops()
         -- Re-asserts collision + SM_Book_1 mesh on unwarded books whose flags drifted (heals
         -- visible-not-grabbable + grabbable-invisible). Read-before-write, gated BOOK_ACTOR_RECONCILE.
         pcall(function() IA.reconcile_book_actors() end)
+        -- Retry the pile copies the last flush could not sink (a few times, then it stops).
+        pcall(function() IA.retry_pile_sinks() end)
         pcall(_invis_scan_step)   -- passive invisible-book detector (off by default)
         return false
     end)
@@ -2965,8 +2928,8 @@ gt_loop("insight_ward", 100, function()
     end
 end)
 
+-- The bag guard always runs; MAGIC_LEAK_TRACE only switches its log line.
 gt_loop("magic_bag_watch", 1000, function()
-    if not diag_on("MAGIC_LEAK_TRACE") then return false end
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._gameplay_active and IA._per_book_unlocks) then return false end
     -- Re-anchor the books we evicted, a second after the drop cleared the field. The rolling
@@ -3008,8 +2971,10 @@ gt_loop("magic_bag_watch", 1000, function()
     if warded ~= _magic_bag_last or _magic_bag_dirty then
         _magic_bag_last = warded
         _magic_bag_dirty = false
-        log(("[magic] BAG items=%d warded=%d%s"):format(
-            total, warded, example and (" e.g. " .. tostring(example)) or ""))
+        if diag_on("MAGIC_LEAK_TRACE") then
+            log(("[magic] BAG items=%d warded=%d%s"):format(
+                total, warded, example and (" e.g. " .. tostring(example)) or ""))
+        end
     end
     if warded > 0 then _magic_evict_bag() end
     gt_drain_magic_reward()
@@ -3535,6 +3500,11 @@ RegisterLoadMapPostHook(function(Engine, World)
         _b2_state = {}
         _b2_last_sig = nil
         _b2_group = {}
+        -- The ward anchor records and the evicted-book list name the old world's actors, as
+        -- ItemApply's _books_warded does. A stale anchor record could let set_ward_attach strip a
+        -- real attachment off a book of the same name the player shelves in the new world.
+        _bh.anchored = {}
+        _bh.evicted = nil
 
         -- Re-arm the apply-gate for this fresh world. Menu->Continue reloads M01 but never calls
         -- deactivate_gameplay, so without this reset the gate never re-runs and warding indexes 0
