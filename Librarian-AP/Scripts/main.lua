@@ -3263,7 +3263,7 @@ gt_loop("autonew", 500, function()
     local IA = package.loaded["AP/ItemApply"]
     local AC = package.loaded["AP/APClient"]
     if not (SI and IA and AC) then return false end
-    if SI.disabled then return true end   -- vanilla: the mod does not touch the buttons at all
+    if SI.disabled then return false end  -- vanilla: hands off, but a later connect re-arms this
     if SI.slots_full then return false end
     if SI.autonew_done or SI.autoload_done or IA._gameplay_active then return false end
     if not (AC._slot_connected and SI.slot_resolved and SI.start_enabled) then return false end
@@ -3316,7 +3316,7 @@ gt_loop("ready_gate", 250, function()
     local IA = package.loaded["AP/ItemApply"]
     local SI = package.loaded["AP/SaveIdentity"]
     if not (IA and SI) then return false end
-    if SI.disabled then return true end   -- vanilla: the mod holds nobody
+    if SI.disabled then return false end  -- vanilla: holds nobody, but a later connect re-arms this
     if not IA._gameplay_active then
         if _pause_gate.shown or _pause_gate.done then
             _pause_gate = { shown = false, done = false, waited = 0, apply = _pause_gate.apply }
