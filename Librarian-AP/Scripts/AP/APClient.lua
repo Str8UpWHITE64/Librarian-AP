@@ -68,6 +68,11 @@ local Client = {
     -- Already-sent location IDs so we don't double-send
     _sent_checks = {},
 
+    -- Sent, but not yet echoed back by the server. A send into a connection that is already dead
+    -- is lost without an error, so these are sent again when the same run reconnects.
+    _unconfirmed_checks = {},
+    _run_key = nil,               -- server, slot and seed the unconfirmed checks belong to
+
     -- Gate on in-game state. When false, received items stay queued in
     -- _pending_items but on_item is NOT fired. Set true after the player
     -- loads M01; lets us defer game-state mutations until the level is
@@ -143,6 +148,9 @@ function Client:connect()
     -- they have already been recorded. _sent_checks is the cross-session truth for how far this slot
     -- has progressed (_compute_sent_level_baseline reads it), so wiping it there would reset the
     -- level floor to zero and re-issue skill upgrades the player already has.
+    --
+    -- _unconfirmed_checks is kept: the slot-connected handler re-sends it only when the new
+    -- connection is the same run, and drops it otherwise.
     self._outgoing_checks = {}
     self._sent_checks = {}
     self._deferred_init = true
@@ -310,6 +318,9 @@ function Client:_register_handlers()
             end
         end)
         self._foreign_logged = {}
+        local room_seed = seed
+        pcall(function() room_seed = c._native:get_seed() or seed end)
+        self:_requeue_unconfirmed(room_seed)
         if self.on_slot_connected then pcall(self.on_slot_connected, self.slot_data) end
         -- Fire scouts for all our missing locations so on_check_sent can
         -- name what we're sending. Batched (25 per tick × 200ms delay) so
@@ -329,7 +340,11 @@ function Client:_register_handlers()
     c:set_location_checked_handler(function(locations)
         if type(locations) ~= "table" then return end
         for _, loc in ipairs(locations) do
-            self._sent_checks[tonumber(loc)] = true
+            local id = tonumber(loc)
+            if id then
+                self._sent_checks[id] = true
+                self._unconfirmed_checks[id] = nil
+            end
         end
     end)
     c:set_print_handler(function(text)
@@ -682,6 +697,29 @@ function Client:set_status(status)
     self._outgoing_status = status
 end
 
+--- Called on every slot connect, before the server's checked list is applied. Checks sent on an
+--- earlier connection of the same run that the server never echoed back are queued again, so one
+--- lost with a dying socket still arrives. They passed the identity gate when first sent, and the
+--- server ignores a location it already has. A different server, slot or seed drops them instead.
+function Client:_requeue_unconfirmed(seed)
+    local key = ("%s|%s|%s"):format(tostring(self.server), tostring(self.slot), tostring(seed))
+    local same_run = self._run_key == key
+    self._run_key = key
+    local pending = self._unconfirmed_checks
+    self._unconfirmed_checks = {}
+    if not same_run then return end
+    local ids = {}
+    for id in pairs(pending) do ids[#ids + 1] = id end
+    if #ids == 0 then return end
+    table.sort(ids)
+    for _, id in ipairs(ids) do
+        self._sent_checks[id] = nil
+        self._outgoing_checks[#self._outgoing_checks + 1] = id
+    end
+    ev("WARN", "checks", ("Re-sending %d location checks the server did not confirm: %s"):format(
+        #ids, table.concat(ids, ", ")))
+end
+
 function Client:_process_outgoing()
     if not self._slot_connected then return end
 
@@ -690,6 +728,10 @@ function Client:_process_outgoing()
         for _, lid in ipairs(self._outgoing_checks) do
             if not self._sent_checks[lid] then
                 self._sent_checks[lid] = true
+                -- Locations the slot does not have are never echoed back, so they are not tracked.
+                if not (self._slot_locations and not self._slot_locations[lid]) then
+                    self._unconfirmed_checks[lid] = true
+                end
                 new_checks[#new_checks + 1] = lid
             end
         end
