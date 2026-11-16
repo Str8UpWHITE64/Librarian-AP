@@ -3272,6 +3272,9 @@ gt_loop("autonew", 500, function()
     -- slot claim while SI.slot is nil -- auto-pressing there would build a world that never claims
     -- one. That case keeps today's behaviour: New Game is enabled and the player clicks it.
     if SI.slot ~= nil then return false end
+    -- A record that only the server holds leaves SI.slot nil while its save is missing. Starting
+    -- over erases that record, so the press has to be the player's own.
+    if SI.save_missing then return false end
 
     local title = FindFirstOf("WBP_Title_C")
     if not (title and title:IsValid()) then return false end
