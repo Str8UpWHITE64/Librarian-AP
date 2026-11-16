@@ -988,15 +988,18 @@ function M.run_baseline_sync()
     local current_level = math.max(xp_level, sent_level)
     log(("Level-up baseline sync: rows_finished=%d, xp_level=%d, sent_level=%d → current_level=%d"):format(
         rows_finished, xp_level, sent_level, current_level))
+    local all_sent = true
     if current_level > 0 then
         local APClient = package.loaded["AP/APClient"]
         if APClient and APClient.send_check then
             for level = 1, current_level do
-                APClient:send_check(AP_LOC_LEVEL_FIRST + (level - 1))
+                if not APClient:send_check(AP_LOC_LEVEL_FIRST + (level - 1)) then all_sent = false end
             end
         end
     end
-    M._levels_reached = current_level
+    -- A refused send (identity not yet verified) leaves the counter at what the server already
+    -- has, so the catch-up in sync_progress_state re-sends the rest once checks are allowed.
+    M._levels_reached = all_sent and current_level or sent_level
 
     local lvl_sent, ms_sent = 0, 0
     pcall(function() lvl_sent, ms_sent = M.sync_progress_state() end)
@@ -4063,12 +4066,13 @@ function M.fire_section_completions()
         end
         if complete_loc and not M._sent_section_completions[sid]
                 and #row_locs > 0 then
-            if _section_finished(sid, #row_locs) then
+            -- Marked only on an accepted send, per send_check's contract: a refusal is temporary
+            -- (identity not yet verified) and marking through one loses the check for the session.
+            if _section_finished(sid, #row_locs) and APClient:send_check(complete_loc) then
                 M._sent_section_completions[sid] = true
                 log(("[section] All %d row(s) complete for section %s → loc %d%s"):format(
                     #row_locs, sid, complete_loc,
                     use_slot_map and "" or " (legacy fallback)"))
-                APClient:send_check(complete_loc)
                 sent = sent + 1
             end
         end
@@ -4108,14 +4112,53 @@ function M.fire_floor_completions()
                     break
                 end
             end
-            if all_done then
+            -- Marked only on an accepted send, as for sections above.
+            if all_done and APClient:send_check(complete_loc) then
                 M._sent_floor_completions[floor_n] = true
                 log(("[floor] All %d row(s) complete for Floor %d -> loc %d%s"):format(
                     #row_locs, floor_n, complete_loc,
                     use_slot_map and "" or " (legacy fallback)"))
-                APClient:send_check(complete_loc)
                 sent = sent + 1
             end
+        end
+    end
+    return sent
+end
+
+--- Chest-opening checks that send_check refused, kept for the world they were opened in. A chest
+--- opens once and nothing re-detects it, so a refused send would otherwise be lost for good.
+M._chest_checks_held = {}
+
+--- Send a chest-opening check. A refusal (identity not yet verified) is held and retried by
+--- fire_held_chest_checks; holds from a world that has since been left are dropped.
+function M.send_chest_check(loc)
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient.send_check) then return end
+    if APClient:send_check(loc) then return end
+    if not (M._slot_data and M._gameplay_active) then return end
+    local epoch = M._world_epoch or 0
+    if M._chest_checks_epoch ~= epoch then
+        M._chest_checks_held, M._chest_checks_epoch = {}, epoch
+    end
+    M._chest_checks_held[loc] = true
+    log(("[chest] check %d held until checks are allowed"):format(loc))
+end
+
+--- Retry the held chest checks. Returns the count sent.
+function M.fire_held_chest_checks()
+    if next(M._chest_checks_held) == nil then return 0 end
+    if M._chest_checks_epoch ~= (M._world_epoch or 0) then
+        M._chest_checks_held = {}
+        return 0
+    end
+    local APClient = package.loaded["AP/APClient"]
+    if not (APClient and APClient.send_check) then return 0 end
+    local sent = 0
+    for loc in pairs(M._chest_checks_held) do
+        if APClient:send_check(loc) then
+            M._chest_checks_held[loc] = nil
+            sent = sent + 1
+            log(("[chest] held check %d sent"):format(loc))
         end
     end
     return sent
@@ -4150,6 +4193,7 @@ function M.fire_completion_passes()
     pcall(function() M.fire_count_ticks() end)
     pcall(function() M.fire_section_completions() end)
     pcall(function() M.fire_floor_completions() end)
+    pcall(function() M.fire_held_chest_checks() end)
 end
 
 --- from FinishRow or CurrentFinishedRowNum). Returns the count sent.
@@ -4855,8 +4899,10 @@ function M.on_level_up_event()
     log(("[progress] level-up event: Reached Level %d → loc %d"):format(
         M._levels_reached, loc))
     local APClient = package.loaded["AP/APClient"]
-    if APClient and APClient.send_check then
-        APClient:send_check(loc)
+    if APClient and APClient.send_check and not APClient:send_check(loc) then
+        -- Refused (identity not yet verified): step back, so the catch-up in sync_progress_state
+        -- sends this level once checks are allowed.
+        M._levels_reached = M._levels_reached - 1
     end
 end
 

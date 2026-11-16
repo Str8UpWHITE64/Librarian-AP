@@ -3591,7 +3591,9 @@ RegisterHook("/Script/Librarian.LibrarianCharacter:UpgradePlayer", function(self
     if loc then
         log(("[AP] queueing chest-open check id=%d (ability=%d %s)"):format(
             loc, idx, ability_name(idx)))
-        ap_send_check(loc)
+        -- Through ItemApply, which keeps a refused chest check and retries it.
+        local IA = package.loaded["AP/ItemApply"]
+        if IA and IA.send_chest_check then IA.send_chest_check(loc) else ap_send_check(loc) end
     end
 end)
 
