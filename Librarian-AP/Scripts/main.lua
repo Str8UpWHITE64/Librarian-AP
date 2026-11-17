@@ -3003,9 +3003,23 @@ RegisterLoadMapPostHook(function(Engine, World)
         if (selected and selected >= 0) or m01_load_count >= 2 then
             in_gameplay = true
         end
-        log(("(M01 LoadMap #%d, SelectedLevel=%s → in_gameplay=%s%s)"):format(
+        -- The player chose Back to Title: this load is the title screen. SelectedLevel stays set
+        -- and the load count is past the first, so without this the title would count as
+        -- gameplay, and the next Continue would enter its world with no pause hold.
+        local to_title = _bh.to_title == true
+        _bh.to_title = nil
+        if to_title then in_gameplay = false end
+        log(("(M01 LoadMap #%d, SelectedLevel=%s → in_gameplay=%s%s%s)"):format(
             m01_load_count, tostring(selected), tostring(in_gameplay),
+            to_title and " [Back to Title]" or "",
             is_our_forced_reload and " [forced reload, count suppressed]" or ""))
+        if to_title then
+            deactivate_gameplay("Back to Title")
+            -- The player went to the title on purpose: leave Continue and New Game to them, rather
+            -- than loading the run straight back in.
+            local SIt = package.loaded["AP/SaveIdentity"]
+            if SIt then SIt.autoload_done, SIt.autonew_done = true, true end
+        end
 
         -- Fresh world -> reset HISM mapping state (captured transforms refer to the old world).
         local IA = package.loaded["AP/ItemApply"]
@@ -3459,7 +3473,7 @@ end
 -- not resident is not free.
 local _pause_hooks_tried = false
 local PAUSE_BP = "/Game/Librarian/UI/Title/WBP_PauseMenu.WBP_PauseMenu_C:"
-gt_loop("pause_hooks", 5000, function()
+gt_loop("pause_hooks", 1000, function()
     if _pause_hooks_tried then return true end
     local menu = FindFirstOf("WBP_PauseMenu_C")
     if not (menu and menu:IsValid()) then return false end
@@ -3467,7 +3481,12 @@ gt_loop("pause_hooks", 5000, function()
     local n = 0
     for _, fn in ipairs({ "OnQuitGame", "OnBackToTitleMenu", "OnBackToTitileScreen" }) do
         if pcall(function()
-            RegisterHook(PAUSE_BP .. fn, function() mirror_now("quit: " .. fn) end)
+            RegisterHook(PAUSE_BP .. fn, function()
+                -- Back to Title: the next M01 load is the title screen, not gameplay (see the
+                -- LoadMap post hook). The game keeps SelectedLevel set there, so nothing else says so.
+                if fn ~= "OnQuitGame" then _bh.to_title = true end
+                mirror_now("quit: " .. fn)
+            end)
         end) then n = n + 1 end
     end
     log(("[save-id] quit hooks registered (%d/3)"):format(n))
