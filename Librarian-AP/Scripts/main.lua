@@ -1202,6 +1202,11 @@ local function try_register_magic_hooks()
             local d; pcall(function() d = self:get() end)
             local ok = false; pcall(function() ok = d and d:IsValid() end)
             if not ok then return end
+            -- Only a world entered as an AP run: gameplay is activated only while connected, and stays
+            -- active through a disconnect until the player leaves the world. Vanilla play keeps the
+            -- game's own door, ending and achievements.
+            local IAd = package.loaded["AP/ItemApply"]
+            if not (IAd and IAd._gameplay_active) then return end
             if not _bh.goal_reached then
                 -- The prompt already up means this hook ran after the door's own code: close it.
                 -- Otherwise the hook ran first (or the game refused by itself), and loosening a few
