@@ -3,15 +3,6 @@
 -- Threading/crash rules referenced below: CRASH_HANDOFF.md.
 
 return {
-    -- Layer 3: hide/reveal warded shelves via the book HISM (visibility + material).
-    BOOK_VISIBILITY    = true,
-
-    -- Just the HISM SetMaterial calls (isolates the "material on a book HISM crashes" rule).
-    HISM_SETMATERIAL   = true,
-
-    -- Marshal Layer 3's HISM writes to the game thread. Off-thread = the Layer-3 crash.
-    BOOK_VIS_GAMETHREAD = true,
-
     -- Layer 2: per-bookcase collision + visibility warding.
     CASE_WARDING       = true,
 
@@ -38,9 +29,6 @@ return {
     -- Register the book SetActorVisible / SetBookInfo / CanBeGrab hooks (required by all BOOK_EVENT_* below).
     BOOK_EVENT_HOOKS   = true,
 
-    -- Keep a warded book hidden when the game tries to show it (the core sync net).
-    BOOK_EVENT_ENFORCE = true,
-
     -- When an unwarded book is shown, restore its mesh-visible flags + collision.
     BOOK_EVENT_REVEAL  = true,
 
@@ -61,10 +49,6 @@ return {
     -- Every 5s, re-assert collision + mesh-visible on unwarded books (heals flag drift). Logs only on a fix.
     BOOK_ACTOR_RECONCILE = true,
 
-    -- BookSanity: hide a locked book by teleporting its pile instance to deep Z (pile stays visible
-    -- as the actor<->pile backfill). Restored on unlock. Off = actor ward alone gates grabbing.
-    BOOK_PILE_TELEPORT = true,
-
     -- Name on the HUD a row that is fully shelved but out of order, until it is fixed.
     MISORDER_NOTICE    = true,
 
@@ -74,7 +58,7 @@ return {
     SHELF_BOOK_DROP    = true,
 
     -- Log what the mass-book magic skills actually touch: which books Assemble takes, whether the
-    -- game asks CanBeGrab first, and which pile instances get rewritten while Insight is up. Cheap
+    -- game asks CanBeGrab first, and what reaches the bag. Cheap
     -- (a few lines per skill use) and it is the only evidence for whether the two guards below are
     -- hitting the right path. Turn off once the behaviour is settled.
     MAGIC_LEAK_TRACE = true,
@@ -85,14 +69,9 @@ return {
     -- and fire a check the run has not earned; the bag eviction is then the only thing stopping it.
     MAGIC_WARD_CANBEGRAB = true,
 
-    -- Insight: ride the game's own pile write and sink a warded book's instance back to deep Z, so
-    -- it is never shown rather than re-hidden afterwards. Off = the post-hoc resweep alone, which
-    -- deliberately leaves locked books visible for the whole skill duration.
-    MAGIC_WARD_HISM_WRITE = true,
-
     -- Insight: refuse the per-book highlight for a warded book by answering its own toggle with
-    -- "off". The pile sink alone was not enough -- the skill also lights the book actor, which is a
-    -- separate layer and the one actually seen.
+    -- "off". The skill lights the book actor, which a cleared pile link does not stop, and which
+    -- in the stacks look stays drawn.
     MAGIC_WARD_SAMETYPE_FX = true,
     -- books -- specifically which per-book call it makes, so that call can be aimed at just the books
     -- we displaced. It takes no arguments, so it recalls EVERY loose book, not only ours: it
@@ -101,8 +80,8 @@ return {
     MAGIC_TEST_RECALL_STONE = false,
 
     -- Insight: re-hide a warded book's ACTOR while the skill is up. Measured cause of the reveal --
-    -- the skill sets bHidden=false on the actor; the pile instance stays sunk throughout, which is
-    -- why re-sinking piles never helped. Off = locked books are visible (but still un-grabbable,
+    -- the skill sets bHidden=false on the actor; the pile copy stays hidden throughout. Off = locked
+    -- books are visible (but still un-grabbable,
     -- collision stays off) for the duration of the skill.
     MAGIC_WARD_INSIGHT_ACTOR = true,
 

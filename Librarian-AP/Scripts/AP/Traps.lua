@@ -22,7 +22,6 @@ local SHUFFLE_N    = 40     -- books nearest the player that Floor Shuffle consi
 local BAND         = 40     -- books trade only within a band this tall
 local VEIL_CHUNK   = 150    -- books hidden or restored per tick, so a big library does not hitch
 local VEIL_SECONDS = 30     -- how long a Veil lasts
-local DEEP_Z       = 1000000.0   -- the pile instance of a veiled book sinks this far, as the ward does
 
 M.HANDLERS = {}
 -- Trap kinds with no argument. Items are named "<kind> Trap"; seeds made before the rename use the bare
@@ -722,55 +721,22 @@ end
 -- Veil
 -- ============================================================================
 
-local function hism_array()
-    local mgr = FindFirstOf("BP_HISM_Manager_C")
-    if not (mgr and mgr:IsValid()) then return nil end
-    local arr
-    pcall(function() arr = mgr.HISMArray end)
-    return arr
-end
-
-local function hide_one(IA, arr, b, e)
+-- A veiled book is locked the way a locked book is (ItemApply.lever_hide): the game collapses its pile
+-- copy, its actor is hidden, its collision off, it is anchored, and its pile link is cleared, so the
+-- game cannot draw it until the Veil gives the link back.
+local function hide_one(IA, b, e)
     pcall(function() e.was_hidden = b.bHidden == true end)
-    pcall(function() b:SetActorHiddenInGame(true) end)
-    pcall(function() b:SetActorEnableCollision(false) end)
-    -- Assemble skips a book whose AttachedActor is set: the same anchor the ward uses.
-    if IA._ward_anchor then pcall(IA._ward_anchor, b, true) end
-    if arr and e.aidx and e.ch then
-        local comp
-        pcall(function() comp = arr[e.aidx + 1] end)
-        if comp and comp:IsValid() then
-            local cap = {}
-            local got = false
-            pcall(function() got = comp:GetInstanceTransform(e.ch, cap, true) end)
-            local o = got and v3(cap.Translation)
-            if o then
-                local orig, deep
-                pcall(function()
-                    orig = { Translation = o, Rotation = { X = cap.Rotation.X, Y = cap.Rotation.Y, Z = cap.Rotation.Z, W = cap.Rotation.W },
-                             Scale3D = { X = cap.Scale3D.X, Y = cap.Scale3D.Y, Z = cap.Scale3D.Z } }
-                    deep = { Translation = { X = o.X, Y = o.Y, Z = o.Z - DEEP_Z }, Rotation = orig.Rotation, Scale3D = orig.Scale3D }
-                end)
-                if orig and deep and pcall(function() comp:UpdateInstanceTransform(e.ch, deep, true, true, true) end) then
-                    e.pile_orig = orig
-                end
-            end
-        end
-    end
+    IA.lever_hide(b)
 end
 
-local function show_one(IA, arr, b, e)
-    if e.pile_orig and arr then
-        local comp
-        pcall(function() comp = arr[e.aidx + 1] end)
-        if comp and comp:IsValid() then
-            pcall(function() comp:UpdateInstanceTransform(e.ch, e.pile_orig, true, true, true) end)
-        end
-    end
-    -- A book the game itself had hidden (far away, drawn by its pile) stays the game's to show.
+local function show_one(IA, b, e)
+    -- No longer held: the rolling check would otherwise lock it again before the Veil's last book
+    -- is back.
+    if e.key then M.veiled[e.key] = nil end
+    IA.lever_show(b)
+    -- lever_show leaves the actor hidden and the pile copy drawn, the game's own state for a book at
+    -- a distance; an actor that was showing before the Veil is shown again.
     if not e.was_hidden then pcall(function() b:SetActorHiddenInGame(false) end) end
-    pcall(function() b:SetActorEnableCollision(true) end)
-    if IA._ward_anchor then pcall(IA._ward_anchor, b, false) end
 end
 
 local function veil_forget(v)
@@ -788,7 +754,6 @@ local function veil_tick(IA)
         return
     end
     if not (IA._gameplay_active and IA._apply_safe) then return end
-    local arr = hism_array()
     if v.phase == "hide" then
         local last = math.min(v.cursor + VEIL_CHUNK - 1, #v.todo)
         for i = v.cursor, last do
@@ -804,7 +769,7 @@ local function veil_tick(IA)
                     M.veiled[k] = e
                     M.veiled_n = M.veiled_n + 1
                     v.items[#v.items + 1] = e
-                    hide_one(IA, arr, b, e)
+                    hide_one(IA, b, e)
                 end
             end
         end
@@ -822,7 +787,7 @@ local function veil_tick(IA)
         local last = math.min(v.cursor + VEIL_CHUNK - 1, #v.items)
         for i = v.cursor, last do
             local e = v.items[i]
-            if e.book and e.book:IsValid() then show_one(IA, arr, e.book, e) end
+            if e.book and e.book:IsValid() then show_one(IA, e.book, e) end
         end
         v.cursor = last + 1
         if v.cursor > #v.items then

@@ -26,10 +26,9 @@ local function diag_on(flag)
     return v and true or false
 end
 local function diag_flags_str()
-    local order = { "BOOK_VISIBILITY", "HISM_SETMATERIAL", "BOOK_VIS_GAMETHREAD",
-                    "CASE_WARDING", "RENDER_STATE_DIRTY", "BOOK_ACTOR_WARDING",
+    local order = { "CASE_WARDING", "RENDER_STATE_DIRTY", "BOOK_ACTOR_WARDING",
                     "BOOK_ACTOR_GAMETHREAD", "WARD_GROUND_TRUTH", "CASE_WARD_GAMETHREAD",
-                    "NAMED_HOOKS", "BOOK_EVENT_HOOKS", "BOOK_EVENT_ENFORCE",
+                    "NAMED_HOOKS", "BOOK_EVENT_HOOKS",
                     "BOOK_EVENT_REVEAL", "BOOK_EVENT_GRABFIX", "BOOK_OPACITY_FIX",
                     "BOOK_REFRESH_FIX", "BOOK_REFRESH_SWEEP",
                     "BOOK_ACTOR_RECONCILE", "BOOK_INVIS_SCAN" }
@@ -47,10 +46,6 @@ local trace = (function()
 end)()
 _G._librarian_trace = trace   -- reachable from hook callbacks if ever needed
 
--- on_game_thread(fn): marshal `fn` onto the game thread. CRITICAL: LoopAsync/ExecuteWithDelay
--- run on a separate async thread; off-thread HISM writes race the engine's render/cluster-tree
--- workers -> native crash (CRASH_HANDOFF.md). Gated BOOK_VIS_GAMETHREAD; falls back to inline if
--- ExecuteInGameThread is unavailable.
 -- Cached once at load: single-thread (game-thread pawn tick) mode. When on, warding runs inline on
 -- the caller (the pawn tick IS the game thread) instead of via the async pump; the async LoopAsync
 -- loops are gated off and their work moves to the pawn-tick master scheduler (Stage 2 single-thread fix).
@@ -74,8 +69,6 @@ local _gt_pending_f6  = false     -- dev: fire the Recall Stone once (MAGIC_TEST
 -- above: set on the input thread, drained by the master tick.
 _gt_pending_f7 = false            -- accept the loaded save as this run's (layout mismatch only)
 _gt_pending_f8 = false            -- write the diagnostic report (also a global, same reason)
-local _l3_resume = nil            -- L3 (book-pile HISM) chunk resume; the master scheduler advances it one chunk/frame
-local _l3c_ep, _l3c_mgr, _l3c_mat, _l3c_ready   -- L3 setup scan cache (per world epoch): HISM mgr / mask material / ready flag
 local _gt_last_epoch = -1         -- last world epoch the scheduler saw; a bump means the captured warding arrays are freed
 -- Hitch attribution + memory triage, reported to the log so a TESTER'S session can name the
 -- culprit. dt is the whole previous frame, so a spike blames every step that ran in it plus
@@ -159,25 +152,10 @@ local function gt_run_deferred(dt_ms)
     end
 end
 
-local function on_game_thread(fn)
-    if POLL_GT then return fn() end   -- single-thread mode: already on the game thread; run inline
-    if diag_on("BOOK_VIS_GAMETHREAD") and type(ExecuteInGameThread) == "function" then
-        -- Route layer 3 through ItemApply's serialized ward pump so it shares the
-        -- single in-flight gate with layers 1-2 (no overlapping marshals = no #1180).
-        local IA = package.loaded["AP/ItemApply"]
-        if IA and IA._pump_enqueue then
-            IA._pump_enqueue(fn)
-        else
-            ExecuteInGameThread(fn)   -- pump not loaded yet (rare): marshal directly
-        end
-    else
-        fn()
-    end
-end
 
 
 -- ============================================================================
--- Book-event hooks: enforce the warded set at the game's own book events
+-- Book-event hooks: correct the game's own book events for warded and unwarded books
 -- (SetActorVisible / SetBookInfo / CanBeGrab).
 -- Gated BOOK_EVENT_HOOKS; registered once on the game thread (single one-shot
 -- ExecuteInGameThread). Each callback re-checks its flag, so a flip = no-op.
@@ -191,7 +169,7 @@ local BOOK_BP = "/Game/Librarian/Prop/GrabbingItem/BP_GrabbingBook.BP_GrabbingBo
 -- A local declared later is not an upvalue for earlier code -- it would resolve to a nil global.
 local _dev = {}
 local _book_hooks_attempted = false
-local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0, enforced = 0, enf_samples = 0,
+local _bh = { setvis = 0, setinfo = 0, canbegrab = 0, samples = 0,
               revealed = 0, rev_samples = 0, grabbed = 0, grab_samples = 0, grabfix = 0 }
 
 local function _bh_series(book_obj)
@@ -202,7 +180,7 @@ local function _bh_series(book_obj)
     return aidx, IA._asset_to_series[aidx]
 end
 
---- The (asset, chapter) pair identifying a book, in the same key space as _book_inst_state.
+--- The (asset, chapter) pair identifying a book: its pile component and its instance in it.
 local function _bh_book_key(book_obj)
     if not book_obj then return nil end
     local IA = package.loaded["AP/ItemApply"]
@@ -521,9 +499,9 @@ local function _mid_dump_vec(mid)
     return s
 end
 
--- Inspect a book's cosmetic pile HISM (what layer 3 wards; the GRAB hook reads the ACTOR and
--- can't see it). Reports whether we left the HISM hidden/masked/moved while series is unwarded.
--- hi = AssetIdx+1 (the layer-3 index mapping). Read-only; game thread (same as layer 3).
+-- Inspect a book's pile copy (the GRAB hook reads the ACTOR and can't see it), for the grab dump:
+-- the component's visibility and material and the nearest instance's height. hi = AssetIdx+1.
+-- Read-only, diagnostics only.
 local function _inspect_pile(b)
     local IA = package.loaded["AP/ItemApply"]
     if not (IA and IA._book_valid_asset_idx) then return "no-IA" end
@@ -757,45 +735,34 @@ local function try_register_book_hooks()
         end
         reg("SetActorVisible", function(self, is_visible)
             if not diag_on("BOOK_EVENT_HOOKS") then return end
+            -- The pile lever's own call (ItemApply.lever_hide / lever_show) is left exactly as made.
+            local IA = package.loaded["AP/ItemApply"]
+            if IA and IA._lever_busy then return end
             _bh.setvis = _bh.setvis + 1
             pcall(_refresh_sweep_step)    -- proactive: redraw unwarded books in chunks (heal corrupt ones)
-            -- Visibility is corrected by riding the game's OWN SetActorVisible call (ENFORCE +
-            -- REVEAL-complete below) -- no separate timer-sweep, no post-hook.
+            -- A locked book has no pile link (ItemApply.lever_hide), so the game's call does nothing
+            -- for it. One whose link has come back is locked again on the next tick. For an unlocked
+            -- one, REVEAL-complete below rides the game's own show call.
             local b, v
             pcall(function() b = self:get() end)
             pcall(function() v = is_visible:get() end)
             _bh_sample("SetActorVisible", b, "vis=" .. tostring(v))
-            -- A Veil keeps its books hidden when the game's distance swap tries to show them.
-            if v == true and b then
-                local IAv = package.loaded["AP/ItemApply"]
-                if IAv and IAv._veil_has and IAv._veil_has(b) then
-                    pcall(function() is_visible:set(false) end)
-                    return
-                end
-            end
-            -- One verdict for both paths below, from the shared rule (ItemApply.book_rule). It
-            -- reads the published snapshots only: this fires per book on every distance swap.
-            local IA = package.loaded["AP/ItemApply"]
+            -- The verdict from the shared rule (ItemApply.book_rule). It reads the published
+            -- snapshots only: this fires per book on every distance swap.
             local show_book, series = nil, nil
-            if v == true and b and IA and IA.book_shows
-                    and (diag_on("BOOK_EVENT_ENFORCE") or diag_on("BOOK_EVENT_REVEAL")) then
+            if v == true and b and IA and IA.book_shows then
                 show_book, series = IA.book_shows(b)
+                -- Not while a Veil holds it: the Veil hides unlocked books for a while.
+                if show_book == true and IA._veil_has and IA._veil_has(b) then show_book = false end
             end
-            -- ENFORCE: when the game tries to SHOW (v==true) a WARDED book, override the arg to
-            -- false so its own call keeps it hidden -- no flicker, no re-entrancy. Unwarded books
-            -- show normally (unlock takes effect on next show). A book of a known series that the
-            -- rule cannot judge is kept hidden too: the ward flush hid it on the same terms.
-            -- stacks mode (_book_hide_mode==false): warded actor stays visible, just non-grabbable
-            -- (collision is layer 1's job) -- never force-hide it.
-            if diag_on("BOOK_EVENT_ENFORCE") and series
-                    and IA._book_hide_mode ~= false and show_book ~= true then
-                local set_ok = pcall(function() is_visible:set(false) end)
-                _bh.enforced = _bh.enforced + 1
-                if _bh.enf_samples < 10 then
-                    _bh.enf_samples = _bh.enf_samples + 1
-                    log(("[book-hook] ENFORCE keep-hidden warded series=%s set_ok=%s"):format(
-                        tostring(series), tostring(set_ok)))
-                end
+            -- The game is showing a locked book, which it can only do through a pile link that has
+            -- come back by some route other than the pile rebuild. Not during a reconnect, when the
+            -- empty snapshots read every book as locked.
+            if series and show_book ~= true and IA.lever_note_shown and not IA._reconnect_settle_active
+                    and IA.lever_on and IA.lever_on() then
+                local linked = false
+                pcall(function() local c = b.HISMController; linked = c ~= nil and c:IsValid() end)
+                if linked then IA.lever_note_shown(b) end
             end
             -- REVEAL-complete: when the game SHOWS an UNWARDED book it doesn't always restore the
             -- MESH -- a stuck SM_Book_1 bHiddenInGame/bVisible leaves it "shown" yet invisible.
@@ -870,44 +837,13 @@ local function try_register_book_hooks()
             local b; pcall(function() b = self:get() end)
             _bh_grab_check(b, "GRAB")
         end)
-        log("[book-hook] hooks registered (enforce/reveal/grabfix active per flags)")
+        log("[book-hook] hooks registered (reveal/grabfix active per flags)")
     end)
 end
 
 -- ============================================================
 -- Magic-skill guards: keep the mass-book skills off warded books
 -- ============================================================
--- Pile instances the game has just re-placed that we still consider hidden, waiting to be put back
--- down. A queue rather than an immediate write because the correction cannot happen inside the
--- game's own call: rewriting the transform argument does not stick, and the post-hook that would
--- run after it never fires for this function. So the pre-hook records, and the master tick -- which
--- runs later in the same frame -- does the write, using the path the hide already relies on.
-local _magic_resink = {}
-local _magic_resink_n = 0
-
-local function _magic_queue_resink(aidx, chap)
-    local k = aidx .. "|" .. chap
-    if _magic_resink[k] then return end
-    _magic_resink[k] = { aidx = aidx, chap = chap }
-    _magic_resink_n = _magic_resink_n + 1
-end
-
---- Drained from the master tick. Bounded per pass: Insight re-places a whole series at once, and a
---- long queue must not turn one frame into a stall.
-local function gt_drain_magic_resink()
-    if _magic_resink_n == 0 then return end
-    local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA.resink_pile) then _magic_resink = {}; _magic_resink_n = 0; return end
-    local done = 0
-    for k, e in pairs(_magic_resink) do
-        _magic_resink[k] = nil
-        _magic_resink_n = _magic_resink_n - 1
-        pcall(function() IA.resink_pile(e.aidx, e.chap) end)
-        done = done + 1
-        if done >= 32 then break end
-    end
-end
-
 -- Set by the bag-intake hook when a warded book arrives. Only a hint for the watcher below -- the
 -- watcher does not depend on it, because the whole difficulty here is that the interesting routes
 -- may not dispatch through anything hookable.
@@ -1009,10 +945,15 @@ local function gt_drain_magic_reward()
                     local dx, dy, dz = x - e.x0, y - e.y0, z - e.z0
                     moved = ("%.0f"):format(math.sqrt(dx*dx + dy*dy + dz*dz))
                 end
-                pcall(function()
-                    if not IA or IA._book_hide_mode then b:SetActorHiddenInGame(true) end
-                    b:SetActorEnableCollision(false)
-                end)
+                if IA and IA.lever_on and IA.lever_on() then
+                    -- The ward's lock, which also clears a pile link the drop gave back.
+                    pcall(IA.lever_hide, b)
+                else
+                    pcall(function()
+                        if not IA or IA._book_hide_mode then b:SetActorHiddenInGame(true) end
+                        b:SetActorEnableCollision(false)
+                    end)
+                end
                 -- The number that decides whether this approach works: how far the book came to
                 -- rest from where we told it to go. Near zero means the teleport home landed and
                 -- the recorded layout will still describe this world after a reload.
@@ -1158,13 +1099,13 @@ local function _magic_bag_report(when)
 end
 
 -- Two skills reach books by a route the ward does not cover. Assemble collects by book type rather
--- than by what the player can touch, so collision-off does not stop it; Insight re-shows pile
--- instances from the game's own rest data, overwriting the deep-Z sink.
+-- than by what the player can touch, so collision-off does not stop it; Insight lights every book
+-- of a series, locked ones included.
 --
--- Both guards ride the game's own call and correct its argument, the same shape as the
--- SetActorVisible ENFORCE path -- nothing here moves an actor. That is deliberate: the save-identity
--- fingerprint reads book actor positions to decide whether a save belongs to the run, so a mod that
--- relocates actors turns that signal into a record of itself.
+-- The guards ride the game's own calls and correct their arguments -- nothing here moves an
+-- actor. That is deliberate: the save-identity fingerprint reads book actor positions to decide
+-- whether a save belongs to the run, so a mod that relocates actors turns that signal into a
+-- record of itself.
 --
 -- Registered separately from the book hooks because these live on the character and the HISM
 -- manager, not on the book, and each class only becomes resident once its actor exists.
@@ -1195,38 +1136,18 @@ local function try_register_magic_hooks()
             return ok
         end
 
-        -- Shared reader for the UpdateInstance hook below. Built once and passed to pcall by
-        -- reference: that hook fires on every instance the game re-places, so an inline
-        -- pcall(function() ... end) would allocate a fresh closure each time, before it even knows
-        -- whether the book is warded.
-        local function inst_key(info)
-            local i = info:get()
-            return tonumber(i.AssetIdx), tonumber(i.Chapter)
-        end
-
-        -- Insight. Correcting the transform the game hands its own UpdateInstance does not stick --
-        -- the hook lands on exactly the right books, but a struct argument written back from Lua is
-        -- not what the game goes on to use. So let the call complete and put the instance straight
-        -- back down afterwards, using the write the hide path already relies on. Post, not pre.
-        mreg(HISM_MGR_BP .. ":UpdateInstance", "UpdateInstance", function(self, info, transform)
-            if not diag_on("BOOK_EVENT_HOOKS") then return end
+        -- The game rebuilding every book pile (once per world entry). It sets every book's pile link
+        -- again, which undoes the pile lever's locks, so ItemApply checks the whole library again
+        -- one tick later (lever_tick). Only counted here: the rebuild runs inside this call.
+        mreg(HISM_MGR_BP .. ":CreateHISMArray", "CreateHISMArray", function()
             local IA = package.loaded["AP/ItemApply"]
-            if not (IA and IA._per_book_unlocks and IA._book_inst_state) then return end
-            local ok, aidx, chap = pcall(inst_key, info)
-            if not (ok and aidx and chap) then return end
-            local st = IA._book_inst_state[aidx .. "|" .. chap]
-            if not (st and st.hidden) then return end
-            if not diag_on("MAGIC_WARD_HISM_WRITE") then return end
-            _magic_queue_resink(aidx, chap)
-            if diag_on("MAGIC_LEAK_TRACE") then
-                _magic_trace("queued re-sink", ("aidx=%d chap=%d"):format(aidx, chap))
-            end
+            if IA then IA._lever_rebuilt = (IA._lever_rebuilt or 0) + 1 end
         end)
 
-        -- Insight's per-book highlight. Sinking the pile was not enough: the skill lights the book
-        -- ACTOR too, and that is the layer the player actually sees -- which is why 24 pile
-        -- re-sinks changed nothing on screen. Answering the toggle with "off" refuses the effect at
-        -- source. A bool argument does write back, unlike the transform struct the pile path needed.
+        -- Insight's per-book highlight. The skill lights the book ACTOR, which is the layer the
+        -- player sees; a locked book's cleared pile link does not stop that call. Answering the
+        -- toggle with "off" refuses the effect at source (a bool argument does write back). It is
+        -- what keeps a locked book unlit in the stacks look too, where its actor stays drawn.
         mreg(BOOK_BP .. ":ToggleSameTypeEffect", "ToggleSameTypeEffect", function(self, is_on)
             if not diag_on("BOOK_EVENT_HOOKS") then return end
             local v; pcall(function() v = is_on:get() end)
@@ -1321,13 +1242,6 @@ local function try_register_magic_hooks()
             log("[end-door] player confirmed the ending")
             if _bh.goal_reached and _bh.arm_victory then _bh.arm_victory() end
         end)
-        -- Insight ending. Zero-latency edge for the existing resweep, which otherwise waits for the
-        -- 3s poll to notice -- a fatigued Insight can be shorter than that and be missed entirely.
-        mreg(CHAR_NATIVE .. ":HideSameTypeBook", "HideSameTypeBook", function()
-            local IA = package.loaded["AP/ItemApply"]
-            if IA then IA._insight_ended = true end
-            if diag_on("MAGIC_LEAK_TRACE") then _magic_trace("HideSameTypeBook", "insight ended") end
-        end)
     end)
 end
 
@@ -1339,8 +1253,8 @@ local function bh_report_periodic()
     -- refresh-grab is reported alongside refresh-sweep: the grab-path redraw rewrites book
     -- materials, and leaving it out of this line hid it while a material-state bug was being
     -- chased through the counters that were printed.
-    log(("[book-hook] counts: SetActorVisible=%d (enf=%d rev=%d) SetBookInfo=%d CanBeGrab=%d Grab=%d (grabfix=%d) refresh-grab=%d refresh-sweep=%d | magic: anchored=%d cleared=%d fx-denied=%d bag-evicted=%d"):format(
-        _bh.setvis, _bh.enforced, _bh.revealed, _bh.setinfo, _bh.canbegrab,
+    log(("[book-hook] counts: SetActorVisible=%d (rev=%d) SetBookInfo=%d CanBeGrab=%d Grab=%d (grabfix=%d) refresh-grab=%d refresh-sweep=%d | magic: anchored=%d cleared=%d fx-denied=%d bag-evicted=%d"):format(
+        _bh.setvis, _bh.revealed, _bh.setinfo, _bh.canbegrab,
         _bh.grabbed, _bh.grabfix, _bh.refreshed or 0, _bh.rsweep or 0,
         _bh.ward_attached or 0, _bh.ward_detached or 0,
         _bh.fx_denied or 0, _bh.bag_evicted or 0))
@@ -1443,352 +1357,6 @@ local function _invis_scan_step()
 end
 
 
--- Layer 3: hide warded book-pile shelves (HISM) + REVEAL on unlock. Each HISM = one series (via
--- the index mapping); hide = SetVisibility/SetHiddenInGame false + swap to M_APBookMask (originals
--- recorded first), REVEAL restores them. Runs every pass; cheap when nothing drifted.
--- CRASH RULE: a MID on the book HISM crashes this game -- never reintroduce CreateDynamicMaterial*.
-local _b2_state = {}        -- [hi] = { hidden = bool, ns = N, mats = {[s] = origMaterial} }
-                            -- plus string-keyed pass state: .pass (tick count), .sn (cached
-                            -- per-HISM instance counts), .force (re-read on the next pass).
-                            -- Integer and string keys can't collide, and the wholesale reset on
-                            -- world reload clears both together.
-local _b2_last_sig = nil
-local _b2_running = false
-local _b2_load_requested = false
-local _b2_mat_ref = nil
--- Spatial vote-accumulation classifier (used only by the disabled cross-check below).
-local _b2_group = {}   -- [hi] = { tally={series:count}, total, leader, leadn, locked }
--- Spatial cross-check, DISABLED: the index mapping (series = _asset_to_series[hi-1]) proved
--- correct on fresh + resumed saves and drives visibility alone. Flip true to re-run the spatial
--- classifier as a ground-truth comparison (e.g. to re-confirm HISM<->data order after a patch).
-local B2_SPATIAL_CROSSCHECK = false
-local function apply_book_visibility()
-    if not diag_on("BOOK_VISIBILITY") then return end
-    if _b2_running then return end
-    local IA = package.loaded["AP/ItemApply"]
-    if not (IA and IA._compute_unwarded_set and IA._asset_to_series) then return end
-    -- stacks mode: leave the pile visible (warding is layer-1 collision-off only); skip pile hiding.
-    -- (==false so a nil mode before slot_data arrives still runs the hide path.)
-    if IA._book_hide_mode == false then return end
-    -- BookSanity: the whole-HISM mask is per-SERIES and can't isolate individual books, and hiding
-    -- every pile removes the backfill the game's actor<->pile toggle relies on (unlocked books then
-    -- flicker/vanish). Leave the piles visible here; locked books are hidden per-instance by
-    -- teleporting their pile instance to deep Z. Skip the series mask.
-    if IA._per_book_unlocks then return end
-    -- Snapshot the world epoch (bumped by reset_hism_state each LoadMap). The game-thread chunk
-    -- re-checks it before touching the captured HISM array: if the world reloaded, the freed
-    -- arr[hi] is a native AV pcall can't catch (the main-menu teardown crash).
-    local epoch0 = IA._world_epoch
-    -- Cache the world-stable scan targets per world epoch. Each FindFirstOf / StaticFindObject walks the
-    -- whole (huge) GUObjectArray (~3-4ms); doing 3-4 of them every 5s was the L3 setup hitch. Re-scan only
-    -- when the cached object was freed (streaming) or the world reloaded (epoch bump).
-    if _l3c_ep ~= (epoch0 or 0) then
-        _l3c_ep = epoch0 or 0; _l3c_mgr = nil; _l3c_mat = nil; _l3c_ready = false
-        _b2_state.force = true   -- fresh world: instance counts must be re-read, not carried over
-    end
-    local mgr = _l3c_mgr
-    if not (mgr and mgr:IsValid()) then mgr = FindFirstOf("BP_HISM_Manager_C"); _l3c_mgr = mgr end
-    if not (mgr and mgr:IsValid()) then return end
-    local arr = nil; pcall(function() arr = mgr.HISMArray end)
-    local hn = 0; if arr then pcall(function() hn = #arr end) end
-    if hn == 0 then return end
-    -- Ready-check (cached once true): only ONE book's ItemInfo matters. The full book list is only used
-    -- by the DISABLED spatial cross-check, so fetch it lazily under that flag; otherwise a single probe.
-    local books, bn = nil, 0
-    if B2_SPATIAL_CROSSCHECK then
-        books = FindAllOf("BP_GrabbingBook_C")
-        if not books then return end
-        pcall(function() bn = #books end)
-        if bn == 0 then return end
-    end
-    if not _l3c_ready then
-        local rb = (B2_SPATIAL_CROSSCHECK and books and books[1]) or FindFirstOf("BP_GrabbingBook_C")
-        if not (rb and rb:IsValid()) then return end
-        local rok = false
-        pcall(function() local info = rb.ItemInfo; if info and info:IsValid() then rok = true end end)
-        if not rok then return end
-        _l3c_ready = true
-    end
-    -- Mask material (cached): M_APBookMask is unreferenced, so it must be hard-ref'd by ModActor's
-    -- BookMaskMat var to load; read it there, fallback StaticFindObject. Scan only until found.
-    local mat = _l3c_mat
-    if not (mat and mat:IsValid()) then
-        local ma = FindFirstOf("ModActor_C")
-        if ma and ma:IsValid() then pcall(function() mat = ma.BookMaskMat end) end
-        if not (mat and mat:IsValid()) then
-            pcall(function() mat = StaticFindObject("/Game/Mods/LibrarianAPHUDFix/M_APBookMask.M_APBookMask") end)
-        end
-        if not (mat and mat:IsValid()) then
-            if not _b2_load_requested then
-                _b2_load_requested = true
-                log("[b2] M_APBookMask not available yet (add ModActor Material var 'BookMaskMat' = M_APBookMask, recook); will retry")
-            end
-            return
-        end
-        _l3c_mat = mat
-    end
-    _b2_mat_ref = mat  -- pin against GC
-    -- What can actually differ between two passes: with the spatial cross-check disabled the
-    -- classification driver is _asset_to_series, a static Lua map, so only the unwarded set and a
-    -- HISM going empty/non-empty can move a decision. Re-classifying every 5s to notice that cost a
-    -- reflected PerInstanceSMData read per HISM whether or not anything changed. Run the pass when
-    -- the set moves, the world changes, or the backstop falls due; sig now gates as well as labels.
-    local only_shelfable = IA._slot_data and IA._slot_data.only_unward_shelfable_books == 1
-    local unwarded = IA._compute_unwarded_set(only_shelfable) or {}
-    local skeys = {}
-    for k in pairs(unwarded) do skeys[#skeys + 1] = k end
-    table.sort(skeys)
-    local sig = #skeys .. ":" .. table.concat(skeys, "|")
-    local sig_changed = (sig ~= _b2_last_sig)
-    _b2_last_sig = sig
-    -- Drift backstop every 12th pass (~60s here), mirroring REFRESH_FORCE_EVERY for bookcases: a
-    -- pile whose instance count moved without the set moving is caught there. A hide delayed until
-    -- then is cosmetic -- collision and the actor ward are separate layers and stay current.
-    _b2_state.pass = (_b2_state.pass or 0) + 1
-    local due = (_b2_state.pass % 12) == 0
-    if not (sig_changed or _b2_state.force or due) then return end
-    -- Counts are re-read on a backstop or a new world; a set-change pass reuses them, since arriving
-    -- items don't move instances.
-    if due or _b2_state.force or not _b2_state.sn then _b2_state.sn = {} end
-    _b2_state.force = false
-    _b2_running = true
-    -- 2D nearest-match (X,Y only): HISM instance transforms are component-LOCAL, so their Z doesn't
-    -- match the actor's WORLD Z. Stacked books share X,Y (minor ambiguity) but all get classified.
-    local CELL = 25.0
-    local function gkey(ix, iy) return ix .. "_" .. iy end
-    local grid = {}
-    if B2_SPATIAL_CROSSCHECK then   -- only the cross-check needs the actor-position grid
-    for i = 1, bn do
-        local b = books[i]
-        if b and b:IsValid() then
-            local loc; pcall(function() loc = b:K2_GetActorLocation() end)
-            local info; pcall(function() info = b.ItemInfo end)
-            local ai; if info and info:IsValid() then pcall(function() ai = info.AssetIdx end) end
-            local x, y
-            if loc then pcall(function() x = loc.X end); pcall(function() y = loc.Y end) end
-            if x and y and ai ~= nil then
-                local ser = IA._asset_to_series[ai]
-                local k = gkey(math.floor(x / CELL), math.floor(y / CELL))
-                local cell = grid[k]; if not cell then cell = {}; grid[k] = cell end
-                cell[#cell + 1] = { x = x, y = y, warded = not (ser and unwarded[ser]), series = ser }
-            end
-        end
-    end
-    end
-    local function nearest_entry(px, py)
-        local cx, cy = math.floor(px / CELL), math.floor(py / CELL)
-        local best, bd2 = nil, CELL * CELL
-        for dx = -1, 1 do for dy = -1, 1 do
-            local cell = grid[gkey(cx + dx, cy + dy)]
-            if cell then
-                for _, e in ipairs(cell) do
-                    local ex, ey = e.x - px, e.y - py
-                    local d2 = ex * ex + ey * ey
-                    if d2 <= bd2 then bd2 = d2; best = e end
-                end
-            end
-        end end
-        return best
-    end
-    -- ONE ExecuteInGameThread per pass (CHUNK = hn does all HISMs in one game-thread call). Many
-    -- marshals/pass trip UE4SS #1180 (overlapping engine-tick actions -> abort). Cost: one ~400-HISM
-    -- tick, a brief hitch on connect / set-change. Chunking only existed to pump the async poll loop.
-    local cursor, CHUNK = 1, (POLL_GT and 40 or hn)  -- single-thread: 40 HISMs/frame (spread the ~400 over ~10 frames); legacy = one pass
-    local newly_hidden, revealed, kept_hidden, kept_shown = 0, 0, 0, 0
-    local n_new_hide, mismatch, leader_changed, n_locked = 0, 0, 0, 0
-    -- run_chunk forward-declared so process_chunk can reschedule through it (upvalue must exist
-    -- first). process_chunk = one chunk of HISM work; run_chunk = the game-thread driver.
-    local run_chunk
-    local function process_chunk()
-        -- Teardown guard: if the world reloaded since this pass was scheduled (epoch changed), the
-        -- captured arr/HISMs are freed and arr[hi] is a native AV pcall can't catch. Bail untouched.
-        if (IA._world_epoch or 0) ~= (epoch0 or 0) then
-            _b2_running = false; _l3_resume = nil
-            trace.mark("b2-stale-world", nil,
-                "epoch " .. tostring(epoch0) .. " -> " .. tostring(IA._world_epoch))
-            return
-        end
-        -- Streaming backstop: the HISM manager can be freed by a sublevel unload MID-PASS (no LoadMap,
-        -- so neither the epoch bump nor the LoadMap pre-hook fires). `arr` is bound to mgr.HISMArray, so
-        -- a freed mgr makes arr[hi] a native AV the per-element IsValid can't prevent. Re-validate the
-        -- captured mgr live each chunk before indexing, and re-read the current length so a shrunk array
-        -- can't OOB. IsValid() checks the GUObjectArray slot+serial (UAF-safe); a freed mgr -> bail.
-        if not (mgr and mgr:IsValid()) then
-            _b2_running = false; _l3_resume = nil
-            trace.mark("b2-mgr-gone", nil, "HISM manager freed mid-pass -> released layer-3 lock")
-            return
-        end
-        local cur_hn = hn; pcall(function() cur_hn = #arr end)
-        local last = math.min(cursor + CHUNK - 1, cur_hn)
-        -- Re-fetched per chunk: a world reload between frames swaps _b2_state out from under us.
-        local sncache = _b2_state.sn
-        if not sncache then sncache = {}; _b2_state.sn = sncache end
-        for hi = cursor, last do
-            local h; pcall(function() h = arr[hi] end)
-            if h and h:IsValid() then
-                -- sn only answers "is this HISM empty" now that the cross-check is off, and the
-                -- PerInstanceSMData read behind it is the expensive crossing in this loop -- so
-                -- serve it from the cache and re-read only when the backstop cleared it. The
-                -- cross-check, when enabled, needs the live sm array and so always reads.
-                local sm = nil
-                local sn = sncache[hi]
-                if sn == nil or B2_SPATIAL_CROSSCHECK then
-                    pcall(function() sm = h.PerInstanceSMData end)
-                    sn = 0; if sm then pcall(function() sn = #sm end) end
-                    sncache[hi] = sn
-                end
-                -- DRIVER: the index mapping. hi == the series' position in the data order, so the
-                -- hi-th HISM's series is _asset_to_series[hi-1]. Deterministic, resume-safe, no warm-up.
-                local idx_series = IA._asset_to_series[hi - 1]
-                local should_hide_new
-                if sn == 0 then should_hide_new = false
-                elseif idx_series == nil then should_hide_new = true   -- mapping not populated yet -> assume warded
-                else should_hide_new = (not unwarded[idx_series]) end
-                if should_hide_new then n_new_hide = n_new_hide + 1 end
-
-                -- SPATIAL CROSS-CHECK -- DISABLED. Per-instance nearest-actor vote + size-aware lock
-                -- + index-vs-spatial mismatch log; flip the flag on to re-validate the data order.
-                if B2_SPATIAL_CROSSCHECK then
-                    local nw, nu = 0, 0
-                    local votes = {}
-                    for j = 1, sn do
-                        local t; pcall(function() t = sm[j].Transform end)
-                        local wp; if t then pcall(function() wp = t.WPlane end) end
-                        local e
-                        if wp then
-                            local x, y; pcall(function() x = wp.X end); pcall(function() y = wp.Y end)
-                            if x and y then e = nearest_entry(x, y) end
-                        end
-                        if e then
-                            if e.warded then nw = nw + 1 else nu = nu + 1 end
-                            if e.series then votes[e.series] = (votes[e.series] or 0) + 1 end
-                        else
-                            nw = nw + 1   -- no nearby actor -> treat as warded
-                        end
-                    end
-                    local g = _b2_group[hi]
-                    if not g then g = { tally = {}, total = 0, leader = nil, leadn = 0, locked = false, sn = sn }; _b2_group[hi] = g end
-                    if not g.locked then
-                        g.sn = sn
-                        for s, c in pairs(votes) do g.tally[s] = (g.tally[s] or 0) + c; g.total = g.total + c end
-                        local leader, leadn = nil, 0
-                        for s, c in pairs(g.tally) do if c > leadn then leader = s; leadn = c end end
-                        if leader ~= g.leader and g.leader ~= nil then leader_changed = leader_changed + 1 end
-                        g.leader = leader; g.leadn = leadn
-                        -- size-aware lock: ~3 passes' worth of votes for ANY size.
-                        if leadn >= 3 * sn and leadn * 10 >= g.total * 7 then
-                            g.locked = true; n_locked = n_locked + 1
-                        end
-                    end
-                    local hser = g.leader
-                    if idx_series ~= nil and hser ~= nil and idx_series ~= hser then
-                        mismatch = mismatch + 1
-                        if mismatch <= 20 then
-                            log(("[b2-cmp] MISMATCH hi=%d index=%s spatial=%s (leader %d/%d)"):format(
-                                hi, tostring(idx_series), tostring(hser), g.leadn, g.total))
-                        end
-                    end
-                end
-
-                local should_hide = should_hide_new
-                local st = _b2_state[hi]; if not st then st = { hidden = false }; _b2_state[hi] = st end
-                if should_hide and not st.hidden then
-                    trace.begin("b2-hide", h)
-                    local ns = 1; pcall(function() ns = h:GetNumMaterials() end)
-                    st.ns = ns; st.mats = {}
-                    for s = 0, (ns or 1) - 1 do local m; pcall(function() m = h:GetMaterial(s) end); st.mats[s] = m end
-                    pcall(function() h:SetVisibility(false, false) end)
-                    pcall(function() h:SetHiddenInGame(true, false) end)
-                    if diag_on("HISM_SETMATERIAL") then
-                        for s = 0, (ns or 1) - 1 do pcall(function() h:SetMaterial(s, mat) end) end
-                    end
-                    -- Do NOT touch PerInstanceCustomData: index 0 carries the game's per-book
-                    -- color; overwriting corrupts books on reveal. SetVisibility does the hiding.
-                    trace.finish("b2-hide", h)
-                    st.hidden = true; newly_hidden = newly_hidden + 1
-                elseif (not should_hide) and st.hidden then
-                    trace.begin("b2-reveal", h)
-                    pcall(function() h:SetVisibility(true, false) end)
-                    pcall(function() h:SetHiddenInGame(false, false) end)
-                    if st.mats and diag_on("HISM_SETMATERIAL") then
-                        for s = 0, (st.ns or 1) - 1 do
-                            local m = st.mats[s]; if m then pcall(function() h:SetMaterial(s, m) end) end
-                        end
-                    end
-                    trace.finish("b2-reveal", h)
-                    st.hidden = false; revealed = revealed + 1
-                elseif st.hidden then
-                    kept_hidden = kept_hidden + 1
-                else
-                    kept_shown = kept_shown + 1
-                end
-            end
-        end
-        cursor = last + 1
-        if cursor <= cur_hn then
-            -- Single-thread: process ONE small chunk per pawn-tick frame (the master scheduler calls
-            -- _l3_resume) so the ~400-HISM pass spreads over frames instead of hitching one. Legacy
-            -- path keeps the LoopAsync chunk pacing.
-            if POLL_GT then _l3_resume = run_chunk else LoopAsync(50, function() run_chunk() return true end) end
-        else
-            _l3_resume = nil
-            _b2_running = false
-            -- Stamped whether or not anything changed: the ready gate waits on this to know the
-            -- piles have actually been masked for THIS world, and a pass that hid nothing still
-            -- answers that question.
-            _b2_state.applied_epoch = epoch0 or 0
-            -- Log only when something changed or the cross-check disagrees.
-            if sig_changed or (newly_hidden + revealed) > 0 or mismatch > 0 or leader_changed > 0 or n_locked > 0 then
-                log(("[b2] applied: newly_hidden=%d revealed=%d kept_hidden=%d kept_shown=%d / %d HISMs"):format(
-                    newly_hidden, revealed, kept_hidden, kept_shown, hn))
-                if B2_SPATIAL_CROSSCHECK then
-                    local cached, locked, clean_unlocked = 0, 0, 0
-                    local splits = {}
-                    for hi2, g in pairs(_b2_group) do
-                        if g.leader ~= nil then cached = cached + 1 end
-                        if g.locked then locked = locked + 1
-                        elseif g.total and g.total > 0 and g.leadn * 10 < g.total * 7 then splits[#splits + 1] = { hi = hi2, g = g }
-                        else clean_unlocked = clean_unlocked + 1 end
-                    end
-                    log(("[b2-cmp] index-driver hides=%d | index-vs-spatial mismatches=%d | spatial cached=%d locked=%d/%d (corrections=%d newly-locked=%d)"):format(
-                        n_new_hide, mismatch, cached, locked, hn, leader_changed, n_locked))
-                    -- Split unlocked groups into SPLIT (leader <70% = conflated, leak risk) vs clean
-                    -- (just under-sampled); list the split ones.
-                    if #splits > 0 then
-                        log(("[b2-cmp] unlocked breakdown: split/conflated=%d clean=%d -- listing split (residual-risk groups):"):format(#splits, clean_unlocked))
-                        for i = 1, math.min(#splits, 12) do
-                            local e = splits[i]; local gg = e.g
-                            log(("[b2-cmp]   SPLIT hi=%d size=%s leader=%s %d%% (%d/%d votes)"):format(
-                                e.hi, tostring(gg.sn), tostring(gg.leader), math.floor(gg.leadn * 100 / gg.total), gg.leadn, gg.total))
-                        end
-                    else
-                        log(("[b2-cmp] unlocked breakdown: split/conflated=0 clean=%d (all benign, just under-sampled)"):format(clean_unlocked))
-                    end
-                end
-            end
-        end
-    end
-    -- Driver: run process_chunk's HISM work on the game thread. Reschedules via LoopAsync so we
-    -- never nest ExecuteInGameThread calls (UE4SS #1180). MUST clear _b2_running on error -- a
-    -- stuck flag wedges layer 3 permanently (every later pass early-returns on it).
-    run_chunk = function()
-        on_game_thread(function()
-            local ok, err = pcall(process_chunk)
-            if not ok then
-                _b2_running = false
-                _l3_resume = nil
-                trace.mark("b2-chunk-error", nil, tostring(err))
-                log("[b2] chunk error -> cleared _b2_running: " .. tostring(err))
-            end
-        end)
-    end
-    if sig_changed then
-        log("[b2] unwarded-set change -> re-evaluate (NEW drives off cached series, OLD logged for comparison)")
-    end
-    -- Single-thread: defer even the FIRST chunk to the master scheduler so the maintenance frame does
-    -- only L3 setup (the 40-HISM chunk was ~8ms of the 5s hitch); all chunks then spread across frames.
-    if POLL_GT then _l3_resume = run_chunk else run_chunk() end
-end
 
 
 -- Emit a lifecycle state-machine event. No-op until the SM module loads.
@@ -2530,13 +2098,10 @@ local function start_gameplay_loops()
         pcall(bh_report_periodic)        -- ~30s [book-hook] count report
         pcall(function() IA.refresh_index_if_changed() end)   -- catch lazy-spawned bookcases
         pcall(function() IA._apply_bookcases_to_world() end)  -- Layer 2 bookcase ward
-        pcall(apply_book_visibility)                          -- Layer 3 HISM pile mask
-        -- Actor-state reconcile: Layer 3's continuous counterpart for the BP_GrabbingBook ACTOR.
+        -- Actor-state reconcile for the BP_GrabbingBook ACTOR.
         -- Re-asserts collision + SM_Book_1 mesh on unwarded books whose flags drifted (heals
         -- visible-not-grabbable + grabbable-invisible). Read-before-write, gated BOOK_ACTOR_RECONCILE.
         pcall(function() IA.reconcile_book_actors() end)
-        -- Retry the pile copies the last flush could not sink (a few times, then it stops).
-        pcall(function() IA.retry_pile_sinks() end)
         pcall(_invis_scan_step)   -- passive invisible-book detector (off by default)
         return false
     end)
@@ -2707,9 +2272,6 @@ local function start_gameplay_loops()
             pcall(function() IA.apply_attunement(12) end)
             pcall(function() IA.apply_bag_capacity() end)
             pcall(function() IA.recover_orphaned_bag_books() end)
-            -- Re-hide pile instances Insight dragged up. From here and not the SetActorVisible
-            -- hook: a re-hide issued inside the hook is overwritten while the skill still shows.
-            pcall(function() IA.resweep_book_piles() end)
         end
         return false
     end)
@@ -2831,8 +2393,8 @@ end) end   -- with the flag off, AP/HUD.lua keeps its own async drain; registeri
 local _magic_bag_last = -1
 -- Insight re-ward: keep a locked book's ACTOR hidden while the skill shows its series.
 --
--- Measured: with the skill up a warded book reads bHidden=false while its pile instance is still
--- sunk, so the reveal is the actor and re-sinking piles could never have fixed it.
+-- Measured: with the skill up a warded book reads bHidden=false while its pile copy stays hidden,
+-- so the reveal is the actor.
 --
 -- The book list is walked once per activation and only warded books of that series are kept
 -- (about a dozen); walking all 3072 on a timer would hitch several times per use. `rehid` climbing
@@ -2999,40 +2561,6 @@ end)
 
 
 
---- Move a book's pile instance to match its actor.
----
---- The actor is only half a book: at any distance the game draws books as HISM instances (one
---- component per series, one instance per chapter) and swaps an actor in up close. Moving the actor
---- alone leaves the book showing where it was taken from until you walk over and look at it.
----
---- Warded books must NOT follow the actor home -- their instance is sunk on purpose, and raising it
---- would put an un-unlocked book back on the shelf in plain sight. Those stay sunk.
-function _dev.restore_book_pile(aidx, chapter, home)
-    if not (aidx and chapter and home and home.Translation) then return false, "no key" end
-    local mgr = FindFirstOf("BP_HISM_Manager_C")
-    if not (mgr and mgr:IsValid()) then return false, "no manager" end
-    local arr; pcall(function() arr = mgr.HISMArray end)
-    if not arr then return false, "no HISMArray" end
-    local comp; pcall(function() comp = arr[aidx + 1] end)
-    if not (comp and comp:IsValid()) then return false, "no component" end
-
-    local IA = package.loaded["AP/ItemApply"]
-    local st = IA and IA._book_inst_state and IA._book_inst_state[aidx .. "|" .. chapter]
-
-    if st and st.hidden then
-        -- Same deep offset the hide path uses; a different one here would strand the book.
-        local t = { Translation = { X = home.Translation.X, Y = home.Translation.Y,
-                                    Z = home.Translation.Z - 1000000.0 },
-                    Rotation = home.Rotation, Scale3D = home.Scale3D }
-        local ok = pcall(function() comp:UpdateInstanceTransform(chapter, t, true, true, true) end)
-        -- Deliberately NOT re-aiming st.orig from SpawnTransform. Measured equal, so the write
-        -- would be a no-op; and if they ever diverge, overwriting relocates the book on unlock.
-        return ok, "warded, kept sunk"
-    end
-
-    local ok = pcall(function() comp:UpdateInstanceTransform(chapter, home, true, true, true) end)
-    return ok, ok and "moved" or "write refused"
-end
 
 function _dev.restore_book_home(book)
     local alive = false
@@ -3049,23 +2577,10 @@ function _dev.restore_book_home(book)
     pcall(function() t = book.SpawnTransform end)
     if not t then return false end
 
-    -- A plain-table copy as well as the struct: the actor call takes the FTransform as-is, but the
-    -- instance write wants the table form the rest of the pile code uses.
     local hx, hy, hz
-    local home
     pcall(function()
-        local p, r, s = t.Translation, t.Rotation, t.Scale3D
-        if not p then return end
-        hx, hy, hz = p.X, p.Y, p.Z
-        home = {
-            Translation = { X = p.X, Y = p.Y, Z = p.Z },
-            Rotation = r and { X = r.X, Y = r.Y, Z = r.Z, W = r.W }
-                         or { X = 0, Y = 0, Z = 0, W = 1 },
-            -- A zero scale would make the instance vanish rather than move, which reads as a
-            -- successful write and an invisible book.
-            Scale3D = (s and s.X and s.X ~= 0) and { X = s.X, Y = s.Y, Z = s.Z }
-                                               or { X = 1, Y = 1, Z = 1 },
-        }
+        local p = t.Translation
+        if p then hx, hy, hz = p.X, p.Y, p.Z end
     end)
     -- An unfilled FTransform reads as the world origin, and no book belongs there. Writing it
     -- would pile every such book at 0,0,0 -- far worse than leaving it where it is.
@@ -3087,14 +2602,12 @@ function _dev.restore_book_home(book)
         end)
     end
 
-    -- Second layer. Reported separately because the actor moving without it is exactly the
+    -- Second layer, the pile copy: the game moves it to the actor, and a locked book's stays
+    -- undrawn. Reported separately because the actor moving without it is exactly the
     -- half-restored state this is here to fix.
-    local aidx, chap
-    pcall(function()
-        local info = book.ItemInfo
-        if info then aidx = tonumber(info.AssetIdx); chap = tonumber(info.Chapter) end
-    end)
-    local pile_ok, pile_why = _dev.restore_book_pile(aidx, chap, home)
+    local IA = package.loaded["AP/ItemApply"]
+    local pile_ok, pile_why = false, "no ItemApply"
+    if IA and IA.lever_pile_follow then pile_ok, pile_why = IA.lever_pile_follow(book) end
 
     return ok, hx, hy, hz, pile_ok, pile_why
 end
@@ -3262,7 +2775,20 @@ end)
 -- are disabled while it waits, since each either lets the player out early or writes a save of a
 -- half-warded world. Quit, Back, Options and How To Play stay live, and the wait is capped, so a
 -- readiness signal that never arrives cannot trap anyone in here.
+--
+-- On a New Game the game first plays its opening, with the player not yet in control, until it
+-- places the player in the library about 45 s after Start; only then can anything be locked. The hold therefore starts when
+-- the player is placed and lasts only as long as the first ward flush (which runs in big chunks
+-- while the player is held). Only in a New Game world: a Continue holds from the load as before.
+-- Checked every tick, so the hold begins as soon as the first-move watcher (500 ms) reports it.
 local _pause_gate = { shown = false, done = false, waited = 0 }
+
+--- Has the game placed the player in the library yet (New Game)? The first-move watcher's own
+--- verdict (its "First movement detected" line). The character already moves during the game's
+--- opening, so no position test of its own is used here.
+_pause_gate.placed = function(IA)
+    return IA._baseline_sync_done == true
+end
 
 --- Enable/disable the three buttons that would let the player out or save mid-ward. Returns false
 --- when the widget is not up yet, which is also how the gate knows the menu has not appeared.
@@ -3277,7 +2803,7 @@ _pause_gate.apply = function(pawn, enable)
     return true
 end
 
-gt_loop("ready_gate", 250, function()
+gt_loop("ready_gate", 0, function()
     local IA = package.loaded["AP/ItemApply"]
     local SI = package.loaded["AP/SaveIdentity"]
     if not (IA and SI) then return false end
@@ -3286,9 +2812,10 @@ gt_loop("ready_gate", 250, function()
         if _pause_gate.shown or _pause_gate.done then
             _pause_gate = { shown = false, done = false, waited = 0, apply = _pause_gate.apply }
         end
+        IA._hold_active = false
         return false
     end
-    if _pause_gate.done then return false end
+    if _pause_gate.done then IA._hold_active = false; return false end
 
     local pawn = _G._librarian_tick_pawn
     if not (pawn and pawn:IsValid()) then pawn = FindFirstOf("BP_LibrarianCharacter_C") end
@@ -3298,45 +2825,59 @@ gt_loop("ready_gate", 250, function()
     -- plus pre-apply's own completion where it is running. That last clause is not redundant:
     -- measured, the drain went quiet 1.5s before _pre_apply_complete was set, and releasing on the
     -- drain alone handed the player those 1.5s early -- the beat of freedom testers noticed.
-    -- The pile mask is the LAST thing to finish, ~750ms after everything above went quiet, and it is
-    -- the one the player can see: releasing before it ran handed them a world whose shelves were
-    -- still being hidden. Only wait for it in the modes that actually run it -- BookSanity masks per
-    -- book elsewhere and stacks mode never hides piles, and in both this pass returns immediately
-    -- without ever stamping, so waiting on it there would stall until the timeout.
-    local l3_needed = not IA._per_book_unlocks and IA._book_hide_mode ~= false
-    local l3_done = (not l3_needed)
-        or (not _b2_running and _b2_state.applied_epoch == (IA._world_epoch or 0))
+    -- Locked books are hidden by the ward flush itself (the pile lever); when the game rebuilds its
+    -- piles after that flush, the lever's fast lap has to finish too, or locked books would show
+    -- for a moment once the hold lifts. Not waited for while the save may not be warded at all.
+    local lever_done = (not IA.lever_ready) or IA.lever_ready() or not ward_allowed()
 
     local ready = IA._apply_safe and IA._ward_settled
         and not IA._flush_in_progress
         and (not IA._pump_idle or IA._pump_idle())
         and (not IA._allow_pre_apply or IA._pre_apply_complete)
-        and l3_done
+        and lever_done
 
     if not _pause_gate.shown then
         -- Already ready on arrival (a quick world, or a reload into a warded one): never show it.
         if ready then _pause_gate.done = true; return false end
+        -- The game's New Game opening: the player is not in the library yet (see above).
+        -- Noted on the first pass: SI.fresh_world is cleared again mid-opening, once the save data
+        -- reads as a fresh world, long before the player is placed.
+        if SI.fresh_world then _pause_gate.new_game = true end
+        if _pause_gate.new_game and not _pause_gate.placed(IA) then
+            if not _pause_gate.opening_said then
+                _pause_gate.opening_said = true
+                log("[ready-gate] the game's opening is playing; holding the player once it places them")
+            end
+            return false
+        end
         pcall(function() pawn:SetPauseMenuVisible(true) end)
         -- Only latch once the widget is really up; on the first frames of a world it may not be
         -- spawned yet, and latching early would leave the buttons live behind a menu we think we own.
         if not _pause_gate.apply(pawn, false) then return false end
         _pause_gate.shown = true
+        _pause_gate.since, _pause_gate.reassert = _gt_clock_ms, _gt_clock_ms
+        IA._hold_active = true
         log("[ready-gate] world not ready — holding the player in the pause menu")
         return false
     end
 
-    _pause_gate.waited = _pause_gate.waited + 250
+    _pause_gate.waited = _gt_clock_ms - (_pause_gate.since or _gt_clock_ms)
     local timed_out = _pause_gate.waited >= 60000
     if ready or timed_out then
         _pause_gate.done = true
+        IA._hold_active = false
         _pause_gate.apply(pawn, true)    -- re-enable BEFORE releasing, never leave them dead
         pcall(function() pawn:SetPauseMenuVisible(false) end)
         log(("[ready-gate] released after %.1fs (%s)"):format(
             _pause_gate.waited / 1000, timed_out and "TIMEOUT — world may still be warding" or "world ready"))
         return false
     end
-    -- Re-assert every pass: the menu rebuilds its buttons when it is shown or navigated back to.
-    _pause_gate.apply(pawn, false)
+    -- Re-assert four times a second: the menu rebuilds its buttons when it is shown or navigated
+    -- back to.
+    if _gt_clock_ms - (_pause_gate.reassert or 0) >= 250 then
+        _pause_gate.reassert = _gt_clock_ms
+        _pause_gate.apply(pawn, false)
+    end
     return false
 end)
 
@@ -3430,15 +2971,13 @@ end)
 
 -- LoadMap PRE-hook: fires as UEngine::LoadMap begins, BEFORE the old world is torn down -- the only
 -- signal that LEADS the world-free on every transition (New Game, Continue, quit-to-title, and the
--- forced connect-time reload). Disarm the cross-frame warding resumes here: an L1 (book-flush) or L3
--- (book-pile HISM) resume closure captured the OLD world's actor/HISM arrays, and firing it after the
+-- forced connect-time reload). Disarm the cross-frame warding resume here: the L1 (book-flush)
+-- resume closure captured the OLD world's actor array, and firing it after the
 -- free is a native access violation pcall can't catch. The epoch guard and the 1Hz SelectedLevel
 -- watcher both LAG the free (the epoch only bumps on M01 ENTRY via reset_hism_state; apply_safe drops
 -- ~1s later on the watcher), so those guards miss the leave side -- this closes it. Runs on the game
 -- thread (LoadMap is game-thread), so clearing these here is not a cross-thread write.
 RegisterLoadMapPreHook(function()
-    _l3_resume = nil
-    _b2_running = false
     local IA = package.loaded["AP/ItemApply"]
     if IA then
         IA._l1_resume = nil
@@ -3495,11 +3034,6 @@ RegisterLoadMapPostHook(function(Engine, World)
             end
         end
 
-        -- Layer-3 state is per-world (fresh HISMs start visible; the series cache is tied to the
-        -- old world's actors). Clear it so this world re-snapshots and re-hides from scratch.
-        _b2_state = {}
-        _b2_last_sig = nil
-        _b2_group = {}
         -- The ward anchor records and the evicted-book list name the old world's actors, as
         -- ItemApply's _books_warded does. A stale anchor record could let set_ward_attach strip a
         -- real attachment off a book of the same name the player shelves in the new world.
@@ -4253,18 +3787,16 @@ _G._librarian_gt_master_tick = function(dt_ms)
     end
     local IA = package.loaded["AP/ItemApply"]
     if IA then
-        -- World-reload safety for the cross-frame warding resumes (L1 book actors, L3 book-pile HISMs).
-        -- Each resume closure captured the OLD world's actor/HISM arrays; firing it across a LoadMap is a
+        -- World-reload safety for the cross-frame warding resume (L1 book actors). The resume
+        -- closure captured the OLD world's actor array; firing it across a LoadMap is a
         -- use-after-free the epoch guard alone can't catch in time (the async pump used to drop stale
-        -- marshals; inline per-frame drive lost that net). So: (1) drop both resumes + release L3's pass
-        -- lock the instant the world epoch bumps, and (2) only drive them while the world is confirmed
+        -- marshals; inline per-frame drive lost that net). So: (1) drop the resume the instant the
+        -- world epoch bumps, and (2) only drive it and the pile lever while the world is confirmed
         -- stable (apply_safe) -- during a LoadMap sublevels are still streaming/freeing, exactly when the
         -- captured arrays go dangling and apply_safe is false.
         local ep = IA._world_epoch or 0
         if ep ~= _gt_last_epoch then
             _gt_last_epoch = ep
-            _l3_resume = nil
-            _b2_running = false
             IA._l1_resume = nil
             -- Same reason the resumes go: a pawn resolved under the old world must not be reachable
             -- by any step running under the new one.
@@ -4272,16 +3804,15 @@ _G._librarian_gt_master_tick = function(dt_ms)
         end
         if IA._apply_safe then
             if IA._l1_resume then pcall(IA._l1_resume) end   -- one L1 warding chunk / frame
-            if _l3_resume then pcall(_l3_resume) end          -- one L3 book-pile HISM chunk / frame
+            if IA.lever_tick then pcall(IA.lever_tick) end    -- pile lever: rolling check, re-lock after a rebuild
         end
         if IA._flush_reflush_pending
-                or (IA._books_retry_at and os.time() >= IA._books_retry_at) then   -- L1 finalizer re-fire / book-population retry
+                or (IA._books_retry_at and (os.time() >= IA._books_retry_at or IA._hold_active)) then   -- L1 finalizer re-fire / book-population retry (every frame while the player is held)
             IA._flush_reflush_pending = false
             IA._books_retry_at = nil
             pcall(function() IA.flush_apply() end)
         end
     end
-    gt_drain_magic_resink()                                  -- put Insight-revealed piles back down
     gt_run_deferred(dt_ms)                                   -- one-shot deferred work (title/HUD refreshes)
     gt_run_steps(dt_ms)                                      -- apply-gate / settle / warding / sync / etc.
     if (c._gt_tick_count % 600) == 0 then

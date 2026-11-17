@@ -67,7 +67,7 @@ end
 -- L2-before-L1 order (flush_apply enqueues L2 first).
 -- Threading: enqueue + pop run on the async (LoopAsync) thread; _pump_busy is set
 -- async and cleared in the game-thread closure -- the same cross-thread flag
--- pattern the field-proven layer-3 _b2_running already relies on.
+-- pattern used elsewhere for one-in-flight game-thread work.
 -- ============================================================================
 local PUMP_MS   = 25     -- drain cadence (between the ~16ms frame and the 50ms chunk delay)
 M._ward_q       = {}
@@ -265,7 +265,7 @@ M._slot_data = nil
 M._received_counts   = {}  -- { [item_name] = count }
 M._series_unlocked   = {}  -- { [series_name] = true }
 M._shelves_open      = {}  -- { [section_id] = open_count }
--- Read-only {[series]=true} snapshot for the GAME-THREAD book hooks (ENFORCE/REVEAL/grab-check).
+-- Read-only {[series]=true} snapshot for the GAME-THREAD book hooks (REVEAL/grab-check).
 -- They must NOT call _compute_unwarded_set: it allocates a table and iterates _series_unlocked on
 -- the game thread, racing _recompute_state's mod-thread rebuild -> Lua-heap corruption / UE4SS abort
 -- (the rc3 crash). Published atomically by _recompute_state; hooks do a single lookup, no alloc.
@@ -444,9 +444,10 @@ function M.set_slot_data(slot_data)
     -- but non-grabbable. The three hide paths gate on this so stacks keeps only collision-off.
     -- "~= stacks" defaults any missing/unknown value to the safe hide.
     M._book_hide_mode = (slot_data and slot_data.book_visibility ~= "stacks")
-    log(("[book-vis] mode=%s (slot_data.book_visibility=%s)"):format(
+    log(("[book-vis] mode=%s (slot_data.book_visibility=%s)%s"):format(
         M._book_hide_mode and "HIDDEN" or "stacks",
-        tostring(slot_data and slot_data.book_visibility)))
+        tostring(slot_data and slot_data.book_visibility),
+        M.lever_on() and ", locked books held by the pile lever" or ""))
     M._received_counts    = {}
     M._series_unlocked    = {}
     M._shelves_open       = {}
@@ -1245,6 +1246,456 @@ function M.book_shows(book)
     return M.book_rule(series, chapter), series
 end
 
+-- ============================================================================
+-- Pile lever: hide a locked book through the game's own link to its pile copy
+-- ============================================================================
+-- At a distance the game does not draw a book's actor: it draws one instance of a per-series
+-- instanced mesh, the book's "pile copy", and swaps the actor in when the player comes close. Every
+-- swap goes through the book's SetActorVisible, which returns at once when the book's
+-- HISMController (its link to the manager that owns the pile copies) is not valid.
+--
+-- So a locked book is hidden by:
+--   1. SetActorVisible(true), left to the game, which shrinks the pile copy to nothing and shows the
+--      actor;
+--   2. hiding the actor and turning its collision off;
+--   3. the bookcase anchor (AttachedActor), which keeps Assemble off it;
+--   4. clearing HISMController, after which no swap the game makes can draw the book again.
+-- An unlocked book gets its link back from a live book of the same world, then
+-- SetActorVisible(false), which lays its pile copy at the actor, then collision on and no anchor.
+--
+-- The game rebuilds every pile and sets every book's link again once per world entry
+-- (BP_HISM_Manager_C:CreateHISMArray), which undoes a lock made before it. main.lua hooks that call
+-- and counts it in M._lever_rebuilt; one tick later the whole library is checked again, quickly.
+-- Between rebuilds a slow rolling check (M.lever_tick) confirms that every locked book still has
+-- no link and a hidden actor, and locks again any that does not.
+--
+-- Locked books are hidden this way in the hidden book look only: in the stacks look a locked book
+-- stays drawn and is only made ungrabbable. The Veil trap uses the same lock and unlock in both.
+
+-- Books checked per tick by the rolling check: slow between rebuilds (a lap of ~3,000 books takes
+-- about ten seconds at 60 fps), fast for the lap that follows a rebuild (under a second). Locking
+-- costs about 0.07 ms a book, so the fast lap stays near 4 ms a frame.
+M.LEVER_SLOW_PER_TICK = 5
+M.LEVER_FAST_PER_TICK = 64
+-- The rolling check's repair line is written at most this often (seconds), with the counts summed.
+M.LEVER_REPORT_S = 60
+
+--- Are locked books hidden (the hidden book look) in this run, and so held by the lever?
+function M.lever_on()
+    return M._book_hide_mode ~= false
+end
+
+local function _lever_valid(o)
+    local ok = false
+    pcall(function() ok = o ~= nil and o:IsValid() end)
+    return ok
+end
+
+--- This world's pile manager, taken from a live book's own link: never FindFirstOf, which can
+--- return a manager of another world, and never one kept from an earlier world. Cached for the
+--- world; nil while no live book has a link (before the game has built the piles).
+function M._lever_world_mgr()
+    local ep = M._world_epoch or 0
+    if M._lever_mgr_epoch == ep and _lever_valid(M._lever_mgr) then return M._lever_mgr end
+    M._lever_mgr, M._lever_mgr_epoch = nil, nil
+    -- One search per tick at most: a world with no linked book yet would otherwise be searched
+    -- once for every book that asks.
+    if M._lever_miss_tick ~= nil and M._lever_miss_tick == M._lever_ticks then return nil end
+    local books = FindAllOf("BP_GrabbingBook_C")
+    local n = 0
+    if books then pcall(function() n = #books end) end
+    for i = 1, n do
+        local b = books[i]
+        if _lever_valid(b) then
+            local c, at_origin = nil, true
+            pcall(function() c = b.HISMController end)
+            -- The inert copies of the book set sit at the world origin; only a book in play counts.
+            pcall(function()
+                local l = b:K2_GetActorLocation()
+                at_origin = math.abs(l.X) < 1 and math.abs(l.Y) < 1 and math.abs(l.Z) < 1
+            end)
+            if not at_origin and _lever_valid(c) then
+                M._lever_mgr, M._lever_mgr_epoch = c, ep
+                return c
+            end
+        end
+    end
+    M._lever_miss_tick = M._lever_ticks
+    return nil
+end
+
+--- Call the book's own SetActorVisible. The SetActorVisible hook in main.lua leaves the call alone
+--- while M._lever_busy is set, so the mod's other visibility rules do not rewrite it.
+function M._lever_set_visible(book, v)
+    M._lever_busy = true
+    local ok = pcall(function() book:SetActorVisible(v) end)
+    M._lever_busy = false
+    return ok
+end
+
+--- Lock one book (see above). Idempotent: a book already locked only has its actor hidden and its
+--- collision turned off again. Returns true when the link is clear afterwards.
+function M.lever_hide(book)
+    if not _lever_valid(book) then return false end
+    local ctrl
+    pcall(function() ctrl = book.HISMController end)
+    local had = _lever_valid(ctrl)
+    if had then
+        -- Remember the manager while the link is still there: unlocking needs it back.
+        local ep = M._world_epoch or 0
+        if M._lever_mgr_epoch ~= ep or not _lever_valid(M._lever_mgr) then
+            M._lever_mgr, M._lever_mgr_epoch = ctrl, ep
+        end
+        M._lever_set_visible(book, true)
+    end
+    pcall(function() book:SetActorHiddenInGame(true) end)
+    pcall(function() book:SetActorEnableCollision(false) end)
+    if M._ward_anchor then pcall(M._ward_anchor, book, true) end
+    if had then pcall(function() book.HISMController = nil end) end
+    local still
+    pcall(function() still = book.HISMController end)
+    if _lever_valid(still) then
+        M._lever_note_fail(book, "link would not clear")
+        return false
+    end
+    return true
+end
+
+--- Unlock one book (see above). A book that still has its link is left as it is. Returns false
+--- when the link could not be put back: no live book of this world has one yet, so the game has
+--- not built the piles, and building them gives every book its link anyway.
+function M.lever_show(book)
+    if not _lever_valid(book) then return false end
+    local ctrl
+    pcall(function() ctrl = book.HISMController end)
+    if _lever_valid(ctrl) then return true end
+    local mgr = M._lever_world_mgr()
+    if not mgr then return false end
+    pcall(function() book.HISMController = mgr end)
+    pcall(function() ctrl = book.HISMController end)
+    if not _lever_valid(ctrl) then
+        M._lever_note_fail(book, "link would not set")
+        return false
+    end
+    M._lever_set_visible(book, false)
+    pcall(function() book:SetActorEnableCollision(true) end)
+    if M._ward_anchor then pcall(M._ward_anchor, book, false) end
+    return true
+end
+
+--- After the mod has moved a book's actor (ShelfDrop, the traps, the bag guard sending a book
+--- home): bring its pile copy along the way the game itself would. SetActorVisible(false) lays the
+--- pile copy at the actor; an actor that was showing is shown again and its collision kept, so the
+--- book looks and behaves as it did, only in its new place. A locked book is never drawn: one with
+--- no link has nothing to move, one that still has a link is left for the rolling check to lock.
+--- In the stacks look a locked book is drawn, so its pile copy follows like any other.
+--- Returns ok and a word saying what happened.
+function M.lever_pile_follow(book)
+    if not _lever_valid(book) then return false, "no book" end
+    local ctrl
+    pcall(function() ctrl = book.HISMController end)
+    if not _lever_valid(ctrl) then return true, "held by the lever" end
+    if M.lever_on() then
+        local shows = M.book_shows(book)
+        if M._veil_has(book) then shows = false end
+        if shows ~= true then return true, "locked, left for the lever" end
+    end
+    local shown, coll = false, nil
+    pcall(function() shown = book.bHidden == false end)
+    pcall(function() coll = book:GetActorEnableCollision() end)
+    local ok = M._lever_set_visible(book, false)
+    if shown then pcall(function() book:SetActorHiddenInGame(false) end) end
+    if coll ~= nil then pcall(function() book:SetActorEnableCollision(coll) end) end
+    return ok, ok and "moved" or "SetActorVisible failed"
+end
+
+--- Read a book's pile copy through this world's manager (taken from a live book, see
+--- _lever_world_mgr): true when it is drawn, false when it is collapsed or sunk, nil when it cannot
+--- be read. comps caches each series' component for one lap.
+function M._lever_pile_drawn(book, aidx, comps)
+    local ch
+    pcall(function() ch = tonumber(book.ItemInfo.Chapter) end)
+    if ch == nil or aidx == nil then return nil end
+    local comp = comps and comps[aidx]
+    if comp == nil then
+        local mgr = M._lever_world_mgr()
+        if not mgr then return nil end
+        pcall(function() comp = mgr.HISMArray[aidx + 1] end)
+        if not _lever_valid(comp) then comp = false end
+        if comps then comps[aidx] = comp end
+    end
+    if not comp then return nil end
+    local cap, got = {}, false
+    pcall(function() got = comp:GetInstanceTransform(ch, cap, true) end)
+    if not got then return nil end
+    local s, z
+    pcall(function() s = cap.Scale3D.X; z = cap.Translation.Z end)
+    if type(s) ~= "number" then return nil end
+    if type(z) == "number" and z < -500000 then return false end
+    return math.abs(s) >= 0.01
+end
+
+--- One book of the rolling check. Judged by book_rule against the published snapshots, with a
+--- book a Veil holds counted as locked. A book the player is carrying, or that cannot be judged,
+--- is left alone. Returns what was done:
+---   "relocked"  a locked book had its pile link back and was locked again;
+---   "rehid"     a locked book's actor was showing and was hidden again;
+---   "rezeroed"  a locked book had no link but its pile copy was drawn (written by something other
+---               than the game's SetActorVisible); the link was given back for the lock to collapse it;
+---   "released"  an unlocked book had no pile link and was given it back;
+---   "unjudged"  a book in play whose identity could not be read yet (retried, see lever_tick);
+---   nil         nothing to do.
+--- comps: the lap's component cache for the pile read (optional).
+function M._lever_check(book, comps)
+    if not _lever_valid(book) then return nil end
+    local aidx = _book_valid_asset_idx(book)
+    if aidx == nil then
+        -- The inert copies of the book set sit at the world origin and never have an identity; a
+        -- book in play that has none yet is retried until it does.
+        local at_origin = true
+        pcall(function()
+            local l = book:K2_GetActorLocation()
+            at_origin = math.abs(l.X) < 1 and math.abs(l.Y) < 1 and math.abs(l.Z) < 1
+        end)
+        return (not at_origin) and "unjudged" or nil
+    end
+    local shows, series = M.book_shows(book)
+    if series == nil then return nil end
+    if M._veil_has(book) then shows = false end
+    if shows == nil then return "unjudged" end
+    local holder
+    pcall(function() holder = book.OwningCharacter end)
+    if _lever_valid(holder) then return nil end
+    local ctrl
+    pcall(function() ctrl = book.HISMController end)
+    local linked = _lever_valid(ctrl)
+    if shows == false then
+        if linked then
+            M.lever_hide(book)
+            return "relocked"
+        end
+        -- No link, so the game's own swap cannot draw it. Its collision is left as it is: the bag
+        -- guard turns it on for a book it is sending home.
+        local hidden = true
+        pcall(function() hidden = book.bHidden == true end)
+        if not hidden then
+            pcall(function() book:SetActorHiddenInGame(true) end)
+            return "rehid"
+        end
+        -- The pile copy itself, in case anything but SetActorVisible wrote it.
+        if M._lever_pile_drawn(book, aidx, comps) == true then
+            local mgr = M._lever_world_mgr()
+            if mgr then
+                pcall(function() book.HISMController = mgr end)
+                M.lever_hide(book)
+                return "rezeroed"
+            end
+        end
+        return nil
+    end
+    if not linked and M.lever_show(book) then return "released" end
+    return nil
+end
+
+--- The SetActorVisible hook saw the game show a locked book that still has its pile link. Checked
+--- on the next tick (the hook runs inside the game's own call), so it is locked again at once
+--- instead of waiting for the rolling check to reach it.
+function M.lever_note_shown(book)
+    local q = M._lever_q
+    if not q then q = {}; M._lever_q = q end
+    if #q < 128 then q[#q + 1] = book end
+end
+
+--- Count a book the lever could not lock or unlock, keeping a few names for the log line.
+function M._lever_note_fail(book, what)
+    M._lever_fail = (M._lever_fail or 0) + 1
+    local ex = M._lever_fail_ex
+    if not ex then ex = {}; M._lever_fail_ex = ex end
+    if #ex < 3 then
+        local aidx = _book_valid_asset_idx(book)
+        local ch
+        pcall(function() ch = tonumber(book.ItemInfo.Chapter) end)
+        ex[#ex + 1] = ("%s vol %s (%s)"):format(tostring(aidx and M._asset_to_series[aidx]),
+            ch and tostring(ch + 1) or "?", what)
+    end
+end
+
+--- The ward flush has applied the lever to this world: the rolling check may run from now on.
+function M._lever_armed_now(epoch)
+    if not M.lever_on() then return end
+    if (M._world_epoch or 0) ~= epoch then return end
+    M._lever_armed = epoch
+    M._lever_restart_lap()    -- start a fresh lap over the books as the flush left them
+end
+
+--- Drop the current lap (its counts go to the report first) so the next tick starts a new one.
+function M._lever_restart_lap()
+    if M._lever_lap_r then M._lever_report(M._lever_lap_r, "rolling check", true) end
+    M._lever_lap, M._lever_lap_r, M._lever_lap_comps = nil, nil, nil
+end
+
+local LEVER_KINDS = { "relocked", "rehid", "rezeroed", "released", "unjudged" }
+
+--- Write what the lever repaired or could not do, at INFO under [book-vis]: the first time in a
+--- world at once, then at most once per LEVER_REPORT_S with the counts summed, and only when the
+--- result differs from the last line. hold = only add to the counts.
+function M._lever_report(r, why, hold)
+    local acc = M._lever_acc
+    if not acc then
+        acc = {}
+        for _, k in ipairs(LEVER_KINDS) do acc[k] = 0 end
+        M._lever_acc = acc
+    end
+    for _, k in ipairs(LEVER_KINDS) do acc[k] = acc[k] + (r[k] or 0) end
+    if r.example and not acc.example then acc.example = r.example end
+    acc.why = acc.why or why
+    if hold then return end
+    local fails = M._lever_fail or 0
+    local repaired = acc.relocked + acc.rehid + acc.rezeroed + acc.released
+    if repaired == 0 and acc.unjudged == 0 and fails == (M._lever_fail_said or 0) then
+        M._lever_acc = nil
+        return
+    end
+    local ep, now = M._world_epoch or 0, os.time()
+    if M._lever_said_epoch == ep and now - (M._lever_said_t or 0) < M.LEVER_REPORT_S then return end
+    local sig = ("%d/%d/%d/%d/%d/%d"):format(acc.relocked, acc.rehid, acc.rezeroed, acc.released,
+        acc.unjudged, fails)
+    M._lever_acc = nil
+    if M._lever_said_epoch == ep and sig == M._lever_said_sig and repaired == 0 then return end
+    M._lever_said_epoch, M._lever_said_t, M._lever_said_sig = ep, now, sig
+    M._lever_fail_said = fails
+    local parts = {}
+    if acc.relocked > 0 then parts[#parts + 1] = ("%d locked book(s) had their pile link back and were locked again"):format(acc.relocked) end
+    if acc.rehid > 0 then parts[#parts + 1] = ("%d locked book(s) were showing their actor and were hidden again"):format(acc.rehid) end
+    if acc.rezeroed > 0 then parts[#parts + 1] = ("%d locked book(s) had their pile copy drawn without a link and were hidden again"):format(acc.rezeroed) end
+    if acc.released > 0 then parts[#parts + 1] = ("%d unlocked book(s) had no pile link and were given it back"):format(acc.released) end
+    if acc.unjudged > 0 then parts[#parts + 1] = ("%d book(s) in play could not be identified yet and are retried"):format(acc.unjudged) end
+    if fails > 0 then
+        parts[#parts + 1] = ("%d lock or unlock(s) failed in this world%s"):format(fails,
+            M._lever_fail_ex and (" (" .. table.concat(M._lever_fail_ex, ", ") .. ")") or "")
+    end
+    log(("[book-vis] %s: %s%s"):format(acc.why or why, table.concat(parts, "; "),
+        acc.example and ("; e.g. " .. acc.example) or ""))
+end
+
+--- Driven every tick by main.lua while the world is apply-safe. Locks again the books the
+--- SetActorVisible hook flagged, runs the rolling check, retries books that could not be
+--- identified, and runs a fast lap one tick after the game has rebuilt its piles.
+function M.lever_tick()
+    if not M.lever_on() then return end
+    M._lever_ticks = (M._lever_ticks or 0) + 1
+    local ep = M._world_epoch or 0
+    -- A pile rebuild seen by the hook: wait one tick for the game to finish setting the links.
+    -- A rebuild before this world's first flush needs nothing more, since the flush locks every
+    -- book; one during or after it undoes locks already made, so a fast lap follows.
+    if (M._lever_rebuilt or 0) ~= (M._lever_rebuilt_seen or 0) then
+        if not M._lever_rebuilt_tick then
+            M._lever_rebuilt_tick = M._lever_ticks
+        elseif M._lever_ticks > M._lever_rebuilt_tick then
+            M._lever_rebuilt_seen, M._lever_rebuilt_tick = M._lever_rebuilt, nil
+            M._lever_mgr, M._lever_mgr_epoch = nil, nil
+            if M._lever_armed == ep or M._flush_in_progress then M._lever_fast_due = ep end
+        end
+    end
+    -- Not while a reconnect is settling: the snapshots are empty then, so every book would read
+    -- as locked.
+    if M._reconnect_settle_active then return end
+    if not (M._gameplay_active or M._allow_pre_apply) then return end
+    -- Books the game just tried to show while locked and linked: lock them now.
+    local q = M._lever_q
+    if q and #q > 0 and M._lever_armed == ep then
+        M._lever_q = nil
+        local r = { relocked = 0, rehid = 0, rezeroed = 0, released = 0, unjudged = 0 }
+        for i = 1, #q do
+            local ok, what = pcall(M._lever_check, q[i])
+            if ok and what and r[what] then r[what] = r[what] + 1 end
+        end
+        M._lever_report(r, "locked again when the game tried to show it", true)
+    elseif q and M._lever_armed ~= ep then
+        M._lever_q = nil      -- the flush has not run in this world yet; it locks every book
+    end
+    -- Only in a world the ward flush has already applied the lever to, and not during a flush,
+    -- which does the same work.
+    if M._lever_armed ~= ep then return end
+    if M._flush_in_progress then return end
+    if M._lever_fast_due == ep then
+        M._lever_fast_due = nil
+        M._lever_restart_lap()
+        M._lever_fast = true
+    end
+    -- Books in play that could not be identified: tried again about once a second.
+    local u = M._lever_unjudged
+    if u and #u > 0 and (M._lever_ticks % 60) == 0 then
+        local keep = {}
+        for i = 1, #u do
+            local ok, what = pcall(M._lever_check, u[i])
+            if ok and what == "unjudged" and #keep < 256 then keep[#keep + 1] = u[i] end
+        end
+        M._lever_unjudged = keep
+    end
+    if not M._lever_lap or M._lever_lap_epoch ~= ep or M._lever_i > M._lever_n then
+        if M._lever_lap and M._lever_lap_epoch == ep and M._lever_lap_r then
+            M._lever_report(M._lever_lap_r, M._lever_lap_fast and "after the game rebuilt its book piles"
+                or "rolling check")
+        end
+        M._lever_lap = FindAllOf("BP_GrabbingBook_C")
+        M._lever_n = 0
+        if M._lever_lap then pcall(function() M._lever_n = #M._lever_lap end) end
+        M._lever_i, M._lever_lap_epoch = 1, ep
+        M._lever_lap_fast = M._lever_fast and true or false
+        M._lever_fast = false
+        M._lever_lap_r = { relocked = 0, rehid = 0, rezeroed = 0, released = 0, unjudged = 0 }
+        M._lever_lap_comps = {}
+        M._lever_unjudged = M._lever_unjudged or {}
+        if M._lever_n == 0 then M._lever_lap = nil; return end
+    end
+    local per = M._lever_lap_fast and M.LEVER_FAST_PER_TICK or M.LEVER_SLOW_PER_TICK
+    if M._lever_lap_fast and M._hold_active then per = M.BOOK_APPLY_CHUNK_HOLD end   -- behind the pause hold
+    local hi = math.min(M._lever_i + per - 1, M._lever_n)
+    local r = M._lever_lap_r
+    for i = M._lever_i, hi do
+        local b = M._lever_lap[i]
+        local ok, what = pcall(M._lever_check, b, M._lever_lap_comps)
+        if ok and what then
+            r[what] = r[what] + 1
+            if what == "unjudged" then
+                local u2 = M._lever_unjudged
+                if #u2 < 256 then u2[#u2 + 1] = b end
+            elseif not r.example then
+                local aidx = _book_valid_asset_idx(b)
+                local ch
+                pcall(function() ch = tonumber(b.ItemInfo.Chapter) end)
+                r.example = ("%s vol %s (%s)"):format(tostring(aidx and M._asset_to_series[aidx]),
+                    ch and tostring(ch + 1) or "?", what)
+            end
+        end
+    end
+    M._lever_i = hi + 1
+end
+
+--- Has the lever finished locking this world: its first flush done, and no pile rebuild waiting
+--- for, or in the middle of, its fast lap? The pause hold waits for this. Always true in the
+--- stacks look.
+function M.lever_ready()
+    if not M.lever_on() then return true end
+    local ep = M._world_epoch or 0
+    if M._lever_armed ~= ep then return false end
+    if M._lever_fast_due == ep or M._lever_fast then return false end
+    if (M._lever_rebuilt or 0) ~= (M._lever_rebuilt_seen or 0) then return false end
+    if M._lever_lap_fast and M._lever_lap and (M._lever_i or 1) <= (M._lever_n or 0) then return false end
+    return true
+end
+
+--- What the pile lever holds in this world, for diagnostics and the F8 report.
+function M.lever_state()
+    return { on = M.lever_on() and true or false,
+             armed = M._lever_armed == (M._world_epoch or 0), ready = M.lever_ready(),
+             rebuilt = M._lever_rebuilt or 0, failed = M._lever_fail or 0,
+             unjudged = M._lever_unjudged and #M._lever_unjudged or 0,
+             lap_i = M._lever_i, lap_n = M._lever_n,
+             fast = M._lever_lap_fast and true or false }
+end
+
 --- One bookcase component's visibility. Showing puts it back to the game's own state, recorded the
 --- first time it is touched, rather than forcing it on: forcing it on lit PreviewBookLocation, the
 --- ghost book the game shows only while a book is aimed at the case, on every shelf from load, green
@@ -1534,12 +1985,6 @@ end
 -- Read by the warding/unward passes and the unlocked-state dump.
 M._books_warded = {}
 
--- BookSanity per-book pile-hide tracker. Key "aidx|chapter" (one HISM instance = one volume) ->
--- { hidden=bool, orig=<captured world FTransform table> }. A locked book's pile instance is
--- teleported to deep Z (piles stay visible as the game's actor<->pile backfill). orig is captured
--- once at rest for a clean restore on unlock. Cleared on world reload (reset_hism_state).
-M._book_inst_state = {}
-
 -- Drift probe: per case (keyed by GetFullName), the bHidden we last wrote. Compared before
 -- the next write to log [bookcase-drift] if the game's BP tick reverted our flag.
 M._case_last_applied_hidden = {}
@@ -1590,7 +2035,7 @@ M._flush_pending     = false
 --- that captured the old world bail (see below).
 function M.reset_hism_state()
     -- World epoch, bumped on every reset. Any DEFERRED game-thread closure that captured
-    -- the OLD world's refs (notably layer 3's HISM array) re-checks this and bails instead
+    -- the OLD world's refs (book and bookcase arrays) re-checks this and bails instead
     -- of dereferencing freed memory — the LoadMap-teardown use-after-free (a native AV).
     M._world_epoch = (M._world_epoch or 0) + 1
     M._state_sig, M._bundle_sig, M._apply_sig = nil, nil, nil   -- the first State line of every world prints
@@ -1615,10 +2060,14 @@ function M.reset_hism_state()
     M._fast_stable = 0; M._fast_total = 0; M._fast_prev_case_n = nil   -- reset the button-gate readiness poller
     M._section_sorted_cache = nil   -- old world's case refs; rebuild the cached per-section sort next pass
     M._books_warded = {}
-    M._book_inst_state = {}
-    -- Pile-sink bookkeeping describes the old world's instances.
-    M._pile_retry, M._pile_want, M._pile_nochap, M._pile_report_sig = nil, nil, 0, nil
-    M._pile_via_book, M._pile_other_mgr = 0, 0
+    -- Pile lever: the new world's books have their links again and its own manager; the rolling
+    -- check waits for this world's first flush. A rebuild already counted belongs to the old world.
+    M._lever_mgr, M._lever_mgr_epoch, M._lever_armed = nil, nil, nil
+    M._lever_lap, M._lever_lap_r, M._lever_fast, M._lever_acc = nil, nil, false, nil
+    M._lever_q, M._lever_unjudged, M._lever_fast_due, M._lever_lap_comps = nil, nil, nil, nil
+    M._lever_fail, M._lever_fail_ex, M._lever_fail_said = 0, nil, nil
+    M._hold_active = false   -- main.lua's pause hold sets it again once it holds the player in this world
+    M._lever_rebuilt_seen, M._lever_rebuilt_tick = M._lever_rebuilt, nil
     M._attune_base = {}          -- old world's skill objects are gone; recapture on next pass
     M._attune_log_state = {}
     M._attune_dirty = false      -- fresh skill objects hold the game's own values
@@ -1704,6 +2153,9 @@ end
 -- Chunked-flush tuning: books per tick, and the yield between chunks so the LoopAsync poll
 -- thread can pump c:poll(). 50ms < the 100-150ms AP heartbeat, keeping the socket alive.
 local BOOK_APPLY_CHUNK_SIZE     = M._poll_on_game_thread and 30 or 300  -- single-thread: tiny chunks/frame (spread the flush over ~100 frames, <1s even at 120fps)
+-- While main.lua holds the player in the pause menu (M._hold_active) a frame hitch cannot be felt,
+-- so the flush takes bigger chunks and the hold ends sooner.
+M.BOOK_APPLY_CHUNK_HOLD = 400
 local BOOK_APPLY_CHUNK_DELAY_MS = 50
 
 --- Ward/unward every BP_GrabbingBook_C by whether its series is in the unwarded set.
@@ -1800,7 +2252,7 @@ function M._apply_books_to_world()
     -- (the old-world actor array); if the world reloads mid-flush, a pending LoopAsync
     -- reschedule would re-stamp its pump unit with the NEW epoch and pass the pump's
     -- guard, then iterate freed actors -> native AV. The per-flush epoch closes that
-    -- gap (mirrors layer 3 + reconcile, which the chunk worker otherwise lacks).
+    -- gap (mirrors reconcile, which the chunk worker otherwise lacks).
     local flush_epoch = M._world_epoch
     -- The ~3000-actor walk is too high-volume to mark per book; timestamp the whole flush
     -- so a crash trace shows a flush was in flight. BOOK_ACTOR_WARDING is the bisection lever.
@@ -1814,52 +2266,8 @@ function M._apply_books_to_world()
     local mod_actor = FindFirstOf("ModActor_C")
     if not (mod_actor and mod_actor:IsValid()) then mod_actor = nil end
 
-    -- BookSanity per-book pile hide: cache the HISM manager's component array. A locked book's pile
-    -- instance is teleported to deep Z below (piles stay visible as the game's actor<->pile backfill).
-    -- Each series' HISM = HISMArray[aidx+1]; the instance at index==Chapter is that volume. nil
-    -- (feature off) unless book_sanity + hidden mode + the diag flag are all on.
-    local pile_on = M._per_book_unlocks and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT")
-    local hism_arr, mgr_addr
-    if pile_on then
-        local mgr = FindFirstOf("BP_HISM_Manager_C")
-        if mgr and mgr:IsValid() then
-            pcall(function() hism_arr = mgr.HISMArray end)
-            pcall(function() mgr_addr = mgr:GetAddress() end)
-        end
-    end
-    -- Every locked book's pile copy this flush asked to sink (one key per "aidx|chapter"; both
-    -- copies of a book share it), and the ones that could not be sunk, with the reason. The
-    -- finalizer compares the two and schedules a retry for the failures.
-    stats.pile_want, stats.pile_fail, stats.pile_nochap = {}, {}, 0
-    -- Sink (hide=true) or restore one book's pile copy through M._sink_pile, and count the outcome.
-    local function _teleport_inst(aidx, chapter, hide, book, series)
-        local ok, info, via = M._sink_pile(aidx, chapter, hide, book, hism_arr)
-        if via then stats.tp_via_book = (stats.tp_via_book or 0) + 1 end
-        if info == "hid" then
-            stats.tp_hide = (stats.tp_hide or 0) + 1
-            -- A book whose own manager is not the one found above: the sink then wrote to a
-            -- different manager's pile than the one the game draws for this book. Counted for
-            -- the report only.
-            if mgr_addr and not via then
-                local own
-                pcall(function()
-                    local m = book.HISMController
-                    if m and m:IsValid() then own = m:GetAddress() end
-                end)
-                if own and own ~= mgr_addr then stats.tp_other_mgr = (stats.tp_other_mgr or 0) + 1 end
-            end
-        elseif info == "restored" then
-            stats.tp_show = (stats.tp_show or 0) + 1
-        end
-        if hide then
-            local ikey = aidx .. "|" .. chapter
-            stats.pile_want[ikey] = true
-            if not ok then
-                stats.pile_fail[ikey] = { aidx = aidx, chapter = chapter, series = series,
-                                          book = book, why = info }
-            end
-        end
-    end
+    -- Hidden book look: locked books are held by the pile lever (see "Pile lever" above).
+    local lever_on = M.lever_on()
 
 
     -- Cache any valid BP_BookCase_C as a MoveToBookCase attachment target (it needs a
@@ -1952,18 +2360,28 @@ function M._apply_books_to_world()
                 if not is_warded then
                     stats.gate_skipped_unwards = stats.gate_skipped_unwards + 1
                 end
+                -- Before the actor writes: giving the link back lets the game lay the pile copy
+                -- at the actor, which also hides the actor; the write below shows it again.
+                if lever_on and _diag_on("BOOK_ACTOR_WARDING") then
+                    if not M.lever_show(book) then stats.lever_fail = (stats.lever_fail or 0) + 1 end
+                end
                 if _diag_on("BOOK_ACTOR_WARDING") then
                     book:SetActorHiddenInGame(false)
                     book:SetActorEnableCollision(true)
                 end
                 M._books_warded[key] = nil
+            elseif lever_on then
+                -- Every pass, not only the first: the lock is cheap once in place, and it puts back
+                -- a link the game has set again since.
+                if _diag_on("BOOK_ACTOR_WARDING") then
+                    if M.lever_hide(book) then stats.lever_held = (stats.lever_held or 0) + 1
+                    else stats.lever_fail = (stats.lever_fail or 0) + 1 end
+                end
+                M._books_warded[key] = true
             else
+                -- The stacks look: a locked book stays VISIBLE and is only made ungrabbable.
                 if not is_warded then
-                    if _diag_on("BOOK_ACTOR_WARDING") then
-                        -- stacks mode (_book_hide_mode false): keep VISIBLE, only collision-off.
-                        if M._book_hide_mode then book:SetActorHiddenInGame(true) end
-                        book:SetActorEnableCollision(false)
-                    end
+                    if _diag_on("BOOK_ACTOR_WARDING") then book:SetActorEnableCollision(false) end
                     M._books_warded[key] = true
                 end
             end
@@ -1973,13 +2391,6 @@ function M._apply_books_to_world()
         -- anchor has to be in place before the first cast -- the reconcile cursor covers 20 books
         -- every 5s and would take a quarter of an hour to reach the whole library.
         if M._ward_anchor then pcall(M._ward_anchor, book, not should_unward) end
-        -- BookSanity pile hide: teleport this book's pile instance to deep Z when locked (restore on
-        -- unlock). Hides the far/rest form; the actor ward above hides the close/look form. index == Chapter.
-        if pile_on and chapter ~= nil then
-            _teleport_inst(asset_idx, chapter, not should_unward, book, series_name)
-        elseif pile_on and series_name and not should_unward then
-            stats.pile_nochap = stats.pile_nochap + 1   -- locked, but no chapter to find its pile by
-        end
         -- A revealed book resting on a shelf it spawned on goes to the floor in front of it, so it
         -- is not inside a book the player shelved into its space while it was hidden. Once per
         -- book per world, and only a book that has never been moved.
@@ -2002,16 +2413,11 @@ function M._apply_books_to_world()
     -- Finalizer after the last chunk: diff log, state summary, in-progress/pending bookkeeping.
     local function _finalize_apply()
         M._finalize_apply_books(books, n, stats, series_snap, shelves_snap, last_applied_snap)
-        M._tp_hid = (M._tp_hid or 0) + (stats.tp_hide or 0)
-        M._tp_rest = (M._tp_rest or 0) + (stats.tp_show or 0)
-        if (M._tp_hid + M._tp_rest) > 0 and os.time() - (M._tp_t or 0) >= 60 then
-            M._tp_t = os.time()
-            stats.tp_hide, stats.tp_show = M._tp_hid, M._tp_rest
-            M._tp_hid, M._tp_rest = 0, 0
-            log(("[book-pile] instances teleported: hid=%d restored=%d (tracked=%d)"):format(
-                stats.tp_hide or 0, stats.tp_show or 0, (function() local c = 0; for _ in pairs(M._book_inst_state) do c = c + 1 end; return c end)()))
+        if lever_on then
+            log(("[book-lever] flush: %d locked book(s) held by the pile lever, %d could not be locked or unlocked"):format(
+                stats.lever_held or 0, stats.lever_fail or 0))
+            M._lever_armed_now(flush_epoch)
         end
-        if pile_on then pcall(M._pile_after_flush, stats) end
         M._flush_in_progress = false
 
         if M._flush_pending then
@@ -2035,7 +2441,8 @@ function M._apply_books_to_world()
     --- throwing chunk releases the flush lock instead of wedging every future flush.
     local _book_run_chunk
     local function _book_process_one_chunk()
-        local chunk_end = math.min(cursor + BOOK_APPLY_CHUNK_SIZE - 1, n)
+        local per = (M._hold_active and M._poll_on_game_thread) and M.BOOK_APPLY_CHUNK_HOLD or BOOK_APPLY_CHUNK_SIZE
+        local chunk_end = math.min(cursor + per - 1, n)
         -- The flush spans ~100 frames and logs nothing until the finalizer, so a crash inside it
         -- would otherwise leave no cursor. Every 10th chunk only: trace.mark flushes to disk, and
         -- one synchronous write per frame would perturb the window it is meant to describe.
@@ -2192,17 +2599,17 @@ end
 -- ============================================================================
 -- Periodic actor-state reconciliation
 -- ============================================================================
--- Continuous counterpart to Layer 3 for the ACTOR (not the HISM pile). Pass 1's actor ward
+-- Continuous repair of the book ACTOR (not its pile copy). Pass 1's actor ward
 -- is event-driven and the SetActorVisible/grab hooks miss cases, so when an unwarded book's
 -- actor lazy-streams in or the game's distance swap leaves a flag stale, two bugs appear:
 --   * collision left OFF -> visible but not grabbable.
 --   * SM_Book_1 left hidden -> grabbable but invisible (the shown actor form renders nothing).
 -- For each UNWARDED book, assert those two flags, writing ONLY when the live value disagrees
 -- (read-before-write ground truth, like WARD_GROUND_TRUTH) so steady state = zero render-
--- state churn and can't reintroduce the layer-3 crash. Swap-safe: never touches actor bHidden
+-- state churn. Swap-safe: never touches actor bHidden
 -- (the game's distance swap — pinning it would double-render a far book), and corrects
 -- SM_Book_1 only when bHidden=false (the shown form). Rolling cursor + budget keeps the async
--- poll loop pumping; warded books are skipped (ENFORCE + Layer 3 keep them hidden).
+-- poll loop pumping; warded books are skipped (the pile lever keeps them hidden).
 -- Single-thread runs the reconcile pass on the 60fps pawn tick, so a 1000-book pass hitches; use a
 -- smaller per-pass budget (its rolling cursor still covers everything over a few passes). Legacy async = 1000.
 -- 100 books per 5s pass reads the library in about two and a half minutes; the read pass is a
@@ -2321,7 +2728,10 @@ function M.reconcile_book_actors()
                     local key = nil
                     pcall(function() key = b:GetFullName() end)
                     if key then M._books_warded[key] = nil end
-                    if M._restore_pile_instance then pcall(M._restore_pile_instance, f.aidx, f.chapter) end
+                    -- Give the pile link back; the game then lays the pile copy at the actor and
+                    -- hides the actor, so it is shown again after.
+                    pcall(M.lever_show, b)
+                    pcall(function() b:SetActorHiddenInGame(false) end)
                     c_hide = c_hide + 1
                     if c_hide <= 5 then
                         log(("[reconcile] unwarded %s vol %s: it should show and was hidden"):format(
@@ -3674,6 +4084,14 @@ local function _report_lines()
     add("run: seed %s  ap slot %s  save slot %s  verdict %s", tostring(SI and SI.seed), tostring(SI and SI.ap_slot),
         tostring(SI and SI.slot), tostring(SI and SI.verdict))
     add("modes: unlocks %s, checks %s, shelf gate %s, goal %s", unlock, checks, only_shelfable and "on" or "off", tostring(sd.goal))
+    do
+        local ls = M.lever_state()
+        add("pile lever: %s, %s, %s; rebuilds seen %d, lock or unlock failures %d, books not yet identified %d, rolling check at %s of %s%s",
+            ls.on and "on" or "off (stacks look)", ls.armed and "armed" or "not armed",
+            ls.ready and "ready" or "not ready", ls.rebuilt, ls.failed, ls.unjudged,
+            tostring(ls.lap_i), tostring(ls.lap_n),
+            M._lever_fail_ex and ("; failed e.g. " .. table.concat(M._lever_fail_ex, ", ")) or "")
+    end
     local game_rows, game_books = 0, 0
     pcall(function()
         local gi = FindFirstOf("BP_LibrarianGameInstance_C") or FindFirstOf("LibrarianGameInstanceBase")
@@ -5901,372 +6319,6 @@ function M.dump_unmapped_books()
     end
 end
 
--- ============================================================================
--- Re-hide sweep for BookSanity pile instances
--- ============================================================================
--- Insight ("Show Same Type Book") drags a hidden pile instance back up to its rest position. The
--- warding flush is state-change-driven and its teleport is idempotent on _book_inst_state.hidden,
--- so it never re-teleports a drifted instance -- the book stays visible (still un-grabbable; the
--- actor ward is untouched) until a reload. Only instances we hid (st.hidden) are swept, reusing
--- the stored orig: re-capturing here would take the drifted pose as the rest transform.
--- ============================================================================
-local RESWEEP_CHUNK   = 500
-local RESWEEP_DEEP_DZ = 1000000.0   -- the pile sink depth; every sink and re-sink uses this
-
--- Cached manager -> HISMArray (per-series HISMs); FindFirstOf every pass is not free. The manager
--- is per-world, so a reload leaves the cache dangling: revalidate per call, never prime once.
-local function _hism_arr()
-    local mgr = M._hism_mgr
-    if not (mgr and mgr:IsValid()) then
-        mgr = FindFirstOf("BP_HISM_Manager_C")
-        M._hism_mgr = (mgr and mgr:IsValid()) and mgr or nil
-    end
-    if not M._hism_mgr then return nil end
-    local arr
-    pcall(function() arr = M._hism_mgr.HISMArray end)
-    return arr
-end
-
--- ============================================================================
--- Pile copies of locked books: sink, count failures, retry
--- ============================================================================
--- At a distance the game draws each book as an instance in its series' pile (one HISM component
--- per series, instance index = Chapter). In the per-book modes a locked book's instance is moved
--- deep below the floor; the actor ward only covers the book up close. A sink that fails leaves the
--- book in plain sight on its shelf while the actor side reports a healthy ward, so every failure
--- is counted with its reason, the result is compared with what should be hidden, and the failed
--- books are retried a few times.
-
--- Delays in seconds before each retry of the books a flush could not sink. Then it stops; the
--- next flush (an item, a reload) starts over.
-M.PILE_RETRY_DELAYS = { 5, 10, 20, 40 }
-
---- The pile component for one series: the world manager's HISMArray[aidx + 1]. When that entry
---- is missing or invalid, falls back to the book's own HISMController, the manager the game itself
---- uses for the book. Returns comp, used_book_manager; or nil, reason.
-function M._pile_comp(aidx, book, hism_arr)
-    local comp
-    if hism_arr then pcall(function() comp = hism_arr[aidx + 1] end) end
-    if comp and comp:IsValid() then return comp, false end
-    local reason = hism_arr and "no component" or "no manager"
-    if book then
-        local own
-        pcall(function()
-            local m = book.HISMController
-            if m and m:IsValid() then own = m.HISMArray[aidx + 1] end
-        end)
-        if own and own:IsValid() then return own, true end
-    end
-    return nil, reason
-end
-
---- Sink (hide=true) or restore (hide=false) one book's pile instance. Sinking captures the rest
---- transform once and moves the instance 1,000,000 units down; restoring writes the captured
---- transform back. Idempotent via M._book_inst_state, so the two actors that share an instance
---- move it once. Game thread only; every engine call is pcall-guarded.
----
---- Returns ok, info, used_book_manager. ok is true when the instance is now as asked; info is
---- "hid" or "restored" when this call moved it, nil when it already was, and the reason when ok
---- is false: no manager, no component, transform read, no position, write refused.
-function M._sink_pile(aidx, chapter, hide, book, hism_arr)
-    local ikey = aidx .. "|" .. chapter
-    local st = M._book_inst_state[ikey]
-    if hide then
-        if st and st.hidden then return true end          -- already hidden
-    elseif not (st and st.hidden) then return true end    -- not hidden -> nothing to restore
-    local comp, via = M._pile_comp(aidx, book, hism_arr)
-    if not comp then return false, via end
-    if not hide then
-        local wok = pcall(function() comp:UpdateInstanceTransform(chapter, st.orig, true, true, true) end)
-        if not wok then return false, "write refused", via end
-        st.hidden = false
-        return true, "restored", via
-    end
-    -- Capture the instance's current WORLD transform (GetInstanceTransform fills the table).
-    local cap = {}
-    local got = false
-    pcall(function() got = comp:GetInstanceTransform(chapter, cap, true) end)
-    if not (got and cap.Translation) then return false, "transform read", via end
-    local ox, oy, oz, rx, ry, rz, rw, sx, sy, sz
-    pcall(function()
-        ox, oy, oz = cap.Translation.X, cap.Translation.Y, cap.Translation.Z
-        rx, ry, rz, rw = cap.Rotation.X, cap.Rotation.Y, cap.Rotation.Z, cap.Rotation.W
-        sx, sy, sz = cap.Scale3D.X, cap.Scale3D.Y, cap.Scale3D.Z
-    end)
-    if oz == nil then return false, "no position", via end
-    local orig = { Translation = { X = ox, Y = oy, Z = oz },
-                   Rotation = { X = rx, Y = ry, Z = rz, W = rw },
-                   Scale3D = { X = sx, Y = sy, Z = sz } }
-    local deep = { Translation = { X = ox, Y = oy, Z = oz - RESWEEP_DEEP_DZ },
-                   Rotation = { X = rx, Y = ry, Z = rz, W = rw },
-                   Scale3D = { X = sx, Y = sy, Z = sz } }
-    local wok = pcall(function() comp:UpdateInstanceTransform(chapter, deep, true, true, true) end)
-    if not wok then return false, "write refused", via end
-    M._book_inst_state[ikey] = { hidden = true, orig = orig }
-    return true, "hid", via
-end
-
---- Compare the locked books' pile keys with what is actually recorded as sunk, and log ONE line
---- (tag book-vis, so it reaches a player's log at INFO) when they differ: how many still show,
---- the count per reason, and a few example books. Logged once per distinct result, so a steady
---- state does not repeat it. pending is the {ikey = failure} set still waiting on a retry; note
---- says what happens next; final marks the last retry, which is worth its own line.
-function M._pile_report(pending, note, final)
-    local want = M._pile_want or {}
-    local locked, sunk = 0, 0
-    for ikey in pairs(want) do
-        locked = locked + 1
-        local st = M._book_inst_state[ikey]
-        if st and st.hidden then sunk = sunk + 1 end
-    end
-    local nochap = M._pile_nochap or 0
-    local by, examples, keys = {}, {}, {}
-    for ikey, f in pairs(pending) do
-        local why = tostring(f.why or "?")
-        by[why] = (by[why] or 0) + 1
-        keys[#keys + 1] = ikey
-    end
-    table.sort(keys)
-    for i = 1, math.min(3, #keys) do
-        local f = pending[keys[i]]
-        examples[#examples + 1] = ("%s vol %d"):format(tostring(f.series), (f.chapter or -1) + 1)
-    end
-    local reasons = {}
-    for why, c in pairs(by) do reasons[#reasons + 1] = ("%s=%d"):format(why, c) end
-    table.sort(reasons)
-    if nochap > 0 then reasons[#reasons + 1] = ("chapter unreadable=%d"):format(nochap) end
-    local extra = {}
-    if (M._pile_via_book or 0) > 0 then
-        extra[#extra + 1] = ("%d sunk through the book's own manager"):format(M._pile_via_book)
-    end
-    if (M._pile_other_mgr or 0) > 0 then
-        extra[#extra + 1] = ("%d whose own manager differs from the world's"):format(M._pile_other_mgr)
-    end
-    local short = locked - sunk + nochap
-    -- A healthy pass is silent unless this world already reported something.
-    if short == 0 and #extra == 0 and not M._pile_report_sig then return end
-    local sig = ("%d|%d/%d|%s|%s|%s"):format(M._world_epoch or 0, sunk, locked,
-        table.concat(reasons, ","), table.concat(extra, ","), tostring(final and short > 0))
-    if sig == M._pile_report_sig then return end
-    M._pile_report_sig = sig
-    if short > 0 then
-        log(("[book-vis] pile copies: %d of %d locked books still drawn on their shelf (%s)%s%s; %s"):format(
-            short, locked + nochap, table.concat(reasons, ", "),
-            #examples > 0 and ("; e.g. " .. table.concat(examples, ", ")) or "",
-            #extra > 0 and ("; " .. table.concat(extra, ", ")) or "",
-            tostring(note)))
-    else
-        log(("[book-vis] pile copies: all %d locked books hidden%s"):format(
-            locked, #extra > 0 and ("; " .. table.concat(extra, ", ")) or ""))
-    end
-end
-
---- After a ward flush in the per-book modes: record what it wanted sunk, report any shortfall and
---- arm the retry for the books that failed. stats is the flush's own stats table.
-function M._pile_after_flush(stats)
-    M._pile_want = stats.pile_want or {}
-    M._pile_nochap = stats.pile_nochap or 0
-    M._pile_via_book = stats.tp_via_book or 0
-    M._pile_other_mgr = stats.tp_other_mgr or 0
-    local pending = {}
-    for ikey, f in pairs(stats.pile_fail or {}) do
-        local st = M._book_inst_state[ikey]
-        if not (st and st.hidden) then pending[ikey] = f end   -- the other copy may have sunk it
-    end
-    if next(pending) then
-        M._pile_retry = { list = pending, tries = 0, epoch = M._world_epoch,
-                          at = os.time() + M.PILE_RETRY_DELAYS[1] }
-        M._pile_report(pending, ("retrying in %ds"):format(M.PILE_RETRY_DELAYS[1]))
-    else
-        M._pile_retry = nil
-        M._pile_report(pending, "")
-    end
-end
-
---- Retry the pile sinks the last flush could not do, on the PILE_RETRY_DELAYS schedule, then stop.
---- Called from the 5 s warding loop. Skips books that should now show (the next flush restores
---- them) and books the rule cannot judge. Not during a flush, which redoes every book anyway.
-function M.retry_pile_sinks()
-    local r = M._pile_retry
-    if not r then return end
-    if r.epoch ~= M._world_epoch then M._pile_retry = nil; return end
-    if M._flush_in_progress or not M._apply_safe then return end
-    if os.time() < r.at then return end
-    r.tries = r.tries + 1
-    local arr = _hism_arr()
-    local still, via = {}, 0
-    for ikey, f in pairs(r.list) do
-        local st = M._book_inst_state[ikey]
-        local locked = M.book_rule(f.series, f.chapter) == false
-        -- No longer locked: not a shortfall any more; the next flush deals with it.
-        if not locked and M._pile_want then M._pile_want[ikey] = nil end
-        if not (st and st.hidden) and locked then
-            local alive = false
-            pcall(function() alive = f.book ~= nil and f.book:IsValid() end)
-            local ok, why, used_book = M._sink_pile(f.aidx, f.chapter, true, alive and f.book or nil, arr)
-            if used_book then via = via + 1 end
-            if not ok then f.why = why; still[ikey] = f end
-        end
-    end
-    M._pile_via_book = (M._pile_via_book or 0) + via
-    local delays = M.PILE_RETRY_DELAYS
-    if next(still) and r.tries < #delays then
-        r.list = still
-        r.at = os.time() + delays[r.tries + 1]
-        M._pile_report(still, ("retry %d of %d, next in %ds"):format(r.tries, #delays, delays[r.tries + 1]))
-    else
-        M._pile_retry = nil
-        M._pile_report(still, ("no more retries after %d; the next item or reload tries again"):format(r.tries),
-            true)
-    end
-end
-
---- Put one book's pile instance back where the ward sank it. The flush restores on unward;
---- this is for a book the reconcile sweep unwards itself.
-function M._restore_pile_instance(aidx, chapter)
-    if not (aidx and chapter and M._book_inst_state) then return false end
-    local st = M._book_inst_state[aidx .. "|" .. chapter]
-    if not (st and st.hidden and st.orig) then return false end
-    local arr = _hism_arr()
-    if not arr then return false end
-    local comp
-    pcall(function() comp = arr[aidx + 1] end)
-    if not (comp and comp:IsValid()) then return false end
-    local ok = pcall(function() comp:UpdateInstanceTransform(chapter, st.orig, true, true, true) end)
-    if ok then st.hidden = false end
-    return ok
-end
-
---- Sink ONE pile instance back down, immediately.
----
---- Exists because rewriting the transform the game passes to its own UpdateInstance does not stick:
---- the hook fires on exactly the right books, but a struct argument written back from Lua is not
---- what the game goes on to use. So instead of correcting the call, let it land and put the
---- instance back with the write that is already known to work -- the same one the hide path uses.
----
---- Re-derives deep Z from the stored orig and never re-captures: most calls arrive on a pile that
---- is already down, and taking that pose as the rest pose would sink the well a second time and
---- strand the book when it unlocks.
-function M.resink_pile(aidx, chapter)
-    if not (M._per_book_unlocks and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT")) then return false end
-    local st = M._book_inst_state[aidx .. "|" .. chapter]
-    if not (st and st.hidden and st.orig and st.orig.Translation) then return false end
-    local arr = _hism_arr()
-    if not arr then return false end
-    local comp; pcall(function() comp = arr[aidx + 1] end)
-    if not (comp and comp:IsValid()) then return false end
-    local o = st.orig.Translation
-    local deep = { Translation = { X = o.X, Y = o.Y, Z = o.Z - RESWEEP_DEEP_DZ },
-                   Rotation = st.orig.Rotation, Scale3D = st.orig.Scale3D }
-    return pcall(function() comp:UpdateInstanceTransform(chapter, deep, true, true, true) end)
-end
-
--- Insight-aware re-hide, run from the 3s game-thread loop. Insight ("Show Same Type Book") keeps
--- pushing the revealed piles back up while it is showing, so a re-hide issued then is overwritten:
--- only the >=0 -> -1 edge sticks. GetShowingSameTypeIdx is the gate -- it returns the shown
--- asset-idx while the skill is up, -1 when idle. IsSkillActivated reads unlocked-ness, not firing.
-function M.resweep_book_piles()
-    if not (M._per_book_unlocks and M._book_hide_mode and _diag_on("BOOK_PILE_TELEPORT")) then return end
-    if not (M._gameplay_active and M._apply_safe) then return end
-    local hism_arr = _hism_arr()
-    if not hism_arr then return end
-
-    -- The shown idx is an asset-idx -- the same key space as the <aidx> half of ikey -- so recording
-    -- it here is what lets the just_ended pass match the drifted piles by series.
-    local showing = false
-    do
-        local player = FindFirstOf("BP_LibrarianCharacter_C")
-        if player and player:IsValid() then
-            local sidx
-            pcall(function() sidx = player:GetShowingSameTypeIdx() end)
-            if type(sidx) == "number" and sidx >= 0 then
-                showing = true
-                M._insight_shown = M._insight_shown or {}
-                M._insight_shown[sidx] = true
-            end
-        end
-    end
-    -- The skill's own end call is the reliable edge; the poll below is the fallback for when the
-    -- hook is not registered. Polling alone can miss a short skill entirely -- a fatigued Insight
-    -- can finish inside one sample -- and the drift then waits for the rolling backstop instead.
-    local hook_ended = M._insight_ended == true
-    M._insight_ended = false
-    local just_ended = hook_ended or ((M._insight_showing_prev == true) and (not showing))
-    M._insight_showing_prev = showing
-    if showing and not hook_ended then return end   -- don't fight the active skill; wait for it to stop
-
-    -- Re-hide one instance that drifted back out of the deep-Z well. Deep Z is re-derived from the
-    -- stored orig, never re-captured: most calls land on a still-deep pile, and taking that as orig
-    -- would sink the well another RESWEEP_DEEP_DZ and restore unlocked books to deep Z.
-    local function _recheck(ikey)
-        local st = M._book_inst_state[ikey]
-        if not (st and st.hidden and st.orig and st.orig.Translation) then return 0 end
-        local aidx, chapter = ikey:match("^(%-?%d+)|(%-?%d+)$")
-        aidx = tonumber(aidx); chapter = tonumber(chapter)
-        if not (aidx and chapter) then return 0 end
-        local comp; pcall(function() comp = hism_arr[aidx + 1] end)
-        if not (comp and comp:IsValid()) then return 0 end
-        local cur = {}
-        local got = false
-        pcall(function() got = comp:GetInstanceTransform(chapter, cur, true) end)
-        local oz = st.orig.Translation.Z
-        local cz = got and cur.Translation and cur.Translation.Z
-        if not (oz and cz) then return 0 end
-        if cz <= (oz - RESWEEP_DEEP_DZ) + (RESWEEP_DEEP_DZ * 0.5) then return 0 end
-        local deep = {
-            Translation = { X = st.orig.Translation.X, Y = st.orig.Translation.Y, Z = oz - RESWEEP_DEEP_DZ },
-            Rotation = st.orig.Rotation, Scale3D = st.orig.Scale3D }
-        if pcall(function() comp:UpdateInstanceTransform(chapter, deep, true, true, true) end) then
-            return 1
-        end
-        return 0
-    end
-
-    if just_ended then
-        -- Insight only lifts the piles of the type(s) it showed, so drift is confined to those
-        -- asset-idxs. That filter is what makes this pass safe to run unchunked -- it leaves ~a
-        -- dozen instances, where every hidden pile would be ~3000 transform reads in one tick.
-        local shown = M._insight_shown or {}
-        M._insight_shown = nil
-        local fixed = 0
-        for ikey in pairs(M._book_inst_state) do
-            local a = ikey:match("^(%-?%d+)|")
-            if a and shown[tonumber(a)] then fixed = fixed + _recheck(ikey) end
-        end
-        if fixed > 0 then
-            log(("[book-pile] re-hid %d instance(s) as Insight ended"):format(fixed))
-        end
-        return
-    end
-
-    -- Backstop for drift NOT from Insight: a rolling cursor probes RESWEEP_CHUNK per pass. Drift
-    -- comes per-series in bursts, so a hit means the rest is likely drifted too -- catch the whole
-    -- list now, skipping the range the probe just covered.
-    local list = M._resweep_list
-    local idx = M._resweep_idx or 0
-    if not list or idx >= #list then
-        list = {}
-        for ikey, st in pairs(M._book_inst_state) do
-            if st.hidden and st.orig then list[#list + 1] = ikey end
-        end
-        M._resweep_list = list
-        idx = 0
-    end
-    local fixed = 0
-    local stop = math.min(idx + RESWEEP_CHUNK, #list)
-    for i = idx + 1, stop do fixed = fixed + _recheck(list[i]) end
-    if fixed > 0 then
-        for i = 1, #list do
-            if i <= idx or i > stop then fixed = fixed + _recheck(list[i]) end
-        end
-        M._resweep_idx = #list
-    else
-        M._resweep_idx = stop
-    end
-    if fixed > 0 then
-        log(("[book-pile] re-hid %d drifted instance(s)"):format(fixed))
-    end
-end
 
 -- ============================================================================
 -- Debug console commands

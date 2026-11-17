@@ -258,16 +258,6 @@ local function book_dims(book)
     return { X = (mx.X - mn.X) * math.abs(S.X), Y = (mx.Y - mn.Y) * math.abs(S.Y), Z = (mx.Z - mn.Z) * math.abs(S.Z) }
 end
 
---- UE's FRotator -> FQuat, for the pile instance, which takes a transform.
-local function quat(p, y, r)
-    local d = math.pi / 360
-    local sp, cp = math.sin(p * d), math.cos(p * d)
-    local sy, cy = math.sin(y * d), math.cos(y * d)
-    local sr, cr = math.sin(r * d), math.cos(r * d)
-    return { X = cr * sp * sy - sr * cp * cy, Y = -cr * sp * cy - sr * cp * sy,
-             Z = cr * cp * sy - sr * sp * cy, W = cr * cp * cy + sr * sp * sy }
-end
-
 local function weak_owner_class(wp)
     local name
     pcall(function()
@@ -508,16 +498,9 @@ function M.move(IA, book, spot, why)
         return false
     end
     local name, aidx, ch = book_name(IA, book)
-    -- Second layer: the pile instance, which is what the far view draws.
-    if aidx and ch then
-        local t = { Translation = loc, Rotation = quat(rot.Pitch, rot.Yaw, rot.Roll), Scale3D = spot.scale }
-        pcall(function()
-            local mgr = FindFirstOf("BP_HISM_Manager_C")
-            mgr.HISMArray[aidx + 1]:UpdateInstanceTransform(ch, t, true, true, true)
-        end)
-        local st = IA._book_inst_state and IA._book_inst_state[aidx .. "|" .. ch]
-        if st then st.orig, st.hidden = t, false end
-    end
+    -- Second layer: the pile instance, which is what the far view draws. The game moves it to the
+    -- actor (and never draws a locked book's).
+    if IA.lever_pile_follow then pcall(IA.lever_pile_follow, book) end
     M._landed[#M._landed + 1] = { x = loc.X, y = loc.Y, top = loc.Z + spot.lift }
     M.last_pose = { loc = loc, rot = rot }
     M.stats.moved = M.stats.moved + 1
@@ -547,26 +530,15 @@ function M.loose_position(IA, book)
     return here
 end
 
---- Put a book at a pose: the actor and its pile instance together, physics off. The pile instance
---- keeps the book's own scale. Only the live position moves, never SpawnTransform.
+--- Put a book at a pose: the actor and its pile instance together, physics off. Only the live
+--- position moves, never SpawnTransform.
 function M.set_pose(IA, book, loc, rot)
     pcall(function() book:SetSimulate(false) end)
     local ok = false
     pcall(function() ok = book:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) and true or false end)
     if not ok then return false end
-    local _, aidx, ch = book_name(IA, book)
-    if aidx and ch then
-        local scale
-        pcall(function() scale = v3(book.SpawnTransform.Scale3D) end)
-        if not scale or scale.X == 0 then scale = { X = 1, Y = 1, Z = 1 } end
-        local t = { Translation = loc, Rotation = quat(rot.Pitch, rot.Yaw, rot.Roll), Scale3D = scale }
-        pcall(function()
-            local mgr = FindFirstOf("BP_HISM_Manager_C")
-            mgr.HISMArray[aidx + 1]:UpdateInstanceTransform(ch, t, true, true, true)
-        end)
-        local st = IA._book_inst_state and IA._book_inst_state[aidx .. "|" .. ch]
-        if st then st.orig, st.hidden = t, false end
-    end
+    -- The pile instance: the game moves it to the actor (and never draws a locked book's).
+    if IA.lever_pile_follow then pcall(IA.lever_pile_follow, book) end
     return true
 end
 
