@@ -395,7 +395,7 @@ end
 --- Loosening books is too late when the hook runs after the door's own code: the game has already
 --- asked CanBeFinish and opened the prompt. So when the hook finds the prompt up before the AP
 --- goal, it shuts it again inside the same call, before the frame is drawn: take the dialog off the
---- screen, run the door's CancelLeave, unpause.
+--- screen, run the door's CancelLeave, unpause and start the play-time counter again.
 --- Returns how many dialogs it closed (0 when the hook ran first, or the game refused itself).
 --- With look_only it closes nothing and only counts the dialogs on screen.
 function _bh.door_shut_prompt(door, look_only)
@@ -417,6 +417,12 @@ function _bh.door_shut_prompt(door, look_only)
     local pok = false; pcall(function() pok = p and p:IsValid() end)
     if not pok then pcall(function() p = FindFirstOf("BP_LibrarianCharacter_C") end) end
     pcall(function() p:SetPauseGame(false) end)
+    -- The door stops the game's play-time counter when it opens the prompt, and its own CancelLeave
+    -- never starts it again. The skills' cooldowns and active times only run while it counts, so Insight
+    -- and Assemble would stay frozen until the pause menu is used.
+    local gm; pcall(function() gm = FindFirstOf("GameManager") end)
+    local gok = false; pcall(function() gok = gm and gm:IsValid() end)
+    if gok then pcall(function() gm:SetIsCountingTime(true) end) end
     local HUD_mod = package.loaded["AP/HUD"]
     if HUD_mod and HUD_mod.notify then
         pcall(HUD_mod.notify, "The way out stays shut until your Archipelago goal is reached")
@@ -1238,6 +1244,32 @@ local function try_register_magic_hooks()
             -- The sequence opens the door itself, so leave it alone: calling OpenDoor here just
             -- snapped it open a frame before the cutscene did the same thing properly.
             pcall(function() d:ConfirmLeave() end)
+        end)
+
+        -- Cancelling the leave prompt, by the player's No button or by this mod, leaves the game's play-time
+        -- counter off: the door's CancelLeave switches it off itself after the hook runs, and the skills' cooldowns
+        -- and active times only run while it counts. Hooks on script functions run before the function, so the
+        -- restart is queued for the next game-thread steps and checked until the flag reads on. An AP run only;
+        -- vanilla play keeps the game's own behaviour.
+        mreg("/Game/Librarian/Environment/M01_Library/Meshes/BP_M01_Door_01.BP_M01_Door_01_C" .. ":CancelLeave", "Door.CancelLeave", function()
+            _bh.resume_counting = 12
+        end)
+        gt_loop("door_counter", 250, function()
+            local left = _bh.resume_counting
+            if not left then return end
+            local IAc = package.loaded["AP/ItemApply"]
+            if not (IAc and IAc._gameplay_active) then _bh.resume_counting = nil; return end
+            local gm; pcall(function() gm = FindFirstOf("GameManager") end)
+            local gok = false; pcall(function() gok = gm and gm:IsValid() end)
+            if not gok then _bh.resume_counting = left - 1; if left <= 1 then _bh.resume_counting = nil end; return end
+            pcall(function() gm:SetIsCountingTime(true) end)
+            local on = false; pcall(function() on = gm.IsCountingGameTime end)
+            if on == true or left <= 1 then
+                _bh.resume_counting = nil
+                log(("[end-door] play-time counter %s after the leave prompt was cancelled"):format(on == true and "restarted" or "could not be restarted"))
+            else
+                _bh.resume_counting = left - 1
+            end
         end)
 
         mreg("/Game/Librarian/Environment/M01_Library/Meshes/BP_M01_Door_01.BP_M01_Door_01_C" .. ":ConfirmLeave", "Door.ConfirmLeave", function()
