@@ -51,7 +51,7 @@ So you end up with:
 <Win64>\Mods\mods.txt                          (this repo's version)
 <Win64>\Mods\Librarian-AP\Scripts\main.lua
 <Win64>\Mods\Librarian-AP\Scripts\AP\...
-<Win64>\Mods\Librarian-AP\ap_config.json
+<Win64>\Mods\Librarian-AP\Scripts\ap_config.json
 ```
 
 #### 3. Install the BP companion pak
