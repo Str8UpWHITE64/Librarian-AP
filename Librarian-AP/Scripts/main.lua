@@ -1929,6 +1929,13 @@ local function start_gameplay_loops()
 
     -- Apply-gate retry loop: wait for books to fully populate before mutating
     -- the world. Cheap once gate passes (returns true immediately).
+    --
+    -- A book count and a few seconds are not enough on their own: a New Game spawns its books over
+    -- several seconds, longer on a slower machine, and a pass started in the middle of that walks
+    -- actors the game has not finished setting up. The game builds its book piles as the last
+    -- step of filling a world (after the spawn pass, or after a load has put every book back) and
+    -- gives each book its pile link in that same step, so the gate also waits until a book has
+    -- one.
     local APPLY_MIN_TICKS    = 10   -- 5s of grace before mutating
     local APPLY_MIN_BOOKS    = 1000
     local APPLY_SAMPLE_SIZE  = 50
@@ -1968,12 +1975,30 @@ local function start_gameplay_loops()
 
         local enough_ticks    = apply_attempts >= APPLY_MIN_TICKS
         local enough_distinct = distinct >= APPLY_MIN_DISTINCT
-        local ready = enough_books and enough_distinct and enough_ticks
+        local piles_built = false
+        if enough_books and enough_distinct and enough_ticks then
+            for i = 1, n do
+                local b = books[i]
+                local linked = false
+                pcall(function()
+                    if b and b:IsValid() then
+                        local c = b.HISMController
+                        linked = c ~= nil and c:IsValid()
+                    end
+                end)
+                if linked then piles_built = true break end
+            end
+        end
+        local ready = enough_books and enough_distinct and enough_ticks and piles_built
 
         if not ready then
             if apply_attempts >= APPLY_GIVEUP_TICKS then
                 log(("LoadMap apply-gate → giving up after %d attempts (books=%d distinct=%d ticks_ok=%s) — marking apply-safe anyway so pre-apply completes")
                     :format(apply_attempts, n, distinct, tostring(enough_ticks)))
+                if enough_books and enough_distinct and not piles_built then
+                    log(("[book-vis] the game had not built its book piles %d s after the world loaded; hiding locked books without waiting any longer")
+                        :format(math.floor(apply_attempts / 2)))
+                end
                 -- Unblock the downstream pipeline exactly like the PASS path below: preapply_settle waits
                 -- on _apply_safe, and the Continue/New Game buttons gate on _pre_apply_complete (which only
                 -- latches after that). Silently dropping the pipeline here would leave the menu
@@ -1990,9 +2015,9 @@ local function start_gameplay_loops()
                 return true
             end
             if apply_attempts % 20 == 0 then
-                log(("LoadMap apply-gate waiting: books=%d/%d distinct=%d/%d ticks=%d/%d")
+                log(("LoadMap apply-gate waiting: books=%d/%d distinct=%d/%d ticks=%d/%d piles=%s")
                     :format(n, APPLY_MIN_BOOKS, distinct, APPLY_MIN_DISTINCT,
-                            apply_attempts, APPLY_MIN_TICKS))
+                            apply_attempts, APPLY_MIN_TICKS, tostring(piles_built)))
             end
             return false
         end
