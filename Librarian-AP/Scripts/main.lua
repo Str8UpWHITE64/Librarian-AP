@@ -12,6 +12,15 @@ end
 pcall(require, "AP/runlog")
 pcall(function() require("AP/statelog") end)
 
+-- The mod allocates faster than the default collector settings keep up with while a ward pass or
+-- the rolling check runs, so the heap peaked at several times its live size. A shorter pause and a
+-- faster step keep the peak close to what is in use.
+pcall(function()
+    local p0 = collectgarbage("setpause", 120)
+    local s0 = collectgarbage("setstepmul", 400)
+    log(("[gc] pause %s -> 120, step multiplier %s -> 400"):format(tostring(p0), tostring(s0)))
+end)
+
 -- ============================================================
 -- Crash-hunt instrumentation (see AP/trace.lua, diag_flags.lua, CRASH_HANDOFF.md)
 -- ============================================================
@@ -260,34 +269,50 @@ end
 --- would hand out checks the run has not earned.
 function _bh.set_ward_attach(b, warded)
     local anchor = _bh.ward_anchor
-    local ok = false; pcall(function() ok = anchor and anchor:IsValid() end)
+    local ok = anchor ~= nil and _bh.rd_ok(anchor)
     if not ok then
         pcall(function() anchor = FindFirstOf("BP_BookCase_C") end)
-        pcall(function() ok = anchor and anchor:IsValid() end)
-        if not ok then return end
+        if not _bh.rd_ok(anchor) then return end
         _bh.ward_anchor = anchor
         pcall(function() _bh.ward_anchor_name = anchor:GetFullName() end)
     end
-    local cur, cur_name, has = nil, nil, false
-    pcall(function() cur = b.AttachedActor end)
-    pcall(function() has = cur and cur:IsValid() end)
-    if has then pcall(function() cur_name = cur:GetFullName() end) end
-    local key; pcall(function() key = b:GetFullName() end)
-    _bh.anchored = _bh.anchored or {}
+    local _, cur = pcall(_bh.rd_att, b)
+    local has = _bh.rd_ok(cur)
+    local anchored = _bh.anchored
+    if not anchored then anchored = {}; _bh.anchored = anchored end
     if warded then
         if has then return end                     -- already attached to something real
-        pcall(function() b.AttachedActor = anchor end)
-        if key then _bh.anchored[key] = true end
+        local _, key = pcall(_bh.rd_name, b)
+        pcall(_bh.wr_att, b, anchor)
+        if type(key) == "string" then anchored[key] = true end
         _bh.ward_attached = (_bh.ward_attached or 0) + 1
-    elseif has and key and _bh.anchored[key] and cur_name == _bh.ward_anchor_name then
-        -- Clear only an anchor we recorded setting. The anchor is a real bookcase, so matching on
-        -- identity alone would also strip the attachment off a book the player genuinely shelves
-        -- there, which is the game's own bookkeeping and not ours to erase.
-        pcall(function() b.AttachedActor = nil end)
-        _bh.anchored[key] = nil
-        _bh.ward_detached = (_bh.ward_detached or 0) + 1
+    elseif has then
+        local _, key = pcall(_bh.rd_name, b)
+        if type(key) ~= "string" or not anchored[key] then return end
+        local _, cur_name = pcall(_bh.rd_name, cur)
+        if cur_name == _bh.ward_anchor_name then
+            -- Clear only an anchor the mod recorded setting. The anchor is a real bookcase, so matching on
+            -- identity alone would also strip the attachment off a book the player genuinely shelves
+            -- there, which is the game's own bookkeeping and not ours to erase.
+            pcall(_bh.wr_att, b, nil)
+            anchored[key] = nil
+            _bh.ward_detached = (_bh.ward_detached or 0) + 1
+        end
     end
 end
+
+-- Readers for set_ward_attach, named so each call hands pcall a function instead of building a
+-- closure: it runs for every locked book on every ward pass.
+do
+    local function chk(o) return o ~= nil and o:IsValid() end
+    function _bh.rd_ok(o)
+        local ok, v = pcall(chk, o)
+        return ok and v == true
+    end
+end
+function _bh.rd_att(b) return b.AttachedActor end
+function _bh.rd_name(o) return o:GetFullName() end
+function _bh.wr_att(b, a) b.AttachedActor = a end
 
 --- Keep the end door shut until the AP goal is reached.
 ---

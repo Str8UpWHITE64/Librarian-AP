@@ -1170,22 +1170,34 @@ end
 --- BP_GrabbingBook_C's AssetIdx if initialized, else nil (orphan with default ItemInfo).
 --- AssetIdx=0 is VALID (section 1A's first series), so we can't gate on >0; instead
 --- disambiguate via ItemInfo.Mesh (real books have a mesh, OpenLevel-reload orphans leave nil).
+-- Property readers for the per-book paths (the ward flush, the pile lever's rolling check). Named
+-- functions handed to pcall, so reading a property builds no closure: those paths touch thousands of
+-- books, and a closure per read was most of the garbage they made.
+local _rd = {}
+function _rd.info(b) return b.ItemInfo end
+function _rd.aidx(i) return i.AssetIdx end
+function _rd.mesh_ok(i) local m = i.Mesh; return m ~= nil and m:IsValid() end
+function _rd.ok(o) return o ~= nil and o:IsValid() end
+function _rd.hism(b) return b.HISMController end
+function _rd.owner(b) return b.OwningCharacter end
+function _rd.hidden(b) return b.bHidden end
+function _rd.setvis(b, v) b:SetActorVisible(v) end
+function _rd.hide(b) b:SetActorHiddenInGame(true) end
+function _rd.coll(b, v) b:SetActorEnableCollision(v) end
+function _rd.set_hism(b, m) b.HISMController = m end
+
 local function _book_valid_asset_idx(book)
     if not book or not book:IsValid() then return nil end
-    local info; pcall(function() info = book.ItemInfo end)
+    local _, info = pcall(_rd.info, book)
     -- IsValid the ItemInfo sub-UObject too: book:IsValid() alone isn't enough — a stale
     -- ItemInfo ref makes the next .AssetIdx read AV in IsA (a native crash pcall can't catch).
     if not info or not info:IsValid() then return nil end
-    local aidx; pcall(function() aidx = info.AssetIdx end)
+    local _, aidx = pcall(_rd.aidx, info)
     if aidx == nil then return nil end
     if aidx > 0 then return aidx end
     if aidx == 0 then
-        local mesh_valid = false
-        pcall(function()
-            local m = info.Mesh
-            if m and m:IsValid() then mesh_valid = true end
-        end)
-        if mesh_valid then return 0 end
+        local ok, mesh_valid = pcall(_rd.mesh_ok, info)
+        if ok and mesh_valid then return 0 end
     end
     return nil
 end
@@ -1231,8 +1243,8 @@ end
 --- book_rule for a book actor, against the published snapshots. Returns the verdict and the
 --- book's series; series is nil when the book cannot be identified (uninitialised, or an asset
 --- with no series), and the verdict is then nil too.
-function M.book_shows(book)
-    local aidx = _book_valid_asset_idx(book)
+function M.book_shows(book, aidx)
+    aidx = aidx or _book_valid_asset_idx(book)
     if aidx == nil then return nil, nil end
     local series = M._asset_to_series[aidx]
     if not series then return nil, nil end
@@ -1272,10 +1284,12 @@ end
 -- Locked books are hidden this way in the hidden book look only: in the stacks look a locked book
 -- stays drawn and is only made ungrabbable. The Veil trap uses the same lock and unlock in both.
 
--- Books checked per tick by the rolling check: slow between rebuilds (a lap of ~3,000 books takes
--- about ten seconds at 60 fps), fast for the lap that follows a rebuild (under a second). Locking
--- costs about 0.07 ms a book, so the fast lap stays near 4 ms a frame.
-M.LEVER_SLOW_PER_TICK = 5
+-- Books checked per tick by the rolling check: slow between rebuilds (a lap over the library, with
+-- the inert copies of the book set, takes about a minute at 60 fps; it is a backstop, since the
+-- SetActorVisible hook locks a shown book at once), fast for the lap that follows a rebuild (under a
+-- second). Each lap lists every book actor and each book read allocates, so a faster slow lap only
+-- fed the garbage collector. Locking costs about 0.07 ms a book, so the fast lap stays near 4 ms a frame.
+M.LEVER_SLOW_PER_TICK = 2
 M.LEVER_FAST_PER_TICK = 64
 -- The rolling check's repair line is written at most this often (seconds), with the counts summed.
 M.LEVER_REPORT_S = 60
@@ -1286,9 +1300,8 @@ function M.lever_on()
 end
 
 local function _lever_valid(o)
-    local ok = false
-    pcall(function() ok = o ~= nil and o:IsValid() end)
-    return ok
+    local ok, v = pcall(_rd.ok, o)
+    return ok and v == true
 end
 
 --- This world's pile manager, taken from a live book's own link: never FindFirstOf, which can
@@ -1328,7 +1341,7 @@ end
 --- while M._lever_busy is set, so the mod's other visibility rules do not rewrite it.
 function M._lever_set_visible(book, v)
     M._lever_busy = true
-    local ok = pcall(function() book:SetActorVisible(v) end)
+    local ok = pcall(_rd.setvis, book, v)
     M._lever_busy = false
     return ok
 end
@@ -1337,8 +1350,7 @@ end
 --- collision turned off again. Returns true when the link is clear afterwards.
 function M.lever_hide(book)
     if not _lever_valid(book) then return false end
-    local ctrl
-    pcall(function() ctrl = book.HISMController end)
+    local _, ctrl = pcall(_rd.hism, book)
     local had = _lever_valid(ctrl)
     if had then
         -- Remember the manager while the link is still there: unlocking needs it back.
@@ -1348,12 +1360,11 @@ function M.lever_hide(book)
         end
         M._lever_set_visible(book, true)
     end
-    pcall(function() book:SetActorHiddenInGame(true) end)
-    pcall(function() book:SetActorEnableCollision(false) end)
+    pcall(_rd.hide, book)
+    pcall(_rd.coll, book, false)
     if M._ward_anchor then pcall(M._ward_anchor, book, true) end
-    if had then pcall(function() book.HISMController = nil end) end
-    local still
-    pcall(function() still = book.HISMController end)
+    if had then pcall(_rd.set_hism, book, nil) end
+    local _, still = pcall(_rd.hism, book)
     if _lever_valid(still) then
         M._lever_note_fail(book, "link would not clear")
         return false
@@ -1366,19 +1377,18 @@ end
 --- not built the piles, and building them gives every book its link anyway.
 function M.lever_show(book)
     if not _lever_valid(book) then return false end
-    local ctrl
-    pcall(function() ctrl = book.HISMController end)
+    local _, ctrl = pcall(_rd.hism, book)
     if _lever_valid(ctrl) then return true end
     local mgr = M._lever_world_mgr()
     if not mgr then return false end
-    pcall(function() book.HISMController = mgr end)
-    pcall(function() ctrl = book.HISMController end)
+    pcall(_rd.set_hism, book, mgr)
+    _, ctrl = pcall(_rd.hism, book)
     if not _lever_valid(ctrl) then
         M._lever_note_fail(book, "link would not set")
         return false
     end
     M._lever_set_visible(book, false)
-    pcall(function() book:SetActorEnableCollision(true) end)
+    pcall(_rd.coll, book, true)
     if M._ward_anchor then pcall(M._ward_anchor, book, false) end
     return true
 end
@@ -1459,15 +1469,13 @@ function M._lever_check(book, comps)
         end)
         return (not at_origin) and "unjudged" or nil
     end
-    local shows, series = M.book_shows(book)
+    local shows, series = M.book_shows(book, aidx)
     if series == nil then return nil end
     if M._veil_has(book) then shows = false end
     if shows == nil then return "unjudged" end
-    local holder
-    pcall(function() holder = book.OwningCharacter end)
+    local _, holder = pcall(_rd.owner, book)
     if _lever_valid(holder) then return nil end
-    local ctrl
-    pcall(function() ctrl = book.HISMController end)
+    local _, ctrl = pcall(_rd.hism, book)
     local linked = _lever_valid(ctrl)
     if shows == false then
         if linked then
@@ -1476,17 +1484,17 @@ function M._lever_check(book, comps)
         end
         -- No link, so the game's own swap cannot draw it. Its collision is left as it is: the bag
         -- guard turns it on for a book it is sending home.
-        local hidden = true
-        pcall(function() hidden = book.bHidden == true end)
+        local hok, hv = pcall(_rd.hidden, book)
+        local hidden = (not hok) or hv == true
         if not hidden then
-            pcall(function() book:SetActorHiddenInGame(true) end)
+            pcall(_rd.hide, book)
             return "rehid"
         end
         -- The pile copy itself, in case anything but SetActorVisible wrote it.
         if M._lever_pile_drawn(book, aidx, comps) == true then
             local mgr = M._lever_world_mgr()
             if mgr then
-                pcall(function() book.HISMController = mgr end)
+                pcall(_rd.set_hism, book, mgr)
                 M.lever_hide(book)
                 return "rezeroed"
             end
