@@ -20,7 +20,7 @@ The game folder is `Librarian Tidy Up the Arcane Library!` in your Steam `steama
 4. Copy `librarian.apworld` into `custom_worlds/` in your Archipelago folder.
 5. Steam Deck or Linux only: add a launch option. See [Troubleshooting](docs/TROUBLESHOOTING.md#steam-deck-and-linux-proton).
 
-Upgrading: do the same steps. Regenerate any seed you have not started yet.
+Upgrading: do the same steps. The zip carries a blank `ap_config.json`, so merging replaces your saved server and slot. Back up `Mods/Librarian-AP/Scripts/ap_config.json` first if you want them back, or type them in again. Replace `librarian.apworld` too. Seeds made with 3.0.2 keep working with 3.0.3; regenerate any seed you have not started yet.
 
 Where the files land:
 
