@@ -2863,18 +2863,25 @@ end)
 -- half-warded world. Quit, Back, Options and How To Play stay live, and the wait is capped, so a
 -- readiness signal that never arrives cannot trap anyone in here.
 --
--- On a New Game the game first plays its opening, with the player not yet in control, until it
--- places the player in the library about 45 s after Start; only then can anything be locked. The hold therefore starts when
--- the player is placed and lasts only as long as the first ward flush (which runs in big chunks
--- while the player is held). Only in a New Game world: a Continue holds from the load as before.
--- Checked every tick, so the hold begins as soon as the first-move watcher (500 ms) reports it.
+-- A New Game started with no save up at the title plays the game's opening first: the title world
+-- becomes the game world in place, and the character waits at the world origin, not in control,
+-- until the game places it at the library entrance about 45 s after Start. The hold waits for that
+-- placement, so the menu does not sit over the opening. A New Game started with a save up at the
+-- title reloads the library instead and the player is in control at the entrance at once, so the
+-- hold starts from the load there, as it does for a Continue. Checked every tick.
 local _pause_gate = { shown = false, done = false, waited = 0 }
 
---- Has the game placed the player in the library yet (New Game)? The first-move watcher's own
---- verdict (its "First movement detected" line). The character already moves during the game's
---- opening, so no position test of its own is used here.
+--- Is the player in the library (New Game)? The character stands away from the world origin, or
+--- the first-move watcher has seen it move. Read from the same character the watcher reads: during
+--- the opening the ticking pawn already stands away from the origin while this one waits there.
 _pause_gate.placed = function(IA)
-    return IA._baseline_sync_done == true
+    if IA._baseline_sync_done == true then return true end
+    local away = false
+    pcall(function()
+        local l = FindFirstOf("BP_LibrarianCharacter_C"):K2_GetActorLocation()
+        away = math.abs(l.X) > 50 or math.abs(l.Y) > 50
+    end)
+    return away
 end
 
 --- Enable/disable the three buttons that would let the player out or save mid-ward. Returns false
@@ -2945,6 +2952,15 @@ gt_loop("ready_gate", 0, function()
         _pause_gate.since, _pause_gate.reassert = _gt_clock_ms, _gt_clock_ms
         IA._hold_active = true
         log("[ready-gate] world not ready — holding the player in the pause menu")
+        return false
+    end
+
+    -- The opening moved the character back to the origin after the hold went up: let it play.
+    if _pause_gate.new_game and not _pause_gate.placed(IA) then
+        _pause_gate.shown, IA._hold_active = false, false
+        _pause_gate.apply(pawn, true)
+        pcall(function() pawn:SetPauseMenuVisible(false) end)
+        log("[ready-gate] the game's opening started; hold lifted until it places the player")
         return false
     end
 
