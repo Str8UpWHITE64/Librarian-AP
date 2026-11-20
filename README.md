@@ -55,6 +55,7 @@ More in [Troubleshooting](docs/TROUBLESHOOTING.md).
 - [Options](docs/OPTIONS.md): every YAML option
 - [Logic and rules](docs/LOGIC.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Handing a run to another player](docs/TROUBLESHOOTING.md#handing-a-run-to-another-player): `Librarian-AP_SaveShare.bat` on the release page
 - [Developing](docs/DEVELOPING.md): build from source
 - Credits: AP integration by Str8UpWHITE64. The game belongs to its developer and publisher.
 - Licence: MIT, see [`LICENSE`](LICENSE). The bundled UE4SS is also MIT licensed, see [`third_party/UE4SS/README.md`](third_party/UE4SS/README.md).

@@ -9,6 +9,12 @@ neither of which contains the other:
                                           <Archipelago>/custom_worlds/ to
                                           generate / host seeds.
 
+    dist/Librarian-AP_SaveShare.bat       Save sharing tool (export a run's save
+                                          to hand to another player, import one).
+                                          One file: a batch header that runs the
+                                          PowerShell script tools/SaveShare.ps1
+                                          carried below it.
+
     dist/Librarian-AP_v<version>.zip      Player-side game-files archive.
                                           Layout:
 
@@ -65,6 +71,27 @@ MODS_TXT         = REPO_ROOT / "mods.txt"       # our version of mods.txt
 HUD_PAK          = REPO_ROOT / "LibrarianAPHUDFix.pak"
 APWORLD_SRC      = REPO_ROOT / "apworld" / "librarian"
 ARCHIPELAGO_JSON = APWORLD_SRC / "archipelago.json"
+SAVE_SHARE_SRC   = REPO_ROOT / "tools" / "SaveShare.ps1"
+SAVE_SHARE_NAME  = "Librarian-AP_SaveShare.bat"
+
+# Runs the script below the marker line. Windows does not run a .ps1 on a double-click, and PowerShell's
+# -Command does not pass a dropped file's path through intact, so the script is written to a temp file
+# and run with -File, which takes the batch file's own arguments as they are.
+CR, LF = chr(13), chr(10)
+CRLF = CR + LF
+SAVE_SHARE_HEADER = "".join(line + CRLF for line in (
+    '@echo off',
+    'setlocal',
+    'set "SS_SELF=%~f0"',
+    'set "SS_TMP=%TEMP%\\Librarian-AP_SaveShare_%RANDOM%%RANDOM%.ps1"',
+    'powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=[IO.File]::ReadAllText($env:SS_SELF); $i=$t.IndexOf(\'#\'+\'##POWERSHELL\'); [IO.File]::WriteAllText($env:SS_TMP, $t.Substring($i), (New-Object Text.UTF8Encoding $true))"',
+    'powershell -NoProfile -ExecutionPolicy Bypass -File "%SS_TMP%" %*',
+    'set "SS_CODE=%ERRORLEVEL%"',
+    'del "%SS_TMP%" >nul 2>&1',
+    'if not defined SS_NOPAUSE pause',
+    'exit /b %SS_CODE%',
+    '###POWERSHELL',
+))
 
 # Output dir (created on demand).
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "dist"
@@ -132,6 +159,7 @@ def validate_inputs() -> None:
         "Lua mod folder":    LIBRARIAN_AP_DIR,
         "mods.txt":          MODS_TXT,
         "HUD pak":           HUD_PAK,
+        "save share script": SAVE_SHARE_SRC,
         "apworld source":    APWORLD_SRC,
         "archipelago.json":  ARCHIPELAGO_JSON,
     }
@@ -181,6 +209,20 @@ def build_apworld(output_dir: Path) -> Path:
                     continue
                 zf.write(path, arcname.as_posix())
     info(f"wrote {out.relative_to(REPO_ROOT)} ({out.stat().st_size:,} bytes)")
+    return out
+
+
+def build_save_share(output_dir: Path) -> Path:
+    """Build the one-file save sharing tool: the batch header, then tools/SaveShare.ps1 (CRLF)."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out = output_dir / SAVE_SHARE_NAME
+    step(f"Building {SAVE_SHARE_NAME}")
+    script = SAVE_SHARE_SRC.read_text(encoding="utf-8").replace(CRLF, LF)
+    if not script.isascii():
+        fail(f"{SAVE_SHARE_SRC.name} must stay ASCII (Windows PowerShell reads the temp copy as UTF-8 with BOM)")
+    body = SAVE_SHARE_HEADER + script.replace(LF, CRLF)
+    out.write_bytes(body.encode("ascii"))
+    info(f"wrote {out.name} ({out.stat().st_size:,} bytes)")
     return out
 
 
@@ -333,11 +375,22 @@ def main() -> int:
         help=f"Where to write the release zip (default: {DEFAULT_OUTPUT_DIR.relative_to(REPO_ROOT)}).",
     )
     parser.add_argument(
+        "--save-share-only",
+        action="store_true",
+        help=f"Build only {SAVE_SHARE_NAME}.",
+    )
+    parser.add_argument(
         "--keep-staging",
         action="store_true",
         help="Don't delete the staging directory after building (useful for debugging).",
     )
     args = parser.parse_args()
+
+    if args.save_share_only:
+        if not SAVE_SHARE_SRC.exists():
+            fail(f"Missing {SAVE_SHARE_SRC.relative_to(REPO_ROOT)}")
+        print(f"  {build_save_share(args.output_dir)}")
+        return 0
 
     validate_inputs()
     version = args.version or read_version()
@@ -350,6 +403,7 @@ def main() -> int:
     staging_root = Path(tempfile.mkdtemp(prefix="librarian-ap-build-"))
     try:
         out_apworld = build_apworld(args.output_dir)
+        out_share = build_save_share(args.output_dir)
         build_game_tree(staging_root)
         write_install_txt(staging_root, version)
         out_zip = build_release_zip(staging_root, args.output_dir, version)
@@ -361,6 +415,7 @@ def main() -> int:
 
     step("Done. Artifacts:")
     print(f"  {out_apworld}")
+    print(f"  {out_share}")
     print(f"  {out_zip}")
     return 0
 

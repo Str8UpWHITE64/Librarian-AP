@@ -63,6 +63,10 @@ M.mirror_pending = nil     -- a save happened; copy the world into our slot
 -- save and restart. Survives reset() on purpose, so a reconnect in the same session is refused too.
 M.slots_full = false
 M.mirroring    = false     -- a mirror write is in flight; ignore its own hook echo
+-- The local record says this run's save was imported into another save slot on this PC (the save
+-- sharing tool's "moved" mark). The server still names the slot the save came from, so this is the one
+-- case where the local record wins: the connect handler tells the server the new slot, then drops the mark.
+M.imported     = false
 M.disabled     = false     -- player chose vanilla; passive until the next connect
 
 --- A fresh run is the one case identity is established by causation rather than
@@ -207,7 +211,11 @@ function M.read_local(seed, ap_slot)
     if not f then return nil end
     local found
     pcall(function()
-        for line in f:lines() do
+        for raw in f:lines() do
+            -- A trailing ",moved" is the save sharing tool's import mark (see M.imported).
+            local line, moved = raw, false
+            local base = raw:match("^(.-),moved$")
+            if base then line, moved = base, true end
             -- "slot,hNNN" is home-keyed. "slot,NNN" is the older position-keyed hash and is
             -- discarded, not compared: comparing bases would reject every run already on disk.
             -- Those re-record a home-keyed hash at their next save.
@@ -220,6 +228,7 @@ function M.read_local(seed, ap_slot)
             if k == want then
                 found = tonumber(v)
                 M.stored_fp = fp and tonumber(fp) or nil
+                M.imported = moved
             end
         end
     end)
@@ -674,6 +683,7 @@ function M.reset()
     M.stored_fp, M.fp_checked, M.autoload_done = nil, false, false
     M.autonew_done, M.slot_resolved, M.start_enabled = false, false, false
     M.save_missing = nil
+    M.imported = false
     M.mirror_pending = nil
     -- Cleared here on purpose: a connection re-arms the mod even if the player
     -- had chosen vanilla earlier in the session. The vanilla path sets this

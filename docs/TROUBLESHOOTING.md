@@ -92,6 +92,42 @@ back and reconnect and the run continues as before. Press **New Game** and
 the seed starts over from scratch. Nothing is thrown away until you press
 it.
 
+## Handing a run to another player
+
+If you can't finish a run, someone else can carry on from your save. Both
+of you use `Librarian-AP_SaveShare.bat` from the release page. It is one
+file: download it and double-click it. Close the game first.
+
+**You (giving the run away):**
+
+1. Double-click `Librarian-AP_SaveShare.bat` and choose **1** (Export).
+2. It lists your AP saves with their slot name, seed and progress. Type the
+   save number of the run to hand over.
+3. It writes `Librarian-AP save - <slot name> - <seed>.zip` to your Desktop.
+   Send that file to the new player.
+
+The zip holds the save and the details the mod needs to recognise it. It
+never holds your password or any other save. Don't play that slot yourself
+afterwards: two copies of one run drift apart.
+
+**The new player:**
+
+1. Install the mod as usual (see the README).
+2. Drop the zip onto `Librarian-AP_SaveShare.bat`, or double-click it and
+   choose **2** (Import).
+3. It puts the run in a free AP save slot (20–30) and never overwrites one
+   of your saves. If the slot number it came from is free, it keeps it.
+4. Say yes if you want it to fill in the server and slot name for you. Your
+   password, if the room has one, is not included: type it in the
+   connection menu.
+5. Start the game and connect as that slot. The mod loads the save by
+   itself and the run carries on where it was left.
+
+Nothing else needs moving: items, checks and hints live on the server. If
+Windows warns about the file, choose **More info**, then **Run anyway**.
+If the tool can't find your game (not installed through Steam), run it from
+a command prompt with `-GameDir "<your game folder>"`.
+
 
 ## Known issues
 

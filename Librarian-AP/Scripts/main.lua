@@ -4626,6 +4626,23 @@ APClient.on_slot_connected = function(slot_data)
 
     storage_handlers[slot_key] = function(v)
         local n = tonumber(v)
+        -- A save brought over from another PC with the save sharing tool. When the slot it came from was
+        -- taken here, it sits in another slot and the local record is marked "moved"; the server still
+        -- names the old slot, which on this PC holds a different save. Only while that imported save is
+        -- really on disk does the local record win: the server is told the new slot and the mark is
+        -- dropped, so every later connect follows the server again.
+        if SaveIdentity.imported then
+            SaveIdentity.imported = false
+            if from_local and SaveIdentity.slot_exists(from_local, false) == true then
+                if n ~= from_local then
+                    pcall(function() APClient:storage_write(slot_key, from_local) end)
+                    log(("[save-id] imported save: slot %d here, server named %s -- server updated")
+                        :format(from_local, tostring(n)))
+                end
+                n = from_local
+                SaveIdentity.write_local(seed, ap_slot, from_local)
+            end
+        end
         -- The server seeds this key to -1 when absent, which means "never claimed".
         if n and n >= SaveIdentity.SLOT_MIN and n <= SaveIdentity.SLOT_MAX
                 and SaveIdentity.slot_exists(n, false) == false then
