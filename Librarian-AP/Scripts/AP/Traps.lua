@@ -170,6 +170,8 @@ local BF_DIRS    = { 0, 45, -45, 90, -90, 135, -135, 180 }   -- degrees off the 
 local BF_DISTS   = { 70, 55 }   -- how far from the player's middle a pile may stand
 local BF_KNEE    = 20     -- the way to the spot is tested this far over the floor, above books lying there
 local BF_FLOOR   = 15     -- a landing must be within this of the player's own floor
+local BF_FAR_DISTS = { 300, 360 }   -- with every pile by the player full: further out, after the usual distances
+local BF_DROP    = 200    -- ...and a floor this far below the player's own counts too (the hall below a plinth)
 local BF_PILE_MAX = 60    -- a pile this tall over its floor takes no more books; the next goes beside it
 local BF_STAGGER = 2      -- ticks (a quarter second each) between two books of one trap
 local BF_PIN_TICKS = 32   -- ticks a dropped book is held where it was laid (8 s)
@@ -225,11 +227,14 @@ local function bf_trace(from, to, ignore, types)
     return hitp, z, inside, who
 end
 
---- A line down to the floor: the static world first, so a book lying there is not taken for the
---- floor; anything solid when the static world is not hit at all.
+--- A line down to the floor: the first solid surface, so the top of a cabinet or a case counts (a
+--- static-only line passes through those to whatever lies under them). When that surface is a book,
+--- the static world under it.
 local function bf_floor_trace(from, to, ignore)
-    local got, z, inside = bf_trace(from, to, ignore, { 0 })
-    if got == false then got, z, inside = bf_trace(from, to, ignore, { 0, 1 }) end
+    local got, z, inside, who = bf_trace(from, to, ignore, { 0, 1 })
+    if got and not inside and not (who and who:find("GrabbingBook", 1, true)) then return got, z, inside end
+    local gs, zs, ins = bf_trace(from, to, ignore, { 0 })
+    if gs ~= false then return gs, zs, ins end
     return got, z, inside
 end
 
@@ -325,8 +330,9 @@ end
 --- Spots of open floor around the player, in the order to try: ahead first, then to the sides,
 --- then behind; each one with the way there clear at knee height and the player's own floor under
 --- the whole book (not a railing, a case or a drop). The player's feet last.
+--- `far`: no feet, and a floor down to BF_DROP below the player's own counts (the whole book on it, room over it).
 --- Each spot: { x, y, fz, yaw, dir, d }.
-local function bf_spots(p, ignore, fl, dists)
+local function bf_spots(p, ignore, fl, dists, far)
     local px, py, pz
     pcall(function() local l = p:K2_GetActorLocation(); px, py, pz = l.X, l.Y, l.Z end)
     if not px then return {} end
@@ -337,17 +343,27 @@ local function bf_spots(p, ignore, fl, dists)
         M.bf_raw_logged = (M.bf_raw_logged or 0) + 1
         log(("Butterfingers: floor trace at the feet: %s"):format(tostring(M.bf_raw)))
     end
-    if not fz then
-        local hh = 90
-        pcall(function() hh = p.CapsuleComponent:GetScaledCapsuleHalfHeight() end)
-        fz = pz - hh
+    local hh = 90
+    pcall(function() hh = p.CapsuleComponent:GetScaledCapsuleHalfHeight() end)
+    local feet = pz - hh
+    if not fz then fz = feet end
+    -- a reading over the feet is something the body stands in (a case beside it), not a floor: read again from the feet
+    if fz > feet + 5 then
+        local g2, z2, in2 = bf_floor_trace({ X = px, Y = py, Z = feet + 5 }, { X = px, Y = py, Z = pz - 300 }, ignore)
+        fz = (g2 and not in2 and type(z2) == "number" and z2 <= feet + 5) and z2 or feet
     end
+    -- standing on something, the floor is just under the feet: a reading well below them went past it
+    local grounded = false
+    pcall(function() grounded = p.CharacterMovement:IsMovingOnGround() == true end)
+    if grounded and fz < pz - hh - 12 then fz = pz - hh - 2 end
     local yaw0 = 0
     pcall(function() yaw0 = p:K2_GetActorRotation().Yaw or 0 end)
     local out, why = {}, {}
-    local function floor_at(x, y)
-        local g, hz, inn = bf_floor_trace({ X = x, Y = y, Z = fz + 40 }, { X = x, Y = y, Z = fz - 60 }, ignore)
-        if g and not inn and type(hz) == "number" and math.abs(hz - fz) <= BF_FLOOR then return hz end
+    -- a floor near `ref`; `drop`: or down to that far below it
+    local function floor_at(x, y, ref, drop)
+        ref = ref or fz
+        local g, hz, inn = bf_floor_trace({ X = x, Y = y, Z = ref + 40 }, { X = x, Y = y, Z = ref - (drop and drop + 20 or 60) }, ignore)
+        if g and not inn and type(hz) == "number" and hz <= ref + BF_FLOOR and hz >= ref - (drop or BF_FLOOR) then return hz end
         return nil
     end
     for _, a in ipairs(BF_DIRS) do
@@ -362,10 +378,11 @@ local function bf_spots(p, ignore, fl, dists)
                 why[#why + 1] = ("%d/%d way %s"):format(a, d, g == nil and "unreadable" or ((gin and "from inside " or "") .. tostring(gwho)))
             end
             if g == false then
-                local hz = floor_at(x, y)
+                local hz = floor_at(x, y, fz, far and BF_DROP or nil)
                 local h = fl.len / 2
-                if hz and floor_at(x + tx * h, y + ty * h) and floor_at(x - tx * h, y - ty * h)
-                       and floor_at(x + fx * (fl.wid / 2 + 4), y + fy * (fl.wid / 2 + 4)) then
+                local room = hz and (not far or bf_trace({ X = x, Y = y, Z = hz + 1 }, { X = x, Y = y, Z = hz + fl.thick + 10 }, ignore) == false)
+                if room and floor_at(x + tx * h, y + ty * h, far and hz) and floor_at(x - tx * h, y - ty * h, far and hz)
+                       and floor_at(x + fx * (fl.wid / 2 + 4), y + fy * (fl.wid / 2 + 4), far and hz) then
                     -- the long side lies across the way out, so the near edge stays clear of the player
                     local yaw = yaw0 + a + (fl.long_x and 90 or 0)
                     out[#out + 1] = { x = x, y = y, fz = hz, yaw = yaw, dir = a, d = d }
@@ -375,6 +392,7 @@ local function bf_spots(p, ignore, fl, dists)
             end
         end
     end
+    if far then return out end
     out[#out + 1] = { x = px, y = py, fz = fz, yaw = yaw0, dir = 0, d = 0 }
     if #out == 1 and (M.bf_why_logged or 0) < 3 then
         M.bf_why_logged = (M.bf_why_logged or 0) + 1
@@ -410,7 +428,9 @@ end
 --- Lay a book that is out of the hands on open floor by the player: the job's pile while it has room, else the
 --- first checked spot around the player. Holds it there like Butterfingers does. Returns the spot, the book's final
 --- location, the floor or pile top it rests on, and how many books it was lifted over; nil when no spot is readable.
-local function bf_lay(IA, p, book, job, key, px, py, SD)
+--- `again` ({ x, y, floor }) is where this book was laid before and found buried: a spot there is raised onto `floor`,
+--- or skipped when no floor is known.
+local function bf_lay(IA, p, book, job, key, px, py, SD, again)
     local fl = bf_flat(book)
     local ignore = { book, p }
     for _, o in ipairs(select(2, bf_held(IA, p))) do ignore[#ignore + 1] = o end
@@ -430,15 +450,67 @@ local function bf_lay(IA, p, book, job, key, px, py, SD)
     for _, o in ipairs(ignore) do way_ignore[#way_ignore + 1] = o end
     for _, n in ipairs(near) do way_ignore[#way_ignore + 1] = n.book end
     for _, s in ipairs(bf_spots(p, way_ignore, fl, job.dists)) do tries[#tries + 1] = s end
-    for _, s in ipairs(tries) do
-        local hx, hy = bf_half(fl, s.yaw)
-        local top = bf_pile_top(near, s.x, s.y, hx, hy, s.fz)
-        if not top or top - s.fz < BF_PILE_MAX or s.d == 0 then
-            spot, base = s, math.max(s.fz, top or s.fz)
-            break
+    local was_loc, was_rot
+    pcall(function() was_loc = v3(book:K2_GetActorLocation()); local r = book:K2_GetActorRotation(); was_rot = { Pitch = r.Pitch, Yaw = r.Yaw, Roll = r.Roll } end)
+    local full = {}
+    local function first_with_room(list)
+        for _, t in ipairs(list) do
+            local s = t
+            if again and math.sqrt((t.x - again.x) ^ 2 + (t.y - again.y) ^ 2) < 20 then
+                if again.floor then
+                    s = { x = t.x, y = t.y, fz = math.max(t.fz, again.floor), yaw = t.yaw, dir = t.dir, d = t.d }
+                else
+                    s = nil
+                end
+            end
+            if s then
+                -- the pile under the book's real footprint there (its pivot is not its middle), as the lift below reads it
+                SD.set_pose(IA, book, { X = s.x, Y = s.y, Z = s.fz + fl.thick / 2 + 0.5 }, { Pitch = fl.pitch, Yaw = s.yaw, Roll = fl.roll })
+                local o, e = bf_box(book)
+                local top
+                if o then
+                    top = bf_pile_top(near, o.X, o.Y, e.X, e.Y, s.fz)
+                else
+                    local hx, hy = bf_half(fl, s.yaw)
+                    top = bf_pile_top(near, s.x, s.y, hx, hy, s.fz)
+                end
+                if not top or top - s.fz < BF_PILE_MAX then return s, math.max(s.fz, top or s.fz) end
+                full[#full + 1] = { s = s, top = top, h = top - s.fz }
+            end
+        end
+        return nil
+    end
+    spot, base = first_with_room(tries)
+    -- every pile by the player full: further out, and lower floors
+    if not spot then
+        local far = {}
+        for _, d in ipairs(job.dists or BF_DISTS) do far[#far + 1] = d end
+        for _, d in ipairs(BF_FAR_DISTS) do far[#far + 1] = d end
+        spot, base = first_with_room(bf_spots(p, way_ignore, fl, far, true))
+    end
+    -- still nothing: the shortest pile whose next book has room over it (none of it in a wall or a case)
+    if not spot then
+        table.sort(full, function(a, b) return a.h < b.h end)
+        for _, c in ipairs(full) do
+            SD.set_pose(IA, book, { X = c.s.x, Y = c.s.y, Z = c.top + fl.thick / 2 + 0.5 }, { Pitch = fl.pitch, Yaw = c.s.yaw, Roll = fl.roll })
+            local o, e = bf_box(book)
+            if o then
+                local dz = c.top + 0.3 - (o.Z - e.Z)
+                local z0, z1 = o.Z - e.Z + dz + 1, o.Z + e.Z + dz - 1
+                local clear = true
+                for _, k in ipairs({ { 0, 0 }, { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } }) do
+                    local x, y = o.X + k[1] * (e.X - 3), o.Y + k[2] * (e.Y - 3)
+                    if bf_trace({ X = x, Y = y, Z = z0 }, { X = x, Y = y, Z = z1 }, way_ignore) ~= false then clear = false; break end
+                end
+                if clear then spot, base = c.s, math.max(c.s.fz, c.top); break end
+            end
         end
     end
-    if not spot then return nil end   -- the player's place unreadable: the game's own fall puts it down
+    if not spot then
+        -- nowhere with room: the book stays where it was
+        if was_loc and was_rot then SD.set_pose(IA, book, was_loc, was_rot) end
+        return nil
+    end
     job.spot = spot
     if spot.d > 0 then
         M.bf_pile = { x = spot.x, y = spot.y, fz = spot.fz, yaw = spot.yaw, dir = spot.dir, d = spot.d, epoch = IA._world_epoch or 0 }
@@ -1618,16 +1690,16 @@ end
 M.util = { trace = bf_trace, box = bf_box, collision = collision_on, key = key_of, still = bf_still, pawn = pawn }
 
 --- Lay a loose book on open floor by the player, as Butterfingers does its dropped books, and hold it there for
---- a few seconds. `job` is a table kept for one batch of books: they share one pile. Returns the spot and the
---- book's final location, or nil when the player or a floor cannot be read.
-function M.lay_loose(IA, book, job)
+--- a few seconds. `job` is a table kept for one batch of books: they share one pile; `again` as for bf_lay. Returns
+--- the spot and the book's final location, or nil when the player or a floor cannot be read.
+function M.lay_loose(IA, book, job, again)
     local p = pawn()
     local SD = shelf_drop_mod()
     if not (p and SD) then return nil end
     local px, py
     pcall(function() local l = p:K2_GetActorLocation(); px, py = l.X, l.Y end)
     if not px then return nil end
-    local spot, final = bf_lay(IA, p, book, job, key_of(book), px, py, SD)
+    local spot, final = bf_lay(IA, p, book, job, key_of(book), px, py, SD, again)
     return spot, final
 end
 

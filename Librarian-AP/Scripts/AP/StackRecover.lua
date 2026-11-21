@@ -17,6 +17,7 @@ local PER_TICK = 3              -- books re-seated per tick
 local PROBE_UP = 60             -- the upward probe reaches this far over the book's top
 local PROBE_DOWN = 40           -- the downward probe starts this far over the book's top
 local RECHECK_TICKS = 16        -- a second look this long after the first: some books settle late
+local SAME_SPOT = 3             -- a book this close to where it was laid has not moved since
 local LAY_DISTS = { 90, 130, 180, 240 }   -- how far from the player a recovered book may be laid, nearest first
 
 M.stats = { puts = 0, buried = 0, laid = 0, failed = 0 }
@@ -93,7 +94,8 @@ local function read_list(IA, items, n)
     return list
 end
 
---- How deep a settled book lies in the floor or a wall; nil when it is not buried.
+--- How deep a settled book lies in the floor or a wall, and the height of the surface it lies in; nil when it is
+--- not buried.
 --- A probe up from just over its bottom starts inside geometry (or meets it before the book's top) when the
 --- surface runs through the book; a probe down from over its top then says how far up the floor reaches.
 local function buried_depth(u, book, ignore)
@@ -110,7 +112,7 @@ local function buried_depth(u, book, ignore)
     if h2 and not in2 and type(z2) == "number" then
         if who2 and tostring(who2):find("GrabbingBook", 1, true) then return nil, "over another book" end
         local depth = z2 - bottom
-        if depth > DEPTH_MIN then return depth end
+        if depth > DEPTH_MIN then return depth, nil, z2 end
         return nil
     end
     return 999        -- the whole book is inside something (a wall, a bookcase)
@@ -160,7 +162,7 @@ local function judge(IA, p, job)
             else
                 local x, y, z = loc_of(b)
                 if x and not (x == 0 and y == 0 and z == 0) then
-                    local d, why = buried_depth(u, b, ignore)
+                    local d, why, surf = buried_depth(u, b, ignore)
                     if why then
                         log(("book %s not moved: %s (%.0f, %.0f, %.0f)"):format(name_of(IA, b), why, x, y, z))
                     end
@@ -171,8 +173,16 @@ local function judge(IA, p, job)
                         local okc, here = pcall(SD.loose_position, IA, b)
                         lodged = okc and here == nil and not reachable(u, b, ignore)
                     end
-                    if d then todo[#todo + 1] = { book = b, depth = d }
-                    elseif lodged then todo[#todo + 1] = { book = b, depth = 0, case = true } end
+                    local e
+                    if d then e = { book = b, depth = d }
+                    elseif lodged then e = { book = b, depth = 0, case = true } end
+                    -- still buried where it was laid: that spot is not open floor at the height it was read
+                    local was = e and job.laid_at and job.laid_at[b]
+                    if was and math.abs(x - was.X) < SAME_SPOT and math.abs(y - was.Y) < SAME_SPOT
+                           and math.abs(z - was.Z) < SAME_SPOT then
+                        e.again = { x = x, y = y, floor = (d and d < 900) and surf or nil }
+                    end
+                    if e then todo[#todo + 1] = e end
                 end
             end
         end
@@ -198,18 +208,26 @@ local function lay_some(IA, p, job)
         if valid(b) and not owned(b) and not attached(b) then
             local x0, y0, z0 = loc_of(b)
             u.still(b)
-            local spot, final = T.lay_loose(IA, b, job.lay)
+            local spot, final = T.lay_loose(IA, b, job.lay, e.again)
             if spot and final then
                 job.laid = job.laid + 1
                 M.stats.laid = M.stats.laid + 1
-                log(("book %s was buried%s at (%.0f, %.0f, %.0f); laid on the floor at (%.0f, %.0f, %.0f), %.0f from the player"):format(
+                job.laid_at = job.laid_at or {}
+                job.laid_at[b] = { X = final.X, Y = final.Y, Z = final.Z }
+                log(("book %s was buried%s at (%.0f, %.0f, %.0f)%s; laid on the floor at (%.0f, %.0f, %.0f), %.0f from the player"):format(
                     name_of(IA, b),
                     e.case and " lodged in a bookcase" or (e.depth < 900 and (" " .. string.format("%.0f", e.depth) .. " deep") or " inside geometry"),
-                    x0 or 0, y0 or 0, z0 or 0, final.X, final.Y, final.Z, spot.d or 0))
+                    x0 or 0, y0 or 0, z0 or 0, e.again and ", where it was laid" or "", final.X, final.Y, final.Z, spot.d or 0))
             else
                 job.failed = job.failed + 1
                 M.stats.failed = M.stats.failed + 1
-                log(("book %s is buried and no open floor by the player could be read"):format(name_of(IA, b)))
+                -- once per book: the second look meets it again where it was left
+                job.left = job.left or {}
+                if not job.left[b] then
+                    job.left[b] = true
+                    log(("book %s is buried and no open floor by the player has room for it%s; left where it lies"):format(
+                        name_of(IA, b), e.again and " (other than where it was laid)" or ""))
+                end
             end
         end
     end
@@ -246,9 +264,16 @@ function M.tick(IA)
                 if valid(b) and not owned(b) then gone[#gone + 1] = b end
             end
             if #gone > 0 then
-                job = job or { books = {}, age = 0, still = 0, pass = 1, lay = { dists = LAY_DISTS } }
+                job = job or { books = {}, seen = {}, age = 0, still = 0, pass = 1, lay = { dists = LAY_DISTS } }
                 st.job = job
-                for _, b in ipairs(gone) do job.books[#job.books + 1] = b end
+                -- a book can still be listed in the bag a read after it left: count it once
+                for _, b in ipairs(gone) do
+                    local k = T.util.key(b) or tostring(b)
+                    if not job.seen[k] then
+                        job.seen[k] = true
+                        job.books[#job.books + 1] = b
+                    end
+                end
                 job.quiet = 0           -- ticks since the last book left
             end
         end
